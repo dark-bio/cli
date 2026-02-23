@@ -8,6 +8,7 @@ mod wire_protocol;
 use clap::{Parser, Subcommand};
 use console::style;
 use nusb::MaybeFuture;
+#[cfg(feature = "internal")]
 use std::path::PathBuf;
 use std::process;
 
@@ -30,6 +31,7 @@ enum Command {
     List,
 
     /// Onboard an enclave with a signed attestation certificate
+    #[cfg(feature = "internal")]
     Onboard {
         /// Path to the CWT attestation file
         #[arg(long)]
@@ -46,6 +48,7 @@ fn main() {
 
     match cli.command {
         Command::List => cmd_list(),
+        #[cfg(feature = "internal")]
         Command::Onboard { cwt } => {
             let mut enc = open_enclave();
             cmd_onboard(&mut enc, &cwt);
@@ -110,6 +113,7 @@ fn cmd_list() {
 }
 
 /// Reads a CWT attestation file and sends it to the enclave for onboarding.
+#[cfg(feature = "internal")]
 fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
     let cwt = std::fs::read(cwt_path).unwrap_or_else(|err| {
         eprintln!(

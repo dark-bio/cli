@@ -127,6 +127,7 @@ impl Enclave {
     }
 
     /// Onboards the enclave with a signed attestation certificate (CWT).
+    #[cfg(feature = "internal")]
     pub fn onboard(&mut self, device_attestation: &[u8]) -> Result<(), EnclaveError> {
         use wire_protocol::host_to_ark::Content;
 
