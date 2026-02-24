@@ -1,7 +1,7 @@
 // ark: command line interface for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-use crate::wire::{Wire, WireError};
+use crate::wire::{SessionInfo, TrustMode, Wire, WireError};
 use crate::wire_protocol::{self, ArkToHost, HostToArk};
 
 use nusb::descriptors::TransferType;
@@ -45,6 +45,7 @@ pub enum EnclaveError {
 /// interface claim, then the USB handle.
 pub struct Enclave {
     wire: Wire<EndpointRead<Bulk>, EndpointWrite<Bulk>>,
+    session_info: SessionInfo,
     next_id: u64,
 
     _iface: nusb::Interface,
@@ -53,9 +54,9 @@ pub struct Enclave {
 
 impl Enclave {
     /// Opens an Ark enclave from its USB device info. This claims the first
-    /// interface that has bulk IN and OUT endpoints, resets the wire session,
-    /// and returns a ready-to-use Enclave.
-    pub fn open(info: &nusb::DeviceInfo) -> Result<Self, EnclaveError> {
+    /// interface that has bulk IN and OUT endpoints, establishes an encrypted
+    /// session, and returns a ready-to-use Enclave.
+    pub fn open(info: &nusb::DeviceInfo, trust: TrustMode) -> Result<Self, EnclaveError> {
         let device = info.open().wait().map_err(EnclaveError::Open)?;
 
         // Walk the active configuration to locate bulk IN + OUT endpoints.
@@ -103,15 +104,21 @@ impl Enclave {
         let reader = ep_in.reader(64 * 1024);
         let writer = ep_out.writer(64 * 1024);
         let mut wire = Wire::new(reader, writer);
-
-        wire.reset_session()?;
+        let session_info = wire.establish_session(trust)?;
 
         Ok(Self {
             wire,
+            session_info,
             next_id: 1,
             _iface: iface,
             _device: device,
         })
+    }
+
+    /// Returns device information extracted from the CWT during session
+    /// establishment.
+    pub fn session_info(&self) -> &SessionInfo {
+        &self.session_info
     }
 
     /// Performs a handshake to retrieve enclave identity and version info.

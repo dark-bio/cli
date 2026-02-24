@@ -9,7 +9,9 @@ internal = []
 [dependencies]
 chrono = "0.4.41"
 clap = { version = "4.5.60", features = ["derive"] }
-cobs = { package = "darkbio-cobs", version = "0.1.2" }
+darkbio-cobs = "0.1.2"
+darkbio-crypto = { version = "0.14.0", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
+hex = "0.4.3"
 console = "0.15.11"
 nusb = "0.2.2"
 prost = "0.14.1"

@@ -1,7 +1,9 @@
 // ark: command line interface for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
+mod attests;
 mod enclave;
+mod pubkeys;
 mod wire;
 mod wire_protocol;
 
@@ -13,6 +15,8 @@ use std::path::PathBuf;
 use std::process;
 
 use enclave::Enclave;
+use pubkeys::Release;
+use wire::TrustMode;
 
 /// USB VID:PID for Dark Bio Ark enclaves.
 const ARK_VID: u16 = 0x2e8a;
@@ -50,18 +54,18 @@ fn main() {
         Command::List => cmd_list(),
         #[cfg(feature = "internal")]
         Command::Onboard { cwt } => {
-            let mut enc = open_enclave();
+            let mut enc = open_enclave(TrustMode::RootOrSelf);
             cmd_onboard(&mut enc, &cwt);
         }
         Command::Status => {
-            let mut enc = open_enclave();
+            let mut enc = open_enclave(TrustMode::RootOrSelf);
             cmd_status(&mut enc);
         }
     }
 }
 
-/// Locates exactly one Ark enclave and opens a connection. Exits on error.
-fn open_enclave() -> Enclave {
+/// Locates exactly one Ark enclave and opens an encrypted connection. Exits on error.
+fn open_enclave(trust: TrustMode) -> Enclave {
     let devices: Vec<_> = nusb::list_devices()
         .wait()
         .expect("failed to enumerate USB devices")
@@ -79,7 +83,7 @@ fn open_enclave() -> Enclave {
         );
         process::exit(2);
     }
-    Enclave::open(&devices[0]).unwrap_or_else(|err| {
+    Enclave::open(&devices[0], trust).unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
     })
@@ -133,6 +137,11 @@ fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
 
 /// Performs a handshake and prints hardware, firmware and identity information.
 fn cmd_status(enc: &mut Enclave) {
+    let serial = enc.session_info().serial.clone();
+    let hw_model = enc.session_info().hw_model.clone();
+    let hw_version = enc.session_info().hw_version.clone();
+    let release = enc.session_info().release;
+    let cwt_fingerprint = enc.session_info().ark_identity.fingerprint();
     let info = enc.handshake().unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
@@ -144,24 +153,105 @@ fn cmd_status(enc: &mut Enclave) {
         .unwrap()
         .format("%Y-%m-%d %H:%M:%S %Z");
 
-    println!(
-        "{} {} - {}",
-        style("Hardware: ").dim(),
-        info.version_str,
-        info.revision_str
-    );
+    // Cross-check CWT claims against device-reported values (only for root-signed)
+    let root_signed = release.is_some();
+    let reported_hw = format!("{} - {}", info.version_str, info.revision_str);
+    let hw_mismatch = root_signed && hw_version != reported_hw;
+    let id_mismatch = root_signed
+        && !info.compute_identity.is_empty()
+        && info.compute_identity != cwt_fingerprint.to_bytes().as_slice();
+
+    // Hardware
+    let hw_model_str = String::from_utf8(hw_model)
+        .unwrap_or_else(|err| format!("0x{}", hex::encode(err.into_bytes())));
+
+    if hw_mismatch {
+        println!(
+            "{} {} - {} ({}) ({})",
+            style("Hardware: ").dim(),
+            info.version_str,
+            info.revision_str,
+            style(&hw_model_str).dim(),
+            style(format!("certificate contains \"{}\"", hw_version)).red(),
+        );
+    } else {
+        println!(
+            "{} {} - {} ({})",
+            style("Hardware: ").dim(),
+            info.version_str,
+            info.revision_str,
+            style(&hw_model_str).dim(),
+        );
+    }
+    // Serial
+    if root_signed {
+        println!("{} {}", style("Serial:   ").dim(), serial);
+    } else {
+        println!(
+            "{} {}",
+            style("Serial:   ").dim(),
+            style("not onboarded").red(),
+        );
+    }
+
+    // Genuine
+    match release {
+        Some(Release::Release) => {
+            println!("{} {}", style("Genuine:  ").dim(), style("genuine").green());
+        }
+        Some(Release::Staging) => {
+            println!(
+                "{} {} ({})",
+                style("Genuine:  ").dim(),
+                style("genuine").green(),
+                style("staging").yellow(),
+            );
+        }
+        Some(Release::Develop) => {
+            println!(
+                "{} {} ({})",
+                style("Genuine:  ").dim(),
+                style("genuine").green(),
+                style("develop").red(),
+            );
+        }
+        None => {
+            println!(
+                "{} {}",
+                style("Genuine:  ").dim(),
+                style("not genuine").red(),
+            );
+        }
+    }
+    // Firmware
     println!(
         "{} {} ({})",
         style("Firmware: ").dim(),
         info.firmware_version,
         style(published).dim()
     );
+    // Identity
     if !info.compute_identity.is_empty() {
         let hex: String = info
             .compute_identity
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        println!("{} {}", style("Identity: ").dim(), hex);
+
+        if id_mismatch {
+            let cwt_hex: String = cwt_fingerprint
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            println!(
+                "{} {} ({})",
+                style("Identity: ").dim(),
+                hex,
+                style(format!("certificate contains \"{}\"", cwt_hex)).red(),
+            );
+        } else {
+            println!("{} {}", style("Identity: ").dim(), hex);
+        }
     }
 }
