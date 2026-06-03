@@ -65,6 +65,21 @@ fn main() {
             let trust = parse_trust_mode(pubkey);
             let mut enc = open_enclave(trust);
             cmd_onboard(&mut enc, &cwt);
+
+            // Refresh the session and print the status for immediate visual
+            // feedback. Onboarding already succeeded, so a status read failure
+            // only warns instead of failing the command.
+            match enc.refresh_session(TrustMode::RootOrSelf) {
+                Ok(()) => {
+                    println!();
+                    cmd_status(&mut enc);
+                }
+                Err(err) => eprintln!(
+                    "{} could not read status after onboarding: {}",
+                    style("warning:").yellow().bold(),
+                    err,
+                ),
+            }
         }
         Command::Status { pubkey } => {
             let trust = parse_trust_mode(pubkey);

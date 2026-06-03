@@ -145,6 +145,17 @@ impl Enclave {
         Ok(())
     }
 
+    /// Re-runs the encrypted handshake on the existing connection, refreshing
+    /// the cached session info. Used after onboarding so a follow-up status
+    /// reflects the freshly injected attestation rather than the pre-onboard
+    /// identity captured when the enclave was first opened.
+    #[cfg(feature = "internal")]
+    pub fn refresh_session(&mut self, trust: TrustMode) -> Result<(), EnclaveError> {
+        self.session_info = self.wire.establish_session(trust)?;
+        self.next_id = 1;
+        Ok(())
+    }
+
     /// Sends a request to the enclave and returns the validated response.
     /// If the enclave signals an error in the response envelope, it is
     /// converted into an EnclaveError::Remote.
