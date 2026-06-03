@@ -138,6 +138,10 @@ pub enum TrustMode {
     /// Require the CWT to be signed by a known device root key.
     /// Used for production commands.
     RootOnly,
+
+    /// Skip CWT verification entirely and use the provided public key as the
+    /// Ark's identity. Used for recovering devices with corrupted/empty CWTs.
+    Recover(xdsa::PublicKey),
 }
 
 // ---------- Wire transport ----------
@@ -245,20 +249,46 @@ impl<R: Read, W: Write> Wire<R, W> {
             WireError::HandshakeFailed(format!("invalid ark hello payload: {}", err))
         })?;
 
-        // Step 2c: Verify the CWT and extract the Ark's identity and device info
-        let session_info = verify_cwt(&unverified.ark_attest, &trust)?;
-
-        // Step 2d: Verify the COSE_Sign1 signature with the discovered key
-        let ark_hello: HandshakeArkHello = cose::verify(
-            &sign1,
-            &auth,
-            &session_info.ark_identity,
-            CRYPTO_DOMAIN_WIRE,
-            None,
-        )
-        .map_err(|err| {
-            WireError::HandshakeFailed(format!("ark hello signature invalid: {}", err))
-        })?;
+        // Steps 2c+2d: Verify the Ark's identity and COSE_Sign1 signature.
+        //
+        // In normal modes we extract the identity from the CWT attestation and
+        // verify the signature against it. In recovery mode the caller supplies
+        // the Ark's public key directly (the CWT may be corrupted / empty).
+        let (session_info, ark_hello) = match &trust {
+            TrustMode::Recover(ark_identity) => {
+                // Recovery: caller-provided key, verify signature but skip CWT.
+                let hello: HandshakeArkHello =
+                    cose::verify(&sign1, &auth, ark_identity, CRYPTO_DOMAIN_WIRE, None).map_err(
+                        |err| {
+                            WireError::HandshakeFailed(format!(
+                                "ark hello signature invalid: {}",
+                                err
+                            ))
+                        },
+                    )?;
+                let info = SessionInfo {
+                    ark_identity: ark_identity.clone(),
+                    serial: String::new(),
+                    hw_model: Vec::new(),
+                    hw_version: String::new(),
+                    release: None,
+                };
+                (info, hello)
+            }
+            _ => {
+                // Normal: verify CWT, then verify COSE_Sign1 with discovered key.
+                let info = verify_cwt(&unverified.ark_attest, &trust)?;
+                let hello: HandshakeArkHello =
+                    cose::verify(&sign1, &auth, &info.ark_identity, CRYPTO_DOMAIN_WIRE, None)
+                        .map_err(|err| {
+                            WireError::HandshakeFailed(format!(
+                                "ark hello signature invalid: {}",
+                                err
+                            ))
+                        })?;
+                (info, hello)
+            }
+        };
 
         // Set up the Ark->Host receiver context
         let enc_a2h: [u8; xhpke::ENCAP_KEY_SIZE] = ark_hello
@@ -485,27 +515,29 @@ fn verify_cwt(cwt_bytes: &[u8], trust: &TrustMode) -> Result<SessionInfo, WireEr
 
     // Try each known root key until we find one whose fingerprint matches
     for release in [Release::Release, Release::Staging, Release::Develop] {
-        let root_key = pubkeys::device_root(release);
-        if root_key.fingerprint() != signer_fp {
-            continue;
-        }
-        // Fingerprint matches, verify the CWT with this root key
-        let attestation: DeviceAttestation =
-            cwt::verify(cwt_bytes, &root_key, CRYPTO_DOMAIN_DEVICE_ATTESTATION, None).map_err(
-                |err| WireError::HandshakeFailed(format!("CWT verification failed: {}", err)),
-            )?;
+        for root_key in pubkeys::device_root_keys(release) {
+            if root_key.fingerprint() != signer_fp {
+                continue;
+            }
+            // Fingerprint matches, verify the CWT with this root key
+            let attestation: DeviceAttestation =
+                cwt::verify(cwt_bytes, &root_key, CRYPTO_DOMAIN_DEVICE_ATTESTATION, None).map_err(
+                    |err| WireError::HandshakeFailed(format!("CWT verification failed: {}", err)),
+                )?;
 
-        return Ok(SessionInfo {
-            ark_identity: attestation.cnf.key().clone(),
-            serial: attestation.sub.sub,
-            hw_model: attestation.hwm.hw_model,
-            hw_version: attestation.hwv.version().to_string(),
-            release: Some(release),
-        });
+            return Ok(SessionInfo {
+                ark_identity: attestation.cnf.key().clone(),
+                serial: attestation.sub.sub,
+                hw_model: attestation.hwm.hw_model,
+                hw_version: attestation.hwv.version().to_string(),
+                release: Some(release),
+            });
+        }
     }
     // No root key matched. Check for self-signed if the trust mode allows it.
+    // Recover mode never reaches here (handled by establish_session directly).
     match trust {
-        TrustMode::RootOnly => Err(WireError::HandshakeFailed(
+        TrustMode::RootOnly | TrustMode::Recover(_) => Err(WireError::HandshakeFailed(
             "device CWT not signed by a known root key".into(),
         )),
         TrustMode::RootOrSelf => {

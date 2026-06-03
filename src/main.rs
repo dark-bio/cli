@@ -40,10 +40,18 @@ enum Command {
         /// Path to the CWT attestation file
         #[arg(long)]
         cwt: PathBuf,
+
+        /// Hex-encoded xDSA public key for recovery (bypasses CWT verification)
+        #[arg(long)]
+        pubkey: Option<String>,
     },
 
     /// Query enclave identity and firmware information
-    Status,
+    Status {
+        /// Hex-encoded xDSA public key for recovery (bypasses CWT verification)
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
 }
 
 /// CLI entry point. Parses arguments and dispatches to the appropriate command.
@@ -53,13 +61,49 @@ fn main() {
     match cli.command {
         Command::List => cmd_list(),
         #[cfg(feature = "internal")]
-        Command::Onboard { cwt } => {
-            let mut enc = open_enclave(TrustMode::RootOrSelf);
+        Command::Onboard { cwt, pubkey } => {
+            let trust = parse_trust_mode(pubkey);
+            let mut enc = open_enclave(trust);
             cmd_onboard(&mut enc, &cwt);
         }
-        Command::Status => {
-            let mut enc = open_enclave(TrustMode::RootOrSelf);
+        Command::Status { pubkey } => {
+            let trust = parse_trust_mode(pubkey);
+            let mut enc = open_enclave(trust);
             cmd_status(&mut enc);
+        }
+    }
+}
+
+/// Parses an optional hex-encoded xDSA public key into a TrustMode. If a key is
+/// provided, returns Recover mode; otherwise returns the default RootOrSelf.
+fn parse_trust_mode(pubkey: Option<String>) -> TrustMode {
+    match pubkey {
+        None => TrustMode::RootOrSelf,
+        Some(hex_key) => {
+            let bytes = hex::decode(&hex_key).unwrap_or_else(|err| {
+                eprintln!(
+                    "{} invalid --pubkey hex: {}",
+                    style("error:").red().bold(),
+                    err,
+                );
+                process::exit(1);
+            });
+            let key_bytes: [u8; darkbio_crypto::xdsa::PUBLIC_KEY_SIZE] =
+                bytes.as_slice().try_into().unwrap_or_else(|_| {
+                    eprintln!(
+                        "{} invalid --pubkey length (expected {} bytes, got {})",
+                        style("error:").red().bold(),
+                        darkbio_crypto::xdsa::PUBLIC_KEY_SIZE,
+                        bytes.len(),
+                    );
+                    process::exit(1);
+                });
+            let key =
+                darkbio_crypto::xdsa::PublicKey::from_bytes(&key_bytes).unwrap_or_else(|err| {
+                    eprintln!("{} invalid --pubkey: {}", style("error:").red().bold(), err);
+                    process::exit(1);
+                });
+            TrustMode::Recover(key)
         }
     }
 }
@@ -254,4 +298,32 @@ fn cmd_status(enc: &mut Enclave) {
             println!("{} {}", style("Identity: ").dim(), hex);
         }
     }
+    // Public key
+    let pubkey_bytes: [u8; darkbio_crypto::xdsa::PUBLIC_KEY_SIZE] = info
+        .compute_pubkey
+        .as_slice()
+        .try_into()
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "{} invalid public key length (expected {}, got {})",
+                style("error:").red().bold(),
+                darkbio_crypto::xdsa::PUBLIC_KEY_SIZE,
+                info.compute_pubkey.len(),
+            );
+            process::exit(3);
+        });
+    let pubkey = darkbio_crypto::xdsa::PublicKey::from_bytes(&pubkey_bytes).unwrap_or_else(|err| {
+        eprintln!("{} {}", style("error:").red().bold(), err);
+        process::exit(3);
+    });
+    println!(
+        "{} {}",
+        style("Pubkey:   ").dim(),
+        hex::encode(&info.compute_pubkey)
+    );
+    println!(
+        "{} {}",
+        style("Fingerp.: ").dim(),
+        hex::encode(pubkey.fingerprint().to_bytes())
+    );
 }
