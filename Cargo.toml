@@ -10,7 +10,7 @@ internal = []
 chrono = "0.4.41"
 clap = { version = "4.5.60", features = ["derive"] }
 darkbio-cobs = "0.1.2"
-darkbio-crypto = { version = "0.16.0", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
+darkbio-crypto = { version = "0.17.1", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
 hex = "0.4.3"
 console = "0.15.11"
 nusb = "0.2.2"
