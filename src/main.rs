@@ -1,22 +1,19 @@
 // ark: command line interface for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-mod attests;
 mod enclave;
-mod pubkeys;
 mod wire;
-mod wire_protocol;
 
 use clap::{Parser, Subcommand};
 use console::style;
+use darkbio_trust::Environment;
 use nusb::MaybeFuture;
 #[cfg(feature = "internal")]
 use std::path::PathBuf;
 use std::process;
 
 use enclave::Enclave;
-use pubkeys::Release;
-use wire::TrustMode;
+use wire::{Identity, TrustMode};
 
 /// USB VID:PID for Dark Bio Ark enclaves.
 const ARK_VID: u16 = 0x2e8a;
@@ -63,13 +60,13 @@ fn main() {
         #[cfg(feature = "internal")]
         Command::Onboard { cwt, pubkey } => {
             let trust = parse_trust_mode(pubkey);
-            let mut enc = open_enclave(trust);
+            let mut enc = open_enclave(&trust);
             cmd_onboard(&mut enc, &cwt);
 
             // Refresh the session and print the status for immediate visual
             // feedback. Onboarding already succeeded, so a status read failure
             // only warns instead of failing the command.
-            match enc.refresh_session(TrustMode::RootOrSelf) {
+            match enc.refresh_session(&TrustMode::RootOrSelf) {
                 Ok(()) => {
                     println!();
                     cmd_status(&mut enc);
@@ -83,7 +80,7 @@ fn main() {
         }
         Command::Status { pubkey } => {
             let trust = parse_trust_mode(pubkey);
-            let mut enc = open_enclave(trust);
+            let mut enc = open_enclave(&trust);
             cmd_status(&mut enc);
         }
     }
@@ -124,7 +121,7 @@ fn parse_trust_mode(pubkey: Option<String>) -> TrustMode {
 }
 
 /// Locates exactly one Ark enclave and opens an encrypted connection. Exits on error.
-fn open_enclave(trust: TrustMode) -> Enclave {
+fn open_enclave(trust: &TrustMode) -> Enclave {
     let devices: Vec<_> = nusb::list_devices()
         .wait()
         .expect("failed to enumerate USB devices")
@@ -196,11 +193,7 @@ fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
 
 /// Performs a handshake and prints hardware, firmware and identity information.
 fn cmd_status(enc: &mut Enclave) {
-    let serial = enc.session_info().serial.clone();
-    let hw_model = enc.session_info().hw_model.clone();
-    let hw_version = enc.session_info().hw_version.clone();
-    let release = enc.session_info().release;
-    let cwt_fingerprint = enc.session_info().ark_identity.fingerprint();
+    let identity = enc.identity().clone();
     let info = enc.handshake().unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
@@ -212,53 +205,63 @@ fn cmd_status(enc: &mut Enclave) {
         .unwrap()
         .format("%Y-%m-%d %H:%M:%S %Z");
 
-    // Cross-check CWT claims against device-reported values (only for root-signed)
-    let root_signed = release.is_some();
+    // Cross-check the attested claims against device-reported values (only for
+    // root-signed)
+    let (environment, device) = match &identity {
+        Identity::Attested {
+            environment,
+            device,
+        } => (Some(*environment), Some(device)),
+        _ => (None, None),
+    };
+    let fingerprint = identity.key().fingerprint();
     let reported_hw = format!("{} - {}", info.version_str, info.revision_str);
-    let hw_mismatch = root_signed && hw_version != reported_hw;
-    let id_mismatch = root_signed
+    let hw_mismatch = device.is_some_and(|device| device.version != reported_hw);
+    let id_mismatch = device.is_some()
         && !info.compute_identity.is_empty()
-        && info.compute_identity != cwt_fingerprint.to_bytes().as_slice();
+        && info.compute_identity != fingerprint.to_bytes().as_slice();
 
     // Hardware
-    let hw_model_str = String::from_utf8(hw_model)
-        .unwrap_or_else(|err| format!("0x{}", hex::encode(err.into_bytes())));
+    match device {
+        Some(device) => {
+            let model = String::from_utf8(device.model.clone())
+                .unwrap_or_else(|err| format!("0x{}", hex::encode(err.into_bytes())));
 
-    if hw_mismatch {
-        println!(
-            "{} {} - {} ({}) ({})",
-            style("Hardware: ").dim(),
-            info.version_str,
-            info.revision_str,
-            style(&hw_model_str).dim(),
-            style(format!("certificate contains \"{}\"", hw_version)).red(),
-        );
-    } else {
-        println!(
-            "{} {} - {} ({})",
-            style("Hardware: ").dim(),
-            info.version_str,
-            info.revision_str,
-            style(&hw_model_str).dim(),
-        );
+            if hw_mismatch {
+                println!(
+                    "{} {} ({}) ({})",
+                    style("Hardware: ").dim(),
+                    reported_hw,
+                    style(&model).dim(),
+                    style(format!("certificate contains \"{}\"", device.version)).red(),
+                );
+            } else {
+                println!(
+                    "{} {} ({})",
+                    style("Hardware: ").dim(),
+                    reported_hw,
+                    style(&model).dim(),
+                );
+            }
+        }
+        None => println!("{} {}", style("Hardware: ").dim(), reported_hw),
     }
     // Serial
-    if root_signed {
-        println!("{} {}", style("Serial:   ").dim(), serial);
-    } else {
-        println!(
+    match device {
+        Some(device) => println!("{} {}", style("Serial:   ").dim(), device.serial),
+        None => println!(
             "{} {}",
             style("Serial:   ").dim(),
             style("not onboarded").red(),
-        );
+        ),
     }
 
     // Genuine
-    match release {
-        Some(Release::Release) => {
+    match environment {
+        Some(Environment::Release) => {
             println!("{} {}", style("Genuine:  ").dim(), style("genuine").green());
         }
-        Some(Release::Staging) => {
+        Some(Environment::Staging) => {
             println!(
                 "{} {} ({})",
                 style("Genuine:  ").dim(),
@@ -266,7 +269,7 @@ fn cmd_status(enc: &mut Enclave) {
                 style("staging").yellow(),
             );
         }
-        Some(Release::Develop) => {
+        Some(Environment::Develop) => {
             println!(
                 "{} {} ({})",
                 style("Genuine:  ").dim(),
@@ -298,7 +301,7 @@ fn cmd_status(enc: &mut Enclave) {
             .collect();
 
         if id_mismatch {
-            let cwt_hex: String = cwt_fingerprint
+            let cwt_hex: String = fingerprint
                 .to_bytes()
                 .iter()
                 .map(|b| format!("{b:02x}"))

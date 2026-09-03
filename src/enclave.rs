@@ -1,13 +1,13 @@
 // ark: command line interface for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-use crate::wire::{SessionInfo, TrustMode, Wire, WireError};
-use crate::wire_protocol::{self, ArkToHost, HostToArk};
-
+use crate::wire::{Identity, TrustMode, WireError};
+use darkbio_wire::HostSide;
+use darkbio_wire::protocol::{self, ArkToHost, HostToArk};
+use nusb::MaybeFuture;
 use nusb::descriptors::TransferType;
 use nusb::io::{EndpointRead, EndpointWrite};
 use nusb::transfer::{Bulk, Direction, In, Out};
-use nusb::MaybeFuture;
 use thiserror::Error;
 
 /// Errors returned by Enclave operations.
@@ -44,8 +44,8 @@ pub enum EnclaveError {
 /// (which owns the endpoint readers/writers) is dropped first, then the
 /// interface claim, then the USB handle.
 pub struct Enclave {
-    wire: Wire<EndpointRead<Bulk>, EndpointWrite<Bulk>>,
-    session_info: SessionInfo,
+    wire: HostSide<EndpointRead<Bulk>, EndpointWrite<Bulk>>,
+    identity: Identity,
     next_id: u64,
 
     _iface: nusb::Interface,
@@ -56,7 +56,7 @@ impl Enclave {
     /// Opens an Ark enclave from its USB device info. This claims the first
     /// interface that has bulk IN and OUT endpoints, establishes an encrypted
     /// session, and returns a ready-to-use Enclave.
-    pub fn open(info: &nusb::DeviceInfo, trust: TrustMode) -> Result<Self, EnclaveError> {
+    pub fn open(info: &nusb::DeviceInfo, trust: &TrustMode) -> Result<Self, EnclaveError> {
         let device = info.open().wait().map_err(EnclaveError::Open)?;
 
         // Walk the active configuration to locate bulk IN + OUT endpoints.
@@ -103,32 +103,32 @@ impl Enclave {
         // Wrap the endpoints into std::io::Read/Write and create the wire.
         let reader = ep_in.reader(64 * 1024);
         let writer = ep_out.writer(64 * 1024);
-        let mut wire = Wire::new(reader, writer);
-        let session_info = wire.establish_session(trust)?;
+        let mut wire = HostSide::new(reader, writer);
+        let identity = wire.handshake(trust)?;
 
         Ok(Self {
             wire,
-            session_info,
+            identity,
             next_id: 1,
             _iface: iface,
             _device: device,
         })
     }
 
-    /// Returns device information extracted from the CWT during session
+    /// Returns the identity of the enclave established during session
     /// establishment.
-    pub fn session_info(&self) -> &SessionInfo {
-        &self.session_info
+    pub fn identity(&self) -> &Identity {
+        &self.identity
     }
 
     /// Performs a handshake to retrieve enclave identity and version info.
-    pub fn handshake(&mut self) -> Result<wire_protocol::HandshakeResponse, EnclaveError> {
-        use wire_protocol::host_to_ark::Content;
+    pub fn handshake(&mut self) -> Result<protocol::HandshakeResponse, EnclaveError> {
+        use protocol::host_to_ark::Content;
 
-        let resp = self.request(Content::Handshake(wire_protocol::HandshakeRequest {}))?;
+        let resp = self.request(Content::Handshake(protocol::HandshakeRequest {}))?;
 
         match resp.content {
-            Some(wire_protocol::ark_to_host::Content::Handshake(hs)) => Ok(hs),
+            Some(protocol::ark_to_host::Content::Handshake(hs)) => Ok(hs),
             _ => Err(EnclaveError::UnexpectedResponse),
         }
     }
@@ -136,9 +136,9 @@ impl Enclave {
     /// Onboards the enclave with a signed attestation certificate (CWT).
     #[cfg(feature = "internal")]
     pub fn onboard(&mut self, device_attestation: &[u8]) -> Result<(), EnclaveError> {
-        use wire_protocol::host_to_ark::Content;
+        use protocol::host_to_ark::Content;
 
-        self.request(Content::Onboard(wire_protocol::OnboardingRequest {
+        self.request(Content::Onboard(protocol::OnboardingRequest {
             device_attestation: device_attestation.to_vec(),
         }))?;
 
@@ -146,12 +146,12 @@ impl Enclave {
     }
 
     /// Re-runs the encrypted handshake on the existing connection, refreshing
-    /// the cached session info. Used after onboarding so a follow-up status
+    /// the cached identity. Used after onboarding so a follow-up status
     /// reflects the freshly injected attestation rather than the pre-onboard
     /// identity captured when the enclave was first opened.
     #[cfg(feature = "internal")]
-    pub fn refresh_session(&mut self, trust: TrustMode) -> Result<(), EnclaveError> {
-        self.session_info = self.wire.establish_session(trust)?;
+    pub fn refresh_session(&mut self, trust: &TrustMode) -> Result<(), EnclaveError> {
+        self.identity = self.wire.handshake(trust)?;
         self.next_id = 1;
         Ok(())
     }
@@ -161,7 +161,7 @@ impl Enclave {
     /// converted into an EnclaveError::Remote.
     fn request(
         &mut self,
-        content: wire_protocol::host_to_ark::Content,
+        content: protocol::host_to_ark::Content,
     ) -> Result<ArkToHost, EnclaveError> {
         let id = self.next_id;
         self.next_id += 1;
