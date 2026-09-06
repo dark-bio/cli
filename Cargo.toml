@@ -9,13 +9,13 @@ internal = []
 [dependencies]
 chrono = "0.4.41"
 clap = { version = "4.5.60", features = ["derive"] }
-darkbio-crypto = { version = "0.17.1", features = ["xdsa"] }
-darkbio-trust = { version = "0.2.0", features = ["release", "staging", "develop"] }
-darkbio-wire = "0.2.0"
+darkbio-crypto = { version = "0.18.0", features = ["xdsa"] }
+darkbio-trust = { version = "0.3.0", features = ["release", "staging", "develop"] }
+darkbio-wire = "0.4.0"
 hex = "0.4.3"
 console = "0.15.11"
 nusb = "0.2.2"
 thiserror = "2.0.17"
 
 [dev-dependencies]
-darkbio-crypto = { version = "0.17.1", features = ["cwt"] }
+darkbio-crypto = { version = "0.18.0", features = ["cwt"] }

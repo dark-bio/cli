@@ -2,7 +2,7 @@
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
 use crate::wire::{Identity, TrustMode, WireError};
-use darkbio_wire::HostSide;
+use darkbio_wire::Client;
 use darkbio_wire::protocol::{self, ArkToHost, HostToArk};
 use nusb::MaybeFuture;
 use nusb::descriptors::TransferType;
@@ -44,7 +44,7 @@ pub enum EnclaveError {
 /// (which owns the endpoint readers/writers) is dropped first, then the
 /// interface claim, then the USB handle.
 pub struct Enclave {
-    wire: HostSide<EndpointRead<Bulk>, EndpointWrite<Bulk>>,
+    wire: Client<EndpointRead<Bulk>, EndpointWrite<Bulk>>,
     identity: Identity,
     next_id: u64,
 
@@ -103,7 +103,7 @@ impl Enclave {
         // Wrap the endpoints into std::io::Read/Write and create the wire.
         let reader = ep_in.reader(64 * 1024);
         let writer = ep_out.writer(64 * 1024);
-        let mut wire = HostSide::new(reader, writer);
+        let mut wire = Client::new(reader, writer);
         let identity = wire.handshake(trust)?;
 
         Ok(Self {
@@ -121,14 +121,14 @@ impl Enclave {
         &self.identity
     }
 
-    /// Performs a handshake to retrieve enclave identity and version info.
-    pub fn handshake(&mut self) -> Result<protocol::HandshakeResponse, EnclaveError> {
+    /// Retrieves the hardware and firmware version info of the enclave.
+    pub fn device_info(&mut self) -> Result<protocol::DeviceInfoResponse, EnclaveError> {
         use protocol::host_to_ark::Content;
 
-        let resp = self.request(Content::Handshake(protocol::HandshakeRequest {}))?;
+        let resp = self.request(Content::DeviceInfo(protocol::DeviceInfoRequest {}))?;
 
         match resp.content {
-            Some(protocol::ark_to_host::Content::Handshake(hs)) => Ok(hs),
+            Some(protocol::ark_to_host::Content::DeviceInfo(info)) => Ok(info),
             _ => Err(EnclaveError::UnexpectedResponse),
         }
     }

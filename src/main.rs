@@ -191,10 +191,10 @@ fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
     println!("{}", style("Enclave onboarded successfully.").green());
 }
 
-/// Performs a handshake and prints hardware, firmware and identity information.
+/// Retrieves the device info and prints hardware, firmware and identity information.
 fn cmd_status(enc: &mut Enclave) {
     let identity = enc.identity().clone();
-    let info = enc.handshake().unwrap_or_else(|err| {
+    let info = enc.device_info().unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
     });
@@ -217,9 +217,6 @@ fn cmd_status(enc: &mut Enclave) {
     let fingerprint = identity.key().fingerprint();
     let reported_hw = format!("{} - {}", info.version_str, info.revision_str);
     let hw_mismatch = device.is_some_and(|device| device.version != reported_hw);
-    let id_mismatch = device.is_some()
-        && !info.compute_identity.is_empty()
-        && info.compute_identity != fingerprint.to_bytes().as_slice();
 
     // Hardware
     match device {
@@ -293,55 +290,14 @@ fn cmd_status(enc: &mut Enclave) {
         style(published).dim()
     );
     // Identity
-    if !info.compute_identity.is_empty() {
-        let hex: String = info
-            .compute_identity
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-
-        if id_mismatch {
-            let cwt_hex: String = fingerprint
-                .to_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            println!(
-                "{} {} ({})",
-                style("Identity: ").dim(),
-                hex,
-                style(format!("certificate contains \"{}\"", cwt_hex)).red(),
-            );
-        } else {
-            println!("{} {}", style("Identity: ").dim(), hex);
-        }
-    }
-    // Public key
-    let pubkey_bytes: [u8; darkbio_crypto::xdsa::PUBLIC_KEY_SIZE] = info
-        .compute_pubkey
-        .as_slice()
-        .try_into()
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "{} invalid public key length (expected {}, got {})",
-                style("error:").red().bold(),
-                darkbio_crypto::xdsa::PUBLIC_KEY_SIZE,
-                info.compute_pubkey.len(),
-            );
-            process::exit(3);
-        });
-    let pubkey = darkbio_crypto::xdsa::PublicKey::from_bytes(&pubkey_bytes).unwrap_or_else(|err| {
-        eprintln!("{} {}", style("error:").red().bold(), err);
-        process::exit(3);
-    });
     println!(
         "{} {}",
-        style("Pubkey:   ").dim(),
-        hex::encode(&info.compute_pubkey)
+        style("Identity: ").dim(),
+        hex::encode(fingerprint.to_bytes())
     );
     println!(
         "{} {}",
-        style("Fingerp.: ").dim(),
-        hex::encode(pubkey.fingerprint().to_bytes())
+        style("Pubkey:   ").dim(),
+        hex::encode(identity.key().to_bytes())
     );
 }

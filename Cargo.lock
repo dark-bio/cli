@@ -181,6 +181,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -193,6 +194,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -400,11 +402,12 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto"
-version = "0.17.1"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d240122ae8e22e5d7e354331ac5b9cbb265a263ceacb762413e47b4fe5b1539f"
+checksum = "9a75c1e707f065a5d9955e0a4a5e4701ed20aa04f58e2ede4d55e9593fab96ac"
 dependencies = [
  "base64",
+ "chacha20poly1305",
  "darkbio-crypto-cbor-derive",
  "der 0.8.1",
  "ed25519-dalek",
@@ -413,7 +416,6 @@ dependencies = [
  "hpke",
  "ml-dsa",
  "pkcs8 0.11.0",
- "rand_chacha 0.10.0",
  "rsa",
  "serde",
  "sha2 0.11.0",
@@ -426,9 +428,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto-cbor-derive"
-version = "0.17.1"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fa0bfe17ff7f79c67a47f5658db32303c10cbd1b37d806d031ce6169545aa94"
+checksum = "5cc8e60c71b10c3ec23711f874999dad8b0a1464fbeb40a4983ad4fe07aac171"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -437,9 +439,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-trust"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaa33b9ccc391cef0243b6f2c8f26ffe7c1cf20ee6e5b7f1f7cc1550626c7882"
+checksum = "b25f74cc71bb685cc5cb438e2ee13415bb5bdb2af537a195c20202dc80af4d65"
 dependencies = [
  "darkbio-crypto",
  "hex",
@@ -448,9 +450,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-wire"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a52f746121072b644be4c9790c24a7c25dc0e664c79f8f207f928e0709171ddf"
+checksum = "a70c9a3901f8919da786625f77e0f84fe50eccadf451b5b34cd49d5724026ea7"
 dependencies = [
  "darkbio-cobs",
  "darkbio-crypto",
@@ -713,12 +715,13 @@ dependencies = [
 
 [[package]]
 name = "hpke"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd5130e119706b4d8c2180da6126f7e60b6c38c2d340d539219f57051f0a7af7"
+checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
 dependencies = [
  "aead",
  "chacha20poly1305",
+ "getrandom 0.4.3",
  "hkdf",
  "hybrid-array",
  "ml-kem",
@@ -906,6 +909,7 @@ dependencies = [
  "pkcs8 0.11.0",
  "shake",
  "signature 3.0.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -1255,7 +1259,7 @@ version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
- "rand_chacha 0.3.1",
+ "rand_chacha",
  "rand_core 0.6.4",
 ]
 
@@ -1267,16 +1271,6 @@ checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
 dependencies = [
  "ppv-lite86",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1896,6 +1890,7 @@ dependencies = [
  "sha3 0.12.0",
  "shake",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -1906,6 +1901,7 @@ checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
  "curve25519-dalek",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
