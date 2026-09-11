@@ -16,7 +16,7 @@ develop = ["darkbio-trust/develop"]
 base64 = "0.23.1"
 darkbio-crypto = { version = "0.18.0", features = ["cbor", "xdsa"] }
 darkbio-trust = "0.5.0"
-darkbio-wire = "0.7.0"
+darkbio-wire = "0.8.0"
 hex = "0.4.3"
 nusb = "0.2.7"
 mio = { version = "1.2", features = ["os-poll", "net"] }
@@ -26,7 +26,3 @@ sha2 = "0.10"
 thiserror = "2.0"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
-
-[dev-dependencies]
-darkbio-crypto = { version = "0.18.0", features = ["cwt", "xdsa"] }
-prost = "0.14"

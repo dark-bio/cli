@@ -175,10 +175,10 @@ mod testing;
 
 pub use ark::{Ark, Client, Closer, Pending};
 pub use cloud::{Firmware, Registration, UpdateProgress};
-pub use darkbio_trust as trust;
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
 pub use darkbio_wire::protocol::{CodedError, Promise, Responder};
+pub use darkbio_wire::trust;
 pub use dataset::UploadProgress;
 pub use device::{Device, DeviceKind, Locator};
 pub use discovery::{Discovery, list};

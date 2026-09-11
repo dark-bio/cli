@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use console::style;
 use darkbio_connect::schema::{DeviceInfoRequest, DeviceInfoResponse, UnlockRequest};
 use darkbio_connect::trust::{Environment, Realm};
-use darkbio_connect::wire::{protocol, transport};
+use darkbio_connect::wire::{crypto, protocol, transport};
 use darkbio_connect::{Ark, Device, DeviceKind, Discovery, Identity, TrustMode};
 #[cfg(feature = "internal")]
 use std::path::PathBuf;
@@ -292,11 +292,11 @@ fn parse_trust_mode(pubkey: Option<&str>) -> Result<TrustMode, String> {
     let key_bytes = bytes.as_slice().try_into().map_err(|_| {
         format!(
             "invalid --pubkey length (expected {} bytes, got {})",
-            darkbio_crypto::xdsa::PUBLIC_KEY_SIZE,
+            crypto::xdsa::PUBLIC_KEY_SIZE,
             bytes.len(),
         )
     })?;
-    let key = darkbio_crypto::xdsa::PublicKey::from_bytes(key_bytes)
+    let key = crypto::xdsa::PublicKey::from_bytes(key_bytes)
         .map_err(|error| format!("invalid --pubkey: {error}"))?;
     Ok(TrustMode::Recover(Box::new(key)))
 }
@@ -564,8 +564,8 @@ mod tests {
             env,
             device: darkbio_connect::trust::device::Device {
                 realm: Realm::Emulator,
-                identity: darkbio_crypto::xdsa::SecretKey::generate().public_key(),
-                oem: darkbio_crypto::cwt::claims::eat::Oemid::new_pen(0),
+                identity: crypto::xdsa::SecretKey::generate().public_key(),
+                oem: crypto::cwt::claims::eat::Oemid::new_pen(0),
                 serial: "verified-serial".into(),
                 model: vec![0xff],
                 version: "certified revision".into(),
@@ -586,7 +586,7 @@ mod tests {
     /// firmware timestamps remain printable.
     #[test]
     fn test_unverified_status() {
-        let key = darkbio_crypto::xdsa::SecretKey::generate().public_key();
+        let key = crypto::xdsa::SecretKey::generate().public_key();
         let info = DeviceInfoResponse {
             firmware_publish: u64::MAX,
             ..Default::default()

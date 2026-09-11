@@ -268,12 +268,12 @@ handlers. Create the client and closer before moving the owner to that loop.
 The returned wire `Responder` preserves reply completion:
 `responder.reply(response, deadline)?.wait()?` checks that the adapter accepted
 the output. It does not confirm delivery or processing by the peer.
-The relay adapter is private. It maps wire 0.7's wrappers to the outer cloud
+The relay adapter is private. It maps wire's wrappers to the outer cloud
 envelope and preserves encrypted bodies and request IDs. Presence and notification
-envelopes have no wire 0.7 input and are ignored. Connect does not interpret
+envelopes have no wire input and are ignored. Connect does not interpret
 companion authorization or expose a relay protocol API.
 
-Wire 0.7 automatically replies `UNKNOWN` to requests outside its schema.
+Wire automatically replies `UNKNOWN` to requests outside its schema.
 Handlers receive known requests and can reply `UNSUPPORTED` for operations they
 never serve, or `UNAVAILABLE` when the current state prevents serving them.
 Use `schema::Error::reserved` with `schema::ReservedErrors` for those codes.

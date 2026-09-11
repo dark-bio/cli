@@ -1,7 +1,7 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Carries opaque companion messages between the cloud socket and wire 0.7.
+//! Carries opaque companion messages between the cloud socket and the Ark.
 
 use super::{Failure, dns};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
@@ -560,7 +560,7 @@ fn pump(
                                     .reply(schema::RelayAppToArkResponse { id, res }, deadline)?;
                             }
                         }
-                        Frame::Notice => {} // Wire 0.7 has no notification or presence input.
+                        Frame::Notice => {} // The wire has no notification or presence input.
                     },
                     Ok(Message::Pong(bytes)) => heartbeat.pong(&bytes, Instant::now()),
                     Ok(Message::Ping(_)) => {}

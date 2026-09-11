@@ -440,11 +440,12 @@ mod tests {
     fn test_unknown_requests() {
         use crate::testing::self_attestation;
         use darkbio_crypto::xdsa;
-        use darkbio_wire::{memory, transport};
+        use darkbio_wire::{memory, prost, transport};
         use prost::Message as _;
 
         /// Future Ark envelope carrying content absent from the current wire schema.
         #[derive(prost::Message)]
+        #[prost(prost_path = "darkbio_wire::prost")]
         struct FutureRequest {
             #[prost(uint64, tag = "1")]
             id: u64,
