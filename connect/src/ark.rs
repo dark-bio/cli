@@ -5,7 +5,7 @@
 
 use crate::cloud::Services;
 use crate::incoming::{self, Incoming};
-use crate::{Error, Identity, Registration, Request, Setup};
+use crate::{Error, Firmware, Identity, Registration, Request, Setup, UpdateProgress};
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
 use std::io;
@@ -202,6 +202,27 @@ impl Client {
     /// The returned registration may be inactive; its flags explain why.
     pub fn genuine(&self, deadline: Instant) -> Result<Registration, Error> {
         self.services.genuine(&self.requester, deadline)
+    }
+
+    /// Lists published firmware for this attested Ark, newest first.
+    /// Listing packages does not synchronize or change the device.
+    pub fn firmwares(&self, deadline: Instant) -> Result<Vec<Firmware>, Error> {
+        self.services.firmwares(deadline)
+    }
+
+    /// Authorizes, streams, verifies and installs firmware under one deadline.
+    /// The callback runs on this caller's thread. Success acknowledges installation;
+    /// the Ark then reboots, and this call does not verify the subsequent boot.
+    /// Failed updates are never replayed automatically. Raw firmware requests
+    /// must not run concurrently with this operation.
+    pub fn update_firmware(
+        &self,
+        firmware: &Firmware,
+        deadline: Instant,
+        progress: impl FnMut(UpdateProgress),
+    ) -> Result<(), Error> {
+        self.services
+            .update_firmware(&self.requester, firmware, deadline, progress)
     }
 }
 

@@ -76,6 +76,15 @@
 //! the companion takes to authorize. A refused or expired forwarded request
 //! leaves other exchanges on the attachment running.
 //!
+//! [`Client::firmwares`] lists published firmware for an attested Ark,
+//! newest first. [`Firmware::is_update_for`] compares against the installed version;
+//! the Ark decides whether to accept an update. [`Client::update_firmware`]
+//! authorizes, streams, verifies and installs an archive under one deadline,
+//! reporting [`UpdateProgress`] on the caller's thread. It checks download length
+//! and SHA-256 before device verification.
+//! Client clones share an update lock. Success acknowledges installation and a
+//! pending reboot; it does not verify the new boot. Failed stages are not retried.
+//!
 //! ```no_run
 //! use darkbio_connect::{Client, Error, schema::UnlockRequest};
 //! use std::time::{Duration, Instant};
@@ -145,7 +154,7 @@ mod request;
 mod testing;
 
 pub use ark::{Ark, Client, Closer, Pending};
-pub use cloud::Registration;
+pub use cloud::{Firmware, Registration, UpdateProgress};
 pub use darkbio_trust as trust;
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
@@ -161,6 +170,10 @@ use std::io;
 /// Things that can go wrong finding, reaching or talking to an Ark.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Firmware selection, transfer or update state was invalid.
+    #[error("firmware update failed: {0}")]
+    Firmware(String),
+
     /// A relay connection or forwarded exchange failed.
     #[error("relay operation failed: {0}")]
     Relay(String),

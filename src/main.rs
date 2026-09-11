@@ -3,6 +3,8 @@
 
 //! Command dispatch, endpoint selection and terminal output for the Ark CLI.
 
+mod update;
+
 use clap::{Parser, Subcommand};
 use console::style;
 use darkbio_connect::schema::{DeviceInfoRequest, DeviceInfoResponse, UnlockRequest};
@@ -24,6 +26,25 @@ struct Cli {
 enum Command {
     /// List hardware Arks and running emulators
     List,
+
+    /// Install published firmware and reboot the Ark
+    Update {
+        /// Endpoint locator, or a unique serial, name or disk image
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Published version to install (defaults to the newest build)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Show the available update without changing the Ark
+        #[arg(long)]
+        check: bool,
+
+        /// Total budget in seconds for approval, transfer and installation
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+    },
 
     /// Unlock the Ark with approval from its paired companion app
     Unlock {
@@ -110,6 +131,14 @@ fn main() -> ExitCode {
 /// subsequent status query fails.
 fn run(command: Command) -> Result<(), Error> {
     match command {
+        Command::Update {
+            device,
+            version,
+            check,
+            timeout,
+        } => {
+            update::run(device.as_deref(), version.as_deref(), check, timeout)?;
+        }
         Command::List => {
             let found = discover()?;
             if found.devices.is_empty() {

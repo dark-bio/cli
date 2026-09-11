@@ -4,9 +4,11 @@
 //! Cloud prerequisites and registry checks for an attested Ark connection.
 
 mod dns;
+mod firmware;
 mod http;
 mod relay;
 
+pub use firmware::{Firmware, UpdateProgress};
 pub use http::Registration;
 
 use crate::schema::{
@@ -23,6 +25,7 @@ use std::time::Instant;
 pub(crate) struct Services {
     cloud: Option<http::Api>, // Absent when the verifier did not establish an attested identity
     state: Mutex<State>,      // Current initialization attempt and connection lifecycle
+    updating: Mutex<()>,      // One firmware transfer at a time across client clones
 }
 
 /// Initialization progresses once at a time and becomes reusable only on success.
@@ -89,6 +92,7 @@ impl Services {
         Self {
             cloud: http::Api::new(identity),
             state: Mutex::new(State::default()),
+            updating: Mutex::new(()),
         }
     }
 
@@ -397,6 +401,7 @@ mod tests {
         let services = Arc::new(Services {
             cloud: Some(super::http::tests::api(url, Realm::Hardware)),
             state: Mutex::new(State::default()),
+            updating: Mutex::new(()),
         });
         Ark::start(session, services).unwrap()
     }

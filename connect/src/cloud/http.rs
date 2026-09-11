@@ -21,10 +21,11 @@ const MAX_RESPONSE: u64 = 64 * 1024;
 /// Cloud operations selected by the identity established during the handshake.
 #[derive(Debug)]
 pub(super) struct Api {
-    agent: ureq::Agent, // HTTP connections reused across the cloud exchange
-    url: String,        // API of the environment verified during the handshake
-    realm: Realm,       // Verified realm selecting the device registry
-    serial: String,     // Attested serial expected in the registry response
+    pub(super) agent: ureq::Agent, // HTTP connections reused across the cloud exchange
+    pub(super) url: String,        // API of the environment verified during the handshake
+    pub(super) packages: String,   // Package repository of the same verified environment
+    pub(super) realm: Realm,       // Verified realm selecting the device registry
+    serial: String,                // Attested serial expected in the registry response
 }
 
 impl Api {
@@ -49,6 +50,7 @@ impl Api {
         Some(Self {
             agent: agent(),
             url: api_url(*env).into(),
+            packages: package_url(*env).into(),
             realm: device.realm,
             serial: device.serial.clone(),
         })
@@ -109,6 +111,18 @@ fn api_url(env: Environment) -> &'static str {
         Environment::Staging => "https://api.darkbio.xyz/v1",
         #[cfg(feature = "develop")]
         Environment::Develop => "https://api.darkbio.dev/v1",
+    }
+}
+
+/// Firmware archives live on the package host of the authenticated environment.
+fn package_url(env: Environment) -> &'static str {
+    match env {
+        #[cfg(feature = "release")]
+        Environment::Release => "https://pkg.dark.bio",
+        #[cfg(feature = "staging")]
+        Environment::Staging => "https://pkg.darkbio.xyz",
+        #[cfg(feature = "develop")]
+        Environment::Develop => "https://pkg.darkbio.dev",
     }
 }
 
@@ -212,7 +226,7 @@ fn fetch_registration(
 }
 
 /// Reads one successful JSON response under the remaining deadline and size limit.
-fn get<T: DeserializeOwned>(
+pub(super) fn get<T: DeserializeOwned>(
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     deadline: Instant,
 ) -> Result<T, Failure> {
@@ -249,6 +263,7 @@ pub(super) mod tests {
     pub(in crate::cloud) fn api(url: String, realm: Realm) -> Api {
         Api {
             agent: http(),
+            packages: url.trim_end_matches("/v1").to_owned(),
             url,
             realm,
             serial: "test-serial".into(),

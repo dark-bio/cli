@@ -13,6 +13,8 @@ cargo run -- list
 cargo run -- status --device emulator:18181
 cargo run -- genuine --device emulator:18181
 cargo run -- unlock --device emulator:18181 --timeout 60
+cargo run -- update --device SERIAL --check
+cargo run -- update --device SERIAL
 cargo run --features internal -- onboard --device emulator:18181 --cwt device.cwt
 ```
 
@@ -30,6 +32,27 @@ forwards the encrypted authorization exchange internally. `--timeout` bounds
 that whole operation in seconds (60 by default). The firmware also enforces its
 own approval window. Success is printed only after the Ark confirms unlocking;
 denial, an unavailable relay or an expired deadline exits with status 3.
+
+`ark update` installs the newest published firmware for the Ark's
+attested environment. `--check` only displays the available update;
+`--version 0.12.0-1234567` selects an exact published build and lets the Ark decide
+whether to accept it. Automatic selection looks for a higher semantic version
+or a replacement for a develop build at the same version.
+`--timeout` covers cloud setup, approval, download, upload,
+verification and installation in seconds (600 by default, after connecting).
+
+An unpaired Ark needs no approval. A paired, locked Ark requests a button press;
+an unlocked Ark requests companion approval through the relay. The CLI streams
+the encrypted archive, checks its advertised length and SHA-256, then asks the
+Ark to verify and install it. Progress is printed to stderr. Successful installation
+reboots the Ark; the command acknowledges installation but does not wait to verify
+the subsequent boot. Errors stop the sequence, and chunks or installation are
+never retried automatically. If the connection is lost during installation, check
+the Ark's status after reconnecting before attempting another update.
+
+Cloud firmware updates require an attested environment. Self-signed and recovery
+connections have no authenticated cloud routing. The Ark decides whether it can
+perform an update, and its rejection is returned unchanged.
 
 Connect owns cloud setup, which is lazy and tied to the connection. Requests
 declare `Request::SETUP` as `Setup::None`, `Setup::Cloud` or `Setup::Relay`.
@@ -116,6 +139,14 @@ use darkbio_connect::schema::UnlockRequest;
 
 client.call_timeout(UnlockRequest {}, Duration::from_secs(60))?;
 ```
+
+Firmware discovery and the complete update sequence are also available through
+connect. `Client::firmwares(deadline)` returns published `Firmware` entries newest
+first. `Firmware::is_update_for(installed)` follows the device's version rules.
+`Client::update_firmware(&firmware, deadline, progress)` reports `UpdateProgress`
+stages on the caller's thread and returns after the installation acknowledgement.
+Client clones cannot start overlapping updates through this helper. Callers using
+raw firmware requests must coordinate those separately.
 
 Execution scheduling and slot repair/deletion also establish the relay before
 sending. Firmware preparation and uploads attach when the Ark first requests
