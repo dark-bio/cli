@@ -5,6 +5,7 @@
 //! Discovery metadata is unverified. Connecting establishes the peer's identity.
 
 use crate::emulator::Instance;
+use crate::trust::{Environment, Realm};
 use crate::{Ark, Error, Identity, emulator, hardware};
 use darkbio_wire::transport::Verifier;
 use std::fmt;
@@ -146,9 +147,38 @@ impl Device {
         &self,
         verifier: &V,
     ) -> Result<(Ark, Identity), Error> {
+        self.open(verifier, None)
+    }
+
+    /// Connects with an explicit cloud environment, overriding the attestation's
+    /// environment without changing its trust result. Cloud access stays lazy.
+    /// Self-signed and recovery peers use the discovered kind to select a registry;
+    /// attested peers retain their verified realm. The Ark verifies the cloud's
+    /// certificates, and the cloud verifies device proofs against its registry.
+    pub fn connect_with_env<V: Verifier<Info = Identity>>(
+        &self,
+        verifier: &V,
+        env: Environment,
+    ) -> Result<(Ark, Identity), Error> {
+        self.open(verifier, Some(env))
+    }
+
+    /// Opens the retained transport with any caller-supplied cloud route.
+    fn open<V: Verifier<Info = Identity>>(
+        &self,
+        verifier: &V,
+        env: Option<Environment>,
+    ) -> Result<(Ark, Identity), Error> {
+        let cloud = env.map(|env| {
+            let realm = match self.kind() {
+                DeviceKind::Hardware => Realm::Hardware,
+                DeviceKind::Emulator => Realm::Emulator,
+            };
+            (env, realm)
+        });
         match &self.source {
-            Source::Usb(info) => hardware::connect(info, verifier),
-            Source::Registry(instance) => emulator::connect(&instance.url(), verifier),
+            Source::Usb(info) => hardware::connect(info, verifier, cloud),
+            Source::Registry(instance) => emulator::connect(&instance.url(), verifier, cloud),
         }
     }
 }

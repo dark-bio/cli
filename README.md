@@ -13,6 +13,7 @@ cargo run -- list
 cargo run -- status --device emulator:18181
 cargo run -- genuine --device emulator:18181
 cargo run -- unlock --device emulator:18181 --timeout 60
+cargo run -- slots --device SERIAL
 cargo run -- update --device SERIAL --check
 cargo run -- update --device SERIAL
 cargo run --features internal,develop -- onboard --device emulator:18181 --cwt device.cwt
@@ -24,12 +25,40 @@ environments and internal commands. Use `--no-default-features --features develo
 for a develop-only build. Cargo's `--release` flag selects optimization, while
 the `release` feature selects the production trust roots.
 
-`ark genuine` checks an attested Ark against the cloud device registry. It
+An attestation from an excluded environment reports the feature needed to
+connect. For a develop Ark, use `cargo run --features develop -- status`.
+
+`--env release|staging|develop` explicitly selects the cloud environment. Its
+matching build feature must be enabled, for example:
+
+```sh
+cargo run --features develop -- slots --env develop
+```
+
+Attested Arks select their cloud automatically unless overridden. Self-signed
+and recovery connections require `--env` for cloud-dependent commands; discovery
+selects their hardware or emulator registry. An attested realm takes precedence
+over discovery. Selecting an environment does not change the handshake's trust
+result. The Ark verifies the cloud certificates, and protected cloud endpoints
+verify device proofs against the cloud's registry, independently of the
+certificate presented during the handshake.
+
+`ark slots` fetches the Ark's dataset slot inventory and metadata. It displays
+each slot's name, description, origin, filled or damaged state, dependencies,
+and available build information. Reference slots may also advertise a download
+URL, byte count and SHA-256; these are displayed as metadata. The command transfers
+no dataset files and makes no changes to slots.
+
+Connect synchronizes the cloud before requesting the inventory. `--timeout`
+bounds setup and the request in seconds (30 by default, after connecting).
+The Ark requires unlocking to read its slots; a refusal is returned unchanged.
+Use `ark unlock --device SERIAL` to request unlocking before retrying.
+
+`ark genuine` checks an Ark against the cloud device registry. It
 automatically synchronizes the Ark's cloud keys and clock before requesting
 the genuinity proof. Cloud synchronization and proof verification share a
-30-second budget. The verified environment selects the cloud; the verified
-realm selects the hardware or emulator registry. The result reports the serial,
-enrollment time and any disabled, expired or superseded state. An inactive
+30-second budget. The result reports the serial, enrollment time and any
+disabled, expired or superseded state. An inactive
 registration or a failed check exits with status 3.
 
 `ark unlock` requests approval from the paired companion app. Connect synchronizes
@@ -40,7 +69,7 @@ own approval window. Success is printed only after the Ark confirms unlocking;
 denial, an unavailable relay or an expired deadline exits with status 3.
 
 `ark update` installs the newest published firmware for the Ark's
-attested environment. `--check` only displays the available update;
+selected environment. `--check` only displays the available update;
 `--version 0.12.0-1234567` selects an exact published build and lets the Ark decide
 whether to accept it. Automatic selection looks for a higher semantic version
 or a replacement for a develop build at the same version.
@@ -56,9 +85,9 @@ the subsequent boot. Errors stop the sequence, and chunks or installation are
 never retried automatically. If the connection is lost during installation, check
 the Ark's status after reconnecting before attempting another update.
 
-Cloud firmware updates require an attested environment. Self-signed and recovery
-connections have no authenticated cloud routing. The Ark decides whether it can
-perform an update, and its rejection is returned unchanged.
+Self-signed and recovery connections can update with an explicit environment.
+The Ark decides whether it can perform an update, and its rejection is returned
+unchanged.
 
 Develop and staging builds include login support for package hosts protected by
 Cloudflare Access. Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
@@ -89,9 +118,7 @@ Connect owns cloud setup, which is lazy and tied to the connection. Requests
 declare `Request::SETUP` as `Setup::None`, `Setup::Cloud` or `Setup::Relay`.
 Relay setup includes cloud synchronization. Client clones share
 one setup attempt and reuse a completed sync; failures allow a later retry.
-`status` and `onboard` do not contact the cloud. Self-signed and recovery
-connections skip cloud sync; genuinity checks and automatic relay attachment
-require an attested identity. Requests requiring `Setup::Relay` also attach
+`status` and `onboard` do not contact the cloud. Requests requiring `Setup::Relay` attach
 the relay lazily and reuse it across client clones.
 
 Onboarding reads the certificate before connecting and reconnects to the same
@@ -114,6 +141,10 @@ kinds of Ark and retains independent discovery failures. `hardware::list()`
 and `emulator::list()` each return `Result<Vec<Device>, Error>` for one kind.
 Devices from either list connect and authenticate through `Device::connect`.
 Custom verifiers return `Identity` to establish cloud routing along with trust.
+`Device::connect_with_env(&verifier, env)` supplies an explicit environment while
+preserving the verifier's identity. The setting is fixed for the connection and
+shared by every client handle. Without an attested or explicit environment,
+cloud-dependent operations return `Error::MissingEnvironment`.
 Hardware owns its USB adapter; emulator owns its WebSocket adapter and launcher
 registry discovery. Those implementation modules are private.
 
@@ -186,7 +217,7 @@ Transport ping/pong checks detect a dead connection independently of companion
 authorization. Wire refusals and timeouts of individual forwarded requests leave
 other exchanges running; only the Ark can seal an error response for the companion.
 
-Connect handles attested relay traffic without an application receive
+Connect handles relay traffic for a selected cloud without an application receive
 loop. `Ark::recv` remains available for other incoming requests and explicit
 handlers. Create the client and closer before moving the owner to that loop.
 The returned wire `Responder` preserves reply completion:

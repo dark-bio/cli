@@ -158,7 +158,7 @@ impl Services {
         if let Some(error) = &self.state.lock().expect("cloud setup not poisoned").error {
             return Err(error.clone().into());
         }
-        self.cloud.as_ref().ok_or(Error::Unattested)
+        self.cloud.as_ref().ok_or(Error::MissingEnvironment)
     }
 
     pub(crate) fn firmwares(
@@ -720,7 +720,7 @@ mod tests {
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, identity) =
             darkbio_wire::protocol::connect(peer.stream(), &verifier).unwrap();
-        let mut services = Services::new(&identity);
+        let mut services = Services::new(&identity, None);
         services.cloud = Some(http::tests::api(cloud.url.clone(), Realm::Emulator));
         let ark = crate::Ark::start(session, Arc::new(services)).unwrap();
         let client = ark.client();
@@ -747,23 +747,23 @@ mod tests {
         );
     }
 
-    /// Firmware discovery needs an attested environment and a live owner.
+    /// Firmware discovery needs a selected environment and a live owner.
     #[test]
     fn test_identity_and_closure() {
         let mut peer = Peer::spawn(Box::new(|_, _, _| panic!("unexpected device request")));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, identity) =
             darkbio_wire::protocol::connect(peer.stream(), &verifier).unwrap();
-        let services = Services::new(&identity);
+        let services = Services::new(&identity, None);
         let firmware = firmware(&[42]);
         let deadline = Instant::now() + TIMEOUT;
         assert!(matches!(
             services.firmwares(deadline, None),
-            Err(Error::Unattested)
+            Err(Error::MissingEnvironment)
         ));
         assert!(matches!(
             services.update_firmware(&session.requester(), &firmware, deadline, |_| {}, None),
-            Err(Error::Unattested)
+            Err(Error::MissingEnvironment)
         ));
         services.close();
         assert!(matches!(

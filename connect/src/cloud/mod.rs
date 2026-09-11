@@ -1,7 +1,7 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Cloud prerequisites and registry checks for an attested Ark connection.
+//! Cloud prerequisites and registry checks for an Ark connection.
 
 mod dns;
 mod firmware;
@@ -24,7 +24,7 @@ use std::time::Instant;
 /// run outside its lock so independent requests and closure remain available.
 #[derive(Debug)]
 pub(crate) struct Services {
-    cloud: Option<http::Api>, // Absent when the verifier did not establish an attested identity
+    cloud: Option<http::Api>, // Absent without an attested or caller-supplied environment
     state: Mutex<State>,      // Current initialization attempt and connection lifecycle
     updating: Mutex<()>,      // One firmware transfer at a time across client clones
 }
@@ -88,10 +88,13 @@ impl Services {
         error.into()
     }
 
-    /// Records verified cloud routing without starting network I/O.
-    pub(crate) fn new(identity: &Identity) -> Self {
+    /// Records cloud routing without starting network I/O.
+    pub(crate) fn new(
+        identity: &Identity,
+        cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
+    ) -> Self {
         Self {
-            cloud: http::Api::new(identity),
+            cloud: http::Api::new(identity, cloud),
             state: Mutex::new(State::default()),
             updating: Mutex::new(()),
         }
@@ -118,8 +121,8 @@ impl Services {
                 return Err(error.clone().into());
             }
             match step {
-                Step::Sync if self.cloud.is_none() || state.synced => return Ok(()),
-                Step::Relay if self.cloud.is_none() => return Err(Error::Unattested),
+                _ if self.cloud.is_none() => return Err(Error::MissingEnvironment),
+                Step::Sync if state.synced => return Ok(()),
                 Step::Relay if state.relay.as_ref().is_some_and(relay::Relay::connected) => {
                     return Ok(());
                 }
@@ -174,7 +177,7 @@ impl Services {
 
     /// Authenticates relay attachment with a fresh authorization from the Ark.
     fn join(&self, requester: &Requester, deadline: Instant) -> Result<relay::Relay, Failure> {
-        let cloud = self.cloud.as_ref().expect("attested cloud available");
+        let cloud = self.cloud.as_ref().expect("cloud route available");
         let joined = requester
             .request(RelayJoinRequest {}, deadline)?
             .wait::<RelayJoinResponse>()?;
@@ -188,7 +191,7 @@ impl Services {
 
     /// Attaches on demand when the Ark conditionally needs authorization. Wire
     /// replies progress independently of this dispatcher waiting for attachment.
-    /// Unattested connections retain their explicit receive interface.
+    /// Connections without a cloud route retain their explicit receive interface.
     pub(crate) fn forward(
         &self,
         requester: &Requester,
@@ -219,7 +222,7 @@ impl Services {
         requester: &Requester,
         deadline: Instant,
     ) -> Result<Registration, Error> {
-        let cloud = self.cloud.as_ref().ok_or(Error::Unattested)?;
+        let cloud = self.cloud.as_ref().ok_or(Error::MissingEnvironment)?;
         self.sync(requester, deadline)?;
         let proof = requester
             .request(GenuinityProofRequest {}, deadline)?
@@ -230,7 +233,7 @@ impl Services {
     /// Exchanges cloud keys and signed time with raw wire requests, bypassing
     /// the prerequisite gate that this exchange is completing.
     fn synchronize(&self, requester: &Requester, deadline: Instant) -> Result<(), Failure> {
-        let cloud = self.cloud.as_ref().expect("attested cloud available");
+        let cloud = self.cloud.as_ref().expect("cloud route available");
         let identity = cloud.identity(deadline)?;
         let started = requester
             .request(identity, deadline)?
@@ -463,6 +466,14 @@ mod tests {
                             .wait()
                             .unwrap();
                     }
+                    Content::SlotList(_) => {
+                        assert!(synced, "slots requested before cloud sync");
+                        responder
+                            .reply(crate::schema::SlotListResponse::default(), deadline)
+                            .unwrap()
+                            .wait()
+                            .unwrap();
+                    }
                     request => return answering(session, request, responder),
                 }
                 true
@@ -583,8 +594,8 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 0);
     }
 
-    /// Self-signed and recovery sessions retain local operations but have no
-    /// authenticated cloud route and cannot claim a registry verification.
+    /// Self-signed and recovery sessions retain local operations. Cloud-dependent
+    /// requests fail clearly when the caller did not supply an environment.
     #[test]
     fn test_unattested_setup() {
         for recover in [false, true] {
@@ -594,24 +605,84 @@ mod tests {
             } else {
                 TrustMode::RootOrSelf
             };
-            let (ark, _) = Ark::attach(peer.stream(), &policy).unwrap();
+            let (ark, _) = Ark::attach(peer.stream(), &policy, None).unwrap();
             let client = ark.client();
             assert!(matches!(
                 client.call(GenuinityProofRequest {}, Instant::now() + TIMEOUT),
-                Err(Error::Remote(error))
-                    if error.code == crate::schema::ReservedErrors::Unsupported as u64
+                Err(Error::MissingEnvironment)
             ));
             assert!(matches!(
                 client.genuine(Instant::now() + TIMEOUT),
-                Err(Error::Unattested)
+                Err(Error::MissingEnvironment)
             ));
             assert!(matches!(
                 client.call(crate::schema::UnlockRequest {}, Instant::now() + TIMEOUT),
-                Err(Error::Unattested)
+                Err(Error::MissingEnvironment)
             ));
             client
                 .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
                 .unwrap();
+        }
+    }
+
+    /// Explicit routing lets self-signed and recovery peers sync and query slots.
+    /// Registry authentication uses their opaque proofs without an attested serial.
+    #[cfg(any(feature = "release", feature = "staging", feature = "develop"))]
+    #[test]
+    fn test_unattested_cloud() {
+        for recover in [false, true] {
+            for realm in [Realm::Hardware, Realm::Emulator] {
+                let mut responses = sync_responses();
+                responses.push((Duration::ZERO, response(200, r#"{"serial":"registry-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)));
+                responses.push((Duration::ZERO, response(403, "registry refused proof")));
+                let (url, requests) = serve(responses);
+                let (mut peer, starts, proofs) = peer(false);
+                let policy = if recover {
+                    TrustMode::Recover(Box::new(peer.identity.clone()))
+                } else {
+                    TrustMode::RootOrSelf
+                };
+                let (session, identity) = protocol::connect(peer.stream(), &policy).unwrap();
+                assert_eq!(identity.realm(), None);
+                assert_eq!(matches!(identity, Identity::Recovered(_)), recover);
+
+                let env = crate::identity::ENVIRONMENTS[0];
+                let mut services = Services::new(&identity, Some((env, realm)));
+                let cloud = services.cloud.as_mut().unwrap();
+                cloud.url = url;
+                cloud.agent = http();
+                let ark = Ark::start(session, Arc::new(services)).unwrap();
+                let client = ark.client();
+                let deadline = Instant::now() + TIMEOUT;
+
+                client.call(DeviceInfoRequest {}, deadline).unwrap();
+                assert_eq!(starts.load(Ordering::SeqCst), 0);
+                for _ in 0..2 {
+                    client
+                        .call(crate::schema::SlotListRequest {}, deadline)
+                        .unwrap();
+                }
+                let registration = client.genuine(deadline).unwrap();
+                assert_eq!(registration.serial, "registry-serial");
+                assert!(registration.active());
+                assert!(matches!(client.genuine(deadline), Err(Error::Cloud(_))));
+                assert_eq!(starts.load(Ordering::SeqCst), 1);
+                assert_eq!(proofs.load(Ordering::SeqCst), 2);
+
+                let registry = match realm {
+                    Realm::Hardware => "/v1/genuine",
+                    Realm::Emulator => "/v1/sandbox/genuine",
+                };
+                for path in [
+                    "/v1/cloudsync/identity",
+                    "/v1/cloudsync/time?challenge=03",
+                    registry,
+                    registry,
+                ] {
+                    let request = requests.recv_timeout(TIMEOUT).unwrap();
+                    assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+                }
+            }
         }
     }
 }

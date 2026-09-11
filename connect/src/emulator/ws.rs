@@ -39,6 +39,7 @@ const INBOUND_LIMIT: usize = 2 * MAX_MESSAGE;
 pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     url: &str,
     verifier: &V,
+    cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
 ) -> Result<(Ark, V::Info), Error> {
     // Resolve the endpoint before starting the TCP and HTTP handshake budget.
     let request = url.into_client_request().map_err(Error::Upgrade)?;
@@ -100,7 +101,11 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     })?;
     // Transfer the upgraded socket to its worker and give wire blocking adapters.
     let (reader, writer, shutdown) = adapters(socket).map_err(Error::Unreachable)?;
-    Ark::attach(transport::Stream::new(reader, writer, shutdown), verifier)
+    Ark::attach(
+        transport::Stream::new(reader, writer, shutdown),
+        verifier,
+        cloud,
+    )
 }
 
 /// Socket used during the blocking HTTP upgrade and subsequent nonblocking I/O.
@@ -729,6 +734,7 @@ mod tests {
         let (ark, _) = connect(
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -756,6 +762,7 @@ mod tests {
         let (ark, _) = connect(
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
+            None,
         )
         .unwrap();
         let err = ark

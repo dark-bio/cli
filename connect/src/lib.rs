@@ -53,22 +53,26 @@
 //! Requests declare their prerequisites through [`Request::SETUP`]: [`Setup::None`],
 //! [`Setup::Cloud`] or [`Setup::Relay`]. Device info, onboarding, pairing status and the sync
 //! exchange itself need none. Other requests synchronize cloud keys and time
-//! lazily, using the environment authenticated during the handshake. Client
+//! lazily, using the attested environment or [`Device::connect_with_env`]. Client
 //! clones share a successful sync for the lifetime of their connection.
 //! Concurrent callers join one attempt: the first caller supplies its deadline,
 //! and each waiter can expire sooner. Failed attempts can be retried by a later
-//! call. Self-signed and recovery connections skip cloud synchronization.
+//! call. Self-signed and recovery connections need an explicit environment for
+//! cloud operations; otherwise they return [`Error::MissingEnvironment`].
+//! Discovery selects their hardware or emulator registry without establishing
+//! trust. An attested realm always takes precedence. The Ark verifies cloud
+//! certificates, and the cloud authenticates device proofs using its own registry.
 //!
 //! [`Client::genuine`] synchronizes if needed, obtains an Ark proof and checks
-//! the cloud registry, all under one deadline. It requires an attested identity
-//! and returns a [`Registration`] whose flags explain whether it is active.
+//! the cloud registry, all under one deadline. It returns a [`Registration`]
+//! whose flags explain whether it is active.
 //!
 //! [`schema::UnlockRequest`] requires [`Setup::Relay`]. Sending it first
 //! synchronizes and attaches the companion relay under the supplied deadline.
 //! Connect carries encrypted companion traffic internally; unlock needs no
-//! application receive loop. Relay attachment requires an attested identity and
-//! is shared by client clones. A later call replaces a failed relay, without
-//! replaying the operation that failed. Closing the Ark closes its relay too.
+//! application receive loop. Relay attachment is shared by client clones.
+//! A later call replaces a failed relay, without replaying the operation that
+//! failed. Closing the Ark closes its relay too.
 //! Scheduling execution and repairing or deleting slots also require relay setup.
 //! Firmware preparation and uploads attach on the Ark's first reverse request,
 //! allowing operations that need no companion authorization to proceed without it.
@@ -76,7 +80,7 @@
 //! the companion takes to authorize. A refused or expired forwarded request
 //! leaves other exchanges on the attachment running.
 //!
-//! [`Client::firmwares`] lists published firmware for an attested Ark,
+//! [`Client::firmwares`] lists published firmware for the selected environment,
 //! newest first. [`Firmware::is_update_for`] compares against the installed version;
 //! the Ark decides whether to accept an update. [`Client::update_firmware`]
 //! authorizes, streams, verifies and installs an archive under one deadline,
@@ -144,7 +148,7 @@
 //! and `develop` crate features, as well as self-signed attestations. Self-signing
 //! proves key possession only. Recovery pins a key without checking attestation.
 //! Callers requiring stricter trust can supply another verifier returning
-//! [`Identity`], which also determines authenticated cloud routing.
+//! [`Identity`]. Cloud routing follows the attestation unless explicitly overridden.
 
 pub mod emulator;
 pub mod hardware;
@@ -188,9 +192,9 @@ pub enum Error {
     /// A connection worker could not be started.
     #[error("failed to start connection worker: {0}")]
     Worker(io::Error),
-    /// Cloud operations need an environment and realm established by attestation.
-    #[error("cloud operation requires an attested Ark")]
-    Unattested,
+    /// Neither the attestation nor the caller selected a cloud environment.
+    #[error("cloud environment unknown; specify an environment when connecting")]
+    MissingEnvironment,
 
     /// A cloud request failed or its response could not be used.
     #[error("cloud operation failed: {0}")]

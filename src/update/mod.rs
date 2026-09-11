@@ -6,19 +6,21 @@
 #[cfg(any(feature = "develop", feature = "staging"))]
 mod access;
 
-use crate::{Error, find_enclave};
+use crate::{Error, connect, find_enclave};
 use console::style;
+use darkbio_connect::trust::Environment;
 use darkbio_connect::{Firmware, TrustMode, UpdateProgress, schema};
 use std::time::{Duration, Instant};
 
 pub(super) fn run(
     selector: Option<&str>,
+    env: Option<Environment>,
     version: Option<&str>,
     check: bool,
     timeout: u64,
 ) -> Result<(), Error> {
     let endpoint = find_enclave(selector)?;
-    let (ark, _) = endpoint.connect(&TrustMode::RootOrSelf)?;
+    let (ark, _) = connect(&endpoint, &TrustMode::RootOrSelf, env)?;
     let client = ark.client();
     #[cfg(any(feature = "develop", feature = "staging"))]
     let client = client.with_package_auth(access::authenticate());

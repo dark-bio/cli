@@ -15,7 +15,7 @@ develop = ["darkbio-trust/develop"]
 [dependencies]
 base64 = "0.23.1"
 darkbio-crypto = { version = "0.18.0", features = ["cbor", "xdsa"] }
-darkbio-trust = "0.3.0"
+darkbio-trust = "0.5.0"
 darkbio-wire = "0.7.0"
 hex = "0.4.3"
 nusb = "0.2.7"

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// Owner of a connection to an Ark. Closing or dropping it ends the session,
 /// including requests issued through its [`Client`] handles.
 ///
-/// Connect dispatches attested relay traffic internally. Other incoming requests
+/// Connect dispatches relay traffic internally when a cloud is selected. Other requests
 /// wait in a bounded queue for [`Self::recv`] while clients issue outgoing calls.
 pub struct Ark {
     /// Request and closure handles of the wire session owned by the dispatcher.
@@ -35,6 +35,7 @@ impl Ark {
     pub(crate) fn attach<R, W, V>(
         stream: transport::Stream<R, W>,
         verifier: &V,
+        cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
     ) -> Result<(Self, V::Info), Error>
     where
         R: transport::Read + Send + 'static,
@@ -54,7 +55,7 @@ impl Ark {
             }
             Error::Handshake(err)
         })?;
-        let services = Arc::new(Services::new(&info));
+        let services = Arc::new(Services::new(&info, cloud));
         Ok((Self::start(session, services)?, info))
     }
 
@@ -199,14 +200,14 @@ impl Client {
         self.send(request, deadline)
     }
 
-    /// Checks the cloud registry for this attested Ark, synchronizing first if
+    /// Checks the cloud registry for this Ark, synchronizing first if
     /// necessary. Setup, proof generation and HTTP share the supplied deadline.
     /// The returned registration may be inactive; its flags explain why.
     pub fn genuine(&self, deadline: Instant) -> Result<Registration, Error> {
         self.services.genuine(&self.requester, deadline)
     }
 
-    /// Lists published firmware for this attested Ark, newest first.
+    /// Lists published firmware for the selected environment, newest first.
     /// Listing packages does not synchronize or change the device.
     pub fn firmwares(&self, deadline: Instant) -> Result<Vec<Firmware>, Error> {
         self.services
@@ -435,7 +436,7 @@ mod tests {
             replies
         });
         let (mut ark, _) =
-            Ark::attach(host, &crate::TrustMode::Recover(Box::new(identity))).unwrap();
+            Ark::attach(host, &crate::TrustMode::Recover(Box::new(identity)), None).unwrap();
         let (request, responder) = ark.recv().unwrap();
         assert!(matches!(
             request,

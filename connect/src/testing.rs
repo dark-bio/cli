@@ -137,7 +137,11 @@ impl Peer {
     /// Attaches to the peer using its pinned identity key.
     pub fn attach(&mut self) -> Result<(Ark, Identity), Error> {
         let stream = self.stream();
-        Ark::attach(stream, &TrustMode::Recover(Box::new(self.identity.clone())))
+        Ark::attach(
+            stream,
+            &TrustMode::Recover(Box::new(self.identity.clone())),
+            None,
+        )
     }
 }
 

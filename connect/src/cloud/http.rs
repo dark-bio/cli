@@ -42,14 +42,14 @@ impl std::fmt::Debug for PackageAuth {
 /// Maximum JSON response, enough for cloud certificates, signed time or registry state.
 const MAX_RESPONSE: u64 = 64 * 1024;
 
-/// Cloud operations selected by the identity established during the handshake.
+/// Cloud operations selected by the attestation or an explicit environment.
 #[derive(Debug)]
 pub(super) struct Api {
     pub(super) agent: ureq::Agent, // HTTP connections reused across the cloud exchange
-    pub(super) url: String,        // API of the environment verified during the handshake
-    pub(super) packages: String,   // Package repository of the same verified environment
-    pub(super) realm: Realm,       // Verified realm selecting the device registry
-    serial: String,                // Attested serial expected in the registry response
+    pub(super) url: String,        // API of the selected environment
+    pub(super) packages: String,   // Package repository of the same environment
+    pub(super) realm: Realm,       // Realm selecting the device registry
+    serial: Option<String>,        // Attested serial, when available, checked against the registry
 }
 
 impl Api {
@@ -90,7 +90,7 @@ impl Api {
         Ok(response)
     }
 
-    /// Uses the authenticated environment and realm for relay attachment.
+    /// Uses the selected environment and realm for relay attachment.
     pub(super) fn relay_url(&self) -> String {
         let url = self
             .url
@@ -102,18 +102,26 @@ impl Api {
         }
     }
 
-    /// Prepares cloud access without I/O. Self-signed and recovery connections
-    /// have no authenticated environment or realm and skip cloud setup.
-    pub(super) fn new(identity: &Identity) -> Option<Self> {
-        let Identity::Attested { env, device } = identity else {
-            return None;
+    /// Prepares cloud access without I/O. An explicit environment overrides the
+    /// attested one. Its discovery realm is used only without an attested realm.
+    pub(super) fn new(identity: &Identity, cloud: Option<(Environment, Realm)>) -> Option<Self> {
+        let (env, realm, serial) = match identity {
+            Identity::Attested { env, device } => (
+                cloud.as_ref().map_or(env, |(env, _)| env),
+                device.realm,
+                Some(device.serial.clone()),
+            ),
+            Identity::SelfSigned(_) | Identity::Recovered(_) => {
+                let (env, realm) = cloud.as_ref()?;
+                (env, *realm, None)
+            }
         };
         Some(Self {
             agent: agent(),
             url: api_url(*env).into(),
             packages: package_url(*env).into(),
-            realm: device.realm,
-            serial: device.serial.clone(),
+            realm,
+            serial,
         })
     }
 
@@ -132,10 +140,14 @@ impl Api {
     }
 
     /// Checks the registry with the Ark's opaque proof and matches its serial
-    /// against the identity authenticated during the handshake.
+    /// against the identity authenticated during the handshake, when attested.
     pub(super) fn genuine(&self, proof: &[u8], deadline: Instant) -> Result<Registration, Failure> {
         let registration = fetch_registration(&self.agent, &self.url, self.realm, proof, deadline)?;
-        if registration.serial != self.serial {
+        if self
+            .serial
+            .as_ref()
+            .is_some_and(|serial| *serial != registration.serial)
+        {
             return Err(Failure::Cloud(
                 "cloud registry serial does not match the attested Ark".into(),
             ));
@@ -166,23 +178,17 @@ impl From<ureq::Error> for Failure {
 /// Cloud sync serves hardware and emulators through the same environment routes.
 fn api_url(env: Environment) -> &'static str {
     match env {
-        #[cfg(feature = "release")]
         Environment::Release => "https://api.dark.bio/v1",
-        #[cfg(feature = "staging")]
         Environment::Staging => "https://api.darkbio.xyz/v1",
-        #[cfg(feature = "develop")]
         Environment::Develop => "https://api.darkbio.dev/v1",
     }
 }
 
-/// Firmware archives live on the package host of the authenticated environment.
+/// Firmware archives live on the package host of the selected environment.
 fn package_url(env: Environment) -> &'static str {
     match env {
-        #[cfg(feature = "release")]
         Environment::Release => "https://pkg.dark.bio",
-        #[cfg(feature = "staging")]
         Environment::Staging => "https://pkg.darkbio.xyz",
-        #[cfg(feature = "develop")]
         Environment::Develop => "https://pkg.darkbio.dev",
     }
 }
@@ -341,7 +347,59 @@ pub(super) mod tests {
             packages: url.trim_end_matches("/v1").to_owned(),
             url,
             realm,
-            serial: "test-serial".into(),
+            serial: Some("test-serial".into()),
+        }
+    }
+
+    /// Overrides select the cloud without replacing a verified realm or serial.
+    /// Without attestation, the supplied discovery realm selects the registry.
+    #[cfg(any(feature = "release", feature = "staging", feature = "develop"))]
+    #[test]
+    fn test_cloud_routing() {
+        let key = darkbio_crypto::xdsa::SecretKey::generate().public_key();
+        for &env in crate::identity::ENVIRONMENTS {
+            let identity = Identity::Attested {
+                env,
+                device: crate::trust::device::Device {
+                    realm: Realm::Emulator,
+                    identity: key.clone(),
+                    oem: darkbio_crypto::cwt::claims::eat::Oemid::new_pen(0),
+                    serial: "attested-serial".into(),
+                    model: vec![],
+                    version: String::new(),
+                    issued: 0,
+                    expiry: Some(1),
+                },
+            };
+            let cloud = Api::new(&identity, None).unwrap();
+            assert_eq!(cloud.url, api_url(env));
+            assert_eq!(cloud.realm, Realm::Emulator);
+            for &selected in crate::identity::ENVIRONMENTS {
+                let cloud = Api::new(&identity, Some((selected, Realm::Hardware))).unwrap();
+                assert_eq!(cloud.url, api_url(selected));
+                assert_eq!(cloud.packages, package_url(selected));
+                assert_eq!(cloud.realm, Realm::Emulator);
+                assert!(cloud.relay_url().ends_with("/sandbox/relaying"));
+                assert_eq!(cloud.serial.as_deref(), Some("attested-serial"));
+            }
+            for identity in [
+                Identity::SelfSigned(key.clone()),
+                Identity::Recovered(key.clone()),
+            ] {
+                assert!(Api::new(&identity, None).is_none());
+                for realm in [Realm::Hardware, Realm::Emulator] {
+                    let cloud = Api::new(&identity, Some((env, realm))).unwrap();
+                    assert_eq!(cloud.url, api_url(env));
+                    assert_eq!(cloud.packages, package_url(env));
+                    assert_eq!(cloud.realm, realm);
+                    assert_eq!(cloud.serial, None);
+                    assert_eq!(
+                        cloud.relay_url().contains("/sandbox/"),
+                        realm == Realm::Emulator
+                    );
+                    assert_eq!(identity.realm(), None);
+                }
+            }
         }
     }
 

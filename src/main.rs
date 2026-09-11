@@ -3,12 +3,14 @@
 
 //! Command dispatch, endpoint selection and terminal output for the Ark CLI.
 
+mod slots;
 mod update;
 
 use clap::{Parser, Subcommand};
 use console::style;
 use darkbio_connect::schema::{DeviceInfoRequest, DeviceInfoResponse, UnlockRequest};
 use darkbio_connect::trust::{Environment, Realm};
+use darkbio_connect::wire::{protocol, transport};
 use darkbio_connect::{Ark, Device, DeviceKind, Discovery, Identity, TrustMode};
 #[cfg(feature = "internal")]
 use std::path::PathBuf;
@@ -18,6 +20,10 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "ark", about = "Command line interface for Ark enclaves")]
 struct Cli {
+    /// Cloud environment override (requires the matching build feature)
+    #[arg(long, global = true, value_parser = parse_env)]
+    env: Option<Environment>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -26,6 +32,17 @@ struct Cli {
 enum Command {
     /// List hardware Arks and running emulators
     List,
+
+    /// List the Ark's dataset slots and metadata
+    Slots {
+        /// Endpoint locator, or a unique serial, name or disk image
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Total budget in seconds for cloud setup and the slot request
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+    },
 
     /// Install published firmware and reboot the Ark
     Update {
@@ -109,16 +126,27 @@ impl From<String> for Error {
 impl From<darkbio_connect::Error> for Error {
     /// Reports connection and request failures with exit status 3.
     fn from(error: darkbio_connect::Error) -> Self {
-        Self {
-            code: 3,
-            message: error.to_string(),
-        }
+        let message = if let darkbio_connect::Error::Handshake(protocol::Error::Transport(cause)) =
+            &error
+            && let transport::Error::HandshakeFailed(reason) = cause.as_ref()
+        {
+            reason.clone()
+        } else {
+            match error {
+                darkbio_connect::Error::MissingEnvironment => {
+                    "cloud environment unknown; select one with --env".into()
+                }
+                error => error.to_string(),
+            }
+        };
+        Self { code: 3, message }
     }
 }
 
 /// Parses the command and returns its exit status after printing any failure.
 fn main() -> ExitCode {
-    match run(Cli::parse().command) {
+    let cli = Cli::parse();
+    match run(cli.command, cli.env) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{} {}", style("error:").red().bold(), error.message);
@@ -129,15 +157,18 @@ fn main() -> ExitCode {
 
 /// Runs the selected command, retaining successful onboarding even when its
 /// subsequent status query fails.
-fn run(command: Command) -> Result<(), Error> {
+fn run(command: Command, env: Option<Environment>) -> Result<(), Error> {
     match command {
+        Command::Slots { device, timeout } => {
+            slots::run(device.as_deref(), env, timeout)?;
+        }
         Command::Update {
             device,
             version,
             check,
             timeout,
         } => {
-            update::run(device.as_deref(), version.as_deref(), check, timeout)?;
+            update::run(device.as_deref(), env, version.as_deref(), check, timeout)?;
         }
         Command::List => {
             let found = discover()?;
@@ -156,12 +187,12 @@ fn run(command: Command) -> Result<(), Error> {
         Command::Status { pubkey, device } => {
             let trust = parse_trust_mode(pubkey.as_deref())?;
             let endpoint = find_enclave(device.as_deref())?;
-            let (ark, identity) = endpoint.connect(&trust)?;
+            let (ark, identity) = connect(&endpoint, &trust, env)?;
             println!("{}", status(&ark, &identity)?);
         }
         Command::Unlock { device, timeout } => {
             let endpoint = find_enclave(device.as_deref())?;
-            let (ark, _) = endpoint.connect(&TrustMode::RootOrSelf)?;
+            let (ark, _) = connect(&endpoint, &TrustMode::RootOrSelf, env)?;
             eprintln!(
                 "{}",
                 style("Requesting unlock. Approve it in your companion app.").dim()
@@ -172,7 +203,7 @@ fn run(command: Command) -> Result<(), Error> {
         }
         Command::Genuine { device } => {
             let endpoint = find_enclave(device.as_deref())?;
-            let (ark, _) = endpoint.connect(&TrustMode::RootOrSelf)?;
+            let (ark, _) = connect(&endpoint, &TrustMode::RootOrSelf, env)?;
             let registration = ark
                 .client()
                 .genuine(Instant::now() + Duration::from_secs(30))?;
@@ -195,7 +226,7 @@ fn run(command: Command) -> Result<(), Error> {
             let certificate = std::fs::read(&cwt)
                 .map_err(|error| format!("failed to read {}: {error}", cwt.display()))?;
             let endpoint = find_enclave(device.as_deref())?;
-            let (ark, _) = endpoint.connect(&trust)?;
+            let (ark, _) = connect(&endpoint, &trust, env)?;
             ark.client().call_timeout(
                 darkbio_connect::schema::OnboardingRequest {
                     device_attestation: certificate,
@@ -207,8 +238,7 @@ fn run(command: Command) -> Result<(), Error> {
 
             // Reuse the selected endpoint. Names and discovery metadata can change
             // after onboarding; neither reconnection nor status failure undoes it.
-            let feedback = endpoint
-                .connect(&TrustMode::RootOrSelf)
+            let feedback = connect(&endpoint, &TrustMode::RootOrSelf, env)
                 .and_then(|(ark, identity)| status(&ark, &identity));
             match feedback {
                 Ok(status) => println!("\n{status}"),
@@ -217,6 +247,34 @@ fn run(command: Command) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Selects cloud routing independently of the handshake's trust policy.
+fn connect(
+    endpoint: &Device,
+    trust: &TrustMode,
+    env: Option<Environment>,
+) -> Result<(Ark, Identity), darkbio_connect::Error> {
+    match env {
+        Some(env) => endpoint.connect_with_env(trust, env),
+        None => endpoint.connect(trust),
+    }
+}
+
+/// Accepts only environments enabled by this build's features.
+fn parse_env(value: &str) -> Result<Environment, String> {
+    match value {
+        #[cfg(feature = "release")]
+        "release" => Ok(Environment::Release),
+        #[cfg(feature = "staging")]
+        "staging" => Ok(Environment::Staging),
+        #[cfg(feature = "develop")]
+        "develop" => Ok(Environment::Develop),
+        _ if matches!(value, "release" | "staging" | "develop") => Err(format!(
+            "cloud environment {value} is disabled; build with --features {value}"
+        )),
+        _ => Err("expected release, staging or develop".into()),
+    }
 }
 
 /// Selects root verification or decodes the identity key supplied for recovery.
@@ -274,15 +332,12 @@ fn find_enclave(selector: Option<&str>) -> Result<Device, String> {
         })
 }
 
-/// Returns the environment label used in terminal output.
-fn env_name(env: Environment) -> &'static str {
+/// Highlights internal environments consistently with the status output.
+fn env_style(env: Environment) -> console::Style {
     match env {
-        #[cfg(feature = "release")]
-        Environment::Release => "release",
-        #[cfg(feature = "staging")]
-        Environment::Staging => "staging",
-        #[cfg(feature = "develop")]
-        Environment::Develop => "develop",
+        Environment::Release => console::Style::new().dim(),
+        Environment::Staging => console::Style::new().yellow(),
+        Environment::Develop => console::Style::new().red(),
     }
 }
 
@@ -376,14 +431,7 @@ fn render_status(info: &DeviceInfoResponse, identity: &Identity) -> String {
                 Realm::Hardware => "hardware",
                 Realm::Emulator => "emulator",
             };
-            let env = match *env {
-                #[cfg(feature = "release")]
-                Environment::Release => style(env_name(*env)).dim(),
-                #[cfg(feature = "staging")]
-                Environment::Staging => style(env_name(*env)).yellow(),
-                #[cfg(feature = "develop")]
-                Environment::Develop => style(env_name(*env)).red(),
-            };
+            let env = env_style(*env).apply_to(env);
             (
                 format!("{reported_hw} ({}){mismatch}", style(model).dim()),
                 style(device.serial.as_str()),
@@ -433,6 +481,37 @@ fn render_status(info: &DeviceInfoResponse, identity: &Identity) -> String {
 mod tests {
     use super::*;
 
+    /// Cloud selection works before or after the command and refuses environments
+    /// disabled at build time. Enabling a feature does not select its cloud.
+    #[test]
+    fn test_cloud_environment() {
+        assert!(Cli::try_parse_from(["ark", "slots"]).unwrap().env.is_none());
+        for (env, enabled) in [
+            ("release", cfg!(feature = "release")),
+            ("staging", cfg!(feature = "staging")),
+            ("develop", cfg!(feature = "develop")),
+        ] {
+            for args in [
+                ["ark", "--env", env, "slots"],
+                ["ark", "slots", "--env", env],
+            ] {
+                match Cli::try_parse_from(args) {
+                    Ok(cli) => {
+                        assert!(enabled);
+                        assert_eq!(cli.env.map(|env| env.to_string()).as_deref(), Some(env));
+                    }
+                    Err(error) => {
+                        assert!(!enabled);
+                        assert!(error.to_string().contains(&format!("--features {env}")));
+                    }
+                }
+            }
+        }
+        assert!(Cli::try_parse_from(["ark", "slots", "--env", "unknown"]).is_err());
+        let error = Error::from(darkbio_connect::Error::MissingEnvironment);
+        assert!(error.message.contains("--env"));
+    }
+
     /// Registry output preserves all inactive states and handles an invalid
     /// timestamp without obscuring the verified serial or reporting active.
     #[test]
@@ -479,7 +558,8 @@ mod tests {
             env,
             device: darkbio_connect::trust::device::Device {
                 realm: Realm::Emulator,
-                signer: darkbio_crypto::xdsa::SecretKey::generate().public_key(),
+                identity: darkbio_crypto::xdsa::SecretKey::generate().public_key(),
+                oem: darkbio_crypto::cwt::claims::eat::Oemid::new_pen(0),
                 serial: "verified-serial".into(),
                 model: vec![0xff],
                 version: "certified revision".into(),
@@ -490,7 +570,7 @@ mod tests {
         let rendered = render_status(&DeviceInfoResponse::default(), &identity);
         let status = console::strip_ansi_codes(&rendered);
         assert_eq!(identity.realm(), Some(Realm::Emulator));
-        assert!(status.contains(&format!("attested ({}, emulator)", env_name(env))));
+        assert!(status.contains(&format!("attested ({}, emulator)", env)));
         assert!(status.contains("verified-serial"));
         assert!(status.contains("0xff"));
         assert!(status.contains("certificate contains \"certified revision\""));
