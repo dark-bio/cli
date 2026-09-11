@@ -5,7 +5,7 @@
 
 use clap::{Parser, Subcommand};
 use console::style;
-use darkbio_connect::schema::{DeviceInfoRequest, DeviceInfoResponse};
+use darkbio_connect::schema::{DeviceInfoRequest, DeviceInfoResponse, UnlockRequest};
 use darkbio_connect::trust::{Environment, Realm};
 use darkbio_connect::{Ark, Device, DeviceKind, Discovery, Identity, TrustMode};
 #[cfg(feature = "internal")]
@@ -24,6 +24,17 @@ struct Cli {
 enum Command {
     /// List hardware Arks and running emulators
     List,
+
+    /// Unlock the Ark with approval from its paired companion app
+    Unlock {
+        /// Endpoint locator, or a unique serial, name or disk image
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Total budget in seconds for cloud setup and companion approval
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+    },
 
     /// Verify the Ark against the cloud device registry
     Genuine {
@@ -118,6 +129,17 @@ fn run(command: Command) -> Result<(), Error> {
             let endpoint = find_enclave(device.as_deref())?;
             let (ark, identity) = endpoint.connect(&trust)?;
             println!("{}", status(&ark, &identity)?);
+        }
+        Command::Unlock { device, timeout } => {
+            let endpoint = find_enclave(device.as_deref())?;
+            let (ark, _) = endpoint.connect(&TrustMode::RootOrSelf)?;
+            eprintln!(
+                "{}",
+                style("Requesting unlock. Approve it in your companion app.").dim()
+            );
+            ark.client()
+                .call_timeout(UnlockRequest {}, Duration::from_secs(timeout))?;
+            println!("{}", style("Enclave unlocked successfully.").green());
         }
         Command::Genuine { device } => {
             let endpoint = find_enclave(device.as_deref())?;

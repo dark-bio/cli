@@ -12,6 +12,7 @@ Both select discovered Arks; connect handles the transport used to reach them.
 cargo run -- list
 cargo run -- status --device emulator:18181
 cargo run -- genuine --device emulator:18181
+cargo run -- unlock --device emulator:18181 --timeout 60
 cargo run --features internal -- onboard --device emulator:18181 --cwt device.cwt
 ```
 
@@ -23,13 +24,21 @@ realm selects the hardware or emulator registry. The result reports the serial,
 enrollment time and any disabled, expired or superseded state. An inactive
 registration or a failed check exits with status 3.
 
+`ark unlock` requests approval from the paired companion app. Connect synchronizes
+the Ark and attaches its cloud relay before sending the unlock request, then
+forwards the encrypted authorization exchange internally. `--timeout` bounds
+that whole operation in seconds (60 by default). The firmware also enforces its
+own approval window. Success is printed only after the Ark confirms unlocking;
+denial, an unavailable relay or an expired deadline exits with status 3.
+
 Connect owns cloud setup, which is lazy and tied to the connection. Requests
-declare whether they need it through `Request::CLOUD_SYNC`. Client clones share
+declare `Request::SETUP` as `Setup::None`, `Setup::Cloud` or `Setup::Relay`.
+Relay setup includes cloud synchronization. Client clones share
 one setup attempt and reuse a completed sync; failures allow a later retry.
 `status` and `onboard` do not contact the cloud. Self-signed and recovery
-connections skip cloud setup; a genuinity check
-requires an attested identity. Relay setup will be added with operations that
-need it.
+connections skip cloud sync; genuinity checks and automatic relay attachment
+require an attested identity. Requests requiring `Setup::Relay` also attach
+the relay lazily and reuse it across client clones.
 
 Onboarding reads the certificate before connecting and reconnects to the same
 endpoint for status. Failure of that follow-up check is a warning after
@@ -94,16 +103,37 @@ individual flags explain an inactive registration.
 
 When calls join an ongoing sync, the first caller's deadline bounds the attempt.
 Other callers retain their own deadlines while waiting. Closing the Ark releases
-setup waiters; an HTTP request already in progress retains its deadline.
+setup waiters; setup I/O already in progress retains its deadline. Relay setup
+follows the same rules. A later call can replace a failed relay; failed operations
+are not automatically replayed.
+Unfinished DNS lookups are shared across attachment retries; a caller timing out
+does not start a replacement lookup while the previous one is still running.
 
-Operations requiring companion authorization need the application to receive
-and service requests through `Ark::recv` concurrently with outgoing calls.
-Create the client and closer before moving the owner to the receive loop.
+Unlock is a normal typed request:
+
+```rust
+use darkbio_connect::schema::UnlockRequest;
+
+client.call_timeout(UnlockRequest {}, Duration::from_secs(60))?;
+```
+
+Execution scheduling and slot repair/deletion also establish the relay before
+sending. Firmware preparation and uploads attach when the Ark first requests
+authorization, so unpaired updates and catalog uploads need no companion relay.
+Transport ping/pong checks detect a dead connection independently of companion
+authorization. Wire refusals and timeouts of individual forwarded requests leave
+other exchanges running; only the Ark can seal an error response for the companion.
+
+Connect handles attested relay traffic without an application receive
+loop. `Ark::recv` remains available for other incoming requests and explicit
+handlers. Create the client and closer before moving the owner to that loop.
 The returned wire `Responder` preserves reply completion:
 `responder.reply(response, deadline)?.wait()?` checks that the adapter accepted
 the output. It does not confirm delivery or processing by the peer.
-The application owns handler dispatch, shutdown and any cloud relay integration;
-the CLI exposes status, onboarding and cloud genuinity checks.
+The relay adapter is private. It maps wire 0.7's wrappers to the outer cloud
+envelope and preserves encrypted bodies and request IDs. Presence and notification
+envelopes have no wire 0.7 input and are ignored. Connect does not interpret
+companion authorization or expose a relay protocol API.
 
 Wire 0.7 automatically replies `UNKNOWN` to requests outside its schema.
 Handlers receive known requests and can reply `UNSUPPORTED` for operations they
@@ -126,8 +156,8 @@ HTTP client with a size limit and overall deadline; it disables proxies and
 redirects for the local service.
 
 This cleanup changes the library API: use `ark.client().call(Request { ... }, deadline)`
-in place of per-operation convenience methods, an explicit receive loop in
-place of request/disconnect callbacks, and `Discovery::select` for endpoint
+in place of per-operation convenience methods, an optional receive loop for
+application handlers, and `Discovery::select` for endpoint
 selection. `Device::kind()` reports the discovery classification; the
 authenticated realm is available on `Identity`.
 

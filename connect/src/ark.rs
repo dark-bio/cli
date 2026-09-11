@@ -4,7 +4,8 @@
 //! Session ownership and typed request handles.
 
 use crate::cloud::Services;
-use crate::{Error, Identity, Registration, Request};
+use crate::incoming::{self, Incoming};
+use crate::{Error, Identity, Registration, Request, Setup};
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
 use std::io;
@@ -15,14 +16,16 @@ use std::time::{Duration, Instant};
 /// Owner of a connection to an Ark. Closing or dropping it ends the session,
 /// including requests issued through its [`Client`] handles.
 ///
-/// Receive incoming requests through [`Self::recv`] while other threads issue
-/// calls through [`Self::client`]. Wire keeps incoming requests in its bounded
-/// queue until received. The application owns dispatch and handler lifetimes.
+/// Connect dispatches attested relay traffic internally. Other incoming requests
+/// wait in a bounded queue for [`Self::recv`] while clients issue outgoing calls.
 pub struct Ark {
-    /// Wire session whose lifetime owns the connection and its I/O workers.
-    session: Session,
+    /// Request and closure handles of the wire session owned by the dispatcher.
+    requester: Requester,
+    closer: Closer,
+    /// Requests not claimed by cloud services.
+    incoming: Arc<Incoming>,
     /// Lazy prerequisites shared by all request handles of this session.
-    pub(crate) services: Arc<Services>,
+    services: Arc<Services>,
 }
 
 impl Ark {
@@ -52,33 +55,49 @@ impl Ark {
             Error::Handshake(err)
         })?;
         let services = Arc::new(Services::new(&info));
-        Ok((Self { session, services }, info))
+        Ok((Self::start(session, services)?, info))
+    }
+
+    /// Starts dispatch for an authenticated session and its cloud services.
+    pub(crate) fn start(session: Session, services: Arc<Services>) -> Result<Self, Error> {
+        let incoming = Arc::new(Incoming::default());
+        let ark = Self {
+            requester: session.requester(),
+            closer: Closer {
+                wire: session.closer(),
+                services: services.clone(),
+                incoming: incoming.clone(),
+            },
+            incoming: incoming.clone(),
+            services: services.clone(),
+        };
+        std::thread::Builder::new()
+            .name("ark-dispatch".into())
+            .spawn(move || incoming::dispatch(session, services, incoming))
+            .map_err(Error::Worker)?;
+        Ok(ark)
     }
 
     /// Returns a clonable request handle bound to this session. The handle
     /// does not keep the connection open.
     pub fn client(&self) -> Client {
         Client {
-            requester: self.session.requester(),
+            requester: self.requester.clone(),
             services: self.services.clone(),
         }
     }
 
-    /// Blocks for the next known Ark request, or returns the session's ending reason.
-    /// Wire answers unknown request types before application dispatch. The returned
-    /// responder retains wire's reply completion and automatic reply semantics.
+    /// Blocks for a request not handled by cloud services, or returns the
+    /// session's ending reason. Wire answers unknown request types automatically.
+    /// The responder retains wire's reply completion and automatic reply semantics.
     pub fn recv(&mut self) -> Result<(schema::ark_to_host::Content, Responder), Error> {
-        let (message, responder) = self.session.recv()?;
-        Ok((message.try_into()?, responder))
+        Ok(self.incoming.recv()?)
     }
 
     /// Returns a handle for closing the session from another thread, including
     /// while its owner is blocked in [`Self::recv`].
     pub fn closer(&self) -> Closer {
-        Closer {
-            wire: self.session.closer(),
-            services: self.services.clone(),
-        }
+        self.closer.clone()
     }
 
     /// Closes the session, wakes blocked receives and fails pending requests.
@@ -101,14 +120,16 @@ impl Drop for Ark {
 pub struct Closer {
     wire: protocol::Closer,  // Closes the original wire session
     services: Arc<Services>, // Ends prerequisite waits on that session
+    incoming: Arc<Incoming>, // Wakes application receives when the owner closes
 }
 
 impl Closer {
-    /// Closes the original connection. An HTTP request already in progress
-    /// remains bounded by its deadline; setup waiters are released immediately.
+    /// Closes the original connection and relay. Setup I/O already in progress
+    /// retains its deadline; setup waiters are released immediately.
     pub fn close(&self) {
-        self.services.close();
         self.wire.close();
+        self.services.close();
+        self.incoming.close(protocol::Error::Closed);
     }
 }
 
@@ -140,7 +161,8 @@ impl Client {
     }
 
     /// Establishes the request's prerequisites, then queues it without waiting for
-    /// output or a response. The first cloud-dependent send may wait for sync.
+    /// output or a response. The first cloud-dependent send may wait for sync
+    /// and relay attachment, according to the request's prerequisites.
     /// Waiting on the promise does not refresh the deadline; dropping
     /// it does not cancel the request. Wire's output queue has no capacity limit,
     /// so the caller bounds the number of outstanding requests.
@@ -149,10 +171,15 @@ impl Client {
         request: R,
         deadline: Instant,
     ) -> Result<Pending<R::Response>, Error> {
-        if R::CLOUD_SYNC {
-            self.services.sync(&self.requester, deadline)?;
+        match R::SETUP {
+            Setup::None => {}
+            Setup::Cloud => self.services.sync(&self.requester, deadline)?,
+            Setup::Relay => self.services.relay(&self.requester, deadline)?,
         }
-        let promise = self.requester.request(request, deadline)?;
+        let promise = self
+            .requester
+            .request(request, deadline)
+            .map_err(|error| self.services.wire_error(error))?;
         Ok(Pending {
             promise,
             response: PhantomData,
@@ -223,6 +250,20 @@ mod tests {
     /// Budget for test I/O that is not exercising expiration.
     const TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Exercises manual reverse requests without automatic cloud attachment.
+    struct ManualUnlock;
+
+    impl From<ManualUnlock> for Message {
+        fn from(_: ManualUnlock) -> Self {
+            UnlockRequest {}.into()
+        }
+    }
+
+    impl Request for ManualUnlock {
+        type Response = UnlockResponse;
+        const SETUP: Setup = Setup::None;
+    }
+
     /// Application error codes reach the peer, and a reserved refusal leaves the
     /// session available for subsequent requests.
     #[test]
@@ -268,9 +309,7 @@ mod tests {
         }));
         let (mut ark, _) = peer.attach().unwrap();
         let client = ark.client();
-        let pending = client
-            .send(UnlockRequest {}, Instant::now() + TIMEOUT)
-            .unwrap();
+        let pending = client.send(ManualUnlock, Instant::now() + TIMEOUT).unwrap();
         let (request, responder) = ark.recv().unwrap();
         assert!(matches!(request, schema::ark_to_host::Content::RelayReq(_)));
         responder
@@ -541,8 +580,7 @@ mod tests {
         }));
         let (mut ark, _) = peer.attach().unwrap();
         let client = ark.client();
-        let operation =
-            thread::spawn(move || client.call(UnlockRequest {}, Instant::now() + TIMEOUT));
+        let operation = thread::spawn(move || client.call(ManualUnlock, Instant::now() + TIMEOUT));
         let (request, responder) = ark.recv().unwrap();
         let schema::ark_to_host::Content::RelayReq(request) = request else {
             panic!("expected relay request")

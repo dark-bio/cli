@@ -28,6 +28,18 @@ pub(super) struct Api {
 }
 
 impl Api {
+    /// Uses the authenticated environment and realm for relay attachment.
+    pub(super) fn relay_url(&self) -> String {
+        let url = self
+            .url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        match self.realm {
+            Realm::Hardware => format!("{url}/relaying"),
+            Realm::Emulator => format!("{url}/sandbox/relaying"),
+        }
+    }
+
     /// Prepares cloud access without I/O. Self-signed and recovery connections
     /// have no authenticated environment or realm and skip cloud setup.
     pub(super) fn new(identity: &Identity) -> Option<Self> {

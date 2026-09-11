@@ -3,13 +3,17 @@
 
 //! Cloud prerequisites and registry checks for an attested Ark connection.
 
+mod dns;
 mod http;
+mod relay;
 
 pub use http::Registration;
 
-use crate::schema::GenuinityProofRequest;
+use crate::schema::{
+    GenuinityProofRequest, RelayArkToAppRequest, RelayJoinRequest, RelayJoinResponse,
+};
 use crate::{Error, Identity};
-use darkbio_wire::protocol::{self, Requester};
+use darkbio_wire::protocol::{self, Requester, Responder};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -24,9 +28,11 @@ pub(crate) struct Services {
 /// Initialization progresses once at a time and becomes reusable only on success.
 #[derive(Debug, Default)]
 struct State {
-    synced: bool,                  // Whether an automatic sync completed on this connection
-    closed: bool,                  // Whether the owner or its closer ended the connection
-    attempt: Option<Arc<Attempt>>, // Attempt joined by concurrent callers
+    synced: bool,                   // Whether an automatic sync completed on this connection
+    error: Option<protocol::Error>, // Why the owning wire session ended
+    syncing: Option<Arc<Attempt>>,  // Cloud sync joined by concurrent callers
+    relay: Option<relay::Relay>,    // Relay attached lazily to this connection
+    joining: Option<Arc<Attempt>>,  // Relay attachment joined by concurrent callers
 }
 
 /// One attempt's outcome, retained by its waiters even after a retry starts.
@@ -40,6 +46,7 @@ struct Attempt {
 #[derive(Clone, Debug)]
 enum Failure {
     Cloud(String),         // HTTP or response decoding failure
+    Relay(String),         // Relay connection or envelope failure
     Wire(protocol::Error), // Device failure, retaining remote codes and disconnect reasons
 }
 
@@ -59,12 +66,24 @@ impl From<Failure> for Error {
     fn from(error: Failure) -> Self {
         match error {
             Failure::Cloud(error) => Self::Cloud(error),
+            Failure::Relay(error) => Self::Relay(error),
             Failure::Wire(error) => error.into(),
         }
     }
 }
 
 impl Services {
+    /// A stopped dispatcher has dropped its wire session. Preserve its ending
+    /// reason when a surviving weak requester can only report that it is gone.
+    pub(crate) fn wire_error(&self, error: protocol::Error) -> Error {
+        if matches!(error, protocol::Error::Closed)
+            && let Some(ended) = &self.state.lock().expect("cloud setup not poisoned").error
+        {
+            return ended.clone().into();
+        }
+        error.into()
+    }
+
     /// Records verified cloud routing without starting network I/O.
     pub(crate) fn new(identity: &Identity) -> Self {
         Self {
@@ -73,26 +92,46 @@ impl Services {
         }
     }
 
-    /// Completes or joins synchronization under the caller's deadline. The first
-    /// caller supplies the attempt's budget; each waiter bounds its own wait.
-    /// Unattested connections skip setup and let the Ark decide what it can serve.
+    /// Synchronizes once per connection. Each caller bounds its own wait, and
+    /// the caller starting the exchange supplies its I/O deadline.
     pub(crate) fn sync(&self, requester: &Requester, deadline: Instant) -> Result<(), Error> {
+        self.ensure(requester, Step::Sync, deadline)
+    }
+
+    /// Attaches the relay after cloud sync, reusing a healthy connection. A
+    /// failed relay is replaced on the next call without replaying any operation.
+    pub(crate) fn relay(&self, requester: &Requester, deadline: Instant) -> Result<(), Error> {
+        self.sync(requester, deadline)?;
+        self.ensure(requester, Step::Relay, deadline)
+    }
+
+    /// Serializes one prerequisite while allowing unrelated device traffic.
+    fn ensure(&self, requester: &Requester, step: Step, deadline: Instant) -> Result<(), Error> {
         let (attempt, leader) = {
             let mut state = self.state.lock().expect("cloud setup not poisoned");
-            if state.closed {
-                return Err(Error::Closed);
+            if let Some(error) = &state.error {
+                return Err(error.clone().into());
             }
-            if self.cloud.is_none() || state.synced {
-                return Ok(());
+            match step {
+                Step::Sync if self.cloud.is_none() || state.synced => return Ok(()),
+                Step::Relay if self.cloud.is_none() => return Err(Error::Unattested),
+                Step::Relay if state.relay.as_ref().is_some_and(relay::Relay::connected) => {
+                    return Ok(());
+                }
+                _ => {}
             }
             if Instant::now() >= deadline {
                 return Err(Error::Timeout);
             }
-            match &state.attempt {
+            let pending = match step {
+                Step::Sync => &mut state.syncing,
+                Step::Relay => &mut state.joining,
+            };
+            match pending {
                 Some(attempt) => (attempt.clone(), false),
                 None => {
                     let attempt = Arc::new(Attempt::default());
-                    state.attempt = Some(attempt.clone());
+                    *pending = Some(attempt.clone());
                     (attempt, true)
                 }
             }
@@ -100,17 +139,73 @@ impl Services {
         if !leader {
             return attempt.wait(deadline).map_err(Into::into);
         }
-        let result = self.synchronize(requester, deadline);
-        let mut state = self.state.lock().expect("cloud setup not poisoned");
-        let result = if state.closed {
-            Err(Failure::Wire(protocol::Error::Closed))
-        } else {
-            result
+        let result = match step {
+            Step::Sync => self.synchronize(requester, deadline).map(|()| None),
+            Step::Relay => self.join(requester, deadline).map(Some),
         };
-        state.synced = result.is_ok();
-        state.attempt = None;
+        let mut state = self.state.lock().expect("cloud setup not poisoned");
+        let result = if let Some(error) = &state.error {
+            Err(Failure::Wire(error.clone()))
+        } else {
+            result.and_then(|relay| {
+                match step {
+                    Step::Sync => state.synced = true,
+                    Step::Relay => {
+                        let mut relay = relay.expect("relay setup returned an attachment");
+                        relay.start()?;
+                        state.relay = Some(relay);
+                    }
+                }
+                Ok(())
+            })
+        };
+        match step {
+            Step::Sync => state.syncing = None,
+            Step::Relay => state.joining = None,
+        }
         attempt.finish(result.clone());
         result.map_err(Into::into)
+    }
+
+    /// Authenticates relay attachment with a fresh authorization from the Ark.
+    fn join(&self, requester: &Requester, deadline: Instant) -> Result<relay::Relay, Failure> {
+        let cloud = self.cloud.as_ref().expect("attested cloud available");
+        let joined = requester
+            .request(RelayJoinRequest {}, deadline)?
+            .wait::<RelayJoinResponse>()?;
+        relay::Relay::connect(
+            &cloud.relay_url(),
+            &joined.auth,
+            requester.clone(),
+            deadline,
+        )
+    }
+
+    /// Attaches on demand when the Ark conditionally needs authorization. Wire
+    /// replies progress independently of this dispatcher waiting for attachment.
+    /// Unattested connections retain their explicit receive interface.
+    pub(crate) fn forward(
+        &self,
+        requester: &Requester,
+        request: RelayArkToAppRequest,
+        responder: Responder,
+    ) -> Option<(RelayArkToAppRequest, Responder)> {
+        if self.cloud.is_none() {
+            return Some((request, responder));
+        }
+        let deadline = Instant::now() + relay::EXCHANGE_TIMEOUT;
+        if let Err(error) = self.relay(requester, deadline) {
+            relay::fail(responder, &error.to_string());
+            return None;
+        }
+        let state = self.state.lock().expect("cloud setup not poisoned");
+        match &state.relay {
+            Some(relay) => {
+                relay.forward(request, responder, deadline);
+            }
+            None => relay::fail(responder, "relay closed"),
+        }
+        None
     }
 
     /// Verifies the Ark's registration after establishing its cloud prerequisites.
@@ -142,15 +237,35 @@ impl Services {
         Ok(())
     }
 
-    /// Ends setup waits when the owning connection closes. An HTTP request already
-    /// in progress retains its deadline; it cannot revive the closed connection.
+    /// Ends setup and relay traffic when the owning connection closes.
     pub(crate) fn close(&self) {
+        self.end(protocol::Error::Closed);
+    }
+
+    /// Retains the wire's original ending reason for setup waiters as well.
+    pub(crate) fn end(&self, error: protocol::Error) {
         let mut state = self.state.lock().expect("cloud setup not poisoned");
-        state.closed = true;
-        if let Some(attempt) = state.attempt.take() {
-            attempt.finish(Err(Failure::Wire(protocol::Error::Closed)));
+        if state.error.is_some() {
+            return;
+        }
+        state.error = Some(error.clone());
+        for attempt in [state.syncing.take(), state.joining.take()]
+            .into_iter()
+            .flatten()
+        {
+            attempt.finish(Err(Failure::Wire(error.clone())));
+        }
+        if let Some(relay) = state.relay.take() {
+            relay.close();
         }
     }
+}
+
+/// Prerequisites are initialized independently and always in this order.
+#[derive(Clone, Copy)]
+enum Step {
+    Sync,
+    Relay,
 }
 
 impl Attempt {
@@ -276,13 +391,14 @@ mod tests {
     }
 
     /// Attaches a real wire session with cloud routes redirected to the test server.
-    fn attach(peer: &mut Peer, url: String) -> Ark {
-        let (mut ark, _) = peer.attach().unwrap();
-        ark.services = Arc::new(Services {
+    pub(super) fn attach(peer: &mut Peer, url: String) -> Ark {
+        let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
+        let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
+        let services = Arc::new(Services {
             cloud: Some(super::http::tests::api(url, Realm::Hardware)),
             state: Mutex::new(State::default()),
         });
-        ark
+        Ark::start(session, services).unwrap()
     }
 
     /// Peer that only issues a proof after sync, retaining counts for duplicate
@@ -481,6 +597,10 @@ mod tests {
             ));
             assert!(matches!(
                 client.genuine(Instant::now() + TIMEOUT),
+                Err(Error::Unattested)
+            ));
+            assert!(matches!(
+                client.call(crate::schema::UnlockRequest {}, Instant::now() + TIMEOUT),
                 Err(Error::Unattested)
             ));
             client

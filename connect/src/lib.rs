@@ -50,8 +50,8 @@
 //! }
 //! ```
 //!
-//! Requests declare whether they need cloud synchronization through
-//! [`Request::CLOUD_SYNC`]. Device info, onboarding, pairing status and the sync
+//! Requests declare their prerequisites through [`Request::SETUP`]: [`Setup::None`],
+//! [`Setup::Cloud`] or [`Setup::Relay`]. Device info, onboarding, pairing status and the sync
 //! exchange itself need none. Other requests synchronize cloud keys and time
 //! lazily, using the environment authenticated during the handshake. Client
 //! clones share a successful sync for the lifetime of their connection.
@@ -63,10 +63,31 @@
 //! the cloud registry, all under one deadline. It requires an attested identity
 //! and returns a [`Registration`] whose flags explain whether it is active.
 //!
-//! Operations such as unlock need a companion response before they can finish.
-//! Keep [`Ark::recv`] running while clients wait for those operations. The
-//! application decides how to dispatch incoming requests, forward opaque relay
-//! messages and manage its handlers. Responders expose wire's completion
+//! [`schema::UnlockRequest`] requires [`Setup::Relay`]. Sending it first
+//! synchronizes and attaches the companion relay under the supplied deadline.
+//! Connect carries encrypted companion traffic internally; unlock needs no
+//! application receive loop. Relay attachment requires an attested identity and
+//! is shared by client clones. A later call replaces a failed relay, without
+//! replaying the operation that failed. Closing the Ark closes its relay too.
+//! Scheduling execution and repairing or deleting slots also require relay setup.
+//! Firmware preparation and uploads attach on the Ark's first reverse request,
+//! allowing operations that need no companion authorization to proceed without it.
+//! Transport ping/pong checks detect dead attachments independently of how long
+//! the companion takes to authorize. A refused or expired forwarded request
+//! leaves other exchanges on the attachment running.
+//!
+//! ```no_run
+//! use darkbio_connect::{Client, Error, schema::UnlockRequest};
+//! use std::time::{Duration, Instant};
+//!
+//! fn unlock(client: &Client) -> Result<(), Error> {
+//!     client.call(UnlockRequest {}, Instant::now() + Duration::from_secs(60))?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! [`Ark::recv`] receives requests not claimed by cloud services. Applications
+//! using this interface own their handlers. Responders expose wire's completion
 //! promises: enqueueing a reply and successfully writing it are separate steps.
 //!
 //! ```no_run
@@ -117,6 +138,7 @@ mod cloud;
 mod device;
 mod discovery;
 mod identity;
+mod incoming;
 mod request;
 
 #[cfg(test)]
@@ -131,7 +153,7 @@ pub use darkbio_wire::protocol::{CodedError, Promise, Responder};
 pub use device::{Device, DeviceKind, Locator};
 pub use discovery::{Discovery, list};
 pub use identity::{Identity, TrustMode};
-pub use request::Request;
+pub use request::{Request, Setup};
 
 use darkbio_wire::protocol;
 use std::io;
@@ -139,6 +161,13 @@ use std::io;
 /// Things that can go wrong finding, reaching or talking to an Ark.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A relay connection or forwarded exchange failed.
+    #[error("relay operation failed: {0}")]
+    Relay(String),
+
+    /// A connection worker could not be started.
+    #[error("failed to start connection worker: {0}")]
+    Worker(io::Error),
     /// Cloud operations need an environment and realm established by attestation.
     #[error("cloud operation requires an attested Ark")]
     Unattested,
