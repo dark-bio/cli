@@ -3,7 +3,7 @@
 
 //! Published firmware and the authenticated update sequence for Arks.
 
-use super::{Failure, Services, http, relay};
+use super::{Failure, PackageAuth, Services, http, relay};
 use crate::{Error, schema};
 use base64::{
     Engine,
@@ -161,14 +161,13 @@ impl Services {
         self.cloud.as_ref().ok_or(Error::Unattested)
     }
 
-    pub(crate) fn firmwares(&self, deadline: Instant) -> Result<Vec<Firmware>, Error> {
+    pub(crate) fn firmwares(
+        &self,
+        deadline: Instant,
+        auth: Option<&PackageAuth>,
+    ) -> Result<Vec<Firmware>, Error> {
         let cloud = self.firmware_cloud()?;
-        let listing: Listing = http::get(
-            cloud
-                .agent
-                .get(format!("{}/imgs/arkos.pkgs", cloud.packages)),
-            deadline,
-        )?;
+        let listing: Listing = http::json(cloud.package("imgs/arkos.pkgs", auth, deadline)?)?;
         listing.firmwares()
     }
 
@@ -180,6 +179,7 @@ impl Services {
         firmware: &Firmware,
         deadline: Instant,
         mut progress: impl FnMut(UpdateProgress),
+        auth: Option<&PackageAuth>,
     ) -> Result<(), Error> {
         let cloud = self.firmware_cloud()?;
         Version::parse(&firmware.version)?;
@@ -222,15 +222,7 @@ impl Services {
             uploaded: 0,
             total: firmware.size,
         });
-        let remaining = relay::remaining(deadline).map_err(relay::io_error)?;
-        let mut response = cloud
-            .agent
-            .get(format!("{}/{}", cloud.packages, firmware.path()))
-            .config()
-            .timeout_global(Some(remaining))
-            .build()
-            .call()
-            .map_err(Failure::from)?;
+        let mut response = cloud.package(&firmware.path(), auth, deadline)?;
         if !response.status().is_success() {
             return Err(Error::Cloud(format!(
                 "firmware download returned HTTP {}",
@@ -509,7 +501,13 @@ mod tests {
         let cloud = Cloud::start(&expected, bytes, 200);
         let (mut peer, stages) = peer(&expected, None);
         let ark = attach(&mut peer, cloud.url.clone());
-        let client = ark.client();
+        let authentications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = authentications.clone();
+        let client = ark.client().with_package_auth(move |_, redirect, _| {
+            assert!(redirect.is_none());
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(("test-auth".into(), "private-token".into())))
+        });
         let deadline = Instant::now() + TIMEOUT;
         let firmwares = client.firmwares(deadline).unwrap();
         assert_eq!(firmwares[0].sha256, expected.sha256);
@@ -519,6 +517,7 @@ mod tests {
         );
         let mut progress = Vec::new();
         client
+            .clone()
             .update_firmware(&firmwares[0], deadline, |stage| {
                 if stage == UpdateProgress::Preparing {
                     assert!(matches!(
@@ -563,6 +562,7 @@ mod tests {
             ]
         );
         assert_eq!(cloud.finish().len(), 5);
+        assert_eq!(authentications.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// Refusal at any stage prevents later stages, and losing the install reply
@@ -758,14 +758,17 @@ mod tests {
         let firmware = firmware(&[42]);
         let deadline = Instant::now() + TIMEOUT;
         assert!(matches!(
-            services.firmwares(deadline),
+            services.firmwares(deadline, None),
             Err(Error::Unattested)
         ));
         assert!(matches!(
-            services.update_firmware(&session.requester(), &firmware, deadline, |_| {}),
+            services.update_firmware(&session.requester(), &firmware, deadline, |_| {}, None),
             Err(Error::Unattested)
         ));
         services.close();
-        assert!(matches!(services.firmwares(deadline), Err(Error::Closed)));
+        assert!(matches!(
+            services.firmwares(deadline, None),
+            Err(Error::Closed)
+        ));
     }
 }

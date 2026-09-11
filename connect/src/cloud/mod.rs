@@ -9,6 +9,7 @@ mod http;
 mod relay;
 
 pub use firmware::{Firmware, UpdateProgress};
+pub(crate) use http::PackageAuth;
 pub use http::Registration;
 
 use crate::schema::{

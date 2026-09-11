@@ -3,6 +3,9 @@
 
 //! Firmware selection and terminal progress for the update command.
 
+#[cfg(any(feature = "develop", feature = "staging"))]
+mod access;
+
 use crate::{Error, find_enclave};
 use console::style;
 use darkbio_connect::{Firmware, TrustMode, UpdateProgress, schema};
@@ -17,6 +20,8 @@ pub(super) fn run(
     let endpoint = find_enclave(selector)?;
     let (ark, _) = endpoint.connect(&TrustMode::RootOrSelf)?;
     let client = ark.client();
+    #[cfg(any(feature = "develop", feature = "staging"))]
+    let client = client.with_package_auth(access::authenticate());
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(timeout))
         .ok_or_else(|| "update timeout is too large".to_owned())?;

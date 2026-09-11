@@ -3,7 +3,7 @@
 
 //! Session ownership and typed request handles.
 
-use crate::cloud::Services;
+use crate::cloud::{PackageAuth, Services};
 use crate::incoming::{self, Incoming};
 use crate::{Error, Firmware, Identity, Registration, Request, Setup, UpdateProgress};
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
@@ -84,6 +84,7 @@ impl Ark {
         Client {
             requester: self.requester.clone(),
             services: self.services.clone(),
+            package_auth: None,
         }
     }
 
@@ -139,6 +140,7 @@ impl Closer {
 pub struct Client {
     requester: Requester,    // Wire handle bound to the original session
     services: Arc<Services>, // Prerequisite state shared with the owner and other clients
+    package_auth: Option<Arc<PackageAuth>>, // Package credentials supplied by this caller
 }
 
 impl Client {
@@ -207,7 +209,26 @@ impl Client {
     /// Lists published firmware for this attested Ark, newest first.
     /// Listing packages does not synchronize or change the device.
     pub fn firmwares(&self, deadline: Instant) -> Result<Vec<Firmware>, Error> {
-        self.services.firmwares(deadline)
+        self.services
+            .firmwares(deadline, self.package_auth.as_deref())
+    }
+
+    /// Supplies authentication for package requests made through this handle and
+    /// its clones. The callback receives the package origin, an optional login
+    /// redirect and the operation deadline. It returns one HTTP header or None.
+    /// With no redirect it may return cached credentials; with a redirect it may
+    /// authenticate. It must respect the deadline and may run concurrently.
+    /// Requests retry once at the original origin; redirects are never followed.
+    /// Cloud API and relay requests do not use these credentials.
+    pub fn with_package_auth(
+        mut self,
+        auth: impl Fn(&str, Option<&str>, Instant) -> Result<Option<(String, String)>, Error>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.package_auth = Some(Arc::new(PackageAuth::new(auth)));
+        self
     }
 
     /// Authorizes, streams, verifies and installs firmware under one deadline.
@@ -221,8 +242,13 @@ impl Client {
         deadline: Instant,
         progress: impl FnMut(UpdateProgress),
     ) -> Result<(), Error> {
-        self.services
-            .update_firmware(&self.requester, firmware, deadline, progress)
+        self.services.update_firmware(
+            &self.requester,
+            firmware,
+            deadline,
+            progress,
+            self.package_auth.as_deref(),
+        )
     }
 }
 

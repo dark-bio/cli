@@ -277,8 +277,11 @@ fn find_enclave(selector: Option<&str>) -> Result<Device, String> {
 /// Returns the environment label used in terminal output.
 fn env_name(env: Environment) -> &'static str {
     match env {
+        #[cfg(feature = "release")]
         Environment::Release => "release",
+        #[cfg(feature = "staging")]
         Environment::Staging => "staging",
+        #[cfg(feature = "develop")]
         Environment::Develop => "develop",
     }
 }
@@ -373,9 +376,12 @@ fn render_status(info: &DeviceInfoResponse, identity: &Identity) -> String {
                 Realm::Hardware => "hardware",
                 Realm::Emulator => "emulator",
             };
-            let env = match env {
+            let env = match *env {
+                #[cfg(feature = "release")]
                 Environment::Release => style(env_name(*env)).dim(),
+                #[cfg(feature = "staging")]
                 Environment::Staging => style(env_name(*env)).yellow(),
+                #[cfg(feature = "develop")]
                 Environment::Develop => style(env_name(*env)).red(),
             };
             (
@@ -456,10 +462,21 @@ mod tests {
     }
 
     /// Status uses the certificate's realm and reports mismatched hardware claims.
+    #[cfg(any(feature = "release", feature = "staging", feature = "develop"))]
     #[test]
     fn test_attested_status() {
+        #[cfg(feature = "release")]
+        let env = Environment::Release;
+        #[cfg(all(not(feature = "release"), feature = "staging"))]
+        let env = Environment::Staging;
+        #[cfg(all(
+            not(feature = "release"),
+            not(feature = "staging"),
+            feature = "develop"
+        ))]
+        let env = Environment::Develop;
         let identity = Identity::Attested {
-            env: Environment::Develop,
+            env,
             device: darkbio_connect::trust::device::Device {
                 realm: Realm::Emulator,
                 signer: darkbio_crypto::xdsa::SecretKey::generate().public_key(),
@@ -473,7 +490,7 @@ mod tests {
         let rendered = render_status(&DeviceInfoResponse::default(), &identity);
         let status = console::strip_ansi_codes(&rendered);
         assert_eq!(identity.realm(), Some(Realm::Emulator));
-        assert!(status.contains("attested (develop, emulator)"));
+        assert!(status.contains(&format!("attested ({}, emulator)", env_name(env))));
         assert!(status.contains("verified-serial"));
         assert!(status.contains("0xff"));
         assert!(status.contains("certificate contains \"certified revision\""));

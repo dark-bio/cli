@@ -15,8 +15,14 @@ cargo run -- genuine --device emulator:18181
 cargo run -- unlock --device emulator:18181 --timeout 60
 cargo run -- update --device SERIAL --check
 cargo run -- update --device SERIAL
-cargo run --features internal -- onboard --device emulator:18181 --cwt device.cwt
+cargo run --features internal,develop -- onboard --device emulator:18181 --cwt device.cwt
 ```
+
+The default build trusts release Arks. Add `--features develop` or
+`--features staging` to enable those environments, or `--all-features` for all
+environments and internal commands. Use `--no-default-features --features develop`
+for a develop-only build. Cargo's `--release` flag selects optimization, while
+the `release` feature selects the production trust roots.
 
 `ark genuine` checks an attested Ark against the cloud device registry. It
 automatically synchronizes the Ark's cloud keys and clock before requesting
@@ -54,6 +60,31 @@ Cloud firmware updates require an attested environment. Self-signed and recovery
 connections have no authenticated cloud routing. The Ark decides whether it can
 perform an update, and its rejection is returned unchanged.
 
+Develop and staging builds include login support for package hosts protected by
+Cloudflare Access. Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
+on your PATH, then run:
+
+```sh
+cargo run --features develop -- update --device SERIAL --check
+```
+
+When the package host redirects to Access, the CLI invokes
+`cloudflared access login --app https://pkg.darkbio.dev` (or the staging host).
+The helper opens the browser when login is needed and manages its stored token.
+The CLI captures the token and reuses it for package requests during the command.
+Login and the single HTTP retry share the update deadline. Release-only builds
+omit this helper entirely; mixed builds invoke it only for enabled develop or
+staging package hosts. The browser flow follows Cloudflare's
+[CLI authentication procedure](https://developers.cloudflare.com/cloudflare-one/tutorials/cli/).
+
+Connect exposes `Client::with_package_auth` for callers supplying package
+credentials. Its callback receives the package origin, an optional login redirect
+and the deadline, and returns an optional HTTP header. With no redirect it may
+return cached credentials; a redirect allows it to authenticate. The returned
+client and its clones retain the hook. Credentials are sent only to the original
+package origin and never added to cloud API or relay requests. Connect runs no
+login processes and contains no Cloudflare-specific authentication logic.
+
 Connect owns cloud setup, which is lazy and tied to the connection. Requests
 declare `Request::SETUP` as `Setup::None`, `Setup::Cloud` or `Setup::Relay`.
 Relay setup includes cloud synchronization. Client clones share
@@ -72,7 +103,7 @@ failures.
 Status reports what the handshake established: a trusted certificate, a
 self-signed identity, or a key pinned with `--pubkey`. Recovery does not check
 attestation; self-signing does not establish provisioning history. The CLI
-trusts the release, staging and develop roots. Discovery metadata and endpoint
+trusts the roots enabled by its build features. Discovery metadata and endpoint
 locators are not authenticated identities, and locators can change or be
 reused after a device reconnects.
 

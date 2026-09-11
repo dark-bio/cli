@@ -4,9 +4,9 @@
 //! HTTP routes and payloads of the Ark cloud API.
 
 use super::Failure;
-use crate::Identity;
 use crate::schema::{CloudSyncFinishRequest, CloudSyncStartRequest};
 use crate::trust::{Environment, Realm};
+use crate::{Error, Identity};
 use base64::{
     Engine,
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
@@ -14,6 +14,30 @@ use base64::{
 use darkbio_wire::protocol;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::time::Instant;
+
+type Authenticate =
+    dyn Fn(&str, Option<&str>, Instant) -> Result<Option<(String, String)>, Error> + Send + Sync;
+
+/// Caller-owned authentication for the package origin. Credentials never enter
+/// the agent's defaults, where cloud API requests could inherit them.
+pub(crate) struct PackageAuth(Box<Authenticate>);
+
+impl PackageAuth {
+    pub(crate) fn new(
+        auth: impl Fn(&str, Option<&str>, Instant) -> Result<Option<(String, String)>, Error>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Box::new(auth))
+    }
+}
+
+impl std::fmt::Debug for PackageAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PackageAuth")
+    }
+}
 
 /// Maximum JSON response, enough for cloud certificates, signed time or registry state.
 const MAX_RESPONSE: u64 = 64 * 1024;
@@ -29,6 +53,43 @@ pub(super) struct Api {
 }
 
 impl Api {
+    /// Retries a package GET once with caller-supplied authentication. The login
+    /// redirect is only a challenge; the retry always uses the original URL.
+    pub(super) fn package(
+        &self,
+        path: &str,
+        auth: Option<&PackageAuth>,
+        deadline: Instant,
+    ) -> Result<ureq::http::Response<ureq::Body>, Error> {
+        let request = |header: Option<(String, String)>| {
+            let mut request = self.agent.get(format!("{}/{path}", self.packages));
+            if let Some((name, value)) = header {
+                let mut value = ureq::http::HeaderValue::from_str(&value)
+                    .map_err(|_| Failure::Cloud("invalid package authentication header".into()))?;
+                value.set_sensitive(true);
+                request = request.header(name, value);
+            }
+            send(request, deadline)
+        };
+        let header = match auth {
+            Some(auth) => (auth.0)(&self.packages, None, deadline)?,
+            None => None,
+        };
+        let response = request(header)?;
+        if response.status().is_redirection()
+            && let Some(auth) = auth
+            && let Some(redirect) = response
+                .headers()
+                .get("Location")
+                .and_then(|value| value.to_str().ok())
+            && let Some(header) = (auth.0)(&self.packages, Some(redirect), deadline)?
+        {
+            drop(response);
+            return Ok(request(Some(header))?);
+        }
+        Ok(response)
+    }
+
     /// Uses the authenticated environment and realm for relay attachment.
     pub(super) fn relay_url(&self) -> String {
         let url = self
@@ -230,15 +291,29 @@ pub(super) fn get<T: DeserializeOwned>(
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     deadline: Instant,
 ) -> Result<T, Failure> {
+    json(send(request, deadline)?)
+}
+
+/// Sends a GET under the remaining operation deadline without following redirects.
+fn send(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    deadline: Instant,
+) -> Result<ureq::http::Response<ureq::Body>, Failure> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or(protocol::Error::Timeout)?;
-    let mut response = request
+    Ok(request
         .config()
         .timeout_global(Some(remaining))
         .build()
-        .call()?;
+        .call()?)
+}
+
+/// Decodes a successful JSON response within the cloud response size limit.
+pub(super) fn json<T: DeserializeOwned>(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<T, Failure> {
     if !response.status().is_success() {
         return Err(Failure::Cloud(format!("HTTP {}", response.status())));
     }
@@ -267,6 +342,102 @@ pub(super) mod tests {
             url,
             realm,
             serial: "test-serial".into(),
+        }
+    }
+
+    /// Login retries stay on the package origin. Cached credentials reach the
+    /// archive, while cloud API requests through the same agent remain separate.
+    #[test]
+    fn test_package_auth() {
+        let redirect = "https://login.invalid/session?secret=redacted";
+        let (url, requests) = serve(vec![
+            (
+                Duration::ZERO,
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {redirect}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            ),
+            (Duration::ZERO, response(200, "catalog")),
+            (Duration::ZERO, response(200, "archive")),
+            (
+                Duration::ZERO,
+                response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
+            ),
+        ]);
+        let cloud = api(url, Realm::Hardware);
+        let origin = cloud.packages.clone();
+        let cached = std::sync::Mutex::new(false);
+        let auth = PackageAuth::new(move |host, challenge, _| {
+            assert_eq!(host, origin);
+            let mut cached = cached.lock().unwrap();
+            if let Some(challenge) = challenge {
+                assert_eq!(challenge, redirect);
+                assert!(!*cached);
+                *cached = true;
+            }
+            Ok(cached.then(|| ("test-auth".into(), "private-token".into())))
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        for path in ["imgs/arkos.pkgs", "imgs/archive.arch"] {
+            assert_eq!(
+                cloud.package(path, Some(&auth), deadline).unwrap().status(),
+                200
+            );
+        }
+        cloud.identity(deadline).unwrap();
+        for (path, authenticated) in [
+            ("/imgs/arkos.pkgs", false),
+            ("/imgs/arkos.pkgs", true),
+            ("/imgs/archive.arch", true),
+            ("/v1/cloudsync/identity", false),
+        ] {
+            let request = requests.recv_timeout(TIMEOUT).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with(&format!("get {path} http/1.1\r\n")));
+            assert_eq!(
+                request.contains("test-auth: private-token\r\n"),
+                authenticated
+            );
+        }
+        assert_eq!(format!("{auth:?}"), "PackageAuth");
+    }
+
+    /// An ignored or repeated redirect stops the request. Authentication cannot
+    /// extend the deadline or trigger a chain of retries.
+    #[test]
+    fn test_package_auth_failure() {
+        for mode in ["decline", "repeat", "expire", "error"] {
+            let redirect = "HTTP/1.1 302 Found\r\nLocation: https://login.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let count = if mode == "repeat" { 2 } else { 1 };
+            let (url, requests) = serve(vec![(Duration::ZERO, redirect.into()); count]);
+            let cloud = api(url, Realm::Hardware);
+            let auth = PackageAuth::new(move |_, redirect, deadline| {
+                if redirect.is_none() || mode == "decline" {
+                    return Ok(None);
+                }
+                if mode == "error" {
+                    return Err(Error::Cloud("login refused".into()));
+                }
+                if mode == "expire" {
+                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(Some(("test-auth".into(), "private-token".into())))
+            });
+            let result = cloud.package(
+                "imgs/arkos.pkgs",
+                Some(&auth),
+                Instant::now() + Duration::from_millis(100),
+            );
+            match mode {
+                "expire" => assert!(matches!(result, Err(Error::Timeout))),
+                "error" => {
+                    assert!(matches!(result, Err(Error::Cloud(error)) if error == "login refused"))
+                }
+                _ => assert_eq!(result.unwrap().status(), 302),
+            }
+            for _ in 0..count {
+                requests.recv_timeout(TIMEOUT).unwrap();
+            }
+            assert!(requests.recv_timeout(TIMEOUT).is_err());
         }
     }
 

@@ -85,6 +85,13 @@
 //! Client clones share an update lock. Success acknowledges installation and a
 //! pending reboot; it does not verify the new boot. Failed stages are not retried.
 //!
+//! [`Client::with_package_auth`] supplies a caller-owned authentication callback
+//! for private package hosts. It receives the package origin, an optional login
+//! redirect and the deadline, returning an optional HTTP header. The configured
+//! handle and its clones share the callback. Package requests retry once at the
+//! original origin; cloud API and relay requests never receive these credentials.
+//! Callers own browser interaction, credential storage and deadline handling.
+//!
 //! ```no_run
 //! use darkbio_connect::{Client, Error, schema::UnlockRequest};
 //! use std::time::{Duration, Instant};
