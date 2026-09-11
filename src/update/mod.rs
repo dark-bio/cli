@@ -6,6 +6,7 @@
 #[cfg(any(feature = "develop", feature = "staging"))]
 mod access;
 
+use crate::progress::Transfer;
 use crate::{Error, connect, find_enclave};
 use console::style;
 use darkbio_connect::trust::Environment;
@@ -61,22 +62,12 @@ pub(super) fn run(
             .dim()
         );
     }
-    let mut previous = None;
+    let mut transfer = Transfer::default();
     client.update_firmware(firmware, deadline, |progress| match progress {
         UpdateProgress::Preparing => eprintln!("{}", style("Preparing firmware update…").dim()),
         UpdateProgress::Uploading { uploaded, total } => {
-            let percent = (u128::from(uploaded) * 100 / u128::from(total)) as u64;
-            if previous != Some(percent / 10) || uploaded == total {
-                eprintln!(
-                    "{}",
-                    style(format!(
-                        "Uploading: {percent}% ({:.1}/{:.1} MiB)",
-                        uploaded as f64 / (1024.0 * 1024.0),
-                        total as f64 / (1024.0 * 1024.0)
-                    ))
-                    .dim()
-                );
-                previous = Some(percent / 10);
+            if let Some(line) = transfer.update(uploaded, total) {
+                eprintln!("{}", style(line).dim());
             }
         }
         UpdateProgress::Verifying => eprintln!("{}", style("Verifying firmware on the Ark…").dim()),

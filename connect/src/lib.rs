@@ -89,6 +89,14 @@
 //! Client clones share an update lock. Success acknowledges installation and a
 //! pending reboot; it does not verify the new boot. Failed stages are not retried.
 //!
+//! [`Client::upload_dataset`] lets the Ark identify a file, obtains approval,
+//! streams its bytes and waits for validation and indexing. [`Client::upload_reference`]
+//! uses a slot's advertised download, checking its size and SHA-256 before
+//! processing. Both report [`UploadProgress`] and share one operation deadline.
+//! Two chunks may be outstanding to overlap transfer with device writes. Failed
+//! sessions are cancelled when time remains, without replaying the upload.
+//! Reference downloads use HTTPS and carry no cloud or package credentials.
+//!
 //! [`Client::with_package_auth`] supplies a caller-owned authentication callback
 //! for private package hosts. It receives the package origin, an optional login
 //! redirect and the deadline, returning an optional HTTP header. The configured
@@ -155,6 +163,7 @@ pub mod hardware;
 
 mod ark;
 mod cloud;
+mod dataset;
 mod device;
 mod discovery;
 mod identity;
@@ -170,6 +179,7 @@ pub use darkbio_trust as trust;
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
 pub use darkbio_wire::protocol::{CodedError, Promise, Responder};
+pub use dataset::UploadProgress;
 pub use device::{Device, DeviceKind, Locator};
 pub use discovery::{Discovery, list};
 pub use identity::{Identity, TrustMode};
@@ -181,6 +191,14 @@ use std::io;
 /// Things that can go wrong finding, reaching or talking to an Ark.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Dataset identification, transfer or processing failed.
+    #[error("dataset upload failed: {0}")]
+    Dataset(String),
+
+    /// A dataset source could not supply its advertised bytes.
+    #[error("failed to read dataset: {0}")]
+    DatasetRead(io::Error),
+
     /// Firmware selection, transfer or update state was invalid.
     #[error("firmware update failed: {0}")]
     Firmware(String),

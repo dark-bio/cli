@@ -3,8 +3,10 @@
 
 //! Command dispatch, endpoint selection and terminal output for the Ark CLI.
 
+mod progress;
 mod slots;
 mod update;
+mod upload;
 
 use clap::{Parser, Subcommand};
 use console::style;
@@ -32,6 +34,9 @@ struct Cli {
 enum Command {
     /// List hardware Arks and running emulators
     List,
+
+    /// Upload a dataset file or download a reference dataset to the Ark
+    Upload(upload::Args),
 
     /// List the Ark's dataset slots and metadata
     Slots {
@@ -159,6 +164,7 @@ fn main() -> ExitCode {
 /// subsequent status query fails.
 fn run(command: Command, env: Option<Environment>) -> Result<(), Error> {
     match command {
+        Command::Upload(args) => upload::run(args, env)?,
         Command::Slots { device, timeout } => {
             slots::run(device.as_deref(), env, timeout)?;
         }

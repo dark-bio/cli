@@ -5,7 +5,10 @@
 
 use crate::cloud::{PackageAuth, Services};
 use crate::incoming::{self, Incoming};
-use crate::{Error, Firmware, Identity, Registration, Request, Setup, UpdateProgress};
+use crate::{
+    Error, Firmware, Identity, Registration, Request, Setup, UpdateProgress, UploadProgress,
+    dataset,
+};
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
 use std::io;
@@ -249,6 +252,59 @@ impl Client {
             deadline,
             progress,
             self.package_auth.as_deref(),
+        )
+    }
+
+    /// Identifies a dataset, obtains approval when required, streams its bytes
+    /// and waits for processing. The source must contain exactly `size` bytes.
+    /// The Ark selects the slot and decides whether to accept the upload.
+    ///
+    /// Cloud setup, approval, transfer and processing share the deadline. Reads
+    /// and callbacks run on this thread and must return promptly; a blocking
+    /// reader cannot be interrupted by the deadline. Failures attempt to cancel
+    /// the session within the remaining time and are never retried automatically.
+    pub fn upload_dataset(
+        &self,
+        name: &str,
+        size: u64,
+        reader: &mut impl io::Read,
+        deadline: Instant,
+        progress: impl FnMut(UploadProgress),
+    ) -> Result<(), Error> {
+        self.services.sync(&self.requester, deadline)?;
+        dataset::upload(
+            &self.requester,
+            &dataset::Dataset {
+                name: name.into(),
+                size,
+                reference: None,
+            },
+            reader,
+            deadline,
+            progress,
+        )
+    }
+
+    /// Downloads and uploads the reference advertised by a slot, checking its
+    /// exact size and SHA-256 before processing. Uses the same streaming and
+    /// cleanup rules as [`Self::upload_dataset`]. No package or cloud credentials
+    /// are sent to reference hosts; downloads and redirects require HTTPS.
+    pub fn upload_reference(
+        &self,
+        slot: &schema::SlotStatus,
+        deadline: Instant,
+        mut progress: impl FnMut(UploadProgress),
+    ) -> Result<(), Error> {
+        let (source, url) = dataset::Dataset::reference(slot)?;
+        self.services.sync(&self.requester, deadline)?;
+        progress(UploadProgress::Downloading);
+        let mut response = dataset::download(&url, deadline)?;
+        dataset::upload(
+            &self.requester,
+            &source,
+            &mut response.body_mut().as_reader(),
+            deadline,
+            progress,
         )
     }
 }

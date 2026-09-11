@@ -307,7 +307,7 @@ impl Attempt {
 
 /// Shared setup, retries and connection lifecycle over real wire peers.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::schema::host_to_ark::Content;
     use crate::schema::{
@@ -328,7 +328,7 @@ mod tests {
 
     /// Serves scripted responses and captures requests, closing each connection
     /// after its response. Accepts are bounded so a failed test leaves no waiter.
-    pub(super) fn serve(responses: Vec<(Duration, String)>) -> (String, mpsc::Receiver<String>) {
+    pub(crate) fn serve(responses: Vec<(Duration, String)>) -> (String, mpsc::Receiver<String>) {
         serve_inner(responses, None)
     }
 
@@ -381,7 +381,7 @@ mod tests {
     }
 
     /// Formats a response with a known body length and no persistent connection.
-    pub(super) fn response(status: u16, body: &str) -> String {
+    pub(crate) fn response(status: u16, body: &str) -> String {
         format!(
             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len(),
@@ -399,7 +399,7 @@ mod tests {
     }
 
     /// Attaches a real wire session with cloud routes redirected to the test server.
-    pub(super) fn attach(peer: &mut Peer, url: String) -> Ark {
+    pub(crate) fn attach(peer: &mut Peer, url: String) -> Ark {
         let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
         let services = Arc::new(Services {

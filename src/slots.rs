@@ -53,6 +53,7 @@ fn render(slots: &[SlotStatus]) -> String {
             if !slot.desc.is_empty() {
                 lines.push(format!("  {}", style(&slot.desc).dim()));
             }
+            field(&mut lines, "Slot ID", &slot.kind.to_string());
             if !slot.damaged.is_empty() {
                 lines.push(format!(
                     "  {} {}",

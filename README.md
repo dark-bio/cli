@@ -14,6 +14,10 @@ cargo run -- status --device emulator:18181
 cargo run -- genuine --device emulator:18181
 cargo run -- unlock --device emulator:18181 --timeout 60
 cargo run -- slots --device SERIAL
+cargo run -- upload calls.vcf.gz --device SERIAL
+cargo run -- upload --reference-genome --device SERIAL
+cargo run -- upload --gene-annotations --device SERIAL
+cargo run -- upload --variant-catalog --device SERIAL
 cargo run -- update --device SERIAL --check
 cargo run -- update --device SERIAL
 cargo run --features internal,develop -- onboard --device emulator:18181 --cwt device.cwt
@@ -44,7 +48,7 @@ verify device proofs against the cloud's registry, independently of the
 certificate presented during the handshake.
 
 `ark slots` fetches the Ark's dataset slot inventory and metadata. It displays
-each slot's name, description, origin, filled or damaged state, dependencies,
+each slot's name, ID, description, origin, filled or damaged state, dependencies,
 and available build information. Reference slots may also advertise a download
 URL, byte count and SHA-256; these are displayed as metadata. The command transfers
 no dataset files and makes no changes to slots.
@@ -53,6 +57,35 @@ Connect synchronizes the cloud before requesting the inventory. `--timeout`
 bounds setup and the request in seconds (30 by default, after connecting).
 The Ark requires unlocking to read its slots; a refusal is returned unchanged.
 Use `ark unlock --device SERIAL` to request unlocking before retrying.
+
+`ark upload FILE` sends a local dataset to the Ark. The Ark identifies the file
+from its first chunk, selects the slot and requests companion approval when
+needed. Files are streamed as they are, including compressed inputs; format
+validation belongs to the Ark. Uploading waits for validation and indexing to
+finish before reporting success. Transfer and processing progress retain the
+CLI's colored output on the terminal and go to stderr.
+Transfers show recent throughput and estimated time remaining. Processing reports
+name the current step and its position, for example `Processing [2/3] Index: 40%`,
+with an ETA for that step only. Estimates appear after enough progress is observed
+and restart for each new processing step. Slow steps refresh every five seconds
+as reports arrive, even when the displayed percentage has not changed.
+
+`ark upload --reference-genome`, `--gene-annotations` or `--variant-catalog`
+fetches the slot inventory and streams the advertised reference download directly
+to the Ark. Choose one reference flag or a local file per command. The flags select
+the protocol's slot kind, independently of the name reported by the Ark.
+The download must match the advertised byte count and SHA-256
+before processing starts. Reference URLs and redirects require HTTPS and receive
+no cloud or package credentials. The Ark also validates reference content against
+its catalog. Missing download metadata is reported instead of guessing a build.
+
+Both forms synchronize cloud keys and time automatically and attach the relay
+when the Ark requests authorization. They let the Ark enforce locking,
+dependencies and slot availability. `--timeout` covers setup, approval, download,
+transfer and processing in seconds (3600 by default, after connecting).
+Failures are not retried. Once a session is known, failures attempt cancellation
+within the remaining deadline, waiting at most one second for cleanup. After a
+timeout or disconnect, the Ark may retain an incomplete session until it expires.
 
 `ark genuine` checks an Ark against the cloud device registry. It
 automatically synchronizes the Ark's cloud keys and clock before requesting
@@ -79,8 +112,9 @@ verification and installation in seconds (600 by default, after connecting).
 An unpaired Ark needs no approval. A paired, locked Ark requests a button press;
 an unlocked Ark requests companion approval through the relay. The CLI streams
 the encrypted archive, checks its advertised length and SHA-256, then asks the
-Ark to verify and install it. Progress is printed to stderr. Successful installation
-reboots the Ark; the command acknowledges installation but does not wait to verify
+Ark to verify and install it. Progress, transfer throughput and ETA are printed
+to stderr. Successful installation reboots the Ark; the command acknowledges
+installation but does not wait to verify
 the subsequent boot. Errors stop the sequence, and chunks or installation are
 never retried automatically. If the connection is lost during installation, check
 the Ark's status after reconnecting before attempting another update.
@@ -209,6 +243,17 @@ first. `Firmware::is_update_for(installed)` follows the device's version rules.
 stages on the caller's thread and returns after the installation acknowledgement.
 Client clones cannot start overlapping updates through this helper. Callers using
 raw firmware requests must coordinate those separately.
+
+`Client::upload_dataset(name, size, &mut reader, deadline, progress)` identifies,
+authorizes, streams and processes a dataset from a `Read` source. The source must
+provide exactly `size` bytes from its current position. `Client::upload_reference`
+accepts a `schema::SlotStatus` containing the advertised reference download and
+runs the same transfer and processing sequence. Both report `UploadProgress` on
+the calling thread. Reads and progress callbacks must return promptly; a blocking
+caller-supplied reader cannot be interrupted by the operation deadline. Only two
+chunks are outstanding at a time, allowing device writes and USB transfers to
+overlap without buffering the whole file. The Ark coordinates concurrent upload
+sessions and rejects conflicting operations.
 
 Execution scheduling and slot repair/deletion also establish the relay before
 sending. Firmware preparation and uploads attach when the Ark first requests
