@@ -1,23 +1,13 @@
 // ark: command line interface for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-mod enclave;
-mod wire;
-
 use clap::{Parser, Subcommand};
 use console::style;
-use darkbio_trust::Environment;
-use nusb::MaybeFuture;
+use darkbio_connect::trust::Environment;
+use darkbio_connect::{Ark, Device, Identity, Realm, TrustMode};
 #[cfg(feature = "internal")]
 use std::path::PathBuf;
 use std::process;
-
-use enclave::Enclave;
-use wire::{Identity, TrustMode};
-
-/// USB VID:PID for Dark Bio Ark enclaves.
-const ARK_VID: u16 = 0x2e8a;
-const ARK_PID: u16 = 0x10f1;
 
 #[derive(Parser)]
 #[command(name = "ark", about = "Command line interface for Ark enclaves")]
@@ -28,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List all connected Ark enclaves
+    /// List the Ark enclaves plugged in and the emulators running
     List,
 
     /// Onboard an enclave with a signed attestation certificate
@@ -41,6 +31,10 @@ enum Command {
         /// Hex-encoded xDSA public key for recovery (bypasses CWT verification)
         #[arg(long)]
         pubkey: Option<String>,
+
+        /// Serial, name or disk image of the enclave to use, when several are found
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Query enclave identity and firmware information
@@ -48,6 +42,10 @@ enum Command {
         /// Hex-encoded xDSA public key for recovery (bypasses CWT verification)
         #[arg(long)]
         pubkey: Option<String>,
+
+        /// Serial, name or disk image of the enclave to use, when several are found
+        #[arg(long)]
+        device: Option<String>,
     },
 }
 
@@ -58,18 +56,28 @@ fn main() {
     match cli.command {
         Command::List => cmd_list(),
         #[cfg(feature = "internal")]
-        Command::Onboard { cwt, pubkey } => {
+        Command::Onboard {
+            cwt,
+            pubkey,
+            device,
+        } => {
             let trust = parse_trust_mode(pubkey);
-            let mut enc = open_enclave(&trust);
-            cmd_onboard(&mut enc, &cwt);
+            let (ark, _) = open_enclave(device.as_deref(), &trust);
+            cmd_onboard(&ark, &cwt);
 
-            // Refresh the session and print the status for immediate visual
-            // feedback. Onboarding already succeeded, so a status read failure
-            // only warns instead of failing the command.
-            match enc.refresh_session(&TrustMode::RootOrSelf) {
-                Ok(()) => {
+            // Reconnect and print the status for immediate visual feedback, the
+            // fresh handshake presenting the injected attestation. Onboarding
+            // already succeeded, so a failure here only warns instead of failing
+            // the command.
+            drop(ark);
+            match find_enclave(device.as_deref()).and_then(|device| {
+                device
+                    .connect(&TrustMode::RootOrSelf)
+                    .map_err(|err| err.to_string())
+            }) {
+                Ok((ark, identity)) => {
                     println!();
-                    cmd_status(&mut enc);
+                    cmd_status(&ark, &identity);
                 }
                 Err(err) => eprintln!(
                     "{} could not read status after onboarding: {}",
@@ -78,10 +86,10 @@ fn main() {
                 ),
             }
         }
-        Command::Status { pubkey } => {
+        Command::Status { pubkey, device } => {
             let trust = parse_trust_mode(pubkey);
-            let mut enc = open_enclave(&trust);
-            cmd_status(&mut enc);
+            let (ark, identity) = open_enclave(device.as_deref(), &trust);
+            cmd_status(&ark, &identity);
         }
     }
 }
@@ -115,66 +123,108 @@ fn parse_trust_mode(pubkey: Option<String>) -> TrustMode {
                     eprintln!("{} invalid --pubkey: {}", style("error:").red().bold(), err);
                     process::exit(1);
                 });
-            TrustMode::Recover(key)
+            TrustMode::Recover(Box::new(key))
         }
     }
 }
 
-/// Locates exactly one Ark enclave and opens an encrypted connection. Exits on error.
-fn open_enclave(trust: &TrustMode) -> Enclave {
-    let devices: Vec<_> = nusb::list_devices()
-        .wait()
-        .expect("failed to enumerate USB devices")
-        .filter(|d| d.vendor_id() == ARK_VID && d.product_id() == ARK_PID)
+/// Finds the enclave to use, the only one found or the one selected by its
+/// serial, name, disk image or label as listed. A selector several enclaves
+/// match is refused rather than resolved to the first of them.
+fn find_enclave(selector: Option<&str>) -> Result<Device, String> {
+    let devices = darkbio_connect::list().map_err(|err| err.to_string())?;
+    let Some(selector) = selector else {
+        let mut devices = devices.into_iter();
+        return match (devices.next(), devices.next()) {
+            (None, _) => Err("no Ark enclave found".into()),
+            (Some(device), None) => Ok(device),
+            _ => Err("multiple Ark enclaves found, use --device to select one".into()),
+        };
+    };
+    let mut matches: Vec<Device> = devices
+        .into_iter()
+        .filter(|device| {
+            [device.serial(), device.name(), device.image()]
+                .into_iter()
+                .flatten()
+                .any(|facet| facet == selector)
+                || device.to_string() == selector
+        })
         .collect();
+    match matches.len() {
+        0 => Err(format!("no Ark enclave matches {selector}")),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "{selector} matches several Ark enclaves, name one to tell them apart: {}",
+            matches
+                .iter()
+                .map(|device| format!("{device} ({})", notes(device)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
 
-    if devices.is_empty() {
-        eprintln!("{} no Ark enclave found", style("error:").red().bold());
+/// Locates the enclave to use and opens an encrypted connection. Exits on error.
+fn open_enclave(selector: Option<&str>, trust: &TrustMode) -> (Ark, Identity) {
+    let device = find_enclave(selector).unwrap_or_else(|err| {
+        eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(1);
-    }
-    if devices.len() > 1 {
-        eprintln!(
-            "{} multiple Ark enclaves found, use --serial to select one",
-            style("error:").red().bold()
-        );
-        process::exit(2);
-    }
-    Enclave::open(&devices[0], trust).unwrap_or_else(|err| {
+    });
+    device.connect(trust).unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
     })
 }
 
-/// Lists all connected Ark enclaves with their product name and serial number.
-fn cmd_list() {
-    let arks: Vec<_> = nusb::list_devices()
-        .wait()
-        .expect("failed to enumerate USB devices")
-        .filter(|d| d.vendor_id() == ARK_VID && d.product_id() == ARK_PID)
-        .collect();
+/// Name of an environment as printed.
+fn environment_name(environment: Environment) -> &'static str {
+    match environment {
+        Environment::Release => "release",
+        Environment::Staging => "staging",
+        Environment::Develop => "develop",
+    }
+}
 
-    if arks.is_empty() {
+/// What is known of an enclave before connecting, how it is reached, the
+/// environment it says it is bound to and whether it is still booting.
+fn notes(device: &Device) -> String {
+    let mut notes = vec![match device.realm() {
+        Realm::Live => "hardware",
+        Realm::Sandbox => "emulator",
+    }];
+    if let Some(environment) = device.environment() {
+        notes.push(environment_name(environment));
+    }
+    if !device.ready() {
+        notes.push("booting");
+    }
+    notes.join(", ")
+}
+
+/// Lists the enclaves plugged in and the emulators running, each by its label
+/// with what is known of it before connecting.
+fn cmd_list() {
+    let devices = darkbio_connect::list().unwrap_or_else(|err| {
+        eprintln!("{} {}", style("error:").red().bold(), err);
+        process::exit(1);
+    });
+    if devices.is_empty() {
         println!("No Ark enclaves found.");
         return;
     }
-    for (i, dev) in arks.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        let serial = dev.serial_number().unwrap_or("unknown");
-        let product = dev.product_string().unwrap_or("Ark");
-
+    for device in &devices {
         println!(
             "{} {}",
-            style(product).bold(),
-            style(format!("({})", serial)).dim(),
+            style(device).bold(),
+            style(format!("({})", notes(device))).dim(),
         );
     }
 }
 
 /// Reads a CWT attestation file and sends it to the enclave for onboarding.
 #[cfg(feature = "internal")]
-fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
+fn cmd_onboard(ark: &Ark, cwt_path: &PathBuf) {
     let cwt = std::fs::read(cwt_path).unwrap_or_else(|err| {
         eprintln!(
             "{} failed to read {}: {}",
@@ -184,7 +234,7 @@ fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
         );
         process::exit(1);
     });
-    enc.onboard(&cwt).unwrap_or_else(|err| {
+    ark.onboard(cwt).unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
     });
@@ -192,9 +242,8 @@ fn cmd_onboard(enc: &mut Enclave, cwt_path: &PathBuf) {
 }
 
 /// Retrieves the device info and prints hardware, firmware and identity information.
-fn cmd_status(enc: &mut Enclave) {
-    let identity = enc.identity().clone();
-    let info = enc.device_info().unwrap_or_else(|err| {
+fn cmd_status(ark: &Ark, identity: &Identity) {
+    let info = ark.device_info().unwrap_or_else(|err| {
         eprintln!("{} {}", style("error:").red().bold(), err);
         process::exit(3);
     });
@@ -207,7 +256,7 @@ fn cmd_status(enc: &mut Enclave) {
 
     // Cross-check the attested claims against device-reported values (only for
     // root-signed)
-    let (environment, device) = match &identity {
+    let (environment, device) = match identity {
         Identity::Attested {
             environment,
             device,
