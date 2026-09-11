@@ -18,6 +18,10 @@ cargo run -- upload calls.vcf.gz --device SERIAL
 cargo run -- upload --reference-genome --device SERIAL
 cargo run -- upload --gene-annotations --device SERIAL
 cargo run -- upload --variant-catalog --device SERIAL
+cargo run -- delete snp-indel-calls --device SERIAL
+cargo run -- repair 2 --device SERIAL
+cargo run -- execute app.wasm --device SERIAL > result.json
+cargo run -- cancel 42 --device SERIAL
 cargo run -- update --device SERIAL --check
 cargo run -- update --device SERIAL
 cargo run --features internal,develop -- onboard --device emulator:18181 --cwt device.cwt
@@ -58,6 +62,15 @@ bounds setup and the request in seconds (30 by default, after connecting).
 The Ark requires unlocking to read its slots; a refusal is returned unchanged.
 Use `ark unlock --device SERIAL` to request unlocking before retrying.
 
+`ark delete SLOT` removes a healthy, filled slot's contents. `ark repair SLOT`
+resets a slot to empty, removing damaged or incomplete data too; it does not
+restore data. Select an ID from `ark slots` or a protocol name:
+`reference-genome`, `gene-annotations`, `snp-indel-calls` or `variant-catalog`.
+Both commands synchronize the cloud and attach the companion relay automatically.
+Approve the operation in the companion app. The Ark enforces slot state and
+dependencies, and its refusal is returned unchanged. `--timeout` covers setup,
+approval and deletion in seconds (60 by default, after connecting).
+
 `ark upload FILE` sends a local dataset to the Ark. The Ark identifies the file
 from its first chunk, selects the slot and requests companion approval when
 needed. Files are streamed as they are, including compressed inputs; format
@@ -86,6 +99,27 @@ transfer and processing in seconds (3600 by default, after connecting).
 Failures are not retried. Once a session is known, failures attempt cancellation
 within the remaining deadline, waiting at most one second for cleanup. After a
 timeout or disconnect, the Ark may retain an incomplete session until it expires.
+
+`ark execute FILE.wasm` streams an app to the Ark, requests companion approval,
+and waits for its result. The Ark validates the app and its dataset requirements.
+Uploads show throughput and ETA; running apps show elapsed time, since the
+protocol provides no execution percentage. All CLI progress and completion
+messages go to stderr. The app's stdout and stderr are written as bytes to their
+respective streams, including when the app fails. This allows redirecting stdout
+to a result file without CLI messages entering it.
+
+`--timeout` covers cloud setup, upload, approval and execution in seconds (3600
+by default, after connecting). Execution prints its task ID as soon as the Ark
+allocates it. Ctrl-C requests cancellation and waits up to five seconds for an
+acknowledgement before exiting with status 130. `ark cancel TASK` can also cancel
+an upload or execution after reconnecting, with a default timeout of 30 seconds.
+Another process must release the device before this command can connect to it.
+
+Failed execution operations attempt cancellation within the remaining deadline,
+waiting at most one second. Timeout, disconnect or interruption before receiving
+a task ID can leave work on the Ark; closing the connection alone does not cancel
+it. Operations are never retried automatically. Retrieving a completed execution
+consumes its result, so only one caller should poll a given task.
 
 `ark genuine` checks an Ark against the cloud device registry. It
 automatically synchronizes the Ark's cloud keys and clock before requesting
@@ -159,7 +193,8 @@ Onboarding reads the certificate before connecting and reconnects to the same
 endpoint for status. Failure of that follow-up check is a warning after
 successful onboarding. Exit codes are 0 for success, 1 for local input or
 selection failures, 2 for argument parsing, and 3 for connection or request
-failures.
+failures. An app that finishes unsuccessfully exits with status 4; an interrupted
+execution exits with status 130.
 
 Status reports what the handshake established: a trusted certificate, a
 self-signed identity, or a key pinned with `--pubkey`. Recovery does not check
@@ -254,6 +289,18 @@ caller-supplied reader cannot be interrupted by the operation deadline. Only two
 chunks are outstanding at a time, allowing device writes and USB transfers to
 overlap without buffering the whole file. The Ark coordinates concurrent upload
 sessions and rejects conflicting operations.
+
+`Client::execute(size, &mut reader, deadline, progress)` streams an app, obtains
+companion approval and polls until the Ark returns its `ExecutionResultResponse`.
+It reports `ExecutionProgress` on the caller's thread. `Started { taskid }` exposes
+the ID for `ExecutionCancelRequest` through another client clone, including while
+approval or a status request is pending. Connect installs no signal handlers.
+The source must contain exactly `size` bytes; reads and callbacks must return
+promptly. A failed app returns its output with `success: false`, while transport,
+approval and invalid status errors return `Err`.
+
+Slot deletion and repair remain single typed calls using `SlotDeleteRequest` and
+`SlotRepairRequest`; both select the target through their `slot` field.
 
 Execution scheduling and slot repair/deletion also establish the relay before
 sending. Firmware preparation and uploads attach when the Ark first requests

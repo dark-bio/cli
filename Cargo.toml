@@ -19,6 +19,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 darkbio-connect = { path = "connect" }
 hex = "0.4.3"
 console = "0.15.11"
+ctrlc = "3.5.2"
 
 # Firmware uploads push megabytes through the crypto, which crawls unoptimized,
 # so dependencies build optimized under the dev profile too. The workspace

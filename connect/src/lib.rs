@@ -97,6 +97,15 @@
 //! sessions are cancelled when time remains, without replaying the upload.
 //! Reference downloads use HTTPS and carry no cloud or package credentials.
 //!
+//! [`Client::execute`] uploads an app, obtains companion approval and waits for
+//! its result under one deadline, reporting [`ExecutionProgress`]. The Ark checks
+//! app validity and dataset requirements. An unsuccessful app returns its output
+//! with `success: false`. [`ExecutionProgress::Started`] exposes the task ID for
+//! [`schema::ExecutionCancelRequest`] through another client clone. Completed
+//! results are consumed on retrieval; only one caller should poll each task.
+//! Connect installs no signal handlers. Failures attempt cancellation when time
+//! remains, but closing a connection alone does not stop execution on the Ark.
+//!
 //! [`Client::with_package_auth`] supplies a caller-owned authentication callback
 //! for private package hosts. It receives the package origin, an optional login
 //! redirect and the deadline, returning an optional HTTP header. The configured
@@ -166,6 +175,7 @@ mod cloud;
 mod dataset;
 mod device;
 mod discovery;
+mod execution;
 mod identity;
 mod incoming;
 mod request;
@@ -182,6 +192,7 @@ pub use darkbio_wire::trust;
 pub use dataset::UploadProgress;
 pub use device::{Device, DeviceKind, Locator};
 pub use discovery::{Discovery, list};
+pub use execution::ExecutionProgress;
 pub use identity::{Identity, TrustMode};
 pub use request::{Request, Setup};
 
@@ -191,6 +202,14 @@ use std::io;
 /// Things that can go wrong finding, reaching or talking to an Ark.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// App transfer or execution status was invalid.
+    #[error("execution failed: {0}")]
+    Execution(String),
+
+    /// An app source could not supply its advertised bytes.
+    #[error("failed to read app: {0}")]
+    ExecutionRead(io::Error),
+
     /// Dataset identification, transfer or processing failed.
     #[error("dataset upload failed: {0}")]
     Dataset(String),

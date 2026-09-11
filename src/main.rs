@@ -3,6 +3,7 @@
 
 //! Command dispatch, endpoint selection and terminal output for the Ark CLI.
 
+mod execution;
 mod progress;
 mod slots;
 mod update;
@@ -37,6 +38,18 @@ enum Command {
 
     /// Upload a dataset file or download a reference dataset to the Ark
     Upload(upload::Args),
+
+    /// Delete the contents of a filled dataset slot
+    Delete(slots::ChangeArgs),
+
+    /// Reset a dataset slot to empty, removing damaged or incomplete data
+    Repair(slots::ChangeArgs),
+
+    /// Upload and execute a WASM app with companion approval
+    Execute(execution::Args),
+
+    /// Cancel an execution or unfinished app upload
+    Cancel(execution::CancelArgs),
 
     /// List the Ark's dataset slots and metadata
     Slots {
@@ -165,6 +178,10 @@ fn main() -> ExitCode {
 fn run(command: Command, env: Option<Environment>) -> Result<(), Error> {
     match command {
         Command::Upload(args) => upload::run(args, env)?,
+        Command::Delete(args) => slots::change(args, env, false)?,
+        Command::Repair(args) => slots::change(args, env, true)?,
+        Command::Execute(args) => execution::run(args, env)?,
+        Command::Cancel(args) => execution::cancel(args, env)?,
         Command::Slots { device, timeout } => {
             slots::run(device.as_deref(), env, timeout)?;
         }

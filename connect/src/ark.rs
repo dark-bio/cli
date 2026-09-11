@@ -6,8 +6,8 @@
 use crate::cloud::{PackageAuth, Services};
 use crate::incoming::{self, Incoming};
 use crate::{
-    Error, Firmware, Identity, Registration, Request, Setup, UpdateProgress, UploadProgress,
-    dataset,
+    Error, ExecutionProgress, Firmware, Identity, Registration, Request, Setup, UpdateProgress,
+    UploadProgress, dataset, execution,
 };
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
@@ -305,6 +305,41 @@ impl Client {
             &mut response.body_mut().as_reader(),
             deadline,
             progress,
+        )
+    }
+
+    /// Uploads an app, obtains companion approval and waits for its result.
+    /// The source must contain exactly `size` bytes. The Ark validates the app
+    /// and its dataset requirements. An unsuccessful app still returns its
+    /// result, including stdout and stderr; inspect the result's `success` flag.
+    ///
+    /// Setup, upload, approval and execution share the deadline. Reads and
+    /// progress callbacks run on this thread and must return promptly. A blocking
+    /// reader cannot be interrupted by the deadline. Failed operations attempt
+    /// cancellation within the remaining time and are never retried.
+    ///
+    /// [`ExecutionProgress::Started`] supplies the task ID for cancellation with
+    /// [`schema::ExecutionCancelRequest`] through another client clone. Closing
+    /// the connection alone does not cancel the task. Retrieving a completed
+    /// result consumes it, so only one caller should poll a task's status.
+    pub fn execute(
+        &self,
+        size: u64,
+        reader: &mut impl io::Read,
+        deadline: Instant,
+        progress: impl FnMut(ExecutionProgress),
+    ) -> Result<schema::ExecutionResultResponse, Error> {
+        self.services.sync(&self.requester, deadline)?;
+        execution::execute(
+            &self.requester,
+            size,
+            reader,
+            deadline,
+            progress,
+            |taskid| {
+                self.call(schema::ExecutionScheduleRequest { taskid }, deadline)
+                    .map(drop)
+            },
         )
     }
 }

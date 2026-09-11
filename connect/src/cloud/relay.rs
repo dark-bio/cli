@@ -789,6 +789,38 @@ mod tests {
                             )
                             .unwrap();
                     }
+                    Content::ExecUploadStart(request) => {
+                        assert!(synced);
+                        assert_eq!(request.bytes, 4);
+                        responder
+                            .reply(
+                                schema::ExecutionUploadStartResponse { taskid: 42 },
+                                deadline,
+                            )
+                            .unwrap();
+                    }
+                    Content::ExecUploadChunk(request) => {
+                        assert_eq!(request.taskid, 42);
+                        assert_eq!(request.chunk, [0, 97, 115, 109]);
+                        responder
+                            .reply(schema::ExecutionUploadChunkResponse {}, deadline)
+                            .unwrap();
+                    }
+                    Content::ExecStatus(request) => {
+                        assert_eq!(request.taskid, 42);
+                        responder
+                            .reply(
+                                schema::ExecutionStatusResponse {
+                                    pending: false,
+                                    result: Some(schema::ExecutionResultResponse {
+                                        success: true,
+                                        ..Default::default()
+                                    }),
+                                },
+                                deadline,
+                            )
+                            .unwrap();
+                    }
                     request @ (Content::Unlock(_)
                     | Content::ExecSched(_)
                     | Content::SlotRepair(_)
@@ -1009,7 +1041,7 @@ mod tests {
     #[test]
     fn test_authorization_prerequisites() {
         type Call = fn(&crate::Client) -> Result<(), Error>;
-        let calls: [Call; 3] = [
+        let calls: [Call; 4] = [
             |client| {
                 client
                     .call_timeout(schema::ExecutionScheduleRequest::default(), TIMEOUT)
@@ -1024,6 +1056,16 @@ mod tests {
                 client
                     .call_timeout(schema::SlotDeleteRequest::default(), TIMEOUT)
                     .map(drop)
+            },
+            |client| {
+                let result = client.execute(
+                    4,
+                    &mut [0, 97, 115, 109].as_slice(),
+                    Instant::now() + TIMEOUT,
+                    |_| {},
+                )?;
+                assert!(result.success);
+                Ok(())
             },
         ];
         for call in calls {

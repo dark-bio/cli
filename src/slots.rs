@@ -1,14 +1,79 @@
 // ark: command line interface for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Dataset slot inventory and metadata reported by the Ark.
+//! Dataset slot inventory, deletion and recovery.
 
 use crate::{Error, connect, find_enclave};
 use console::style;
 use darkbio_connect::TrustMode;
-use darkbio_connect::schema::{SlotListRequest, SlotOrigin, SlotStatus, slot_status::Meta};
+use darkbio_connect::schema::{
+    SlotDeleteRequest, SlotKind, SlotListRequest, SlotOrigin, SlotRepairRequest, SlotStatus,
+    slot_status::Meta,
+};
 use darkbio_connect::trust::Environment;
 use std::time::Duration;
+
+#[derive(clap::Args)]
+pub(super) struct ChangeArgs {
+    /// Slot ID from `ark slots`, or reference-genome, gene-annotations,
+    /// snp-indel-calls or variant-catalog
+    #[arg(value_name = "SLOT", value_parser = parse_slot)]
+    slot: i32,
+
+    /// Endpoint locator, or a unique serial, name or disk image
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Total budget in seconds for setup, companion approval and deletion
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: u64,
+}
+
+pub(super) fn change(
+    args: ChangeArgs,
+    env: Option<Environment>,
+    repair: bool,
+) -> Result<(), Error> {
+    let endpoint = find_enclave(args.device.as_deref())?;
+    let (ark, _) = connect(&endpoint, &TrustMode::RootOrSelf, env)?;
+    let action = if repair { "Resetting" } else { "Deleting" };
+    eprintln!(
+        "{}",
+        style(format!(
+            "{action} slot {}. Approve in your companion app.",
+            args.slot
+        ))
+        .dim()
+    );
+    let client = ark.client();
+    let timeout = Duration::from_secs(args.timeout);
+    if repair {
+        client.call_timeout(SlotRepairRequest { slot: args.slot }, timeout)?;
+    } else {
+        client.call_timeout(SlotDeleteRequest { slot: args.slot }, timeout)?;
+    }
+    println!(
+        "{}",
+        style(format!("Slot {} is now empty.", args.slot)).green()
+    );
+    Ok(())
+}
+
+/// IDs allow addressing new slot kinds without a CLI release. Names follow
+/// the protocol enum; display labels and local guesses never select a slot.
+fn parse_slot(value: &str) -> Result<i32, String> {
+    if let Ok(id) = value.parse::<i32>()
+        && id >= 0
+    {
+        return Ok(id);
+    }
+    let name = format!("SLOT_{}", value.replace('-', "_").to_ascii_uppercase());
+    SlotKind::from_str_name(&name)
+        .map(i32::from)
+        .ok_or_else(|| {
+            format!("unknown slot {value:?}; use a slot name or the ID from `ark slots`")
+        })
+}
 
 pub(super) fn run(
     selector: Option<&str>,
@@ -142,10 +207,43 @@ fn download_fields(lines: &mut Vec<String>, url: &str, bytes: u64, sha256: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use darkbio_connect::schema::{
         SlotMetaGeneAnnotations, SlotMetaReferenceGenome, SlotMetaSnpIndelCalls,
         SlotMetaVariantCatalog,
     };
+
+    /// Destructive commands require one explicit target. Numeric IDs keep
+    /// future kinds addressable without guessing from device display labels.
+    #[test]
+    fn test_change_arguments() {
+        for command in ["delete", "repair"] {
+            for (slot, kind) in [
+                ("reference-genome", 0),
+                ("gene-annotations", 1),
+                ("snp-indel-calls", 2),
+                ("variant-catalog", 3),
+                ("99", 99),
+            ] {
+                let parsed = crate::Cli::try_parse_from(["ark", command, slot]).unwrap();
+                let args = match parsed.command {
+                    crate::Command::Delete(args) | crate::Command::Repair(args) => args,
+                    _ => panic!("unexpected command"),
+                };
+                assert_eq!(args.slot, kind);
+            }
+            for tail in [
+                vec![],
+                vec!["unknown"],
+                vec!["1", "2"],
+                vec!["1", "--timeout", "0"],
+            ] {
+                let mut args = vec!["ark", command];
+                args.extend(tail);
+                assert!(crate::Cli::try_parse_from(args).is_err());
+            }
+        }
+    }
 
     /// Rendering preserves each metadata variant and uses the device's names
     /// for dependencies. A populated slot need not advertise a download.
