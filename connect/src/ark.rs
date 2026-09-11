@@ -1,190 +1,105 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! A connected Ark as the caller sees it, the requests of the protobuf
-//! protocol as typed calls over a wire session. A thread of its own receives
-//! the requests the Ark sends and hands them to the handler along with their
-//! responders, the callers sending through the session's requester.
+//! Session ownership and typed request handles.
 
 use crate::{Error, Request};
-use darkbio_wire::protocol::schema::*;
-use darkbio_wire::protocol::{self, Closer, Message, Promise, Requester, Session, schema};
+use darkbio_wire::protocol::{
+    self, Closer, Message, Promise, Requester, Responder, Session, schema,
+};
 use darkbio_wire::transport::{self, Verifier};
 use std::io;
 use std::marker::PhantomData;
-use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use tracing::{error, warn};
 
-/// How long a request waits on the Ark unless told otherwise, the budget of
-/// every request and reply without a deadline of its own. The handshake has
-/// the wire's own budget.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Operational domain a connected device belongs to, live for genuine Arks
-/// and sandbox for emulated ones. It selects the trust roots the device's
-/// attestation is validated against and the cloud API tree it is served from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Realm {
-    Live,
-    Sandbox,
-}
-
-/// Maps a failed handshake to the connection's error, a read running into the
-/// deadline being the Ark timing out rather than a failure of the wire.
-fn handshake_error(err: protocol::Error) -> Error {
-    if let protocol::Error::Transport(err) = &err
-        && let transport::Error::RecvFailed(io) = &**err
-        && matches!(
-            io.kind(),
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-        )
-    {
-        return Error::Timeout;
-    }
-    Error::Handshake(err)
-}
-
-/// Handler of the requests the Ark sends on its own, run on the session's
-/// serving thread with the responder to answer through.
-type RequestHandler = Box<dyn FnMut(ark_to_host::Content, Responder) + Send>;
-
-/// Handler of the session ending without a close, run once, on the serving
-/// thread that saw it end or right away when registered after that.
-type DisconnectHandler = Box<dyn FnOnce(protocol::Error) + Send>;
-
-/// The session's end as the disconnect handler learns of it.
-enum Disconnect {
-    Pending(Option<DisconnectHandler>), // Session alive, with the handler to tell if one was registered
-    Closed,                             // Session closed locally, nothing to tell
-    Ended(protocol::Error), // Session ended without a close, the reason told to every handler
-}
-
-/// State shared between the Ark and its serving thread.
-struct Shared {
-    session: Mutex<Option<Session>>, // Parked once serving ends, so later requests still name the reason
-    handler: Mutex<Option<RequestHandler>>, // Handler of the Ark's requests, taken out while it runs
-    disconnect: Mutex<Disconnect>, // How the session ended, or the handler to tell when it does
-    timeout: Mutex<Duration>,      // Deadline of requests and replies without one of their own
-}
-
-/// A connected Ark, its requests issued from any thread and answered on their
-/// own, the requests it sends on its own handed to a handler and the session
-/// ending reported. Dropping it closes the session.
+/// Owner of a connection to an Ark. Closing or dropping it ends the session,
+/// including requests issued through its [`Client`] handles.
+///
+/// Receive incoming requests through [`Self::recv`] while other threads issue
+/// calls through [`Self::client`]. Wire keeps incoming requests in its bounded
+/// queue until received. The application owns dispatch and handler lifetimes.
 pub struct Ark {
-    realm: Realm,         // Domain the Ark belongs to
-    requester: Requester, // Sends requests through the session
-    closer: Closer,       // Ends the session from any thread
-    shared: Arc<Shared>,  // State shared with the serving thread
+    /// Wire session whose lifetime owns the connection and its I/O workers.
+    session: Session,
 }
 
 impl Ark {
-    /// Runs the wire handshake over a stream of the realm and wraps the
-    /// session, the verifier deciding whether to trust the attestation the
-    /// Ark presents. The handshake waits on the Ark under the wire's own
-    /// budget and failure closes the stream. The requests of the session
-    /// wait `DEFAULT_TIMEOUT` unless changed on it.
-    pub fn attach<R, W, V>(
+    /// Takes ownership of a stream and authenticates the peer under wire's
+    /// handshake timeout. Returns the verifier's identity information. Failure
+    /// closes the stream.
+    pub(crate) fn attach<R, W, V>(
         stream: transport::Stream<R, W>,
-        realm: Realm,
         verifier: &V,
-    ) -> Result<(Ark, V::Info), Error>
+    ) -> Result<(Self, V::Info), Error>
     where
         R: transport::Read + Send + 'static,
         W: transport::Write + Send + 'static,
         V: Verifier,
     {
-        let (session, info) = protocol::connect(stream, verifier).map_err(handshake_error)?;
-        Ok((Ark::new(realm, session), info))
-    }
-
-    /// Wraps an established session, its serving thread handing out the
-    /// requests the Ark sends until the session ends.
-    fn new(realm: Realm, session: Session) -> Self {
-        let shared = Arc::new(Shared {
-            session: Mutex::new(None),
-            handler: Mutex::new(None),
-            disconnect: Mutex::new(Disconnect::Pending(None)),
-            timeout: Mutex::new(DEFAULT_TIMEOUT),
-        });
-        let ark = Self {
-            realm,
-            requester: session.requester(),
-            closer: session.closer(),
-            shared: shared.clone(),
-        };
-        thread::Builder::new()
-            .name("ark-serve".into())
-            .spawn(move || serve(shared, session))
-            .expect("failed to spawn the serving thread");
-        ark
-    }
-
-    /// Domain the Ark belongs to.
-    pub fn realm(&self) -> Realm {
-        self.realm
-    }
-
-    /// Deadline of the requests and replies without one of their own.
-    pub fn timeout(&self) -> Duration {
-        *self.shared.timeout.lock().unwrap()
-    }
-
-    /// Sets the deadline of the requests and replies without one of their own.
-    pub fn set_timeout(&self, timeout: Duration) {
-        *self.shared.timeout.lock().unwrap() = timeout;
-    }
-
-    /// Registers the handler of the requests the Ark sends on its own,
-    /// replacing the previous one, from inside a handler too. Each comes
-    /// with the responder to answer it through, a responder dropped
-    /// unanswered replying that on its own. The handler runs on the serving
-    /// thread, so the requests the Ark sends after it wait for it, the
-    /// answers to the host's own requests do not. Hand the request to
-    /// another thread to work on it at length.
-    pub fn on_request(
-        &self,
-        handler: impl FnMut(ark_to_host::Content, Responder) + Send + 'static,
-    ) {
-        *self.shared.handler.lock().unwrap() = Some(Box::new(handler));
-    }
-
-    /// Registers the handler invoked when the session ends without a close,
-    /// the reason telling a USB unplug or the emulator shutting down apart
-    /// from the Ark dropping the session. A session that already ended tells
-    /// the handler right away.
-    pub fn on_disconnect(&self, handler: impl FnOnce(protocol::Error) + Send + 'static) {
-        let reason = {
-            let mut disconnect = self.shared.disconnect.lock().unwrap();
-            match &mut *disconnect {
-                Disconnect::Pending(slot) => {
-                    *slot = Some(Box::new(handler));
-                    return;
-                }
-                Disconnect::Closed => return,
-                Disconnect::Ended(reason) => reason.clone(),
+        let (session, info) = protocol::connect(stream, verifier).map_err(|err| {
+            if let protocol::Error::Transport(cause) = &err
+                && let transport::Error::RecvFailed(io) | transport::Error::SendFailed(io) =
+                    &**cause
+                && matches!(
+                    io.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                )
+            {
+                return Error::Timeout;
             }
-        };
-        handler(reason);
+            Error::Handshake(err)
+        })?;
+        Ok((Self { session }, info))
     }
 
-    /// Closes the session and the transport underneath, failing the requests
-    /// in flight. Dropping the Ark does the same.
+    /// Returns a clonable request handle bound to this session. The handle
+    /// does not keep the connection open.
+    pub fn client(&self) -> Client {
+        Client {
+            requester: self.session.requester(),
+        }
+    }
+
+    /// Blocks for the next known Ark request, or returns the session's ending reason.
+    /// Wire answers unknown request types before application dispatch. The returned
+    /// responder retains wire's reply completion and automatic reply semantics.
+    pub fn recv(&mut self) -> Result<(schema::ark_to_host::Content, Responder), Error> {
+        let (message, responder) = self.session.recv()?;
+        Ok((message.try_into()?, responder))
+    }
+
+    /// Returns a handle for closing the session from another thread, including
+    /// while its owner is blocked in [`Self::recv`].
+    pub fn closer(&self) -> Closer {
+        self.session.closer()
+    }
+
+    /// Closes the session, wakes blocked receives and fails pending requests.
+    /// Does not join application handlers or wait for the peer to observe closure.
     pub fn close(&self) {
-        self.closer.close();
+        self.session.close();
+    }
+}
+
+/// Clonable handle for issuing typed requests through its original session.
+/// Each request carries its own deadline. Handles do not keep the session open.
+#[derive(Clone, Debug)]
+pub struct Client {
+    requester: Requester, // Wire handle bound to the original session
+}
+
+impl Client {
+    /// Sends a request and waits for its typed response under the supplied deadline.
+    /// The deadline covers queueing, sending and accepting the response; decoding
+    /// is outside it. Reuse one deadline to share a budget across several calls.
+    /// Expiration does not cancel an operation the Ark has already received.
+    pub fn call<R: Request>(&self, request: R, deadline: Instant) -> Result<R::Response, Error> {
+        self.send(request, deadline)?.wait()
     }
 
-    /// Sends a request and waits for its answer within the default timeout,
-    /// an error the Ark answered with surfacing as a remote error.
-    pub fn call<R: Request>(&self, request: R) -> Result<R::Response, Error> {
-        self.call_timeout(request, self.timeout())
-    }
-
-    /// Sends a request and waits for its answer within the timeout, which
-    /// covers the queue, the send and the wait. An error the Ark answered
-    /// with surfaces as a remote error.
+    /// Sends a request and waits with a budget starting now. Use [`Self::call`]
+    /// with one deadline when several requests must share a budget.
     pub fn call_timeout<R: Request>(
         &self,
         request: R,
@@ -193,22 +108,15 @@ impl Ark {
         self.send_timeout(request, timeout)?.wait()
     }
 
-    /// Sends a request without waiting for its answer, which waiting on the
-    /// pending result yields within the default timeout. Sending the next
-    /// request before waiting keeps the wire busy.
-    pub fn send<R: Request>(&self, request: R) -> Result<Pending<R::Response>, Error> {
-        self.send_timeout(request, self.timeout())
-    }
-
-    /// Sends a request without waiting for its answer, which waiting on the
-    /// pending result yields within the timeout. The timeout covers the
-    /// queue, the send and the wait, whenever the caller gets to it.
-    pub fn send_timeout<R: Request>(
+    /// Queues a request under the supplied deadline without waiting for output or
+    /// a response. Waiting on the promise does not refresh the deadline; dropping
+    /// it does not cancel the request. Wire's output queue has no capacity limit,
+    /// so the caller bounds the number of outstanding requests.
+    pub fn send<R: Request>(
         &self,
         request: R,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<Pending<R::Response>, Error> {
-        let deadline = Instant::now() + timeout;
         let promise = self.requester.request(request, deadline)?;
         Ok(Pending {
             promise,
@@ -216,525 +124,410 @@ impl Ark {
         })
     }
 
-    /// Retrieves the hardware and firmware version info of the Ark.
-    pub fn device_info(&self) -> Result<DeviceInfoResponse, Error> {
-        self.call(DeviceInfoRequest {})
-    }
-
-    /// Injects a root-signed device attestation into the Ark, which verifies
-    /// it against its own trust roots and persists it as its identity.
-    pub fn onboard(&self, attestation: Vec<u8>) -> Result<OnboardingResponse, Error> {
-        self.call(OnboardingRequest {
-            device_attestation: attestation,
-        })
-    }
-
-    /// Requests a proof for device authenticity checks.
-    pub fn genuinity_proof(&self) -> Result<GenuinityProofResponse, Error> {
-        self.call(GenuinityProofRequest {})
-    }
-
-    /// Unlocks the Ark, waiting for the approval within the timeout.
-    pub fn unlock(&self, timeout: Duration) -> Result<UnlockResponse, Error> {
-        self.call_timeout(UnlockRequest {}, timeout)
-    }
-
-    /// Starts a cloud synchronization with the attestations of the cloud's
-    /// signing and encryption keys.
-    pub fn cloud_sync_start(
+    /// Queues a request with a budget starting now. Waiting on the returned
+    /// promise retains that deadline, even if the caller waits later.
+    pub fn send_timeout<R: Request>(
         &self,
-        signer: Vec<u8>,
-        crypto: Vec<u8>,
-    ) -> Result<CloudSyncStartResponse, Error> {
-        self.call(CloudSyncStartRequest { signer, crypto })
-    }
-
-    /// Finishes a cloud synchronization with the cloud's signed timestamp.
-    pub fn cloud_sync_finish(
-        &self,
-        unixmilli: u64,
-        signature: Vec<u8>,
-    ) -> Result<CloudSyncFinishResponse, Error> {
-        self.call(CloudSyncFinishRequest {
-            unixmilli,
-            signature,
-        })
-    }
-
-    /// Prepares a firmware update to the version, the hash and the size being
-    /// those of the encrypted archive.
-    pub fn firmware_update_prep(
-        &self,
-        version: &str,
-        sha256: Vec<u8>,
-        bytes: u64,
-    ) -> Result<FirmwareUpdatePrepResponse, Error> {
-        self.call(FirmwareUpdatePrepRequest {
-            version: version.to_owned(),
-            sha256,
-            bytes,
-        })
-    }
-
-    /// Initializes a firmware update with the sealed access to its archive.
-    pub fn firmware_update_init(
-        &self,
-        access: Vec<u8>,
-    ) -> Result<FirmwareUpdateInitResponse, Error> {
-        self.call(FirmwareUpdateInitRequest { access })
-    }
-
-    /// Uploads a chunk of the firmware archive.
-    pub fn firmware_update_upload(
-        &self,
-        chunk: Vec<u8>,
-    ) -> Result<FirmwareUpdateUploadResponse, Error> {
-        self.call(FirmwareUpdateUploadRequest { chunk })
-    }
-
-    /// Verifies an uploaded firmware update.
-    pub fn firmware_update_verify(&self) -> Result<FirmwareUpdateVerifyResponse, Error> {
-        self.call(FirmwareUpdateVerifyRequest {})
-    }
-
-    /// Installs a verified firmware update.
-    pub fn firmware_update_install(&self) -> Result<FirmwareUpdateInstallResponse, Error> {
-        self.call(FirmwareUpdateInstallRequest {})
-    }
-
-    /// Requests the current pairing status.
-    pub fn pairing_status(&self) -> Result<PairingStatusResponse, Error> {
-        self.call(PairingStatusRequest {})
-    }
-
-    /// Initiates a pairing.
-    pub fn pairing_auth(&self) -> Result<PairingAuthResponse, Error> {
-        self.call(PairingAuthRequest {})
-    }
-
-    /// Injects the companion app's sealed identity.
-    pub fn pairing_set_app_id(
-        &self,
-        identity: Vec<u8>,
-    ) -> Result<PairingSetAppIdentityResponse, Error> {
-        self.call(PairingSetAppIdentityRequest { identity })
-    }
-
-    /// Injects the companion app's sealed storage key material.
-    pub fn pairing_set_app_storage(
-        &self,
-        app_key: Vec<u8>,
-    ) -> Result<PairingSetAppStorageResponse, Error> {
-        self.call(PairingSetAppStorageRequest { app_key })
-    }
-
-    /// Confirms with the app's sealed acknowledgement that the Ark's key
-    /// material was received.
-    pub fn pairing_ack_ark_storage(
-        &self,
-        app_ack: Vec<u8>,
-    ) -> Result<PairingAckArkStorageResponse, Error> {
-        self.call(PairingAckArkStorageRequest { app_ack })
-    }
-
-    /// Waits for the pairing to be accepted, within the timeout.
-    pub fn pairing_accept(&self, timeout: Duration) -> Result<PairingAcceptanceResponse, Error> {
-        self.call_timeout(PairingAcceptanceRequest {}, timeout)
-    }
-
-    /// Completes the pairing.
-    pub fn pairing_complete(&self) -> Result<PairingCompletionResponse, Error> {
-        self.call(PairingCompletionRequest {})
-    }
-
-    /// Requests permission to join the relay.
-    pub fn relay_join(&self) -> Result<RelayJoinResponse, Error> {
-        self.call(RelayJoinRequest {})
-    }
-
-    /// Forwards a sealed request of the companion app to the Ark, under the
-    /// app's request id.
-    pub fn relay_req(&self, id: u64, req: Vec<u8>) -> Result<RelayArkToAppResponse, Error> {
-        self.call(RelayAppToArkRequest { id, req })
-    }
-
-    /// Starts uploading an executable of the size.
-    pub fn exec_upload_start(&self, bytes: u64) -> Result<ExecutionUploadStartResponse, Error> {
-        self.call(ExecutionUploadStartRequest { bytes })
-    }
-
-    /// Uploads a chunk of the executable of the task.
-    pub fn exec_upload_chunk(
-        &self,
-        taskid: u64,
-        chunk: Vec<u8>,
-    ) -> Result<ExecutionUploadChunkResponse, Error> {
-        self.call(ExecutionUploadChunkRequest { taskid, chunk })
-    }
-
-    /// Schedules the uploaded executable of the task.
-    pub fn exec_sched(&self, taskid: u64) -> Result<ExecutionScheduleResponse, Error> {
-        self.call(ExecutionScheduleRequest { taskid })
-    }
-
-    /// Requests the status of the task's execution.
-    pub fn exec_status(&self, taskid: u64) -> Result<ExecutionStatusResponse, Error> {
-        self.call(ExecutionStatusRequest { taskid })
-    }
-
-    /// Cancels the task's execution.
-    pub fn exec_cancel(&self, taskid: u64) -> Result<ExecutionCancelResponse, Error> {
-        self.call(ExecutionCancelRequest { taskid })
-    }
-
-    /// Lists the dataset slots.
-    pub fn slot_list(&self) -> Result<SlotListResponse, Error> {
-        self.call(SlotListRequest {})
-    }
-
-    /// Repairs a dataset slot, resetting it to empty.
-    pub fn slot_repair(&self, slot: SlotKind) -> Result<SlotRepairResponse, Error> {
-        self.call(SlotRepairRequest { slot: slot as i32 })
-    }
-
-    /// Deletes a dataset slot.
-    pub fn slot_delete(&self, slot: SlotKind) -> Result<SlotDeleteResponse, Error> {
-        self.call(SlotDeleteRequest { slot: slot as i32 })
-    }
-
-    /// Identifies a dataset from its file name, size and first chunk, among
-    /// the slot kinds given or any if none.
-    pub fn slot_upload_peek(
-        &self,
-        name: &str,
-        size: u64,
-        chunk: Vec<u8>,
-        kinds: &[SlotKind],
-    ) -> Result<SlotUploadPeekResponse, Error> {
-        self.call(SlotUploadPeekRequest {
-            name: name.to_owned(),
-            size,
-            chunk,
-            kinds: kinds.iter().map(|kind| *kind as i32).collect(),
-        })
-    }
-
-    /// Starts uploading a dataset into a slot, its file name, size and first
-    /// chunk checked against the kind.
-    pub fn slot_upload_start(
-        &self,
-        kind: SlotKind,
-        name: &str,
-        size: u64,
-        chunk: Vec<u8>,
-    ) -> Result<SlotUploadStartResponse, Error> {
-        self.call(SlotUploadStartRequest {
-            kind: kind as i32,
-            name: name.to_owned(),
-            size,
-            chunk,
-        })
-    }
-
-    /// Uploads a chunk of the dataset of the upload session.
-    pub fn slot_upload_chunk(
-        &self,
-        session: u64,
-        chunk: Vec<u8>,
-    ) -> Result<SlotUploadChunkResponse, Error> {
-        self.call(SlotUploadChunkRequest { session, chunk })
-    }
-
-    /// Cancels the dataset upload session.
-    pub fn slot_upload_cancel(&self, session: u64) -> Result<SlotUploadCancelResponse, Error> {
-        self.call(SlotUploadCancelRequest { session })
-    }
-
-    /// Processes the uploaded dataset of the session into its slot.
-    pub fn slot_upload_process(&self, session: u64) -> Result<SlotUploadProcessResponse, Error> {
-        self.call(SlotUploadProcessRequest { session })
+        request: R,
+        timeout: Duration,
+    ) -> Result<Pending<R::Response>, Error> {
+        let deadline = Instant::now().checked_add(timeout).ok_or(Error::Timeout)?;
+        self.send(request, deadline)
     }
 }
 
-impl Drop for Ark {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-/// A request sent and not yet answered, the answer taken by waiting on it.
-/// Dropping it discards the answer, not the request, which the Ark may keep
-/// working on.
+/// Result of a typed request, decoded when [`Self::wait`] takes the response.
+/// Dropping it discards the result without cancelling the request.
 #[derive(Debug)]
 pub struct Pending<T> {
-    promise: Promise<Message>, // Answer of the wire, still encoded
-    response: PhantomData<T>,  // Body the answer is expected to be
+    /// Encoded response and the notification registered for its completion.
+    promise: Promise<Message>,
+    /// Response type selected by the request, without owning a value of it.
+    response: PhantomData<fn() -> T>,
 }
 
-impl<T> Pending<T>
-where
-    T: TryFrom<Message, Error = protocol::Error>,
-{
-    /// Waits for the answer within the deadline the request was sent with,
-    /// an error the Ark answered with surfacing as a remote error.
+impl<T> Pending<T> {
+    /// Sends an event when the request completes, successfully or with an error.
+    /// One channel can observe many requests. Registration leaves the response
+    /// encoded until [`Self::wait`] and does not change its deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a notification was already registered on this promise.
+    pub fn notify<E: Copy + Send + 'static>(&mut self, sender: mpsc::Sender<E>, event: E) {
+        self.promise.notify(sender, event);
+    }
+}
+
+impl<T: TryFrom<Message, Error = protocol::Error>> Pending<T> {
+    /// Waits for completion and decodes the expected response. An accepted
+    /// response remains available after its deadline or the session's closure.
     pub fn wait(self) -> Result<T, Error> {
         Ok(self.promise.wait()?)
     }
 }
 
-/// Answers one request the Ark sent, within the Ark's timeout. Dropped
-/// unanswered, the wire tells the Ark so on its own.
-#[derive(Debug)]
-pub struct Responder {
-    inner: protocol::Responder, // Responder of the wire, answering once
-    timeout: Duration,          // Deadline of the reply, the Ark's when the request arrived
-}
-
-impl Responder {
-    /// Answers the request with a response body, queued for sending. A closed
-    /// session refuses it.
-    pub fn reply(self, response: impl Into<Message>) -> Result<(), Error> {
-        self.inner.reply(response, Instant::now() + self.timeout)?;
-        Ok(())
-    }
-
-    /// Answers the request with an error of the application, queued for
-    /// sending. A closed session refuses it.
-    pub fn fail(self, error: schema::Error) -> Result<(), Error> {
-        self.inner.fail(error, Instant::now() + self.timeout)?;
-        Ok(())
-    }
-}
-
-/// Receives the requests the Ark sends until the session ends, handing each to
-/// the handler with a responder carrying the timeout of the moment. The handler
-/// runs outside its slot, so it may replace itself, the replacement taking the
-/// slot it left empty. A body the Ark cannot send is dropped, as is a request
-/// without a handler, the responder answering unanswered on the way out. A
-/// handler panicking is its own bug, the session carries on. The session is
-/// parked afterwards, so later requests are refused with the reason it ended.
-/// A close needs no notification, anything else tells the disconnect handler,
-/// right away if one is registered, else once it is.
-fn serve(shared: Arc<Shared>, mut session: Session) {
-    let reason = loop {
-        let (message, responder) = match session.recv() {
-            Ok(received) => received,
-            Err(err) => break err,
-        };
-        let responder = Responder {
-            inner: responder,
-            timeout: *shared.timeout.lock().unwrap(),
-        };
-        let request = match ark_to_host::Content::try_from(message) {
-            Ok(request) => request,
-            Err(err) => {
-                warn!("dropping request the ark cannot send: {}", err);
-                continue;
-            }
-        };
-        let handler = shared.handler.lock().unwrap().take();
-        match handler {
-            Some(mut handler) => {
-                if panic::catch_unwind(AssertUnwindSafe(|| handler(request, responder))).is_err() {
-                    error!("request handler panicked");
-                }
-                let mut slot = shared.handler.lock().unwrap();
-                if slot.is_none() {
-                    *slot = Some(handler);
-                }
-            }
-            None => warn!("dropping request without a handler"),
-        }
-    };
-    *shared.session.lock().unwrap() = Some(session);
-
-    // Record how the session ended and take the handler waiting for that,
-    // told outside the lock so it may register another
-    let reason = match reason {
-        protocol::Error::Closed => None,
-        reason => Some(reason),
-    };
-    let handler = {
-        let mut disconnect = shared.disconnect.lock().unwrap();
-        let ended = match &reason {
-            None => Disconnect::Closed,
-            Some(reason) => Disconnect::Ended(reason.clone()),
-        };
-        match std::mem::replace(&mut *disconnect, ended) {
-            Disconnect::Pending(handler) => handler,
-            _ => None,
-        }
-    };
-    if let (Some(reason), Some(handler)) = (reason, handler) {
-        handler(reason);
-    }
-}
-
+/// Request ownership, completion and bidirectional protocol regressions.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{
+        DeviceInfoRequest, OnboardingRequest, RelayAppToArkResponse, RelayArkToAppRequest,
+        UnlockRequest, UnlockResponse,
+    };
     use crate::testing::{Peer, answering, hangup, silent};
-    use std::sync::mpsc;
+    use std::thread;
 
-    // Tests that a typed request goes through the session and its response
-    // comes back typed, an error the Ark answered with surfacing as a remote
-    // error.
+    /// Budget for test I/O that is not exercising expiration.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Application error codes reach the peer, and a reserved refusal leaves the
+    /// session available for subsequent requests.
     #[test]
-    fn test_request() {
-        let mut peer = Peer::spawn(Box::new(answering));
-        let (ark, _) = peer.attach().unwrap();
-        assert_eq!(ark.realm(), Realm::Sandbox);
+    fn test_coded_errors() {
+        /// Application refusal returned by the host's companion handler.
+        #[derive(Debug, thiserror::Error)]
+        #[error("companion rejected authorization")]
+        struct Denied;
 
-        let info = ark.device_info().unwrap();
-        assert_eq!(info.firmware_version, "1.0.0");
-
-        let err = ark.slot_list().unwrap_err();
-        assert!(
-            matches!(err, Error::Remote(schema::Error { code: 7, .. })),
-            "{err:?}"
-        );
-        ark.close();
-    }
-
-    // Tests that requests sent ahead of their answers are each answered to
-    // their own pending result.
-    #[test]
-    fn test_pipelining() {
-        let mut peer = Peer::spawn(Box::new(answering));
-        let (ark, _) = peer.attach().unwrap();
-
-        let pending: Vec<_> = (0..4)
-            .map(|_| ark.send(DeviceInfoRequest {}).unwrap())
-            .collect();
-        for pending in pending {
-            assert_eq!(pending.wait().unwrap().firmware_version, "1.0.0");
+        impl crate::CodedError for Denied {
+            fn code(&self) -> u64 {
+                0x100
+            }
         }
+
+        let mut peer = Peer::spawn(Box::new(|session, request, responder| {
+            if !matches!(request, schema::host_to_ark::Content::Unlock(_)) {
+                return answering(session, request, responder);
+            }
+            let deadline = Instant::now() + TIMEOUT;
+            let error = session
+                .requester()
+                .request(RelayArkToAppRequest::default(), deadline)
+                .unwrap()
+                .wait::<RelayAppToArkResponse>()
+                .unwrap_err();
+            assert!(matches!(
+                error, protocol::Error::Remote(error)
+                    if error.code == 0x100 && error.msg == "companion rejected authorization"
+            ));
+            responder
+                .fail(
+                    schema::Error::reserved(
+                        schema::ReservedErrors::Unavailable,
+                        "authorization required",
+                    ),
+                    deadline,
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+            true
+        }));
+        let (mut ark, _) = peer.attach().unwrap();
+        let client = ark.client();
+        let pending = client
+            .send(UnlockRequest {}, Instant::now() + TIMEOUT)
+            .unwrap();
+        let (request, responder) = ark.recv().unwrap();
+        assert!(matches!(request, schema::ark_to_host::Content::RelayReq(_)));
+        responder
+            .fail(Denied, Instant::now() + TIMEOUT)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            pending.wait(), Err(Error::Remote(error))
+                if error.code == schema::ReservedErrors::Unavailable as u64
+        ));
+        assert_eq!(
+            client
+                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                .unwrap()
+                .firmware_version,
+            "1.0.0"
+        );
     }
 
-    // Tests that requests from several threads are answered each to its own
-    // caller, the responses matched by id.
+    /// Wire answers unknown content automatically while known requests continue
+    /// through the host's receive loop.
     #[test]
-    fn test_concurrent_requests() {
+    fn test_unknown_requests() {
+        use crate::testing::self_attestation;
+        use darkbio_crypto::xdsa;
+        use darkbio_wire::{memory, transport};
+        use prost::Message as _;
+
+        /// Future Ark envelope carrying content absent from the current wire schema.
+        #[derive(prost::Message)]
+        struct FutureRequest {
+            #[prost(uint64, tag = "1")]
+            id: u64,
+            #[prost(bytes = "vec", tag = "2047")]
+            content: Vec<u8>,
+        }
+
+        let signer = xdsa::SecretKey::generate();
+        let identity = signer.public_key();
+        let attestation = self_attestation(&signer, identity.clone());
+        let (host, remote) = memory::duplex(256 * 1024);
+        let peer = thread::spawn(move || {
+            let mut server = transport::Server::new(remote, signer, attestation);
+            let transport::Event::Connected(sender) = server.recv().unwrap() else {
+                panic!("expected handshake");
+            };
+            sender
+                .send(
+                    &FutureRequest {
+                        id: 2,
+                        content: vec![42],
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            sender
+                .send(
+                    &schema::ArkToHost {
+                        id: 4,
+                        err: None,
+                        content: Some(schema::ark_to_host::Content::DeviceInfo(Default::default())),
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            let mut replies = std::collections::BTreeMap::new();
+            for _ in 0..2 {
+                let transport::Event::Message(bytes) = server.recv().unwrap() else {
+                    panic!("expected error reply");
+                };
+                let reply = schema::HostToArk::decode(bytes.as_slice()).unwrap();
+                assert!(reply.content.is_none());
+                replies.insert(reply.id, reply.err.unwrap().code);
+            }
+            replies
+        });
+        let (mut ark, _) = Ark::attach(host, &identity).unwrap();
+        let (request, responder) = ark.recv().unwrap();
+        assert!(matches!(
+            request,
+            schema::ark_to_host::Content::DeviceInfo(_)
+        ));
+        responder
+            .fail(
+                schema::Error::reserved(
+                    schema::ReservedErrors::Unsupported,
+                    "host does not serve device info",
+                ),
+                Instant::now() + TIMEOUT,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        // Both replies have been written. Close before joining so a missing reply
+        // causes a peer EOF rather than leaving this test waiting indefinitely.
+        ark.close();
+        let replies = peer.join().unwrap();
+        assert_eq!(
+            replies.get(&2),
+            Some(&(schema::ReservedErrors::Unknown as u64))
+        );
+        assert_eq!(
+            replies.get(&4),
+            Some(&(schema::ReservedErrors::Unsupported as u64))
+        );
+    }
+
+    /// Concurrent typed requests retain their responses and completion tokens.
+    /// A reserved peer refusal is returned through the same request interface.
+    #[test]
+    fn test_requests() {
         let mut peer = Peer::spawn(Box::new(answering));
-        let ark = Arc::new(peer.attach().unwrap().0);
+        let (ark, _) = peer.attach().unwrap();
+        let client = ark.client();
+        let (completed, events) = mpsc::channel();
+        let mut pending = client
+            .send(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+            .unwrap();
+        pending.notify(completed, 7);
+        assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 7);
+        assert_eq!(pending.wait().unwrap().firmware_version, "1.0.0");
 
         let callers: Vec<_> = (0..8)
             .map(|_| {
-                let ark = ark.clone();
-                thread::spawn(move || ark.device_info().unwrap().firmware_version)
+                let client = client.clone();
+                thread::spawn(move || {
+                    client
+                        .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                        .unwrap()
+                        .firmware_version
+                })
             })
             .collect();
         for caller in callers {
             assert_eq!(caller.join().unwrap(), "1.0.0");
         }
+        assert!(
+            matches!(client.call(OnboardingRequest::default(), Instant::now() + TIMEOUT), Err(Error::Remote(error)) if error.code == schema::ReservedErrors::Unsupported as u64)
+        );
     }
 
-    // Tests that the requests the Ark sends on its own reach the handler, and
-    // that a handler panicking neither ends the session nor the serving
-    // thread.
+    /// Dropping the owner closes pending requests and refuses surviving clients.
     #[test]
-    fn test_events() {
-        let mut peer = Peer::spawn(Box::new(answering));
+    fn test_owner_drop() {
+        let mut peer = Peer::spawn(silent());
         let (ark, _) = peer.attach().unwrap();
-
-        let (tx, rx) = mpsc::channel();
-        ark.on_request(move |request, _| tx.send(request).unwrap());
-        ark.unlock(DEFAULT_TIMEOUT).unwrap();
+        let client = ark.client();
+        let pending = client
+            .send(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+            .unwrap();
+        drop(ark);
+        assert!(matches!(pending.wait(), Err(Error::Closed)));
         assert!(matches!(
-            rx.recv_timeout(DEFAULT_TIMEOUT).unwrap(),
-            ark_to_host::Content::DeviceInfo(_)
+            client.call(DeviceInfoRequest {}, Instant::now() + TIMEOUT),
+            Err(Error::Closed)
         ));
-
-        ark.on_request(|_, _| panic!("handler boom"));
-        ark.unlock(DEFAULT_TIMEOUT).unwrap();
-        assert_eq!(ark.device_info().unwrap().firmware_version, "1.0.0");
     }
 
-    // Tests that a handler may replace itself from inside its own callback,
-    // the replacement taking the requests that follow.
+    /// A closer wakes both the receive loop and outstanding requests.
     #[test]
-    fn test_handler_replacement() {
-        let mut peer = Peer::spawn(Box::new(answering));
-        let ark = Arc::new(peer.attach().unwrap().0);
-
-        let (tx, rx) = mpsc::channel();
-        let weak = Arc::downgrade(&ark);
-        ark.on_request({
-            let tx = tx.clone();
-            move |_, _| {
-                if let Some(ark) = weak.upgrade() {
-                    let tx = tx.clone();
-                    ark.on_request(move |_, _| tx.send(2).unwrap());
-                }
-                tx.send(1).unwrap();
-            }
-        });
-        ark.unlock(DEFAULT_TIMEOUT).unwrap();
-        ark.unlock(DEFAULT_TIMEOUT).unwrap();
-        assert_eq!(rx.recv_timeout(DEFAULT_TIMEOUT).unwrap(), 1);
-        assert_eq!(rx.recv_timeout(DEFAULT_TIMEOUT).unwrap(), 2);
-        ark.close();
+    fn test_close() {
+        let mut peer = Peer::spawn(silent());
+        let (mut ark, _) = peer.attach().unwrap();
+        let pending = ark
+            .client()
+            .send(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+            .unwrap();
+        let closer = ark.closer();
+        let receive = thread::spawn(move || ark.recv());
+        closer.close();
+        assert!(matches!(receive.join().unwrap(), Err(Error::Closed)));
+        assert!(matches!(pending.wait(), Err(Error::Closed)));
     }
 
-    // Tests that a request nobody answers times out on its own, the session
-    // outliving it.
+    /// A remote disconnect retains its reason for receives and later requests.
+    #[test]
+    fn test_disconnect() {
+        let mut peer = Peer::spawn(hangup());
+        let (mut ark, _) = peer.attach().unwrap();
+        assert!(matches!(
+            ark.client()
+                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT),
+            Err(Error::Disconnected(_))
+        ));
+        assert!(matches!(ark.recv(), Err(Error::Disconnected(_))));
+        assert!(matches!(
+            ark.client()
+                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT),
+            Err(Error::Disconnected(_))
+        ));
+    }
+
+    /// A short request timeout leaves a concurrent request's budget intact.
     #[test]
     fn test_timeouts() {
         let mut peer = Peer::spawn(silent());
         let (ark, _) = peer.attach().unwrap();
-        ark.set_timeout(Duration::from_millis(50));
-        assert!(matches!(ark.device_info(), Err(Error::Timeout)));
-        assert!(matches!(ark.device_info(), Err(Error::Timeout)));
+        let client = ark.client();
+        let pending = client.send_timeout(DeviceInfoRequest {}, TIMEOUT).unwrap();
+        assert!(matches!(
+            client
+                .clone()
+                .call_timeout(DeviceInfoRequest {}, Duration::from_millis(20)),
+            Err(Error::Timeout)
+        ));
         ark.close();
+        assert!(matches!(pending.wait(), Err(Error::Closed)));
     }
 
-    // Tests that the Ark going away ends the session, the request in flight
-    // and every later one failing with the reason and the disconnect handler
-    // told once, a handler registered after the end told right away.
+    /// Reusing a deadline across calls and cloned handles does not renew its budget.
     #[test]
-    fn test_disconnect() {
-        let mut peer = Peer::spawn(hangup());
+    fn test_deadlines() {
+        let mut peer = Peer::spawn(Box::new(answering));
         let (ark, _) = peer.attach().unwrap();
-
-        let (tx, rx) = mpsc::channel();
-        ark.on_disconnect(move |reason| tx.send(reason).unwrap());
-        let err = ark.device_info().unwrap_err();
-        assert!(matches!(err, Error::Disconnected(_)), "{err:?}");
+        let client = ark.client();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            client
+                .call(DeviceInfoRequest {}, deadline)
+                .unwrap()
+                .firmware_version,
+            "1.0.0"
+        );
+        // Spend the remaining operation budget before issuing the next request.
+        thread::sleep(deadline.saturating_duration_since(Instant::now()));
         assert!(matches!(
-            rx.recv_timeout(DEFAULT_TIMEOUT).unwrap(),
-            protocol::Error::Transport(_)
+            client.clone().call(DeviceInfoRequest {}, deadline),
+            Err(Error::Timeout)
         ));
-        assert!(matches!(ark.device_info(), Err(Error::Disconnected(_))));
-
-        let (tx, rx) = mpsc::channel();
-        ark.on_disconnect(move |reason| tx.send(reason).unwrap());
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            protocol::Error::Transport(_)
-        ));
+        assert_eq!(
+            client
+                .call_timeout(DeviceInfoRequest {}, TIMEOUT)
+                .unwrap()
+                .firmware_version,
+            "1.0.0"
+        );
     }
 
-    // Tests that closing the Ark fails the requests in flight and refuses new
-    // ones, without a disconnect notification, before or after the close.
+    /// An unlock can wait for the host to return an opaque companion response.
     #[test]
-    fn test_close() {
-        let mut peer = Peer::spawn(silent());
-        let ark = Arc::new(peer.attach().unwrap().0);
-
-        let (tx, rx) = mpsc::channel();
-        ark.on_disconnect(move |reason| tx.send(reason).unwrap());
-        let pending = {
-            let ark = ark.clone();
-            thread::spawn(move || ark.device_info())
+    fn test_reverse_requests() {
+        let mut peer = Peer::spawn(Box::new(|session, _, responder| {
+            let deadline = Instant::now() + TIMEOUT;
+            // Unlock cannot complete until the application returns the opaque
+            // companion response through this reverse request.
+            let approval = session
+                .requester()
+                .request(
+                    RelayArkToAppRequest {
+                        id: 42,
+                        req: vec![1, 2, 3],
+                    },
+                    deadline,
+                )
+                .unwrap()
+                .wait::<RelayAppToArkResponse>()
+                .unwrap();
+            assert_eq!(approval.id, 42);
+            assert_eq!(approval.res, [4, 5, 6]);
+            responder
+                .reply(UnlockResponse::default(), deadline)
+                .unwrap()
+                .wait()
+                .unwrap();
+            true
+        }));
+        let (mut ark, _) = peer.attach().unwrap();
+        let client = ark.client();
+        let operation =
+            thread::spawn(move || client.call(UnlockRequest {}, Instant::now() + TIMEOUT));
+        let (request, responder) = ark.recv().unwrap();
+        let schema::ark_to_host::Content::RelayReq(request) = request else {
+            panic!("expected relay request")
         };
-        thread::sleep(Duration::from_millis(50));
-        ark.close();
-        assert!(matches!(pending.join().unwrap(), Err(Error::Closed)));
-        assert!(matches!(ark.device_info(), Err(Error::Closed)));
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(request.req, [1, 2, 3]);
+        responder
+            .reply(
+                RelayAppToArkResponse {
+                    id: request.id,
+                    res: vec![4, 5, 6],
+                },
+                Instant::now() + TIMEOUT,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        operation.join().unwrap().unwrap();
+    }
 
-        let (tx, rx) = mpsc::channel();
-        ark.on_disconnect(move |reason| tx.send(reason).unwrap());
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    /// Request handles can move between threads before selecting where to decode
+    /// a response, including a response type that cannot itself move between threads.
+    #[test]
+    fn test_thread_capabilities() {
+        // Request completion handles remain Send even when a user's response wrapper
+        // isn't Send. The conversion runs in the caller that waits.
+        fn assert_send<T: Send>() {}
+        assert_send::<Pending<std::rc::Rc<()>>>();
+        assert_send::<Client>();
+        assert_send::<Ark>();
     }
 }

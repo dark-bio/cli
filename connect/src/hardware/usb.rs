@@ -14,24 +14,19 @@
 //! Every wait is bounded by the deadline the wire installed and ends early
 //! once the connection is closed.
 
-use crate::ark::{Ark, Realm};
-use crate::link::{Link, expired};
-use crate::{Device, Error, wire};
+use crate::ark::Ark;
+use crate::{Error, wire};
 use nusb::descriptors::TransferType;
 use nusb::transfer::{
     Buffer, Bulk, Completion, Direction, EndpointDirection, In, Out, TransferError,
 };
 use nusb::{ErrorKind, MaybeFuture};
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 use wire::transport::{self, Verifier};
-
-/// Vendor and product id pairs Arks enumerate with.
-pub const ARK_USB_IDS: &[(u16, u16)] = &[
-    (0x2e8a, 0x10f1), // Ark I
-];
 
 /// Class, subclass and protocol of the vendor interface carrying the wire. It
 /// tells the interface from the mass storage a development Ark exposes too,
@@ -51,15 +46,6 @@ const TRANSFER_SIZE: usize = 64 * 1024;
 /// Transfers kept in flight per direction, the queue the firmware keeps on
 /// its end of the bus and the depth the bench found saturating it.
 const TRANSFERS: usize = 16;
-
-/// Lists the Arks plugged into the host.
-pub fn list() -> Result<Vec<Device>, Error> {
-    let devices = nusb::list_devices().wait().map_err(Error::Usb)?;
-    Ok(devices
-        .filter(|info| ARK_USB_IDS.contains(&(info.vendor_id(), info.product_id())))
-        .map(Device::usb)
-        .collect())
-}
 
 /// Name the Ark was given, carried in its product string after the carrier
 /// and the revision.
@@ -100,12 +86,17 @@ pub(crate) fn connect<V: Verifier>(
                 }
             }
             if let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) {
-                found = Some((group.interface_number(), ep_in, ep_out));
+                found = Some((
+                    group.interface_number(),
+                    alt.alternate_setting(),
+                    ep_in,
+                    ep_out,
+                ));
                 break 'search;
             }
         }
     }
-    let (number, ep_in, ep_out) = found.ok_or(Error::Unsupported)?;
+    let (number, alternate, ep_in, ep_out) = found.ok_or(Error::Unsupported)?;
 
     // Claim the interface and open the endpoints, a claim refused for the
     // device being held meaning another program has it. The endpoints keep
@@ -117,28 +108,32 @@ pub(crate) fn connect<V: Verifier>(
             ErrorKind::Busy => Error::Busy(err),
             _ => Error::Usb(err),
         })?;
+    if iface.get_alt_setting() != alternate {
+        iface
+            .set_alt_setting(alternate)
+            .wait()
+            .map_err(Error::Usb)?;
+    }
     let ep_in = iface.endpoint::<Bulk, In>(ep_in).map_err(Error::Usb)?;
     let ep_out = iface.endpoint::<Bulk, Out>(ep_out).map_err(Error::Usb)?;
 
     // Wrap the endpoints into the wire's reader and writer, each woken by
     // its own transfers finishing and by the close
-    let link = Arc::new(Link::new());
+    let closed = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(Notifier::default());
     let writes = Arc::new(Notifier::default());
-    let reader: Box<dyn transport::Read + Send> =
-        Box::new(Reader::new(ep_in, reads.clone(), link.clone()));
-    let writer: Box<dyn transport::Write + Send> =
-        Box::new(Writer::new(ep_out, writes.clone(), link.clone()));
+    let reader = Reader::new(ep_in, reads.clone(), closed.clone());
+    let writer = Writer::new(ep_out, writes.clone(), closed.clone());
 
     // Shutdown ends the waits of both directions, a read then reporting the
     // end of the stream and a write refusing. The wire's closer waits for
     // these calls before reporting the stream closed.
     let stream = transport::Stream::new(reader, writer, move || {
-        link.close();
+        closed.store(true, Ordering::Release);
         reads.notify();
         writes.notify();
     });
-    Ark::attach(stream, Realm::Live, verifier)
+    Ark::attach(stream, verifier)
 }
 
 /// Queue of transfers on one endpoint, what a direction of the adapter
@@ -188,7 +183,7 @@ struct Notifier {
 impl Notifier {
     /// Wakes the waiting direction, or its next wait if none is on.
     fn notify(&self) {
-        *self.woken.lock().unwrap() = true;
+        *self.woken.lock().expect("USB wake state not poisoned") = true;
         self.wake.notify_all();
     }
 }
@@ -203,6 +198,11 @@ impl Wake for Notifier {
     }
 }
 
+/// Returns whether an optional deadline has expired.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
 /// Waits for the next transfer of the queue to finish, giving up without one
 /// once the deadline passes or the connection is closed. Without a deadline
 /// only a finished transfer or the close end the wait. A deadline already
@@ -210,7 +210,7 @@ impl Wake for Notifier {
 fn finished<T: Transfers>(
     queue: &mut T,
     notifier: &Arc<Notifier>,
-    link: &Link,
+    closed: &AtomicBool,
     deadline: Option<Instant>,
 ) -> Option<Completion> {
     let waker = Waker::from(notifier.clone());
@@ -219,16 +219,23 @@ fn finished<T: Transfers>(
         if let Poll::Ready(completion) = queue.poll_finished(&mut cx) {
             return Some(completion);
         }
-        let mut woken = notifier.woken.lock().unwrap();
+        let mut woken = notifier.woken.lock().expect("USB wake state not poisoned");
         while !*woken {
-            if link.closed() || expired(deadline) {
+            if closed.load(Ordering::Acquire) || expired(deadline) {
                 return None;
             }
             woken = match deadline {
-                None => notifier.wake.wait(woken).unwrap(),
+                None => notifier
+                    .wake
+                    .wait(woken)
+                    .expect("USB wake state not poisoned"),
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
-                    notifier.wake.wait_timeout(woken, left).unwrap().0
+                    notifier
+                        .wake
+                        .wait_timeout(woken, left)
+                        .expect("USB wake state not poisoned")
+                        .0
                 }
             };
         }
@@ -259,7 +266,7 @@ fn closed() -> io::Error {
 struct Reader<T: Transfers> {
     queue: T,                  // Transfers in flight on the endpoint
     notifier: Arc<Notifier>,   // Wakes the wait on a finished transfer or the close
-    link: Arc<Link>,           // Close signal
+    closed: Arc<AtomicBool>,   // Close signal
     served: Option<Buffer>,    // Finished transfer being served to the wire
     offset: usize,             // Bytes of it served so far
     deadline: Option<Instant>, // Deadline the wire installed for its reads
@@ -267,7 +274,7 @@ struct Reader<T: Transfers> {
 
 impl<T: Transfers> Reader<T> {
     /// Queues every transfer of the ring on the endpoint.
-    fn new(mut queue: T, notifier: Arc<Notifier>, link: Arc<Link>) -> Self {
+    fn new(mut queue: T, notifier: Arc<Notifier>, closed: Arc<AtomicBool>) -> Self {
         let packet = queue.packet_size();
         let size = TRANSFER_SIZE.div_ceil(packet) * packet;
         for _ in 0..TRANSFERS {
@@ -276,7 +283,7 @@ impl<T: Transfers> Reader<T> {
         Self {
             queue,
             notifier,
-            link,
+            closed,
             served: None,
             offset: 0,
             deadline: None,
@@ -304,16 +311,16 @@ impl<T: Transfers> Read for Reader<T> {
                 self.queue.queue(buffer);
                 self.offset = 0;
             }
-            if self.link.closed() {
+            if self.closed.load(Ordering::Acquire) {
                 return Ok(0);
             }
             if expired(self.deadline) {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
             let Some(completion) =
-                finished(&mut self.queue, &self.notifier, &self.link, self.deadline)
+                finished(&mut self.queue, &self.notifier, &self.closed, self.deadline)
             else {
-                if self.link.closed() {
+                if self.closed.load(Ordering::Acquire) {
                     return Ok(0);
                 }
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -323,7 +330,9 @@ impl<T: Transfers> Read for Reader<T> {
                     self.served = Some(completion.buffer);
                     self.offset = 0;
                 }
-                Err(TransferError::Cancelled) if self.link.closed() => return Ok(0),
+                Err(TransferError::Cancelled) if self.closed.load(Ordering::Acquire) => {
+                    return Ok(0);
+                }
                 Err(err) => return Err(transfer_error(err)),
             }
         }
@@ -348,7 +357,7 @@ impl<T: Transfers> transport::Read for Reader<T> {
 struct Writer<T: Transfers> {
     queue: T,                  // Transfers in flight on the endpoint
     notifier: Arc<Notifier>,   // Wakes the wait on a finished transfer or the close
-    link: Arc<Link>,           // Close signal
+    closed: Arc<AtomicBool>,   // Close signal
     spare: Vec<Buffer>,        // Buffers of finished transfers, reused by the next
     wrote: usize,              // Length of the last write, deciding the zero length packet at flush
     deadline: Option<Instant>, // Deadline the wire installed for its writes
@@ -356,11 +365,11 @@ struct Writer<T: Transfers> {
 
 impl<T: Transfers> Writer<T> {
     /// Wraps the endpoint, the ring empty until the wire writes.
-    fn new(queue: T, notifier: Arc<Notifier>, link: Arc<Link>) -> Self {
+    fn new(queue: T, notifier: Arc<Notifier>, closed: Arc<AtomicBool>) -> Self {
         Self {
             queue,
             notifier,
-            link,
+            closed,
             spare: Vec::new(),
             wrote: 0,
             deadline: None,
@@ -381,9 +390,9 @@ impl<T: Transfers> Writer<T> {
     /// flight to finish within the deadline.
     fn room(&mut self) -> io::Result<()> {
         while self.queue.in_flight() >= TRANSFERS {
-            match finished(&mut self.queue, &self.notifier, &self.link, self.deadline) {
+            match finished(&mut self.queue, &self.notifier, &self.closed, self.deadline) {
                 Some(completion) => self.finished(completion)?,
-                None if self.link.closed() => return Err(closed()),
+                None if self.closed.load(Ordering::Acquire) => return Err(closed()),
                 None => return Err(io::Error::from(io::ErrorKind::TimedOut)),
             }
         }
@@ -408,7 +417,7 @@ impl<T: Transfers> Writer<T> {
     fn reap(&mut self) -> io::Result<()> {
         while self.queue.in_flight() > 0 {
             let now = Some(Instant::now());
-            let Some(completion) = finished(&mut self.queue, &self.notifier, &self.link, now)
+            let Some(completion) = finished(&mut self.queue, &self.notifier, &self.closed, now)
             else {
                 return Ok(());
             };
@@ -420,7 +429,7 @@ impl<T: Transfers> Writer<T> {
 
 impl<T: Transfers> Write for Writer<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.link.closed() {
+        if self.closed.load(Ordering::Acquire) {
             return Err(closed());
         }
         if expired(self.deadline) {
@@ -441,7 +450,7 @@ impl<T: Transfers> Write for Writer<T> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if self.link.closed() {
+        if self.closed.load(Ordering::Acquire) {
             return Err(closed());
         }
         if expired(self.deadline) {
@@ -546,18 +555,18 @@ mod tests {
             .collect()
     }
 
-    fn reader() -> (Reader<Fake>, Fake, Arc<Link>) {
+    fn reader() -> (Reader<Fake>, Fake, Arc<AtomicBool>) {
         let fake = Fake::default();
-        let link = Arc::new(Link::new());
-        let reader = Reader::new(fake.clone(), Arc::new(Notifier::default()), link.clone());
-        (reader, fake, link)
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader = Reader::new(fake.clone(), Arc::new(Notifier::default()), closed.clone());
+        (reader, fake, closed)
     }
 
-    fn writer() -> (Writer<Fake>, Fake, Arc<Link>) {
+    fn writer() -> (Writer<Fake>, Fake, Arc<AtomicBool>) {
         let fake = Fake::default();
-        let link = Arc::new(Link::new());
-        let writer = Writer::new(fake.clone(), Arc::new(Notifier::default()), link.clone());
-        (writer, fake, link)
+        let closed = Arc::new(AtomicBool::new(false));
+        let writer = Writer::new(fake.clone(), Arc::new(Notifier::default()), closed.clone());
+        (writer, fake, closed)
     }
 
     // Tests that the ring is queued ahead, that finished transfers are
@@ -565,7 +574,7 @@ mod tests {
     // empty one is skipped rather than ending the stream.
     #[test]
     fn test_read_serves_transfers() {
-        let (mut reader, fake, _link) = reader();
+        let (mut reader, fake, _closed) = reader();
         assert_eq!(fake.in_flight(), TRANSFERS);
 
         finish(&fake, 3, Ok(()));
@@ -586,7 +595,7 @@ mod tests {
     // ends it with the stream.
     #[test]
     fn test_read_waits() {
-        let (mut reader, fake, link) = reader();
+        let (mut reader, fake, closed) = reader();
         let mut buf = [0u8; 8];
 
         let started = Instant::now();
@@ -610,11 +619,11 @@ mod tests {
         arriving.join().unwrap();
 
         let closing = {
-            let link = link.clone();
+            let closed = closed.clone();
             let notifier = reader.notifier.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
-                link.close();
+                closed.store(true, Ordering::Release);
                 notifier.notify();
             })
         };
@@ -626,7 +635,7 @@ mod tests {
     // reported as the connection lost.
     #[test]
     fn test_read_failure() {
-        let (mut reader, fake, _link) = reader();
+        let (mut reader, fake, _closed) = reader();
         finish(&fake, 0, Err(TransferError::Disconnected));
         assert_eq!(
             reader.read(&mut [0u8; 8]).unwrap_err().kind(),
@@ -640,7 +649,7 @@ mod tests {
     // close refuses output.
     #[test]
     fn test_write_chunks() {
-        let (mut writer, fake, link) = writer();
+        let (mut writer, fake, closed) = writer();
         let data = vec![7u8; 100_000];
         assert_eq!(writer.write(&data).unwrap(), 100_000);
         assert_eq!(queued(&fake), [TRANSFER_SIZE, 100_000 - TRANSFER_SIZE]);
@@ -676,7 +685,7 @@ mod tests {
         assert_eq!(writer.write(&two).unwrap(), TRANSFER_SIZE);
         sending.join().unwrap();
 
-        link.close();
+        closed.store(true, Ordering::Release);
         assert_eq!(
             writer.write(&chunk).unwrap_err().kind(),
             io::ErrorKind::NotConnected
@@ -693,7 +702,7 @@ mod tests {
     // flush without the flush draining the ring.
     #[test]
     fn test_flush() {
-        let (mut writer, fake, _link) = writer();
+        let (mut writer, fake, _closed) = writer();
 
         assert_eq!(writer.write(&[1u8; 2 * PACKET]).unwrap(), 2 * PACKET);
         writer.flush().unwrap();

@@ -1,16 +1,15 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! The pairing of every request body with the body of the response answering
-//! it, which the wire leaves to the layer above. The typed calls of the Ark
-//! are spelled over it.
+//! Request/response pairings used by typed client calls.
+//! Wire checks message direction and content; this table selects the response type.
 
 use darkbio_wire::protocol::schema::*;
 use darkbio_wire::protocol::{self, Message};
 
-/// A request body paired with the body of its response. Implemented for
-/// every request of the protocol, and open, so a body the crate does not
-/// know yet can be paired by its caller.
+/// Request body with the response type selected by [`crate::Client::call`].
+/// Implemented for the public request bodies. Callers may also pair their own
+/// wrappers when those wrappers convert into wire's [`Message`].
 pub trait Request: Into<Message> {
     /// Body the Ark answers this request with.
     type Response: TryFrom<Message, Error = protocol::Error>;

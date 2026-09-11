@@ -1,214 +1,175 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! An Ark the host can reach, however it is reached, the hardware plugged in
-//! and the emulators running on the machine being one kind of thing to list,
-//! tell apart and connect to.
+//! Discovered Arks, their reported details and authenticated connections.
+//! Discovery metadata is unverified. Connecting establishes the peer's identity.
 
-use crate::ark::{Ark, Realm};
-use crate::registry::Instance;
-use crate::{Error, emulator, usb};
-use darkbio_trust::Environment;
+use crate::emulator::Instance;
+use crate::{Ark, Error, emulator, hardware};
 use darkbio_wire::transport::Verifier;
 use std::fmt;
 
-/// Lists the Arks the host can reach, the hardware plugged in first and the
-/// emulators running on the machine after, by port.
-pub fn list() -> Result<Vec<Device>, Error> {
-    let mut devices = usb::list()?;
-    devices.extend(emulator::list()?);
-    Ok(devices)
+/// Kind of Ark reported by discovery. Authentication establishes its identity
+/// separately; this classification does not verify the peer's realm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// Physical Ark attached to the host.
+    Hardware,
+    /// Emulated Ark published by a local launcher.
+    Emulator,
 }
 
-/// An Ark the host can reach, before a session with it. What is known of it
-/// depends on how it is reached, a facet absent being one the device cannot
-/// tell before connecting.
+/// Address used to select one discovered Ark, independent of its display name.
+///
+/// Addresses can change or be reused after an Ark disconnects. A locator is
+/// not an authenticated device identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Locator {
+    /// Host bus and device address assigned during hardware enumeration.
+    Hardware { bus: String, address: u8 },
+    /// Host port assigned by the emulator's launcher.
+    Emulator { port: u16 },
+}
+
+impl fmt::Display for Locator {
+    /// Formats the selector accepted by [`crate::Discovery::select`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hardware { bus, address } => write!(f, "hardware:{bus}:{address}"),
+            Self::Emulator { port } => write!(f, "emulator:{port}"),
+        }
+    }
+}
+
+/// Discovered Ark with the details needed to connect to it.
+/// Reported metadata remains unverified; connecting returns a separate identity.
 #[derive(Clone)]
 pub struct Device {
-    kind: Kind, // How the device is reached, with what it said of itself
+    source: Source, // Discovery record retained for connection and display
 }
 
-/// The ways a device is reached, each with the record it was found by.
+/// Origin of the discovery record, independent of the Ark's authenticated realm.
 #[derive(Clone)]
-enum Kind {
-    Usb(nusb::DeviceInfo), // Enumeration record of an Ark plugged in
-    Emulator(Instance),    // Listing entry of an emulator running on the host
+enum Source {
+    Usb(nusb::DeviceInfo),
+    Registry(Instance),
 }
 
 impl Device {
-    /// Wraps the enumeration record of an Ark plugged in.
-    pub(crate) fn usb(info: nusb::DeviceInfo) -> Self {
+    /// Retains a USB enumeration record for later connection.
+    pub(crate) fn hardware(info: nusb::DeviceInfo) -> Self {
         Self {
-            kind: Kind::Usb(info),
+            source: Source::Usb(info),
         }
     }
 
-    /// Wraps the listing entry of an emulator running on the host.
+    /// Retains an emulator listing entry for later connection.
     pub(crate) fn emulator(instance: Instance) -> Self {
         Self {
-            kind: Kind::Emulator(instance),
+            source: Source::Registry(instance),
         }
     }
 
-    /// Domain the device belongs to, live for hardware and sandbox for
-    /// emulators.
-    pub fn realm(&self) -> Realm {
-        match self.kind {
-            Kind::Usb(_) => Realm::Live,
-            Kind::Emulator(_) => Realm::Sandbox,
+    /// Returns the host address of this endpoint, suitable for explicit selection.
+    pub fn locator(&self) -> Locator {
+        match &self.source {
+            Source::Usb(info) => Locator::Hardware {
+                bus: info.bus_id().to_owned(),
+                address: info.device_address(),
+            },
+            Source::Registry(instance) => Locator::Emulator {
+                port: instance.port,
+            },
         }
     }
 
-    /// Whether the device accepts a connection. Hardware plugged in always
-    /// does, an emulator once its firmware has booted.
-    pub fn ready(&self) -> bool {
-        match &self.kind {
-            Kind::Usb(_) => true,
-            Kind::Emulator(instance) => instance.ready,
+    /// Returns the kind of Ark reported by discovery, before authentication.
+    pub fn kind(&self) -> DeviceKind {
+        match self.source {
+            Source::Usb(_) => DeviceKind::Hardware,
+            Source::Registry(_) => DeviceKind::Emulator,
         }
     }
 
-    /// Serial the device reports. Hardware always has one, its identity
-    /// fingerprint until it is onboarded, an emulator only once onboarded.
+    /// Returns the readiness last reported by an emulator launcher. Hardware
+    /// and launchers omitting readiness return `None`. A report may be stale.
+    pub fn ready(&self) -> Option<bool> {
+        match &self.source {
+            Source::Usb(_) => None,
+            Source::Registry(instance) => instance.ready,
+        }
+    }
+
+    /// Returns the unverified serial from USB enumeration or the launcher.
+    /// Empty serials are treated as absent.
     pub fn serial(&self) -> Option<&str> {
-        match &self.kind {
-            Kind::Usb(info) => info.serial_number(),
-            Kind::Emulator(instance) => instance.serial.as_deref(),
+        match &self.source {
+            Source::Usb(info) => info.serial_number(),
+            Source::Registry(instance) => instance.serial.as_deref(),
         }
+        .filter(|value| !value.is_empty())
     }
 
-    /// Name the device was given, if any.
+    /// Returns the unverified device name, excluding an empty reported name.
     pub fn name(&self) -> Option<&str> {
-        match &self.kind {
-            Kind::Usb(info) => info.product_string().and_then(usb::name),
-            Kind::Emulator(instance) => instance.name.as_deref().filter(|name| !name.is_empty()),
+        match &self.source {
+            Source::Usb(info) => info.product_string().and_then(hardware::name),
+            Source::Registry(instance) => instance.name.as_deref(),
         }
+        .filter(|value| !value.is_empty())
     }
 
-    /// File name of the disk image an emulator runs from, what a fresh one is
-    /// known by. Hardware has none.
+    /// Returns the emulator image basename, if reported. Several emulators may
+    /// use the same basename, so it does not identify an endpoint uniquely.
     pub fn image(&self) -> Option<&str> {
-        match &self.kind {
-            Kind::Usb(_) => None,
-            Kind::Emulator(instance) => {
-                Some(instance.disk.as_str()).filter(|disk| !disk.is_empty())
-            }
+        match &self.source {
+            Source::Usb(_) => None,
+            Source::Registry(instance) => Some(instance.disk.as_str()),
+        }
+        .filter(|value| !value.is_empty())
+    }
+
+    /// Returns the launcher's unverified environment string, independently of
+    /// which trust roots this build enables.
+    pub fn env(&self) -> Option<&str> {
+        match &self.source {
+            Source::Usb(_) => None,
+            Source::Registry(instance) => instance.env.as_deref(),
         }
     }
 
-    /// Environment the device is bound to, if the build knows of it. An
-    /// emulator says once it has booted, hardware only through its
-    /// attestation in the handshake.
-    pub fn environment(&self) -> Option<Environment> {
-        match &self.kind {
-            Kind::Usb(_) => None,
-            Kind::Emulator(instance) => instance.environment(),
-        }
-    }
-
-    /// Connects to the device and runs the wire handshake over it, the
-    /// verifier deciding whether to trust the attestation it presents. The
-    /// handshake has the wire's own budget, the requests of the session wait
-    /// `DEFAULT_TIMEOUT` unless changed on it.
+    /// Connects using the retained endpoint details and authenticates the peer
+    /// with the supplied verifier. Does not repeat discovery or label selection.
     pub fn connect<V: Verifier>(&self, verifier: &V) -> Result<(Ark, V::Info), Error> {
-        match &self.kind {
-            Kind::Usb(info) => usb::connect(info, verifier),
-            Kind::Emulator(instance) => emulator::connect(&instance.url(), verifier),
+        match &self.source {
+            Source::Usb(info) => hardware::connect(info, verifier),
+            Source::Registry(instance) => emulator::connect(&instance.url(), verifier),
         }
     }
 }
 
 impl fmt::Display for Device {
-    /// Labels the device by its name, else its serial, else its image, the
-    /// first of them a device always has. A listing entry with none of them
-    /// falls back to where the device is reached.
+    /// Shows the first available label, falling back to the endpoint locator.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(label) = self
+        match self
             .name()
             .or_else(|| self.serial())
             .or_else(|| self.image())
         {
-            return f.write_str(label);
-        }
-        match &self.kind {
-            Kind::Usb(info) => write!(f, "usb {}:{}", info.bus_id(), info.device_address()),
-            Kind::Emulator(instance) => write!(f, "port {}", instance.port),
+            Some(label) => f.write_str(label),
+            None => self.locator().fmt(f),
         }
     }
 }
 
 impl fmt::Debug for Device {
-    /// Shows the facets of the device, never the record it was found by.
+    /// Shows the locator and reported metadata, without opening the device.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Device")
-            .field("realm", &self.realm())
+            .field("locator", &self.locator())
+            .field("label", &self.to_string())
             .field("ready", &self.ready())
-            .field("serial", &self.serial())
-            .field("name", &self.name())
-            .field("image", &self.image())
-            .field("environment", &self.environment())
+            .field("env", &self.env())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Listing entry of an emulator that has only booted far enough to be
-    // listed, nothing claimed yet.
-    fn instance(port: u16) -> Instance {
-        Instance {
-            port,
-            disk: "ark.img".into(),
-            ready: false,
-            env: None,
-            name: None,
-            serial: None,
-        }
-    }
-
-    // Tests that the facets of an emulator follow what it has claimed so far
-    // and that its label falls back from the name through the serial to the
-    // image, and to the port with none of them.
-    #[test]
-    fn test_emulator_facets() {
-        let fresh = Device::emulator(instance(18181));
-        assert_eq!(fresh.realm(), Realm::Sandbox);
-        assert!(!fresh.ready());
-        assert_eq!(fresh.serial(), None);
-        assert_eq!(fresh.name(), None);
-        assert_eq!(fresh.image(), Some("ark.img"));
-        assert_eq!(fresh.environment(), None);
-        assert_eq!(fresh.to_string(), "ark.img");
-
-        let mut booted = instance(18182);
-        booted.ready = true;
-        booted.env = Some("staging".into());
-        let booted = Device::emulator(booted);
-        assert!(booted.ready());
-        #[cfg(feature = "staging")]
-        assert_eq!(booted.environment(), Some(Environment::Staging));
-        #[cfg(not(feature = "staging"))]
-        assert_eq!(booted.environment(), None);
-        assert_eq!(booted.to_string(), "ark.img");
-
-        let mut onboarded = instance(18183);
-        onboarded.serial = Some("abc123".into());
-        let onboarded = Device::emulator(onboarded);
-        assert_eq!(onboarded.serial(), Some("abc123"));
-        assert_eq!(onboarded.to_string(), "abc123");
-
-        let mut named = instance(18184);
-        named.serial = Some("abc123".into());
-        named.name = Some("lab".into());
-        let named = Device::emulator(named);
-        assert_eq!(named.to_string(), "lab");
-
-        let mut bare = instance(18185);
-        bare.disk = String::new();
-        let bare = Device::emulator(bare);
-        assert_eq!(bare.image(), None);
-        assert_eq!(bare.to_string(), "port 18185");
     }
 }

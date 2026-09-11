@@ -1,11 +1,9 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Peers for the tests, the wire's server over an in-memory stream answering
-//! the client per a script, with the attestations the trust tests need.
+//! Scripted wire peers and attestations for connection and trust tests.
 
-use crate::Error;
-use crate::ark::{Ark, DEFAULT_TIMEOUT, Realm};
+use crate::{Ark, Error};
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
 use darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION;
@@ -16,7 +14,7 @@ use darkbio_wire::protocol::schema::{self, DeviceInfoResponse, UnlockResponse};
 use darkbio_wire::protocol::{Responder, Server, Session};
 use darkbio_wire::transport::Attestation;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Bytes buffered per direction of a peer's stream, enough for the handshake
 /// and a few messages to flow without the other side reading.
@@ -40,16 +38,15 @@ pub fn self_attestation(signer: &xdsa::SecretKey, identity: xdsa::PublicKey) -> 
     Attestation::new(cwt).unwrap()
 }
 
-/// Script deciding how a peer answers each request it receives, the session
-/// there to send requests of its own through, returning whether to keep
-/// serving.
+/// Handles one peer request, with access to the session for reverse requests.
+/// Returning false ends the peer's session.
 pub type Script = Box<dyn FnMut(&Session, Request, Responder) -> bool + Send>;
 
 /// Script answering device info requests with a firmware version, unlock
 /// requests with a request of the peer's own ahead of the reply, and anything
-/// else with an error.
+/// else with the protocol's UNSUPPORTED error.
 pub fn answering(session: &Session, request: Request, responder: Responder) -> bool {
-    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let deadline = Instant::now() + Duration::from_secs(10);
     let queued = match request {
         Request::DeviceInfo(_) => responder.reply(
             DeviceInfoResponse {
@@ -64,7 +61,13 @@ pub fn answering(session: &Session, request: Request, responder: Responder) -> b
                 .request(DeviceInfoResponse::default(), deadline);
             responder.reply(UnlockResponse::default(), deadline)
         }
-        _ => responder.fail(schema::Error::new(7, "nope"), deadline),
+        _ => responder.fail(
+            schema::Error::reserved(
+                schema::ReservedErrors::Unsupported,
+                "request not supported by test peer",
+            ),
+            deadline,
+        ),
     };
     queued.is_ok()
 }
@@ -89,9 +92,8 @@ pub fn hangup() -> Script {
     })
 }
 
-/// The Ark's side of a session in the tests, the wire's server over one end
-/// of an in-memory stream, serving the client on the other end per its script
-/// until the script hangs up or the client goes away.
+/// Scripted Ark peer over an in-memory stream. Runs until its script finishes
+/// or the host closes, and joins its serving thread on drop.
 pub struct Peer {
     pub identity: xdsa::PublicKey, // Identity key the peer signs its handshake with
     stream: Option<Duplex>,        // Client's end of the stream, until taken
@@ -127,24 +129,22 @@ impl Peer {
         }
     }
 
-    /// Takes the client's end of the stream, to attach through or to carry
-    /// over a transport of the test's own.
+    /// Takes the host stream for attachment or forwarding through another transport.
     pub fn stream(&mut self) -> Duplex {
         self.stream.take().expect("stream already taken")
     }
 
-    /// Attaches a client to the peer over the stream, trusting its pinned
-    /// identity.
+    /// Attaches to the peer using its pinned identity key.
     pub fn attach(&mut self) -> Result<(Ark, Attestation), Error> {
         let stream = self.stream();
-        Ark::attach(stream, Realm::Sandbox, &self.identity)
+        Ark::attach(stream, &self.identity)
     }
 }
 
 impl Drop for Peer {
+    /// Releases an unused host stream and joins the peer after its session ends.
     fn drop(&mut self) {
-        // The serving thread ends with the session, which the client's end
-        // of the stream going away ends if nobody attached
+        // An untaken host stream must close before joining the peer's receive loop.
         drop(self.stream.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

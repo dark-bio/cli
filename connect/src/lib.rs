@@ -1,64 +1,140 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Connections to Arks from a host process, the layer above the wire that
-//! finds a device, reaches it and keeps a session with it for the caller to
-//! use:
+//! Discovery, authentication and blocking connections to Ark enclaves.
 //!
-//!   - Discovery: the Arks plugged into the host and the emulators running
-//!     on it, one kind of device to list, tell apart and connect to.
-//!   - Transports: genuine Arks are reached over their USB bulk endpoints,
-//!     emulators over the WebSocket their firmware serves the same byte
-//!     stream on. Both are plain readers and writers to the wire, and any
-//!     other stream attaches the same way.
-//!   - Sessions: the wire handshake under the wire's own budget, the session
-//!     ending reported with its reason, a USB unplug, the emulator shutting
-//!     down or the Ark dropping it, and a close tearing everything down.
-//!   - Requests: the protobuf protocol as typed calls on an Ark, each answered
-//!     or timed out on its own, issued from any number of threads, and sent
-//!     ahead of their answers when a caller wants to pipeline. The requests
-//!     the Ark sends on its own are handed to a handler with the responder to
-//!     answer through.
+//! [`list`] discovers hardware and emulators, retaining independent discovery
+//! failures. [`hardware::list`] and [`emulator::list`] list either kind alone.
+//! Names, serials and launcher metadata are observations; [`Locator`] selects
+//! an endpoint without depending on its display label. Authentication happens
+//! at [`Device::connect`], using the caller's [`wire::transport::Verifier`].
+//! [`Device::kind`] records how an Ark was discovered. [`Identity::realm`] comes
+//! from a trusted certificate, independently of discovery or the connection.
 //!
-//! Trust stays the caller's decision through the wire's `Verifier`. The
-//! `TrustMode` here accepts the Arks attested under the roots of every
-//! environment the build was made for, or never onboarded ones attesting
-//! themselves, and pins a known identity for recovery, anything else being
-//! the wire's `Roots` or a pinned key. Which environments a build trusts is
-//! decided by the crate features of the same names.
+//! [`Ark`] owns a wire session. Dropping it closes the connection, including
+//! pending requests issued through its clonable [`Client`] handles. Wire owns
+//! multiplexing, I/O workers, deadlines and incoming queue limits. Connect adds
+//! typed request/response pairing and USB/WebSocket adapters.
 //!
-//! The crate mirrors the connect package of the dashboard, the same
-//! connections from a process instead of a page.
+//! ```no_run
+//! use darkbio_connect::{schema::DeviceInfoRequest, TrustMode};
+//! use std::time::Duration;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let found = darkbio_connect::list();
+//! for error in &found.errors { eprintln!("discovery warning: {error}"); }
+//! let (ark, identity) = found.select(None)?.connect(&TrustMode::RootOrSelf)?;
+//! let info = ark.client().call_timeout(DeviceInfoRequest {}, Duration::from_secs(2))?;
+//! println!("Firmware: {}", info.firmware_version);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`Client::call`] and [`Client::send`] take an absolute deadline. Reuse it
+//! across requests to share an operation's budget. For one request,
+//! [`Client::call_timeout`] and [`Client::send_timeout`] take a duration starting
+//! at the call. Clients carry no default timeout. Request deadlines cover queueing,
+//! sending and accepting a response; discovery, connection setup and response
+//! decoding are outside them.
+//!
+//! ```no_run
+//! use darkbio_connect::{Client, Error, schema::{DeviceInfoRequest, PairingStatusRequest}};
+//! use std::time::{Duration, Instant};
+//!
+//! fn inspect(client: &Client) -> Result<(), Error> {
+//!     let deadline = Instant::now() + Duration::from_secs(2);
+//!     client.call(DeviceInfoRequest {}, deadline)?;
+//!     client.call(PairingStatusRequest {}, deadline)?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Operations such as unlock need a companion response before they can finish.
+//! Keep [`Ark::recv`] running while clients wait for those operations. The
+//! application decides how to dispatch incoming requests, forward opaque relay
+//! messages and manage its handlers. Responders expose wire's completion
+//! promises: enqueueing a reply and successfully writing it are separate steps.
+//!
+//! ```no_run
+//! use darkbio_connect::{Ark, Error, Responder, schema::ark_to_host::Content};
+//!
+//! fn receive(
+//!     mut ark: Ark,
+//!     mut handle: impl FnMut(Content, Responder) -> Result<(), Error>,
+//! ) -> Result<(), Error> {
+//!     loop {
+//!         let (request, responder) = ark.recv()?;
+//!         handle(request, responder)?;
+//!     }
+//! }
+//! ```
+//!
+//! Create the client and closer before moving Ark to this loop's thread. Close
+//! and join it when finished. A handler can check local reply completion with
+//! `responder.reply(response, deadline)?.wait()?`; this does not confirm that
+//! the peer received or processed it.
+//!
+//! Handlers can pass an application error implementing [`CodedError`] directly
+//! to [`Responder::fail`]. Application codes start at 0x100; named protocol
+//! failures use [`schema::Error::reserved`] and [`schema::ReservedErrors`].
+//! Wire automatically answers requests outside its schema with `UNKNOWN`.
+//! Known requests still reach the handler, which can return `UNSUPPORTED` for
+//! operations it never serves or `UNAVAILABLE` when its current state prevents
+//! serving them. Dropping a responder without replying produces `UNANSWERED`.
+//!
+//! [`Client::send`] queues immediately; wire's output queue is unbounded.
+//! Callers manage the number of outstanding requests. [`Pending::notify`] lets
+//! one channel observe many completions without a waiter thread per request.
+//! Timeouts and dropped promises do not cancel operations already received
+//! by the device.
+//!
+//! [`TrustMode::RootOrSelf`] accepts roots enabled by the `release`, `staging`
+//! and `develop` crate features, as well as self-signed attestations. Self-signing
+//! proves key possession only. Recovery pins a key without checking attestation.
+//! Callers requiring stricter trust can supply another verifier.
 
 pub mod emulator;
-pub mod usb;
+pub mod hardware;
 
 mod ark;
 mod device;
+mod discovery;
 mod identity;
-mod link;
-mod registry;
 mod request;
 
 #[cfg(test)]
 mod testing;
 
-pub use ark::{Ark, DEFAULT_TIMEOUT, Pending, Realm, Responder};
+pub use ark::{Ark, Client, Pending};
 pub use darkbio_trust as trust;
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
-pub use device::{Device, list};
+pub use darkbio_wire::protocol::{Closer, CodedError, Promise, Responder};
+pub use device::{Device, DeviceKind, Locator};
+pub use discovery::{Discovery, list};
 pub use identity::{Identity, TrustMode};
 pub use request::Request;
 
 use darkbio_wire::protocol;
 use std::io;
 
-/// Things that can go wrong reaching or talking to an Ark.
+/// Things that can go wrong finding, reaching or talking to an Ark.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Discovery returned no devices and no selector was supplied.
+    #[error("no Ark enclave found")]
+    NotFound,
+
+    /// No endpoint matches the supplied locator or label.
+    #[error("no Ark enclave matches {0}")]
+    NoMatch(String),
+
+    /// Several endpoints match; their locators let the caller distinguish them.
+    #[error("multiple Ark enclaves match; select an endpoint by its locator")]
+    Ambiguous(Vec<Locator>),
+
     /// Enumerating, opening or configuring a USB device failed.
-    #[error("failed to open usb device: {0}")]
+    #[error("USB operation failed: {0}")]
     Usb(nusb::Error),
 
     /// The device is held by another program, a browser tab included.
@@ -70,11 +146,11 @@ pub enum Error {
     #[error("device has no vendor interface with bulk endpoints")]
     Unsupported,
 
-    /// The emulator's socket could not be reached.
-    #[error("failed to reach emulator: {0}")]
+    /// The WebSocket endpoint could not be reached.
+    #[error("failed to reach WebSocket endpoint: {0}")]
     Unreachable(io::Error),
 
-    /// The emulator refused the WebSocket upgrade.
+    /// The endpoint refused the WebSocket upgrade.
     #[error("failed to open websocket: {0}")]
     Upgrade(tungstenite::Error),
 
@@ -92,7 +168,8 @@ pub enum Error {
     #[error("ark timed out")]
     Timeout,
 
-    /// The Ark answered the request with an error of its own.
+    /// The Ark refused this request with an application or reserved protocol
+    /// error. These replies do not by themselves end the connection.
     #[error("ark error: {} (code {})", .0.msg, .0.code)]
     Remote(schema::Error),
 

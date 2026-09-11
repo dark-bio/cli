@@ -1,85 +1,66 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! The emulators running on the host, as the listing their launchers keep
-//! serves them. Whichever launcher holds the port serves it and the others
-//! publish themselves into it, so nobody serving it means no emulator runs.
-//! The listing is read with one request spoken directly over TCP, a fixed
-//! route against a loopback server being short of what an HTTP client is for.
+//! Emulator discovery through the local launcher registry.
+//!
+//! The launcher holding the registry port serves entries from all launchers.
+//! A refused connection means no registry is running. HTTP framing and the
+//! overall request deadline belong to the client; redirects and proxies are
+//! disabled for this loopback service.
 
 use crate::Error;
-use darkbio_trust::Environment;
 use serde::Deserialize;
-use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::io::{self, Read};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
-/// Address the launchers serve the listing on, one port below the first an
-/// emulator takes.
+/// Loopback address of the registry, one port below the first emulator endpoint.
 const ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18180);
 
-/// How long the lookup may take, a loopback service answering from memory
-/// or not at all.
+/// Overall timeout for fetching a listing from the local registry.
 const TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Largest listing read, a few hundred bytes per emulator. Anything beyond
-/// it is not one.
+/// Largest accepted listing body, before JSON decoding.
 const MAX_LISTING: u64 = 1024 * 1024;
 
-/// A running emulator as the listing describes it. A claim the device has
-/// not made yet is absent rather than empty.
+/// Emulator endpoint and metadata published by its launcher.
+/// Optional reports remain absent until the launcher supplies them.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Instance {
-    pub port: u16, // Host port the emulator forwards into its guest, and what to connect to
+    pub port: u16, // Host port forwarded to the guest's WebSocket endpoint
     #[serde(default)]
-    pub disk: String, // File name of the disk image, never its path
+    pub disk: String, // Image basename, shared by copies of the same image
     #[serde(default)]
-    pub ready: bool, // Whether the firmware booted far enough to accept a client
+    pub ready: Option<bool>, // Whether the firmware reports accepting clients
     #[serde(default)]
-    pub env: Option<String>, // Environment the device is bound to, once it has said
+    pub env: Option<String>, // Environment reported by the device
     #[serde(default)]
-    pub name: Option<String>, // Name the device was given, if any
+    pub name: Option<String>, // Device name, if reported
     #[serde(default)]
-    pub serial: Option<String>, // Serial the device reports, once onboarded
+    pub serial: Option<String>, // Device serial, if reported
 }
 
 impl Instance {
-    /// Wire endpoint of the emulator, the listing publishing a port rather
-    /// than a URL.
+    /// Builds the loopback WebSocket URL from the published host port.
     pub fn url(&self) -> String {
         format!("ws://127.0.0.1:{}/v1/usb", self.port)
     }
-
-    /// Environment the device is bound to, as the listing names it, if the
-    /// build knows of that environment at all.
-    pub fn environment(&self) -> Option<Environment> {
-        match self.env.as_deref()? {
-            #[cfg(feature = "develop")]
-            "develop" => Some(Environment::Develop),
-            #[cfg(feature = "staging")]
-            "staging" => Some(Environment::Staging),
-            #[cfg(feature = "release")]
-            "release" => Some(Environment::Release),
-            _ => None,
-        }
-    }
 }
 
-/// The listing as served, its entries left for a lenient read one by one.
+/// Registry response with entries retained for individual decoding.
 #[derive(Deserialize)]
 struct Listing {
     #[serde(default)]
-    instances: Vec<serde_json::Value>, // Entries as served, read one by one
+    instances: Vec<serde_json::Value>, // Entries decoded independently for compatibility
 }
 
-/// Lists the emulators running on the host. Nobody serving the listing means
-/// none is running.
-pub(crate) fn list() -> Result<Vec<Instance>, Error> {
+/// Lists emulators from the local registry. An absent registry returns an empty list.
+pub(super) fn list() -> Result<Vec<Instance>, Error> {
     list_at(ADDRESS.into())
 }
 
-/// Lists the emulators the service at the address knows of. A refused
-/// connection is an empty listing, anything else failing is an error.
+/// Fetches a registry at the supplied address. Only connection refusal is treated
+/// as an empty listing; transport, HTTP and decoding failures remain errors.
 fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
     let body = match fetch(addr) {
         Ok(body) => body,
@@ -89,8 +70,8 @@ fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
     let listing: Listing = serde_json::from_slice(&body)
         .map_err(|err| Error::Registry(io::Error::new(io::ErrorKind::InvalidData, err)))?;
 
-    // The entries are read one by one, one this build cannot make sense of
-    // dropped rather than failing a listing served by another build
+    // Skip entries this build cannot decode without losing compatible entries
+    // from the same registry response.
     Ok(listing
         .instances
         .into_iter()
@@ -98,56 +79,63 @@ fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
         .collect())
 }
 
-/// Requests the listing and returns its body, any status but success being
-/// an error.
+/// Fetches a successful HTTP response under the registry's deadline and size limit.
 fn fetch(addr: SocketAddr) -> io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-    let request =
-        format!("GET /v1/instances HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
-
-    // The connection closes after the response, so it ends at EOF without
-    // any framing to interpret
-    let mut raw = Vec::new();
-    stream.take(MAX_LISTING).read_to_end(&mut raw)?;
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "listing without headers"))?;
-    let status = std::str::from_utf8(&raw[..split])
-        .ok()
-        .and_then(|head| head.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "listing without a status"))?;
-    if !(200..300).contains(&status) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(TIMEOUT))
+        .build()
+        .into();
+    let mut response = agent
+        .get(format!("http://{addr}/v1/instances"))
+        .call()
+        .map_err(|err| match err {
+            ureq::Error::Io(err) => err,
+            err => io::Error::other(err),
+        })?;
+    if !response.status().is_success() {
         return Err(io::Error::other(format!(
-            "listing refused with status {status}"
+            "listing refused with status {}",
+            response.status()
         )));
     }
-    Ok(raw[split + 4..].to_vec())
+    // One extra byte distinguishes a complete body from a truncated oversized one.
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(MAX_LISTING + 1)
+        .read_to_end(&mut body)?;
+    if body.len() as u64 > MAX_LISTING {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "emulator listing too large",
+        ));
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
 
-    // Binds a listener on a free loopback port for a test's service.
+    /// Binds a registry listener on an available loopback port.
     fn bind() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         (listener, addr)
     }
 
-    // Serves one request on the listener with the canned response, on a
-    // thread of its own, reading the whole request before answering it so
-    // the client never writes into a closed socket.
-    fn serve(listener: TcpListener, response: &'static str) {
+    /// Serves one HTTP request with the supplied response. Reads the complete
+    /// request first so the client does not write into a closed socket.
+    fn serve(listener: TcpListener, response: impl Into<String>) {
+        let response = response.into();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
@@ -180,17 +168,14 @@ mod tests {
         let instances = list_at(addr).unwrap();
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].port, 18182);
-        assert!(instances[0].ready);
-        #[cfg(feature = "develop")]
-        assert_eq!(instances[0].environment(), Some(Environment::Develop));
-        #[cfg(not(feature = "develop"))]
-        assert_eq!(instances[0].environment(), None);
+        assert_eq!(instances[0].ready, Some(true));
+        assert_eq!(instances[0].env.as_deref(), Some("develop"));
         assert_eq!(instances[0].name.as_deref(), Some("test ark"));
         assert_eq!(instances[0].serial.as_deref(), Some("abc123"));
         assert_eq!(instances[0].url(), "ws://127.0.0.1:18182/v1/usb");
         assert_eq!(instances[1].disk, "ark-a.img");
-        assert!(!instances[1].ready);
-        assert_eq!(instances[1].environment(), None);
+        assert_eq!(instances[1].ready, None);
+        assert_eq!(instances[1].env, None);
         assert_eq!(instances[1].name, None);
     }
 
@@ -201,6 +186,37 @@ mod tests {
         let (listener, addr) = bind();
         drop(listener);
         assert!(list_at(addr).unwrap().is_empty());
+    }
+
+    /// HTTP chunk framing is removed before the registry body is decoded.
+    #[test]
+    fn test_chunked_listing() {
+        let (listener, addr) = bind();
+        let parts = ["{\"instances\":[", "{\"port\":18181}]}"];
+        let mut response = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        for part in parts {
+            response.push_str(&format!("{:x}\r\n{part}\r\n", part.len()));
+        }
+        response.push_str("0\r\n\r\n");
+        serve(listener, response);
+        assert_eq!(list_at(addr).unwrap()[0].port, 18181);
+    }
+
+    /// A body exceeding the registry size limit is refused before JSON decoding.
+    #[test]
+    fn test_listing_limit() {
+        let (listener, addr) = bind();
+        let body = " ".repeat(MAX_LISTING as usize + 1);
+        serve(
+            listener,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            matches!(list_at(addr), Err(Error::Registry(error)) if error.kind() == io::ErrorKind::InvalidData)
+        );
     }
 
     // Tests that a service answering with anything but a listing fails the
