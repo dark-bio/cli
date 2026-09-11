@@ -11,7 +11,7 @@ use darkbio_connect::{Ark, Device, DeviceKind, Discovery, Identity, TrustMode};
 #[cfg(feature = "internal")]
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "ark", about = "Command line interface for Ark enclaves")]
@@ -24,6 +24,13 @@ struct Cli {
 enum Command {
     /// List hardware Arks and running emulators
     List,
+
+    /// Verify the Ark against the cloud device registry
+    Genuine {
+        /// Endpoint locator, or a unique serial, name or disk image
+        #[arg(long)]
+        device: Option<String>,
+    },
 
     /// Onboard an enclave with a signed attestation certificate
     #[cfg(feature = "internal")]
@@ -111,6 +118,20 @@ fn run(command: Command) -> Result<(), Error> {
             let endpoint = find_enclave(device.as_deref())?;
             let (ark, identity) = endpoint.connect(&trust)?;
             println!("{}", status(&ark, &identity)?);
+        }
+        Command::Genuine { device } => {
+            let endpoint = find_enclave(device.as_deref())?;
+            let (ark, _) = endpoint.connect(&TrustMode::RootOrSelf)?;
+            let registration = ark
+                .client()
+                .genuine(Instant::now() + Duration::from_secs(30))?;
+            println!("{}", render_registration(&registration));
+            if !registration.active() {
+                return Err(Error {
+                    code: 3,
+                    message: "Ark registration is inactive".into(),
+                });
+            }
         }
         #[cfg(feature = "internal")]
         Command::Onboard {
@@ -236,6 +257,41 @@ fn status(ark: &Ark, identity: &Identity) -> Result<String, darkbio_connect::Err
     Ok(render_status(&info, identity))
 }
 
+/// Formats a verified registry entry and every reason it may be inactive.
+fn render_registration(registration: &darkbio_connect::Registration) -> String {
+    use chrono::{Local, TimeZone};
+
+    let enrolled = Local
+        .timestamp_opt(registration.enrolled, 0)
+        .single()
+        .map(|date| date.format("%Y-%m-%d %H:%M:%S %Z").to_string())
+        .unwrap_or_else(|| "invalid enrollment timestamp".into());
+    let mut inactive = Vec::new();
+    if registration.disabled {
+        inactive.push("disabled");
+    }
+    if registration.expired {
+        inactive.push("expired");
+    }
+    if registration.superseded {
+        inactive.push("superseded");
+    }
+    let state = if inactive.is_empty() {
+        style("active".to_owned()).green()
+    } else {
+        style(inactive.join(", ")).yellow()
+    };
+    format!(
+        "{} {}\n{} {}\n{} {}",
+        style("Serial:   ").dim(),
+        registration.serial,
+        style("Enrolled: ").dim(),
+        style(enrolled).dim(),
+        style("Registry: ").dim(),
+        state,
+    )
+}
+
 /// Formats reported hardware and firmware beside the claims established by the
 /// handshake. Flags certificate mismatches and invalid publication timestamps.
 fn render_status(info: &DeviceInfoResponse, identity: &Identity) -> String {
@@ -319,6 +375,34 @@ fn render_status(info: &DeviceInfoResponse, identity: &Identity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registry output preserves all inactive states and handles an invalid
+    /// timestamp without obscuring the verified serial or reporting active.
+    #[test]
+    fn test_registry_status() {
+        let mut registration = darkbio_connect::Registration {
+            serial: "verified-serial".into(),
+            enrolled: 1_700_000_000,
+            disabled: false,
+            expired: false,
+            superseded: false,
+        };
+        assert!(registration.active());
+        let rendered = render_registration(&registration);
+        let text = console::strip_ansi_codes(&rendered);
+        assert!(text.contains("verified-serial"));
+        assert!(text.contains("active"));
+
+        registration.enrolled = i64::MAX;
+        registration.disabled = true;
+        registration.expired = true;
+        registration.superseded = true;
+        assert!(!registration.active());
+        let rendered = render_registration(&registration);
+        let text = console::strip_ansi_codes(&rendered);
+        assert!(text.contains("invalid enrollment timestamp"));
+        assert!(text.contains("disabled, expired, superseded"));
+    }
 
     /// Status uses the certificate's realm and reports mismatched hardware claims.
     #[test]

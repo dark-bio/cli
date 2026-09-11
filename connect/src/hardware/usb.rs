@@ -58,7 +58,7 @@ pub(crate) fn name(product: &str) -> Option<&str> {
 
 /// Opens the Ark and runs the wire handshake over it, the verifier deciding
 /// whether to trust the attestation it presents.
-pub(crate) fn connect<V: Verifier>(
+pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     info: &nusb::DeviceInfo,
     verifier: &V,
 ) -> Result<(Ark, V::Info), Error> {

@@ -13,16 +13,18 @@ staging = ["darkbio-trust/staging"]
 develop = ["darkbio-trust/develop"]
 
 [dependencies]
+base64 = "0.23.1"
 darkbio-crypto = { version = "0.18.0", features = ["xdsa"] }
 darkbio-trust = "0.3.0"
 darkbio-wire = "0.7.0"
+hex = "0.4.3"
 nusb = "0.2.7"
 mio = { version = "1.2", features = ["os-poll", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"
 tungstenite = "0.30"
-ureq = { version = "3.4", default-features = false }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 darkbio-crypto = { version = "0.18.0", features = ["cwt", "xdsa"] }

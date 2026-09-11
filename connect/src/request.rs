@@ -13,32 +13,40 @@ use darkbio_wire::protocol::{self, Message};
 pub trait Request: Into<Message> {
     /// Body the Ark answers this request with.
     type Response: TryFrom<Message, Error = protocol::Error>;
+
+    /// Whether the request needs cloud keys and a synchronized clock. Wrappers
+    /// default to requiring setup; requests usable before sync override this.
+    const CLOUD_SYNC: bool = true;
 }
 
 /// Pairs each request body with its response body.
 macro_rules! pairs {
-    ($($request:ident => $response:ident,)*) => {
+    ($sync:expr; $($request:ident => $response:ident,)*) => {
         $(
             impl Request for $request {
                 type Response = $response;
+                const CLOUD_SYNC: bool = $sync;
             }
         )*
     };
 }
 
-pairs! {
+pairs! { false;
     DeviceInfoRequest => DeviceInfoResponse,
     OnboardingRequest => OnboardingResponse,
-    GenuinityProofRequest => GenuinityProofResponse,
-    UnlockRequest => UnlockResponse,
     CloudSyncStartRequest => CloudSyncStartResponse,
     CloudSyncFinishRequest => CloudSyncFinishResponse,
+    PairingStatusRequest => PairingStatusResponse,
+}
+
+pairs! { true;
+    GenuinityProofRequest => GenuinityProofResponse,
+    UnlockRequest => UnlockResponse,
     FirmwareUpdatePrepRequest => FirmwareUpdatePrepResponse,
     FirmwareUpdateInitRequest => FirmwareUpdateInitResponse,
     FirmwareUpdateUploadRequest => FirmwareUpdateUploadResponse,
     FirmwareUpdateVerifyRequest => FirmwareUpdateVerifyResponse,
     FirmwareUpdateInstallRequest => FirmwareUpdateInstallResponse,
-    PairingStatusRequest => PairingStatusResponse,
     PairingAuthRequest => PairingAuthResponse,
     PairingSetAppIdentityRequest => PairingSetAppIdentityResponse,
     PairingSetAppStorageRequest => PairingSetAppStorageResponse,

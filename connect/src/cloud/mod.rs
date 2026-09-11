@@ -1,0 +1,491 @@
+// connect-rs: connections to Ark enclaves from host processes
+// Copyright 2026 Dark Bio AG. All rights reserved.
+
+//! Cloud prerequisites and registry checks for an attested Ark connection.
+
+mod http;
+
+pub use http::Registration;
+
+use crate::schema::GenuinityProofRequest;
+use crate::{Error, Identity};
+use darkbio_wire::protocol::{self, Requester};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
+
+/// Setup state shared by every client of one connection. Network and device I/O
+/// run outside its lock so independent requests and closure remain available.
+#[derive(Debug)]
+pub(crate) struct Services {
+    cloud: Option<http::Api>, // Absent when the verifier did not establish an attested identity
+    state: Mutex<State>,      // Current initialization attempt and connection lifecycle
+}
+
+/// Initialization progresses once at a time and becomes reusable only on success.
+#[derive(Debug, Default)]
+struct State {
+    synced: bool,                  // Whether an automatic sync completed on this connection
+    closed: bool,                  // Whether the owner or its closer ended the connection
+    attempt: Option<Arc<Attempt>>, // Attempt joined by concurrent callers
+}
+
+/// One attempt's outcome, retained by its waiters even after a retry starts.
+#[derive(Debug, Default)]
+struct Attempt {
+    result: Mutex<Option<Result<(), Failure>>>, // Shared success or the original failure
+    ready: Condvar,                             // Wakes waiters on completion or closure
+}
+
+/// Failures shareable between callers joining the same initialization attempt.
+#[derive(Clone, Debug)]
+enum Failure {
+    Cloud(String),         // HTTP or response decoding failure
+    Wire(protocol::Error), // Device failure, retaining remote codes and disconnect reasons
+}
+
+impl From<String> for Failure {
+    fn from(error: String) -> Self {
+        Self::Cloud(error)
+    }
+}
+
+impl From<protocol::Error> for Failure {
+    fn from(error: protocol::Error) -> Self {
+        Self::Wire(error)
+    }
+}
+
+impl From<Failure> for Error {
+    fn from(error: Failure) -> Self {
+        match error {
+            Failure::Cloud(error) => Self::Cloud(error),
+            Failure::Wire(error) => error.into(),
+        }
+    }
+}
+
+impl Services {
+    /// Records verified cloud routing without starting network I/O.
+    pub(crate) fn new(identity: &Identity) -> Self {
+        Self {
+            cloud: http::Api::new(identity),
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    /// Completes or joins synchronization under the caller's deadline. The first
+    /// caller supplies the attempt's budget; each waiter bounds its own wait.
+    /// Unattested connections skip setup and let the Ark decide what it can serve.
+    pub(crate) fn sync(&self, requester: &Requester, deadline: Instant) -> Result<(), Error> {
+        let (attempt, leader) = {
+            let mut state = self.state.lock().expect("cloud setup not poisoned");
+            if state.closed {
+                return Err(Error::Closed);
+            }
+            if self.cloud.is_none() || state.synced {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+            match &state.attempt {
+                Some(attempt) => (attempt.clone(), false),
+                None => {
+                    let attempt = Arc::new(Attempt::default());
+                    state.attempt = Some(attempt.clone());
+                    (attempt, true)
+                }
+            }
+        };
+        if !leader {
+            return attempt.wait(deadline).map_err(Into::into);
+        }
+        let result = self.synchronize(requester, deadline);
+        let mut state = self.state.lock().expect("cloud setup not poisoned");
+        let result = if state.closed {
+            Err(Failure::Wire(protocol::Error::Closed))
+        } else {
+            result
+        };
+        state.synced = result.is_ok();
+        state.attempt = None;
+        attempt.finish(result.clone());
+        result.map_err(Into::into)
+    }
+
+    /// Verifies the Ark's registration after establishing its cloud prerequisites.
+    pub(crate) fn genuine(
+        &self,
+        requester: &Requester,
+        deadline: Instant,
+    ) -> Result<Registration, Error> {
+        let cloud = self.cloud.as_ref().ok_or(Error::Unattested)?;
+        self.sync(requester, deadline)?;
+        let proof = requester
+            .request(GenuinityProofRequest {}, deadline)?
+            .wait::<crate::schema::GenuinityProofResponse>()?;
+        cloud.genuine(&proof.proof, deadline).map_err(Into::into)
+    }
+
+    /// Exchanges cloud keys and signed time with raw wire requests, bypassing
+    /// the prerequisite gate that this exchange is completing.
+    fn synchronize(&self, requester: &Requester, deadline: Instant) -> Result<(), Failure> {
+        let cloud = self.cloud.as_ref().expect("attested cloud available");
+        let identity = cloud.identity(deadline)?;
+        let started = requester
+            .request(identity, deadline)?
+            .wait::<crate::schema::CloudSyncStartResponse>()?;
+        let time = cloud.time(&started.challenge, deadline)?;
+        requester
+            .request(time, deadline)?
+            .wait::<crate::schema::CloudSyncFinishResponse>()?;
+        Ok(())
+    }
+
+    /// Ends setup waits when the owning connection closes. An HTTP request already
+    /// in progress retains its deadline; it cannot revive the closed connection.
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock().expect("cloud setup not poisoned");
+        state.closed = true;
+        if let Some(attempt) = state.attempt.take() {
+            attempt.finish(Err(Failure::Wire(protocol::Error::Closed)));
+        }
+    }
+}
+
+impl Attempt {
+    /// Publishes the first outcome, preserving closure if it won the race.
+    fn finish(&self, result: Result<(), Failure>) {
+        let mut outcome = self.result.lock().expect("cloud attempt not poisoned");
+        if outcome.is_none() {
+            *outcome = Some(result);
+            self.ready.notify_all();
+        }
+    }
+
+    /// Waits for this attempt without extending or shortening another caller's budget.
+    fn wait(&self, deadline: Instant) -> Result<(), Failure> {
+        let mut outcome = self.result.lock().expect("cloud attempt not poisoned");
+        loop {
+            if let Some(result) = &*outcome {
+                return result.clone();
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(protocol::Error::Timeout)?;
+            outcome = self
+                .ready
+                .wait_timeout(outcome, remaining)
+                .expect("cloud attempt not poisoned")
+                .0;
+        }
+    }
+}
+
+/// Shared setup, retries and connection lifecycle over real wire peers.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::host_to_ark::Content;
+    use crate::schema::{
+        CloudSyncFinishResponse, CloudSyncStartResponse, DeviceInfoRequest, GenuinityProofResponse,
+    };
+    use crate::testing::{Peer, answering};
+    use crate::trust::Realm;
+    use crate::{Ark, TrustMode};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Budget for loopback I/O that is not exercising expiration.
+    pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Serves scripted responses and captures requests, closing each connection
+    /// after its response. Accepts are bounded so a failed test leaves no waiter.
+    pub(super) fn serve(responses: Vec<(Duration, String)>) -> (String, mpsc::Receiver<String>) {
+        serve_inner(responses, None)
+    }
+
+    /// Holds the first response until released, making setup races deterministic.
+    fn serve_inner(
+        responses: Vec<(Duration, String)>,
+        mut pause: Option<mpsc::Receiver<()>>,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for (delay, response) in responses {
+                let deadline = Instant::now() + TIMEOUT;
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    match stream.read(&mut bytes) {
+                        Ok(0) | Err(_) => return,
+                        Ok(count) => request.extend_from_slice(&bytes[..count]),
+                    }
+                }
+                sender.send(String::from_utf8(request).unwrap()).unwrap();
+                if let Some(pause) = pause.take()
+                    && pause.recv_timeout(TIMEOUT).is_err()
+                {
+                    return;
+                }
+                thread::sleep(delay);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, receiver)
+    }
+
+    /// Formats a response with a known body length and no persistent connection.
+    pub(super) fn response(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+
+    /// Loopback tests ignore ambient proxy settings.
+    pub(super) fn http() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build()
+            .into()
+    }
+
+    /// Attaches a real wire session with cloud routes redirected to the test server.
+    fn attach(peer: &mut Peer, url: String) -> Ark {
+        let (mut ark, _) = peer.attach().unwrap();
+        ark.services = Arc::new(Services {
+            cloud: Some(super::http::tests::api(url, Realm::Hardware)),
+            state: Mutex::new(State::default()),
+        });
+        ark
+    }
+
+    /// Peer that only issues a proof after sync, retaining counts for duplicate
+    /// initialization checks. Optionally refuses its first start request.
+    fn peer(refuse_first: bool) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let proofs = Arc::new(AtomicUsize::new(0));
+        let peer = Peer::spawn(Box::new({
+            let starts = starts.clone();
+            let proofs = proofs.clone();
+            let mut synced = false;
+            move |session, request, responder| {
+                let deadline = Instant::now() + TIMEOUT;
+                match request {
+                    Content::CloudSyncStart(request) => {
+                        assert_eq!(request.signer, [1]);
+                        assert_eq!(request.crypto, [2]);
+                        if starts.fetch_add(1, Ordering::SeqCst) == 0 && refuse_first {
+                            responder
+                                .fail(
+                                    crate::schema::Error::new(0x111, "identity rejected"),
+                                    deadline,
+                                )
+                                .unwrap()
+                                .wait()
+                                .unwrap();
+                        } else {
+                            responder
+                                .reply(CloudSyncStartResponse { challenge: vec![3] }, deadline)
+                                .unwrap()
+                                .wait()
+                                .unwrap();
+                        }
+                    }
+                    Content::CloudSyncFinish(request) => {
+                        assert_eq!(request.unixmilli, 123);
+                        assert_eq!(request.signature, [4]);
+                        synced = true;
+                        responder
+                            .reply(CloudSyncFinishResponse { accepted: 123 }, deadline)
+                            .unwrap()
+                            .wait()
+                            .unwrap();
+                    }
+                    Content::GenuinityProof(_) => {
+                        assert!(synced, "proof requested before cloud sync");
+                        proofs.fetch_add(1, Ordering::SeqCst);
+                        responder
+                            .reply(
+                                GenuinityProofResponse {
+                                    proof: vec![0xfb, 0xff],
+                                },
+                                deadline,
+                            )
+                            .unwrap()
+                            .wait()
+                            .unwrap();
+                    }
+                    request => return answering(session, request, responder),
+                }
+                true
+            }
+        }));
+        (peer, starts, proofs)
+    }
+
+    /// JSON replies used by the real wire peer's cloud synchronization exchange.
+    fn sync_responses() -> Vec<(Duration, String)> {
+        vec![
+            (
+                Duration::ZERO,
+                response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
+            ),
+            (
+                Duration::ZERO,
+                response(200, r#"{"unixmilli":123,"signature":"BA=="}"#),
+            ),
+        ]
+    }
+
+    /// Concurrent clients share setup, status bypasses it, short waiters expire
+    /// independently and subsequent operations reuse the successful exchange.
+    #[test]
+    fn test_shared_setup() {
+        let mut responses = sync_responses();
+        responses.push((Duration::ZERO, response(200, r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)));
+        let (release, pause) = mpsc::channel();
+        let (url, requests) = serve_inner(responses, Some(pause));
+        let (mut peer, starts, proofs) = peer(false);
+        let ark = attach(&mut peer, url);
+        let client = ark.client();
+        let deadline = Instant::now() + TIMEOUT;
+        let leader = thread::spawn({
+            let client = client.clone();
+            move || client.call(GenuinityProofRequest {}, deadline)
+        });
+        requests.recv_timeout(TIMEOUT).unwrap();
+        assert_eq!(
+            client
+                .call(DeviceInfoRequest {}, deadline)
+                .unwrap()
+                .firmware_version,
+            "1.0.0"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            client
+                .clone()
+                .call_timeout(GenuinityProofRequest {}, Duration::from_millis(20)),
+            Err(Error::Timeout)
+        ));
+        let follower = thread::spawn({
+            let client = client.clone();
+            move || client.call(GenuinityProofRequest {}, deadline)
+        });
+        release.send(()).unwrap();
+        leader.join().unwrap().unwrap();
+        follower.join().unwrap().unwrap();
+        assert!(client.genuine(deadline).unwrap().active());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(proofs.load(Ordering::SeqCst), 3);
+        assert!(
+            requests
+                .recv_timeout(TIMEOUT)
+                .unwrap()
+                .starts_with("GET /v1/cloudsync/time?challenge=03 ")
+        );
+        assert!(
+            requests
+                .recv_timeout(TIMEOUT)
+                .unwrap()
+                .starts_with("GET /v1/genuine ")
+        );
+    }
+
+    /// A refused attempt preserves its device error and does not poison a retry.
+    #[test]
+    fn test_setup_retry() {
+        let mut responses = sync_responses();
+        responses.insert(0, responses[0].clone());
+        let (url, _requests) = serve(responses);
+        let (mut peer, starts, proofs) = peer(true);
+        let ark = attach(&mut peer, url);
+        let client = ark.client();
+        let deadline = Instant::now() + TIMEOUT;
+        assert!(matches!(client.call(GenuinityProofRequest {}, deadline),
+            Err(Error::Remote(error)) if error.code == 0x111));
+        client.call(GenuinityProofRequest {}, deadline).unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(proofs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Closing releases setup waiters before the outstanding HTTP response arrives
+    /// and prevents that response from starting any request on the closed Ark.
+    #[test]
+    fn test_close_during_setup() {
+        let (release, pause) = mpsc::channel();
+        let (url, requests) = serve_inner(vec![sync_responses().remove(0)], Some(pause));
+        let (mut peer, starts, _) = peer(false);
+        let ark = attach(&mut peer, url);
+        let client = ark.client();
+        let deadline = Instant::now() + TIMEOUT;
+        let leader = thread::spawn({
+            let client = client.clone();
+            move || client.call(GenuinityProofRequest {}, deadline)
+        });
+        requests.recv_timeout(TIMEOUT).unwrap();
+        let waiter = thread::spawn({
+            let client = client.clone();
+            move || client.call(GenuinityProofRequest {}, deadline)
+        });
+        ark.closer().close();
+        assert!(matches!(waiter.join().unwrap(), Err(Error::Closed)));
+        release.send(()).unwrap();
+        assert!(matches!(leader.join().unwrap(), Err(Error::Closed)));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    /// Self-signed and recovery sessions retain local operations but have no
+    /// authenticated cloud route and cannot claim a registry verification.
+    #[test]
+    fn test_unattested_setup() {
+        for recover in [false, true] {
+            let mut peer = Peer::spawn(Box::new(answering));
+            let policy = if recover {
+                TrustMode::Recover(Box::new(peer.identity.clone()))
+            } else {
+                TrustMode::RootOrSelf
+            };
+            let (ark, _) = Ark::attach(peer.stream(), &policy).unwrap();
+            let client = ark.client();
+            assert!(matches!(
+                client.call(GenuinityProofRequest {}, Instant::now() + TIMEOUT),
+                Err(Error::Remote(error))
+                    if error.code == crate::schema::ReservedErrors::Unsupported as u64
+            ));
+            assert!(matches!(
+                client.genuine(Instant::now() + TIMEOUT),
+                Err(Error::Unattested)
+            ));
+            client
+                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                .unwrap();
+        }
+    }
+}

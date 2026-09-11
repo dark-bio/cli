@@ -36,7 +36,10 @@ const INBOUND_LIMIT: usize = 2 * MAX_MESSAGE;
 /// Opens a plain WebSocket endpoint and authenticates its wire session.
 /// After address resolution, TCP establishment and HTTP upgrade share the
 /// handshake timeout. The encrypted wire handshake starts its own timeout.
-pub(crate) fn connect<V: Verifier>(url: &str, verifier: &V) -> Result<(Ark, V::Info), Error> {
+pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
+    url: &str,
+    verifier: &V,
+) -> Result<(Ark, V::Info), Error> {
     // Resolve the endpoint before starting the TCP and HTTP handshake budget.
     let request = url.into_client_request().map_err(Error::Upgrade)?;
     let uri = request.uri();
@@ -723,7 +726,11 @@ mod tests {
         let stream = peer.stream();
         let served = thread::spawn(move || bridge(listener, stream));
 
-        let (ark, _) = connect(&url, &peer.identity).unwrap();
+        let (ark, _) = connect(
+            &url,
+            &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
+        )
+        .unwrap();
         assert_eq!(
             ark.client()
                 .call_timeout(crate::schema::DeviceInfoRequest {}, Duration::from_secs(2))
@@ -746,7 +753,11 @@ mod tests {
         let stream = peer.stream();
         let served = thread::spawn(move || bridge(listener, stream));
 
-        let (ark, _) = connect(&url, &peer.identity).unwrap();
+        let (ark, _) = connect(
+            &url,
+            &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
+        )
+        .unwrap();
         let err = ark
             .client()
             .call_timeout(crate::schema::DeviceInfoRequest {}, Duration::from_secs(2))

@@ -3,14 +3,13 @@
 
 //! Session ownership and typed request handles.
 
-use crate::{Error, Request};
-use darkbio_wire::protocol::{
-    self, Closer, Message, Promise, Requester, Responder, Session, schema,
-};
+use crate::cloud::Services;
+use crate::{Error, Identity, Registration, Request};
+use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
 use std::io;
 use std::marker::PhantomData;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Owner of a connection to an Ark. Closing or dropping it ends the session,
@@ -22,6 +21,8 @@ use std::time::{Duration, Instant};
 pub struct Ark {
     /// Wire session whose lifetime owns the connection and its I/O workers.
     session: Session,
+    /// Lazy prerequisites shared by all request handles of this session.
+    pub(crate) services: Arc<Services>,
 }
 
 impl Ark {
@@ -35,7 +36,7 @@ impl Ark {
     where
         R: transport::Read + Send + 'static,
         W: transport::Write + Send + 'static,
-        V: Verifier,
+        V: Verifier<Info = Identity>,
     {
         let (session, info) = protocol::connect(stream, verifier).map_err(|err| {
             if let protocol::Error::Transport(cause) = &err
@@ -50,7 +51,8 @@ impl Ark {
             }
             Error::Handshake(err)
         })?;
-        Ok((Self { session }, info))
+        let services = Arc::new(Services::new(&info));
+        Ok((Self { session, services }, info))
     }
 
     /// Returns a clonable request handle bound to this session. The handle
@@ -58,6 +60,7 @@ impl Ark {
     pub fn client(&self) -> Client {
         Client {
             requester: self.session.requester(),
+            services: self.services.clone(),
         }
     }
 
@@ -72,13 +75,40 @@ impl Ark {
     /// Returns a handle for closing the session from another thread, including
     /// while its owner is blocked in [`Self::recv`].
     pub fn closer(&self) -> Closer {
-        self.session.closer()
+        Closer {
+            wire: self.session.closer(),
+            services: self.services.clone(),
+        }
     }
 
     /// Closes the session, wakes blocked receives and fails pending requests.
     /// Does not join application handlers or wait for the peer to observe closure.
     pub fn close(&self) {
-        self.session.close();
+        self.closer().close();
+    }
+}
+
+impl Drop for Ark {
+    /// Ends setup waits along with the owned wire session.
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Clonable handle for closing the connection and waking callers waiting for setup.
+/// Holding the handle does not keep the Ark session open.
+#[derive(Clone, Debug)]
+pub struct Closer {
+    wire: protocol::Closer,  // Closes the original wire session
+    services: Arc<Services>, // Ends prerequisite waits on that session
+}
+
+impl Closer {
+    /// Closes the original connection. An HTTP request already in progress
+    /// remains bounded by its deadline; setup waiters are released immediately.
+    pub fn close(&self) {
+        self.services.close();
+        self.wire.close();
     }
 }
 
@@ -86,13 +116,14 @@ impl Ark {
 /// Each request carries its own deadline. Handles do not keep the session open.
 #[derive(Clone, Debug)]
 pub struct Client {
-    requester: Requester, // Wire handle bound to the original session
+    requester: Requester,    // Wire handle bound to the original session
+    services: Arc<Services>, // Prerequisite state shared with the owner and other clients
 }
 
 impl Client {
     /// Sends a request and waits for its typed response under the supplied deadline.
-    /// The deadline covers queueing, sending and accepting the response; decoding
-    /// is outside it. Reuse one deadline to share a budget across several calls.
+    /// The deadline covers prerequisite setup, queueing, sending and accepting
+    /// the response; decoding is outside it. Reuse it to bound several calls.
     /// Expiration does not cancel an operation the Ark has already received.
     pub fn call<R: Request>(&self, request: R, deadline: Instant) -> Result<R::Response, Error> {
         self.send(request, deadline)?.wait()
@@ -108,8 +139,9 @@ impl Client {
         self.send_timeout(request, timeout)?.wait()
     }
 
-    /// Queues a request under the supplied deadline without waiting for output or
-    /// a response. Waiting on the promise does not refresh the deadline; dropping
+    /// Establishes the request's prerequisites, then queues it without waiting for
+    /// output or a response. The first cloud-dependent send may wait for sync.
+    /// Waiting on the promise does not refresh the deadline; dropping
     /// it does not cancel the request. Wire's output queue has no capacity limit,
     /// so the caller bounds the number of outstanding requests.
     pub fn send<R: Request>(
@@ -117,6 +149,9 @@ impl Client {
         request: R,
         deadline: Instant,
     ) -> Result<Pending<R::Response>, Error> {
+        if R::CLOUD_SYNC {
+            self.services.sync(&self.requester, deadline)?;
+        }
         let promise = self.requester.request(request, deadline)?;
         Ok(Pending {
             promise,
@@ -124,8 +159,8 @@ impl Client {
         })
     }
 
-    /// Queues a request with a budget starting now. Waiting on the returned
-    /// promise retains that deadline, even if the caller waits later.
+    /// Establishes prerequisites and queues a request with a budget starting now.
+    /// Waiting on the returned promise retains that deadline, even if done later.
     pub fn send_timeout<R: Request>(
         &self,
         request: R,
@@ -133,6 +168,13 @@ impl Client {
     ) -> Result<Pending<R::Response>, Error> {
         let deadline = Instant::now().checked_add(timeout).ok_or(Error::Timeout)?;
         self.send(request, deadline)
+    }
+
+    /// Checks the cloud registry for this attested Ark, synchronizing first if
+    /// necessary. Setup, proof generation and HTTP share the supplied deadline.
+    /// The returned registration may be inactive; its flags explain why.
+    pub fn genuine(&self, deadline: Instant) -> Result<Registration, Error> {
+        self.services.genuine(&self.requester, deadline)
     }
 }
 
@@ -306,7 +348,8 @@ mod tests {
             }
             replies
         });
-        let (mut ark, _) = Ark::attach(host, &identity).unwrap();
+        let (mut ark, _) =
+            Ark::attach(host, &crate::TrustMode::Recover(Box::new(identity))).unwrap();
         let (request, responder) = ark.recv().unwrap();
         assert!(matches!(
             request,

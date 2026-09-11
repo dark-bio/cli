@@ -7,14 +7,15 @@
 //! failures. [`hardware::list`] and [`emulator::list`] list either kind alone.
 //! Names, serials and launcher metadata are observations; [`Locator`] selects
 //! an endpoint without depending on its display label. Authentication happens
-//! at [`Device::connect`], using the caller's [`wire::transport::Verifier`].
+//! at [`Device::connect`], using a [`wire::transport::Verifier`] that returns
+//! [`Identity`]. Connecting authenticates the Ark without contacting the cloud.
 //! [`Device::kind`] records how an Ark was discovered. [`Identity::realm`] comes
 //! from a trusted certificate, independently of discovery or the connection.
 //!
 //! [`Ark`] owns a wire session. Dropping it closes the connection, including
 //! pending requests issued through its clonable [`Client`] handles. Wire owns
 //! multiplexing, I/O workers, deadlines and incoming queue limits. Connect adds
-//! typed request/response pairing and USB/WebSocket adapters.
+//! typed request/response pairing, USB/WebSocket adapters and cloud prerequisites.
 //!
 //! ```no_run
 //! use darkbio_connect::{schema::DeviceInfoRequest, TrustMode};
@@ -33,9 +34,9 @@
 //! [`Client::call`] and [`Client::send`] take an absolute deadline. Reuse it
 //! across requests to share an operation's budget. For one request,
 //! [`Client::call_timeout`] and [`Client::send_timeout`] take a duration starting
-//! at the call. Clients carry no default timeout. Request deadlines cover queueing,
-//! sending and accepting a response; discovery, connection setup and response
-//! decoding are outside them.
+//! at the call. Clients carry no default timeout. Request deadlines cover cloud
+//! prerequisites, queueing, sending and accepting a response; discovery, connection
+//! setup and response decoding are outside them.
 //!
 //! ```no_run
 //! use darkbio_connect::{Client, Error, schema::{DeviceInfoRequest, PairingStatusRequest}};
@@ -48,6 +49,19 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Requests declare whether they need cloud synchronization through
+//! [`Request::CLOUD_SYNC`]. Device info, onboarding, pairing status and the sync
+//! exchange itself need none. Other requests synchronize cloud keys and time
+//! lazily, using the environment authenticated during the handshake. Client
+//! clones share a successful sync for the lifetime of their connection.
+//! Concurrent callers join one attempt: the first caller supplies its deadline,
+//! and each waiter can expire sooner. Failed attempts can be retried by a later
+//! call. Self-signed and recovery connections skip cloud synchronization.
+//!
+//! [`Client::genuine`] synchronizes if needed, obtains an Ark proof and checks
+//! the cloud registry, all under one deadline. It requires an attested identity
+//! and returns a [`Registration`] whose flags explain whether it is active.
 //!
 //! Operations such as unlock need a companion response before they can finish.
 //! Keep [`Ark::recv`] running while clients wait for those operations. The
@@ -82,8 +96,9 @@
 //! operations it never serves or `UNAVAILABLE` when its current state prevents
 //! serving them. Dropping a responder without replying produces `UNANSWERED`.
 //!
-//! [`Client::send`] queues immediately; wire's output queue is unbounded.
-//! Callers manage the number of outstanding requests. [`Pending::notify`] lets
+//! [`Client::send`] may wait for cloud prerequisites before queueing the request.
+//! It then returns without waiting for output or a response. Wire's output queue
+//! is unbounded; callers manage the number of outstanding requests. [`Pending::notify`] lets
 //! one channel observe many completions without a waiter thread per request.
 //! Timeouts and dropped promises do not cancel operations already received
 //! by the device.
@@ -91,12 +106,14 @@
 //! [`TrustMode::RootOrSelf`] accepts roots enabled by the `release`, `staging`
 //! and `develop` crate features, as well as self-signed attestations. Self-signing
 //! proves key possession only. Recovery pins a key without checking attestation.
-//! Callers requiring stricter trust can supply another verifier.
+//! Callers requiring stricter trust can supply another verifier returning
+//! [`Identity`], which also determines authenticated cloud routing.
 
 pub mod emulator;
 pub mod hardware;
 
 mod ark;
+mod cloud;
 mod device;
 mod discovery;
 mod identity;
@@ -105,11 +122,12 @@ mod request;
 #[cfg(test)]
 mod testing;
 
-pub use ark::{Ark, Client, Pending};
+pub use ark::{Ark, Client, Closer, Pending};
+pub use cloud::Registration;
 pub use darkbio_trust as trust;
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
-pub use darkbio_wire::protocol::{Closer, CodedError, Promise, Responder};
+pub use darkbio_wire::protocol::{CodedError, Promise, Responder};
 pub use device::{Device, DeviceKind, Locator};
 pub use discovery::{Discovery, list};
 pub use identity::{Identity, TrustMode};
@@ -121,6 +139,14 @@ use std::io;
 /// Things that can go wrong finding, reaching or talking to an Ark.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Cloud operations need an environment and realm established by attestation.
+    #[error("cloud operation requires an attested Ark")]
+    Unattested,
+
+    /// A cloud request failed or its response could not be used.
+    #[error("cloud operation failed: {0}")]
+    Cloud(String),
+
     /// Discovery returned no devices and no selector was supplied.
     #[error("no Ark enclave found")]
     NotFound,
@@ -163,9 +189,9 @@ pub enum Error {
     #[error("handshake failed: {0}")]
     Handshake(protocol::Error),
 
-    /// A request ran past its deadline, or the handshake past the wire's
-    /// budget.
-    #[error("ark timed out")]
+    /// A device or cloud request ran past its deadline, or the handshake past
+    /// the wire's budget.
+    #[error("operation timed out")]
     Timeout,
 
     /// The Ark refused this request with an application or reserved protocol

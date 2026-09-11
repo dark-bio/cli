@@ -3,7 +3,7 @@
 
 //! Scripted wire peers and attestations for connection and trust tests.
 
-use crate::{Ark, Error};
+use crate::{Ark, Error, Identity, TrustMode};
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
 use darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION;
@@ -135,9 +135,9 @@ impl Peer {
     }
 
     /// Attaches to the peer using its pinned identity key.
-    pub fn attach(&mut self) -> Result<(Ark, Attestation), Error> {
+    pub fn attach(&mut self) -> Result<(Ark, Identity), Error> {
         let stream = self.stream();
-        Ark::attach(stream, &self.identity)
+        Ark::attach(stream, &TrustMode::Recover(Box::new(self.identity.clone())))
     }
 }
 

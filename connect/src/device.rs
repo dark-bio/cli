@@ -5,7 +5,7 @@
 //! Discovery metadata is unverified. Connecting establishes the peer's identity.
 
 use crate::emulator::Instance;
-use crate::{Ark, Error, emulator, hardware};
+use crate::{Ark, Error, Identity, emulator, hardware};
 use darkbio_wire::transport::Verifier;
 use std::fmt;
 
@@ -140,7 +140,12 @@ impl Device {
 
     /// Connects using the retained endpoint details and authenticates the peer
     /// with the supplied verifier. Does not repeat discovery or label selection.
-    pub fn connect<V: Verifier>(&self, verifier: &V) -> Result<(Ark, V::Info), Error> {
+    /// The verifier's identity selects cloud routing for later operations;
+    /// connecting itself does not contact the cloud.
+    pub fn connect<V: Verifier<Info = Identity>>(
+        &self,
+        verifier: &V,
+    ) -> Result<(Ark, Identity), Error> {
         match &self.source {
             Source::Usb(info) => hardware::connect(info, verifier),
             Source::Registry(instance) => emulator::connect(&instance.url(), verifier),
