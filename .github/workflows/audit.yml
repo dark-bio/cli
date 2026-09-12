@@ -39,7 +39,7 @@ jobs:
           command: check licenses
 
       - name: Install cargo-about
-        run: cargo install cargo-about --locked
+        run: cargo install cargo-about --locked --features cli
 
       - name: Generate dependency notices
         run: cargo about generate --workspace --all-features --locked --fail --config .packaging/licenses/about.toml .packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"

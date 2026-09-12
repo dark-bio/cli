@@ -2,12 +2,18 @@
 name = "darkbio-connect"
 version = "0.1.0"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
-description = "Connections to Ark enclaves from host processes"
-license = "BSD-3-Clause"
-edition = "2024"
-rust-version = "1.98"
+description = "Client library for Ark enclaves"
 repository = "https://github.com/dark-bio/cli"
 documentation = "https://docs.rs/darkbio-connect"
+categories = ["network-programming", "hardware-support"]
+keywords = ["ark", "dark-bio", "enclave", "usb", "websocket"]
+license = "BSD-3-Clause"
+edition = "2024"
+rust-version = "1.95"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []

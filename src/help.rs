@@ -1,4 +1,4 @@
-// ark: command line for Dark Bio Arks
+// ark: command line interface to Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 //
 // Use of this source code is governed by a BSD-style

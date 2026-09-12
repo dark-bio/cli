@@ -15,7 +15,7 @@ cargo run -- app run app.wasm --unlock > report.md
 cargo run -- firmware update --dry-run
 ```
 
-Build and install locally with Rust 1.98 or later:
+Build and install locally with Rust 1.95 or later:
 
 ```sh
 cargo install --path . --locked

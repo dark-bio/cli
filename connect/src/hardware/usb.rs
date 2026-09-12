@@ -1,4 +1,4 @@
-// connect-rs: connections to Ark enclaves from host processes
+// connect-rs: client library for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 //
 // Use of this source code is governed by a BSD-style
@@ -673,21 +673,16 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
 
-        let sending = {
-            let fake = fake.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(20));
-                finish(&fake, 0, Ok(()));
-            })
-        };
+        // Make one completion available so only the second chunk waits
+        // for its deadline.
+        let two = vec![7u8; 2 * TRANSFER_SIZE];
+        finish(&fake, 0, Ok(()));
         transport::Write::set_write_deadline(
             &mut writer,
             Instant::now() + Duration::from_millis(100),
         )
         .unwrap();
-        let two = vec![7u8; 2 * TRANSFER_SIZE];
         assert_eq!(writer.write(&two).unwrap(), TRANSFER_SIZE);
-        sending.join().unwrap();
 
         closed.store(true, Ordering::Release);
         assert_eq!(

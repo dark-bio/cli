@@ -1,13 +1,15 @@
 [package]
 name = "darkbio-ark"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.98"
-authors = ["Dark Bio AG"]
-description = "Command line for Dark Bio Arks"
-license = "BSD-3-Clause"
+authors = ["Péter Szilágyi <peter@dark.bio>"]
+description = "Command line interface to Ark enclaves"
 repository = "https://github.com/dark-bio/cli"
 homepage = "https://dark.bio"
+categories = ["command-line-utilities", "hardware-support"]
+keywords = ["ark", "dark-bio", "cli", "usb", "enclave"]
+license = "BSD-3-Clause"
+edition = "2024"
+rust-version = "1.95"
 
 [[bin]]
 name = "ark"

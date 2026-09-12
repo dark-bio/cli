@@ -1,4 +1,4 @@
-// connect-rs: connections to Ark enclaves from host processes
+// connect-rs: client library for Ark enclaves
 // Copyright 2026 Dark Bio AG. All rights reserved.
 //
 // Use of this source code is governed by a BSD-style
