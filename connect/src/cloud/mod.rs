@@ -11,6 +11,7 @@
 //! own deadlines. Only successful setup is reused. Closure releases waiters,
 //! while an outstanding blocking I/O retains the initiating caller's deadline.
 
+mod auth;
 mod dns;
 mod firmware;
 mod http;
@@ -19,6 +20,7 @@ pub use pairing::PairingProgress;
 mod relay;
 mod socket;
 
+pub use auth::CloudAuth;
 pub use firmware::{Firmware, UpdateProgress};
 pub use http::Registration;
 
@@ -82,6 +84,13 @@ enum Failure {
     MissingEnvironment,
     /// The cloud refused the Ark's proof, possibly after a key rotation.
     ProofRejected,
+    /// Caller authentication was rejected before reaching the cloud application.
+    AuthRequired,
+    /// Login failed or the caller cannot prompt for it.
+    CloudAuth {
+        origin: String,  // Selected host whose credentials need attention
+        message: String, // Safe diagnostic shared with setup waiters
+    },
     Cloud(String),         // HTTP or response decoding failure
     Relay(String),         // Relay connection or envelope failure
     Wire(protocol::Error), // Device failure, retaining remote codes and disconnect reasons
@@ -107,6 +116,8 @@ impl From<Failure> for Error {
         match error {
             Failure::MissingEnvironment => Self::MissingEnvironment,
             Failure::ProofRejected => Self::ProofRejected,
+            Failure::AuthRequired => Self::Cloud("cloud access still refused after login".into()),
+            Failure::CloudAuth { origin, message } => Self::CloudAuth { origin, message },
             Failure::Cloud(error) => Self::Cloud(error),
             Failure::Relay(error) => Self::Relay(error),
             Failure::Wire(error) => error.into(),
@@ -115,6 +126,12 @@ impl From<Failure> for Error {
 }
 
 impl Services {
+    /// Installs caller-owned credentials without contacting the selected cloud.
+    pub(crate) fn set_cloud_auth(&self, auth: Arc<dyn CloudAuth>) {
+        if let Some(cloud) = &self.cloud {
+            cloud.auth.set(auth);
+        }
+    }
     /// A stopped dispatcher has dropped its wire session. Preserve its ending
     /// reason when a surviving weak requester can only report that it is gone.
     pub(crate) fn wire_error(&self, error: protocol::Error) -> Error {
@@ -267,6 +284,7 @@ impl Services {
                 .request(RelayJoinRequest {}, timing.io())?
                 .wait::<RelayJoinResponse>()?;
             relay::Relay::connect(
+                cloud,
                 &cloud.relay_url(),
                 &joined.auth,
                 requester.clone(),
@@ -284,10 +302,11 @@ impl Services {
         timing: Timing,
         mut attempt: impl FnMut() -> Result<T, Failure>,
     ) -> Result<T, Failure> {
-        let result = attempt();
+        let cloud = self.cloud.as_ref().ok_or(Failure::MissingEnvironment)?;
+        let result = cloud.with_auth(timing, &mut attempt);
         if matches!(result, Err(Failure::ProofRejected)) {
             self.ensure(requester, Step::Refresh, timing)?;
-            return attempt();
+            return cloud.with_auth(timing, attempt);
         }
         result
     }
@@ -362,11 +381,11 @@ impl Services {
             }
         }
         let cloud = self.cloud.as_ref().expect("cloud route available");
-        let identity = cloud.identity(timing.io())?;
+        let identity = cloud.with_auth(timing, || cloud.identity(timing.io()))?;
         let started = requester
             .request(identity, timing.io())?
             .wait::<crate::schema::CloudSyncStartResponse>()?;
-        let time = cloud.time(&started.challenge, timing.io())?;
+        let time = cloud.with_auth(timing, || cloud.time(&started.challenge, timing.io()))?;
         requester
             .request(time, timing.io())?
             .wait::<crate::schema::CloudSyncFinishResponse>()?;
@@ -640,7 +659,7 @@ pub(crate) mod tests {
     }
 
     /// JSON replies used by the real wire peer's cloud synchronization exchange.
-    fn sync_responses() -> Vec<(Duration, String)> {
+    pub(super) fn sync_responses() -> Vec<(Duration, String)> {
         vec![
             (
                 Duration::ZERO,
@@ -991,6 +1010,120 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn caller_authentication_retries_fresh_proofs_without_cloud_sync() {
+        use auth::tests::{Login, refused};
+        for operation in ["genuine", "relaying", "pairing"] {
+            for fail_login in [false, true] {
+                let mut responses = vec![(Duration::ZERO, refused(403))];
+                if !fail_login {
+                    responses.push((Duration::ZERO, if operation == "genuine" {
+                        response(200, r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)
+                    } else { refused(403) }));
+                }
+                let (url, requests) = serve(responses);
+                let proofs = Arc::new(AtomicUsize::new(0));
+                let mut peer = Peer::spawn(Box::new({
+                    let proofs = proofs.clone();
+                    move |_, request, responder| {
+                        let response: protocol::Message = match request {
+                            Content::DeviceInfo(_) => crate::schema::DeviceInfoResponse {
+                                cloud_synced: true,
+                                cloud_clock: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                ..Default::default()
+                            }
+                            .into(),
+                            Content::GenuinityProof(_) => crate::schema::GenuinityProofResponse {
+                                proof: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
+                            }
+                            .into(),
+                            Content::RelayJoin(_) => crate::schema::RelayJoinResponse {
+                                auth: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
+                            }
+                            .into(),
+                            Content::PairingAuth(_) => crate::schema::PairingAuthResponse {
+                                auth: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
+                                fprint: vec![8; 32],
+                            }
+                            .into(),
+                            other => panic!("unexpected request: {other:?}"),
+                        };
+                        responder.reply(response, Instant::now() + TIMEOUT).unwrap();
+                        true
+                    }
+                }));
+                let mut ark = attach(&mut peer, url);
+                let login = Login {
+                    fail: fail_login,
+                    ..Default::default()
+                };
+                ark.set_cloud_auth(login.clone());
+                let client = ark.client();
+                let timing = Timing::inactivity(TIMEOUT);
+                client.call(DeviceInfoRequest {}, timing).unwrap();
+                assert_eq!(login.lookups.load(Ordering::SeqCst), 0);
+                let result = match operation {
+                    "genuine" => client.genuine(timing).map(drop),
+                    "relaying" => client.attach_relay(timing),
+                    "pairing" => {
+                        client.pair(timing, |_| panic!("pairing started before authentication"))
+                    }
+                    _ => unreachable!(),
+                };
+                if operation == "genuine" && !fail_login {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(Error::CloudAuth { .. })), "{result:?}");
+                }
+                let requests: Vec<_> = requests.try_iter().collect();
+                assert_eq!(requests.len(), if fail_login { 1 } else { 2 });
+                assert_eq!(proofs.load(Ordering::SeqCst), requests.len());
+                assert_eq!(login.logins.load(Ordering::SeqCst), 1);
+                assert_eq!(login.lookups.load(Ordering::SeqCst), 1);
+                for (i, request) in requests.iter().enumerate() {
+                    let request = request.to_ascii_lowercase();
+                    assert!(request.starts_with(&format!("get /v1/{operation} ")));
+                    assert!(request.contains(if i == 0 {
+                        "authorization: cached\r\n"
+                    } else {
+                        "authorization: refreshed\r\n"
+                    }));
+                    let auth = if operation == "genuine" {
+                        "dark-auth: "
+                    } else {
+                        "dark-auth|"
+                    };
+                    assert!(
+                        request.contains(&format!("{auth}{}", if i == 0 { "aa" } else { "aq" }))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_sync_logs_in_before_sending_certificates_to_the_ark() {
+        use auth::tests::{Login, refused};
+        let mut responses = vec![(Duration::ZERO, refused(302))];
+        responses.extend(sync_responses());
+        let (url, requests) = serve(responses);
+        let (mut peer, starts, _) = peer(false);
+        let mut ark = attach(&mut peer, url);
+        let login = Login::default();
+        ark.set_cloud_auth(login.clone());
+        ark.client().sync(Timing::inactivity(TIMEOUT)).unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(login.logins.load(Ordering::SeqCst), 1);
+        let requests: Vec<_> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("authorization: cached\r\n"));
+        assert!(requests[1].contains("authorization: refreshed\r\n"));
+        assert!(requests[2].contains("authorization: refreshed\r\n"));
     }
 
     /// Reusing device state needs no HTTP, while explicit diagnostics always

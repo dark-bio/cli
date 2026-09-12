@@ -6,7 +6,7 @@
 
 //! Authenticated cloud sockets with blocking deadlines and relay readiness.
 
-use super::{Failure, dns};
+use super::{Failure, dns, http::Api};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use darkbio_wire::protocol;
 use std::io::{self, Read, Write};
@@ -24,15 +24,19 @@ const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
 pub(super) type Connection = WebSocket<MaybeTlsStream<Socket>>;
 
 /// Opens a cloud socket and requires the requested application subprotocol.
-/// DNS, TCP, TLS and upgrade share one deadline. A 403 remains a proof rejection
-/// so setup can refresh cloud keys before any application exchange begins.
+/// DNS, TCP, TLS and upgrade share one deadline. Caller authentication stays
+/// separate from cloud proof refusals, before any application exchange begins.
 pub(super) fn connect(
+    api: &Api,
     url: &str,
     auth: &[u8],
     subprotocol: &str,
     deadline: Instant,
 ) -> Result<Connection, Failure> {
     let mut request = url.into_client_request().map_err(socket_error)?;
+    request
+        .headers_mut()
+        .extend(api.auth.headers(&api.origin, deadline));
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         format!(
@@ -88,6 +92,13 @@ pub(super) fn connect(
     )
     .map_err(|error| match error {
         HandshakeError::Interrupted(_) => Failure::Wire(protocol::Error::Timeout),
+        HandshakeError::Failure(tungstenite::Error::Http(response))
+            if api
+                .auth
+                .rejected(&api.origin, response.status(), response.headers()) =>
+        {
+            Failure::AuthRequired
+        }
         HandshakeError::Failure(error) => socket_error(error),
     })?;
     if response
@@ -186,5 +197,75 @@ pub(super) fn socket_error(error: tungstenite::Error) -> Failure {
         tungstenite::Error::Io(error) => io_error(error),
         tungstenite::Error::Http(response) if response.status() == 403 => Failure::ProofRejected,
         error => Failure::Cloud(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud::{
+        auth::tests::{Login, refused},
+        http::tests::api,
+        tests::TIMEOUT,
+    };
+    use crate::{Timing, trust::Realm};
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::Ordering};
+    use std::thread;
+
+    #[test]
+    #[allow(clippy::result_large_err)] // Tungstenite's server callback owns its HTTP response.
+    fn socket_upgrades_and_reconnects_use_refreshed_credentials() {
+        for subprotocol in ["Pairing", "Relaying"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("ws://{}/v1/{subprotocol}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                for attempt in 0..3 {
+                    let (stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                    stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+                    if attempt == 0 {
+                        let mut stream = stream;
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).unwrap();
+                            head.push(byte[0]);
+                        }
+                        assert!(
+                            String::from_utf8(head)
+                                .unwrap()
+                                .to_ascii_lowercase()
+                                .contains("authorization: cached\r\n")
+                        );
+                        stream.write_all(refused(302).as_bytes()).unwrap();
+                        continue;
+                    }
+                    let socket = tungstenite::accept_hdr(stream,
+                        |request: &tungstenite::handshake::server::Request, mut response: tungstenite::handshake::server::Response| {
+                            assert_eq!(request.headers()["authorization"], "refreshed");
+                            assert_eq!(request.headers()["sec-websocket-protocol"], format!("{subprotocol}, Dark-Auth|-_8"));
+                            response.headers_mut().insert("sec-websocket-protocol", subprotocol.parse().unwrap());
+                            Ok(response)
+                        }).unwrap();
+                    drop(socket);
+                }
+            });
+            let cloud = api(url.clone(), Realm::Hardware);
+            let login = Login::default();
+            cloud.auth.set(Arc::new(login.clone()));
+            let timing = Timing::inactivity(TIMEOUT);
+            for _ in 0..2 {
+                let socket = cloud
+                    .with_auth(timing, || {
+                        connect(&cloud, &url, &[0xfb, 0xff], subprotocol, timing.io())
+                    })
+                    .unwrap();
+                drop(socket);
+            }
+            server.join().unwrap();
+            assert_eq!(login.logins.load(Ordering::SeqCst), 1);
+            assert_eq!(login.lookups.load(Ordering::SeqCst), 1);
+        }
     }
 }

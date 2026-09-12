@@ -6,11 +6,10 @@
 
 //! Firmware plans, package downloads and verification after reboot.
 
-mod access;
 mod package;
 
 use crate::{
-    args,
+    access, args,
     context::{Connection, Context},
     error::Error,
     http,
@@ -468,19 +467,23 @@ impl Packages {
             request.call().map_err(http::error)
         };
         let response = fetch(self.token.as_deref())?;
-        let response = if self.origin != "https://pkg.dark.bio"
-            && response.status().is_redirection()
-            && response
-                .headers()
-                .get("Location")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|redirect| access::challenge(self.origin, redirect))
-        {
+        let response = if access::required(self.origin, response.status(), response.headers()) {
             self.token = Some(access::authenticate(context, self.origin)?);
             fetch(self.token.as_deref())?
         } else {
             response
         };
+        if access::required(self.origin, response.status(), response.headers()) {
+            return Err(Error::new(
+                4,
+                "login-required",
+                "package access still refused after login",
+            )
+            .hint(format!(
+                "run `cloudflared access login --app {}`",
+                self.origin
+            )));
+        }
         if response.status().is_success() {
             Ok(response)
         } else {

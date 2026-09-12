@@ -69,7 +69,13 @@ impl Services {
             let auth = requester
                 .request(schema::PairingAuthRequest {}, timing.io())?
                 .wait::<schema::PairingAuthResponse>()?;
-            let socket = socket::connect(&cloud.pairing_url(), &auth.auth, "Pairing", timing.io())?;
+            let socket = socket::connect(
+                cloud,
+                &cloud.pairing_url(),
+                &auth.auth,
+                "Pairing",
+                timing.io(),
+            )?;
             Ok((socket, auth.fprint))
         })?;
         // These claims locate the rendezvous and bound scanning. The Ark verifies
@@ -250,7 +256,14 @@ mod tests {
                     .unwrap();
             });
             let deadline = Instant::now() + TIMEOUT;
-            let mut socket = socket::connect(&url, &[], "Pairing", deadline).unwrap();
+            let mut socket = socket::connect(
+                &http::tests::api(url.clone(), Realm::Hardware),
+                &url,
+                &[],
+                "Pairing",
+                deadline,
+            )
+            .unwrap();
             let err = receive(&mut socket, deadline).unwrap_err();
             if reason == "pairing timed out" {
                 assert!(matches!(err, Error::PairingExpired));

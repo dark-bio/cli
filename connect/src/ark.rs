@@ -36,6 +36,12 @@ pub struct Ark {
 }
 
 impl Ark {
+    /// Installs cloud credentials before using the session's clients. The provider
+    /// is shared across cloud requests and reconnects, and is never called by status.
+    pub fn set_cloud_auth(&mut self, auth: impl crate::CloudAuth + 'static) {
+        self.services.set_cloud_auth(Arc::new(auth));
+    }
+
     /// Takes ownership of a stream and authenticates the peer under wire's
     /// handshake timeout. Returns the verifier's identity information. Failure
     /// closes the stream.

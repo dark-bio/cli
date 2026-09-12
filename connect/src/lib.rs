@@ -100,7 +100,7 @@ mod timing;
 mod testing;
 
 pub use ark::{Ark, Client, Closer, Pending};
-pub use cloud::{Firmware, PairingProgress, Registration, UpdateProgress, cloud_synced};
+pub use cloud::{CloudAuth, Firmware, PairingProgress, Registration, UpdateProgress, cloud_synced};
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
 pub use darkbio_wire::protocol::{CodedError, Promise, Responder};
@@ -177,6 +177,15 @@ pub enum Error {
     /// A cloud request failed or its response could not be used.
     #[error("cloud operation failed: {0}")]
     Cloud(String),
+
+    /// A protected cloud host needs caller authentication, independently of Ark trust.
+    #[error("{message}")]
+    CloudAuth {
+        /// HTTPS origin to authenticate with the caller's login helper.
+        origin: String,
+        /// Safe diagnostic without credentials or the rejected request's proof.
+        message: String,
+    },
 
     /// Discovery returned no devices and no selector was supplied.
     #[error("no Ark enclave found")]

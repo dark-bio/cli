@@ -6,6 +6,7 @@
 
 //! Command dispatch; protocol workflows live in the internal connection library.
 
+mod access;
 mod args;
 mod context;
 mod data;

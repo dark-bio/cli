@@ -88,12 +88,13 @@ struct State {
 impl Relay {
     /// Opens an authenticated socket under the original operation's deadline.
     pub(super) fn connect(
+        api: &super::http::Api,
         url: &str,
         auth: &[u8],
         requester: Requester,
         deadline: Instant,
     ) -> Result<Self, Failure> {
-        let mut socket = socket::connect(url, auth, "Relaying", deadline)?;
+        let mut socket = socket::connect(api, url, auth, "Relaying", deadline)?;
         remaining(deadline).map_err(io_error)?;
         let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
             unreachable!()
@@ -567,6 +568,7 @@ mod tests {
     use crate::cloud::tests::{TIMEOUT, attach, response};
     use crate::testing::{Peer, answering};
     use crate::{Error, schema::host_to_ark::Content};
+    use crate::{cloud::http, trust::Realm};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1280,7 +1282,14 @@ mod tests {
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
         let deadline = Instant::now() + TIMEOUT;
-        let mut relay = Relay::connect(&url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
+        let mut relay = Relay::connect(
+            &http::tests::api(url.clone(), Realm::Hardware),
+            &url,
+            &[0xfb, 0xff],
+            session.requester(),
+            deadline,
+        )
+        .unwrap();
         relay.worker.as_mut().unwrap().heartbeat =
             Heartbeat::new(Duration::from_millis(20), Duration::from_millis(200));
         relay.start().unwrap();
@@ -1299,8 +1308,14 @@ mod tests {
             .unwrap()
             .wait::<schema::DeviceInfoResponse>()
             .unwrap();
-        let mut replacement =
-            Relay::connect(&url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
+        let mut replacement = Relay::connect(
+            &http::tests::api(url.clone(), Realm::Hardware),
+            &url,
+            &[0xfb, 0xff],
+            session.requester(),
+            deadline,
+        )
+        .unwrap();
         replacement.start().unwrap();
         assert!(replacement.connected());
         release.send(()).unwrap();
@@ -1328,8 +1343,14 @@ mod tests {
             let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
             let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
             let deadline = Instant::now() + TIMEOUT;
-            let mut relay =
-                Relay::connect(&url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
+            let mut relay = Relay::connect(
+                &http::tests::api(url.clone(), Realm::Hardware),
+                &url,
+                &[0xfb, 0xff],
+                session.requester(),
+                deadline,
+            )
+            .unwrap();
             if started {
                 relay.start().unwrap();
             }
@@ -1363,6 +1384,7 @@ mod tests {
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
         let result = Relay::connect(
+            &http::tests::api(url.clone(), Realm::Hardware),
             &url,
             &[1],
             session.requester(),

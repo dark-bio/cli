@@ -20,3 +20,13 @@ then release. The CLI trusts release, staging and develop roots. An explicit
 Develop and staging routes produce one note per command, hidden by --quiet.
 The offline attested label identifies the signer. Use genuine to check the
 Ark's current cloud registration.
+
+Develop and staging cloud and package hosts may require Cloudflare Access login.
+Install cloudflared when prompted. Interactive commands open a browser when login
+is needed and reuse the session afterward. Without a terminal, under --no-input,
+or in JSON mode, `login-required` includes the manual login command. API and
+package hosts have separate credentials. Status remains usable offline.
+
+Firmware checks cloud access before preparation. If login expires after the Ark
+has prepared the update, the CLI signs in and asks you to rerun the command;
+it never repeats a possible device approval automatically.

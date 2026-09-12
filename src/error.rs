@@ -133,6 +133,8 @@ impl From<ConnectError> for Error {
             }
             Handshake(_) => Self::new(3, "handshake-failed", error.to_string()),
             Cloud(message) => Self::new(4, "cloud-unreachable", message),
+            CloudAuth { origin, message } => Self::new(4, "login-required", message)
+                .hint(format!("run `cloudflared access login --app {origin}`")),
             Relay(message) => Self::new(4, "cloud-unreachable", message),
             Pairing(message) => Self::new(4, "pairing-failed", message),
             ProofRejected => Self::new(4, "proof-rejected", "the cloud rejected the device proof")

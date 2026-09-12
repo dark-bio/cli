@@ -59,8 +59,8 @@ Exit 3, device access:
 Exit 4, cloud:
 - `cloud-unreachable`: an HTTP, package host or relay request failed
 - `environment-unknown`: no cloud environment; select one with --env
-- `login-required`: the package host wants a browser login; the hint has the
-  cloudflared command
+- `login-required`: the cloud or package host wants a browser login; the hint
+  has the cloudflared command
 - `proof-rejected`: the cloud refused the device proof; run `ark doctor`
 - `pairing-failed`: the rendezvous or the companion side failed
 - `registry-inactive`: the registration is disabled, expired or superseded

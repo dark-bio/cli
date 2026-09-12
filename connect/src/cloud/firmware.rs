@@ -87,6 +87,11 @@ impl Services {
             .try_lock()
             .map_err(|_| Error::Firmware("another firmware update is already running".into()))?;
         self.sync(requester, timing)?;
+        // Finish any browser login before asking the Ark to prepare an update.
+        // A protected host can need login even when device sync is still fresh.
+        if cloud.auth.configured() {
+            cloud.with_auth(timing, || cloud.identity(timing.io()))?;
+        }
         progress(UpdateProgress::Preparing);
         let prepared = requester
             .request(
@@ -99,6 +104,7 @@ impl Services {
             )?
             .wait::<schema::FirmwareUpdatePrepResponse>()?;
         let access: Access = match http::get_authenticated(
+            cloud,
             cloud
                 .agent
                 .get(format!("{}/firmware", cloud.url))
@@ -107,6 +113,15 @@ impl Services {
                 .header("Dark-Auth", BASE64_URL_SAFE_NO_PAD.encode(prepared.auth)),
             timing.io(),
         ) {
+            Err(Failure::AuthRequired) => {
+                // Browser login can outlive the prepared proof. Leave a second
+                // preparation and its possible approval to an explicit rerun.
+                cloud.auth.login(&cloud.origin, timing)?;
+                return Err(Error::CloudAuth {
+                    origin: cloud.origin.clone(),
+                    message: "signed in to the cloud; rerun the firmware update".into(),
+                });
+            }
             Err(Failure::ProofRejected) => {
                 // Preparation may already have required approval. Refresh keys
                 // for the next attempt, leaving the caller to start it explicitly.
@@ -539,6 +554,74 @@ mod tests {
                     &paths[3..],
                     ["/v1/cloudsync/identity", "/v1/cloudsync/time?challenge=03"]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn caller_login_precedes_preparation_and_never_repeats_approval() {
+        use crate::cloud::{
+            auth::tests::{Login, refused},
+            tests::{response, serve, sync_responses},
+        };
+        use std::sync::atomic::Ordering;
+        for expires_after_preparation in [false, true] {
+            let bytes = vec![42; 17];
+            let firmware = firmware(&bytes);
+            let mut responses = sync_responses();
+            if !expires_after_preparation {
+                responses.push((Duration::ZERO, refused(302)));
+            }
+            responses.push(sync_responses().remove(0));
+            responses.push((
+                Duration::ZERO,
+                if expires_after_preparation {
+                    refused(403)
+                } else {
+                    response(200, r#"{"access":"/w=="}"#)
+                },
+            ));
+            let (url, requests) = serve(responses);
+            let (mut peer, stages) = peer(&firmware, None);
+            let mut ark = attach(&mut peer, url);
+            let login = Login::default();
+            ark.set_cloud_auth(login.clone());
+            let result = ark.client().update_firmware(
+                &firmware,
+                &mut bytes.as_slice(),
+                Timing::inactivity(TIMEOUT),
+                |stage| {
+                    if stage == UpdateProgress::Preparing {
+                        assert_eq!(
+                            login.logins.load(Ordering::SeqCst),
+                            usize::from(!expires_after_preparation)
+                        );
+                    }
+                },
+            );
+            let stages = stages.lock().unwrap();
+            assert_eq!(
+                stages.iter().filter(|stage| **stage == "prepare").count(),
+                1
+            );
+            assert_eq!(
+                stages
+                    .iter()
+                    .filter(|stage| **stage == "sync-start")
+                    .count(),
+                1
+            );
+            assert_eq!(login.logins.load(Ordering::SeqCst), 1);
+            if expires_after_preparation {
+                assert!(
+                    matches!(result, Err(Error::CloudAuth { message, .. }) if message.contains("rerun"))
+                );
+                assert!(!stages.contains(&"init"));
+                assert_eq!(requests.try_iter().count(), 4);
+            } else {
+                result.unwrap();
+                assert!(stages.contains(&"install"));
+                assert_eq!(requests.try_iter().count(), 5);
             }
         }
     }

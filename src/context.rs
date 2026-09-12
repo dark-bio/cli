@@ -143,6 +143,9 @@ impl Context {
             }
         }
         self.output.environment(env);
+        if env != Environment::Release {
+            ark.set_cloud_auth(crate::access::Login::new(self));
+        }
         let client = ark.client();
         self.interrupt.connection(client.clone(), ark.closer());
         let info = client.call(schema::DeviceInfoRequest {}, timing)?;

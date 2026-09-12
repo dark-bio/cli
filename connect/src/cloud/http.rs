@@ -6,10 +6,10 @@
 
 //! HTTP routes and payloads of the Ark cloud API.
 
-use super::Failure;
-use crate::Identity;
+use super::{Failure, auth};
 use crate::schema::{CloudSyncFinishRequest, CloudSyncStartRequest};
 use crate::trust::{Environment, Realm};
+use crate::{Identity, Timing};
 use base64::{
     Engine,
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
@@ -24,10 +24,12 @@ const MAX_RESPONSE: u64 = 64 * 1024;
 /// Cloud operations selected by the attestation or an explicit environment.
 #[derive(Debug)]
 pub(super) struct Api {
-    pub(super) agent: ureq::Agent, // HTTP connections reused across the cloud exchange
-    pub(super) url: String,        // API of the selected environment
-    pub(super) realm: Realm,       // Realm selecting the device registry
-    serial: Option<String>,        // Attested serial, when available, checked against the registry
+    pub(super) auth: auth::Authorization, // Caller credentials, independent of the Ark proof
+    pub(super) origin: String,            // HTTPS origin shared by API and socket credentials
+    pub(super) agent: ureq::Agent,        // HTTP connections reused across the cloud exchange
+    pub(super) url: String,               // API of the selected environment
+    pub(super) realm: Realm,              // Realm selecting the device registry
+    serial: Option<String>, // Attested serial, when available, checked against the registry
 }
 
 impl Api {
@@ -68,6 +70,8 @@ impl Api {
             }
         };
         Some(Self {
+            auth: auth::Authorization::default(),
+            origin: api_url(*env).trim_end_matches("/v1").into(),
             agent: agent(),
             url: api_url(*env).into(),
             realm,
@@ -77,7 +81,7 @@ impl Api {
 
     /// Retrieves cloud certificates for the Ark to verify.
     pub(super) fn identity(&self, deadline: Instant) -> Result<CloudSyncStartRequest, Failure> {
-        fetch_identity(&self.agent, &self.url, deadline)
+        fetch_identity(self, deadline)
     }
 
     /// Retrieves signed time bound to the Ark's challenge.
@@ -86,13 +90,13 @@ impl Api {
         challenge: &[u8],
         deadline: Instant,
     ) -> Result<CloudSyncFinishRequest, Failure> {
-        fetch_time(&self.agent, &self.url, challenge, deadline)
+        fetch_time(self, challenge, deadline)
     }
 
     /// Checks the registry with the Ark's opaque proof and matches its serial
     /// against the identity authenticated during the handshake, when attested.
     pub(super) fn genuine(&self, proof: &[u8], deadline: Instant) -> Result<Registration, Failure> {
-        let registration = fetch_registration(&self.agent, &self.url, self.realm, proof, deadline)?;
+        let registration = fetch_registration(self, proof, deadline)?;
         if self
             .serial
             .as_ref()
@@ -103,6 +107,27 @@ impl Api {
             ));
         }
         Ok(registration)
+    }
+
+    /// Retries only authentication or read-only requests after login. Callers
+    /// recreate short-lived Ark proofs inside the attempt, after browser login.
+    pub(super) fn with_auth<T>(
+        &self,
+        timing: Timing,
+        mut attempt: impl FnMut() -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let result = attempt();
+        if !matches!(result, Err(Failure::AuthRequired)) {
+            return result;
+        }
+        self.auth.login(&self.origin, timing)?;
+        match attempt() {
+            Err(Failure::AuthRequired) => Err(Failure::CloudAuth {
+                origin: self.origin.clone(),
+                message: "cloud access still refused after login".into(),
+            }),
+            result => result,
+        }
     }
 }
 
@@ -183,13 +208,13 @@ impl Registration {
 }
 
 /// Retrieves and decodes the cloud certificates without interpreting their claims.
-fn fetch_identity(
-    agent: &ureq::Agent,
-    url: &str,
-    deadline: Instant,
-) -> Result<CloudSyncStartRequest, Failure> {
-    let certs: Certificates = get(agent.get(format!("{url}/cloudsync/identity")), deadline)
-        .map_err(|err| err.context("failed to fetch cloud identity"))?;
+fn fetch_identity(api: &Api, deadline: Instant) -> Result<CloudSyncStartRequest, Failure> {
+    let certs: Certificates = get(
+        api,
+        api.agent.get(format!("{}/cloudsync/identity", api.url)),
+        deadline,
+    )
+    .map_err(|err| err.context("failed to fetch cloud identity"))?;
     Ok(CloudSyncStartRequest {
         signer: BASE64_STANDARD
             .decode(certs.signer)
@@ -202,13 +227,16 @@ fn fetch_identity(
 
 /// Sends the Ark's challenge as hex and decodes the cloud's signed response.
 fn fetch_time(
-    agent: &ureq::Agent,
-    url: &str,
+    api: &Api,
     challenge: &[u8],
     deadline: Instant,
 ) -> Result<CloudSyncFinishRequest, Failure> {
-    let url = format!("{url}/cloudsync/time?challenge={}", hex::encode(challenge));
-    let time: SignedTime = get(agent.get(url), deadline)
+    let url = format!(
+        "{}/cloudsync/time?challenge={}",
+        api.url,
+        hex::encode(challenge)
+    );
+    let time: SignedTime = get(api, api.agent.get(url), deadline)
         .map_err(|err| err.context("failed to fetch signed cloud time"))?;
     Ok(CloudSyncFinishRequest {
         unixmilli: time.unixmilli,
@@ -219,20 +247,15 @@ fn fetch_time(
 }
 
 /// Sends the opaque proof to the registry of the authenticated realm.
-fn fetch_registration(
-    agent: &ureq::Agent,
-    url: &str,
-    realm: Realm,
-    proof: &[u8],
-    deadline: Instant,
-) -> Result<Registration, Failure> {
-    let route = match realm {
+fn fetch_registration(api: &Api, proof: &[u8], deadline: Instant) -> Result<Registration, Failure> {
+    let route = match api.realm {
         Realm::Hardware => "genuine",
         Realm::Emulator => "sandbox/genuine",
     };
     get_authenticated(
-        agent
-            .get(format!("{url}/{route}"))
+        api,
+        api.agent
+            .get(format!("{}/{route}", api.url))
             .header("Dark-Auth", BASE64_URL_SAFE_NO_PAD.encode(proof)),
         deadline,
     )
@@ -241,10 +264,11 @@ fn fetch_registration(
 
 /// Reads a proof-authenticated response, retaining refusal as a typed error.
 pub(super) fn get_authenticated<T: DeserializeOwned>(
+    api: &Api,
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     deadline: Instant,
 ) -> Result<T, Failure> {
-    let response = send(request, deadline)?;
+    let response = send(api, request, deadline)?;
     if response.status() == 403 {
         return Err(Failure::ProofRejected);
     }
@@ -253,26 +277,38 @@ pub(super) fn get_authenticated<T: DeserializeOwned>(
 
 /// Reads one successful JSON response under the remaining deadline and size limit.
 pub(super) fn get<T: DeserializeOwned>(
+    api: &Api,
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     deadline: Instant,
 ) -> Result<T, Failure> {
-    json(send(request, deadline)?)
+    json(send(api, request, deadline)?)
 }
 
 /// Sends a GET under the remaining operation deadline without following redirects.
 fn send(
-    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    api: &Api,
+    mut request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     deadline: Instant,
 ) -> Result<ureq::http::Response<ureq::Body>, Failure> {
+    for (name, value) in &api.auth.headers(&api.origin, deadline) {
+        request = request.header(name, value);
+    }
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or(protocol::Error::Timeout)?;
-    Ok(request
+    let response = request
         .config()
         .timeout_global(Some(remaining))
         .build()
-        .call()?)
+        .call()?;
+    if api
+        .auth
+        .rejected(&api.origin, response.status(), response.headers())
+    {
+        return Err(Failure::AuthRequired);
+    }
+    Ok(response)
 }
 
 /// Decodes a successful JSON response within the cloud response size limit.
@@ -302,6 +338,8 @@ pub(super) mod tests {
     /// Redirects an attested connection to the loopback cloud.
     pub(in crate::cloud) fn api(url: String, realm: Realm) -> Api {
         Api {
+            auth: auth::Authorization::default(),
+            origin: url.trim_end_matches("/v1").into(),
             agent: http(),
             url,
             realm,
@@ -390,12 +428,12 @@ pub(super) mod tests {
                 ),
             ),
         ]);
-        let agent = http();
+        let cloud = api(url, Realm::Hardware);
         let deadline = Instant::now() + TIMEOUT;
-        let start = fetch_identity(&agent, &url, deadline).unwrap();
+        let start = fetch_identity(&cloud, deadline).unwrap();
         assert_eq!(start.signer, signer);
         assert_eq!(start.crypto, crypto);
-        let finish = fetch_time(&agent, &url, &[0, 0xfb, 0xff], deadline).unwrap();
+        let finish = fetch_time(&cloud, &[0, 0xfb, 0xff], deadline).unwrap();
         assert_eq!(finish.unixmilli, unixmilli);
         assert_eq!(finish.signature, signature);
         assert!(
@@ -434,14 +472,9 @@ pub(super) mod tests {
                     .to_string(),
                 ),
             )]);
-            let registration = fetch_registration(
-                &http(),
-                &url,
-                realm,
-                &[0xfb, 0xff],
-                Instant::now() + TIMEOUT,
-            )
-            .unwrap();
+            let registration =
+                fetch_registration(&api(url, realm), &[0xfb, 0xff], Instant::now() + TIMEOUT)
+                    .unwrap();
             assert_eq!(registration.serial, "test-serial");
             assert_eq!(registration.enrolled, 123);
             assert!(registration.disabled && registration.expired && registration.superseded);
@@ -493,13 +526,13 @@ pub(super) mod tests {
             ),
         ] {
             let (url, _requests) = serve(vec![(Duration::ZERO, response(status, &body))]);
-            assert!(fetch_identity(&http(), &url, Instant::now() + TIMEOUT).is_err());
+            assert!(fetch_identity(&api(url, Realm::Hardware), Instant::now() + TIMEOUT).is_err());
         }
         let (url, _requests) = serve(vec![(
             Duration::ZERO,
             response(200, r#"{"unixmilli":123,"signature":"!"}"#),
         )]);
-        assert!(fetch_time(&http(), &url, &[1], Instant::now() + TIMEOUT).is_err());
+        assert!(fetch_time(&api(url, Realm::Hardware), &[1], Instant::now() + TIMEOUT).is_err());
     }
 
     /// A later HTTP request retains the original deadline. A stalled response
@@ -508,16 +541,19 @@ pub(super) mod tests {
     fn test_deadlines() {
         let body = r#"{"signer":"AA==","crypto":"AA=="}"#;
         let (url, _requests) = serve(vec![(Duration::ZERO, response(200, body))]);
-        let agent = http();
+        let cloud = api(url, Realm::Hardware);
         let deadline = Instant::now() + Duration::from_secs(1);
-        fetch_identity(&agent, &url, deadline).unwrap();
+        fetch_identity(&cloud, deadline).unwrap();
         thread::sleep(deadline.saturating_duration_since(Instant::now()));
-        let error = fetch_time(&agent, &url, &[1], deadline).unwrap_err();
+        let error = fetch_time(&cloud, &[1], deadline).unwrap_err();
         assert!(matches!(error, Failure::Wire(protocol::Error::Timeout)));
 
         let (url, _requests) = serve(vec![(Duration::from_secs(1), response(200, body))]);
         assert!(matches!(
-            fetch_identity(&agent, &url, Instant::now() + Duration::from_millis(50)),
+            fetch_identity(
+                &api(url, Realm::Hardware),
+                Instant::now() + Duration::from_millis(50)
+            ),
             Err(Failure::Wire(protocol::Error::Timeout))
         ));
     }

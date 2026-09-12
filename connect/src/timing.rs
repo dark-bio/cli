@@ -25,6 +25,11 @@ pub struct Timing {
 }
 
 impl Timing {
+    /// Passes the fixed operation bound to caller-owned authentication.
+    pub(crate) fn deadline(self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// Bounds a whole operation, or several operations sharing this value.
     pub fn until(deadline: Instant) -> Self {
         Self {

@@ -11,8 +11,8 @@ in Ark Companion. You cannot approve for them.
   and JSON events on stderr.
 - Nothing prompts when stdin is not a terminal, under --no-input, or in JSON
   mode. --yes confirms firmware installation; without it the command fails
-  with `confirmation-required`. A develop or staging package host may need a
-  browser login; without a terminal the command fails with `login-required`
+  with `confirmation-required`. A develop or staging cloud or package host may
+  need a browser login; without a terminal the command fails with `login-required`
   and the command to run. The owner still approves operations on the Ark when
   required.
 - Every command blocks until done and its exit code is the outcome. Run long
