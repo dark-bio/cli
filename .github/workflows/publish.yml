@@ -118,8 +118,6 @@ jobs:
 
   publish:
     needs: [ tests, prepare ]
-    # Enable after the crate is published manually and OIDC is configured.
-    if: ${{ false && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
 
     permissions:
@@ -132,17 +130,9 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
-      - name: Publish to crates.io
+      - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          status=$(curl --silent --show-error --retry 3 --output /dev/null --write-out '%{http_code}' \
-            "https://crates.io/api/v1/crates/darkbio-ark/${GITHUB_REF_NAME#v}")
-          case "$status" in
-            200) echo 'darkbio-ark is already published.' ;;
-            404) cargo publish --locked ;;
-            *) echo "Registry lookup failed: HTTP $status" >&2; exit 1 ;;
-          esac
 
   release:
     needs: [ tests, prepare ]
