@@ -1,13 +1,16 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Session ownership and typed request handles.
 
-use crate::cloud::{PackageAuth, Services};
+use crate::cloud::Services;
 use crate::incoming::{self, Incoming};
 use crate::{
-    Error, ExecutionProgress, Firmware, Identity, Registration, Request, Setup, UpdateProgress,
-    UploadProgress, dataset, execution,
+    Dataset, Error, ExecutionProgress, Firmware, Identity, Registration, Request, Setup, Timing,
+    UpdateProgress, UploadProgress, dataset, execution,
 };
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
@@ -88,7 +91,6 @@ impl Ark {
         Client {
             requester: self.requester.clone(),
             services: self.services.clone(),
-            package_auth: None,
         }
     }
 
@@ -144,16 +146,36 @@ impl Closer {
 pub struct Client {
     requester: Requester,    // Wire handle bound to the original session
     services: Arc<Services>, // Prerequisite state shared with the owner and other clients
-    package_auth: Option<Arc<PackageAuth>>, // Package credentials supplied by this caller
 }
 
 impl Client {
-    /// Sends a request and waits for its typed response under the supplied deadline.
-    /// The deadline covers prerequisite setup, queueing, sending and accepting
-    /// the response; decoding is outside it. Reuse it to bound several calls.
+    /// Sends a request and waits for its typed response under the chosen timing.
+    /// An absolute deadline covers setup, queueing, sending and accepting the
+    /// response; decoding is outside it. Reuse it to bound several calls.
+    /// An inactivity allowance is renewed for each prerequisite and the request.
     /// Expiration does not cancel an operation the Ark has already received.
-    pub fn call<R: Request>(&self, request: R, deadline: Instant) -> Result<R::Response, Error> {
-        self.send(request, deadline)?.wait()
+    /// A reserved UNAVAILABLE refusal is retried once after sync only if the
+    /// device reports lost cloud setup. Other refusals are returned unchanged.
+    pub fn call<R: Request>(
+        &self,
+        request: R,
+        timing: impl Into<Timing>,
+    ) -> Result<R::Response, Error> {
+        let timing = timing.into();
+        let request = request.into();
+        if matches!(R::SETUP, Setup::None) {
+            return self.send_message::<R>(request, timing)?.wait();
+        }
+        let result = self.send_message::<R>(request.clone(), timing)?.wait();
+        if matches!(&result, Err(Error::Remote(error)) if error.code == schema::ReservedErrors::Unavailable as u64)
+            && !self.services.synced(&self.requester, timing)?
+        {
+            // UNAVAILABLE refused the request before serving it. Only a reported
+            // loss of cloud setup permits one retry, never an application error.
+            self.sync(timing)?;
+            return self.send_message::<R>(request, timing)?.wait();
+        }
+        result
     }
 
     /// Sends a request and waits with a budget starting now. Use [`Self::call`]
@@ -163,7 +185,8 @@ impl Client {
         request: R,
         timeout: Duration,
     ) -> Result<R::Response, Error> {
-        self.send_timeout(request, timeout)?.wait()
+        let deadline = Instant::now().checked_add(timeout).ok_or(Error::Timeout)?;
+        self.call(request, deadline)
     }
 
     /// Establishes the request's prerequisites, then queues it without waiting for
@@ -175,19 +198,32 @@ impl Client {
     pub fn send<R: Request>(
         &self,
         request: R,
-        deadline: Instant,
+        timing: impl Into<Timing>,
     ) -> Result<Pending<R::Response>, Error> {
+        self.send_message::<R>(request.into(), timing.into())
+    }
+
+    fn send_message<R: Request>(
+        &self,
+        request: Message,
+        timing: Timing,
+    ) -> Result<Pending<R::Response>, Error> {
+        tracing::debug!("sending request {}", std::any::type_name::<R>());
         match R::SETUP {
             Setup::None => {}
-            Setup::Cloud => self.services.sync(&self.requester, deadline)?,
-            Setup::Relay => self.services.relay(&self.requester, deadline)?,
+            Setup::Cloud => self.services.sync(&self.requester, timing)?,
+            Setup::Relay => self.services.relay(&self.requester, timing)?,
         }
+        let deadline = R::WINDOW.map_or_else(|| timing.io(), |window| timing.window(window));
+        let setup = matches!(request, Message::DeviceInfoRequest(_))
+            .then(|| (self.services.clone(), Instant::now()));
         let promise = self
             .requester
             .request(request, deadline)
             .map_err(|error| self.services.wire_error(error))?;
         Ok(Pending {
             promise,
+            setup,
             response: PhantomData,
         })
     }
@@ -205,107 +241,99 @@ impl Client {
 
     /// Checks the cloud registry for this Ark, synchronizing first if
     /// necessary. Setup, proof generation and HTTP share the supplied deadline.
+    /// A refused proof triggers one refresh and a retry with a new proof.
     /// The returned registration may be inactive; its flags explain why.
-    pub fn genuine(&self, deadline: Instant) -> Result<Registration, Error> {
-        self.services.genuine(&self.requester, deadline)
+    pub fn genuine(&self, timing: impl Into<Timing>) -> Result<Registration, Error> {
+        self.services.genuine(&self.requester, timing.into())
     }
 
-    /// Lists published firmware for the selected environment, newest first.
-    /// Listing packages does not synchronize or change the device.
-    pub fn firmwares(&self, deadline: Instant) -> Result<Vec<Firmware>, Error> {
-        self.services
-            .firmwares(deadline, self.package_auth.as_deref())
-    }
-
-    /// Supplies authentication for package requests made through this handle and
-    /// its clones. The callback receives the package origin, an optional login
-    /// redirect and the operation deadline. It returns one HTTP header or None.
-    /// With no redirect it may return cached credentials; with a redirect it may
-    /// authenticate. It must respect the deadline and may run concurrently.
-    /// Requests retry once at the original origin; redirects are never followed.
-    /// Cloud API and relay requests do not use these credentials.
-    pub fn with_package_auth(
-        mut self,
-        auth: impl Fn(&str, Option<&str>, Instant) -> Result<Option<(String, String)>, Error>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        self.package_auth = Some(Arc::new(PackageAuth::new(auth)));
-        self
-    }
-
-    /// Authorizes, streams, verifies and installs firmware under one deadline.
+    /// Authorizes, streams, verifies and installs firmware under the chosen timing.
     /// The callback runs on this caller's thread. Success acknowledges installation;
     /// the Ark then reboots, and this call does not verify the subsequent boot.
     /// Failed updates are never replayed automatically. Raw firmware requests
     /// must not run concurrently with this operation.
+    /// A cloud proof rejection refreshes keys, then returns [`Error::ProofRejected`]
+    /// so the caller can start a new attempt with a new approval.
     pub fn update_firmware(
         &self,
         firmware: &Firmware,
-        deadline: Instant,
+        reader: &mut impl io::Read,
+        timing: impl Into<Timing>,
         progress: impl FnMut(UpdateProgress),
     ) -> Result<(), Error> {
-        self.services.update_firmware(
-            &self.requester,
-            firmware,
-            deadline,
-            progress,
-            self.package_auth.as_deref(),
-        )
+        self.services
+            .update_firmware(&self.requester, firmware, reader, timing.into(), progress)
     }
 
-    /// Identifies a dataset, obtains approval when required, streams its bytes
-    /// and waits for processing. The source must contain exactly `size` bytes.
-    /// The Ark selects the slot and decides whether to accept the upload.
-    ///
-    /// Cloud setup, approval, transfer and processing share the deadline. Reads
-    /// and callbacks run on this thread and must return promptly; a blocking
-    /// reader cannot be interrupted by the deadline. Failures attempt to cancel
-    /// the session within the remaining time and are never retried automatically.
-    pub fn upload_dataset(
+    /// Pairs an unpaired Ark through the cloud rendezvous. The caller presents
+    /// the rendezvous to the owner; the Ark authenticates every opaque exchange.
+    /// Authentication may refresh cloud keys and retry once. The pairing
+    /// exchange itself is never retried automatically.
+    pub fn pair(
+        &self,
+        timing: impl Into<Timing>,
+        progress: impl FnMut(crate::PairingProgress),
+    ) -> Result<(), Error> {
+        self.services.pair(&self.requester, timing.into(), progress)
+    }
+
+    /// Refreshes the cloud keys and signed clock explicitly. Other requests
+    /// synchronize lazily, reusing the Ark's reported setup while fresh.
+    pub fn sync(&self, timing: impl Into<Timing>) -> Result<(), Error> {
+        self.services.resync(&self.requester, timing.into())
+    }
+
+    /// Attaches the companion relay after sync, reusing an existing attachment.
+    pub fn attach_relay(&self, timing: impl Into<Timing>) -> Result<(), Error> {
+        self.services.relay(&self.requester, timing.into())
+    }
+
+    /// Identifies a dataset from its first MiB without opening an upload session.
+    /// Consumes that prefix from the reader; rewind it before uploading.
+    pub fn identify_dataset(
         &self,
         name: &str,
         size: u64,
         reader: &mut impl io::Read,
-        deadline: Instant,
-        progress: impl FnMut(UploadProgress),
-    ) -> Result<(), Error> {
-        self.services.sync(&self.requester, deadline)?;
-        dataset::upload(
-            &self.requester,
-            &dataset::Dataset {
+        timing: impl Into<Timing>,
+    ) -> Result<schema::SlotIdentifyResponse, Error> {
+        let timing = timing.into();
+        timing.check()?;
+        let mut chunk = vec![0; size.min(1024 * 1024) as usize];
+        reader.read_exact(&mut chunk).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                Error::Timeout
+            } else {
+                Error::DatasetRead(error)
+            }
+        })?;
+        timing.check()?;
+        self.call(
+            schema::SlotIdentifyRequest {
                 name: name.into(),
                 size,
-                reference: None,
+                chunk,
+                kinds: Vec::new(),
             },
-            reader,
-            deadline,
-            progress,
+            timing,
         )
     }
 
-    /// Downloads and uploads the reference advertised by a slot, checking its
-    /// exact size and SHA-256 before processing. Uses the same streaming and
-    /// cleanup rules as [`Self::upload_dataset`]. No package or cloud credentials
-    /// are sent to reference hosts; downloads and redirects require HTTPS.
-    pub fn upload_reference(
+    /// Streams exactly the declared bytes and waits for processing. The Ark
+    /// identifies the target when no slot is supplied. An expected SHA-256 is
+    /// checked before processing; no URLs, caching or retries are involved.
+    /// Reads and progress callbacks run on this thread and must return promptly.
+    /// Failures attempt cancellation without replacing the original error.
+    pub fn upload_dataset(
         &self,
-        slot: &schema::SlotStatus,
-        deadline: Instant,
-        mut progress: impl FnMut(UploadProgress),
+        dataset: &Dataset,
+        reader: &mut impl io::Read,
+        timing: impl Into<Timing>,
+        progress: impl FnMut(UploadProgress),
     ) -> Result<(), Error> {
-        let (source, url) = dataset::Dataset::reference(slot)?;
-        self.services.sync(&self.requester, deadline)?;
-        progress(UploadProgress::Downloading);
-        let mut response = dataset::download(&url, deadline)?;
-        dataset::upload(
-            &self.requester,
-            &source,
-            &mut response.body_mut().as_reader(),
-            deadline,
-            progress,
-        )
+        let timing = timing.into();
+        self.services.sync(&self.requester, timing)?;
+        dataset::upload(&self.requester, dataset, reader, timing, progress)
     }
 
     /// Uploads an app, obtains companion approval and waits for its result.
@@ -326,21 +354,15 @@ impl Client {
         &self,
         size: u64,
         reader: &mut impl io::Read,
-        deadline: Instant,
+        timing: impl Into<Timing>,
         progress: impl FnMut(ExecutionProgress),
     ) -> Result<schema::ExecutionResultResponse, Error> {
-        self.services.sync(&self.requester, deadline)?;
-        execution::execute(
-            &self.requester,
-            size,
-            reader,
-            deadline,
-            progress,
-            |taskid| {
-                self.call(schema::ExecutionScheduleRequest { taskid }, deadline)
-                    .map(drop)
-            },
-        )
+        let timing = timing.into();
+        self.services.sync(&self.requester, timing)?;
+        execution::execute(&self.requester, size, reader, timing, progress, |taskid| {
+            self.call(schema::ExecutionScheduleRequest { taskid }, timing)
+                .map(drop)
+        })
     }
 }
 
@@ -350,6 +372,8 @@ impl Client {
 pub struct Pending<T> {
     /// Encoded response and the notification registered for its completion.
     promise: Promise<Message>,
+    /// Device-info observations also inform this connection's lazy setup.
+    setup: Option<(Arc<Services>, Instant)>,
     /// Response type selected by the request, without owning a value of it.
     response: PhantomData<fn() -> T>,
 }
@@ -371,7 +395,13 @@ impl<T: TryFrom<Message, Error = protocol::Error>> Pending<T> {
     /// Waits for completion and decodes the expected response. An accepted
     /// response remains available after its deadline or the session's closure.
     pub fn wait(self) -> Result<T, Error> {
-        Ok(self.promise.wait()?)
+        let message = self.promise.wait::<Message>()?;
+        if let Some((services, requested)) = self.setup
+            && let Message::DeviceInfoResponse(info) = &message
+        {
+            services.reported(info, requested);
+        }
+        Ok(T::try_from(message)?)
     }
 }
 

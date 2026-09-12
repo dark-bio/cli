@@ -1,22 +1,24 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Carries opaque companion messages between the cloud socket and the Ark.
 
-use super::{Failure, dns};
-use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use super::{
+    Failure,
+    socket::{self, Socket, io_error, remaining, socket_error, socket_mut},
+};
 use darkbio_crypto::cbor::{self, Cbor};
 use darkbio_wire::protocol::{self, Promise, Requester, Responder, schema};
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use tungstenite::client::IntoClientRequest;
-use tungstenite::handshake::HandshakeError;
-use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -71,74 +73,9 @@ impl Relay {
         requester: Requester,
         deadline: Instant,
     ) -> Result<Self, Failure> {
-        let mut request = url.into_client_request().map_err(socket_error)?;
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            format!(
-                "Relaying, Dark-Auth|{}",
-                BASE64_URL_SAFE_NO_PAD.encode(auth)
-            )
-            .parse()
-            .expect("base64url is a valid header"),
-        );
-        let host = request
-            .uri()
-            .host()
-            .ok_or_else(|| Failure::Relay("relay URL has no host".into()))?
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned();
-        let port =
-            request
-                .uri()
-                .port_u16()
-                .unwrap_or(if request.uri().scheme_str() == Some("wss") {
-                    443
-                } else {
-                    80
-                });
-
-        let addresses = dns::resolve(&host, port, deadline)?;
-        let mut failure = io::Error::new(io::ErrorKind::AddrNotAvailable, "relay has no address");
-        let mut connected = None;
-        for address in addresses {
-            match TcpStream::connect_timeout(&address, remaining(deadline).map_err(io_error)?) {
-                Ok(stream) => {
-                    connected = Some(stream);
-                    break;
-                }
-                Err(error) => failure = error,
-            }
-        }
-        let stream = connected.ok_or_else(|| io_error(failure))?;
-        stream.set_nodelay(true).map_err(io_error)?;
-        let config = WebSocketConfig::default()
-            .write_buffer_size(0)
-            .max_write_buffer_size(2 * MAX_MESSAGE)
-            .max_message_size(Some(MAX_MESSAGE))
-            .max_frame_size(Some(MAX_MESSAGE));
-        let (mut socket, response) = tungstenite::client_tls_with_config(
-            request,
-            Socket::Handshake { stream, deadline },
-            Some(config),
-            None,
-        )
-        .map_err(|error| match error {
-            HandshakeError::Interrupted(_) => Failure::Wire(protocol::Error::Timeout),
-            HandshakeError::Failure(error) => socket_error(error),
-        })?;
-        if response
-            .headers()
-            .get("Sec-WebSocket-Protocol")
-            .and_then(|v| v.to_str().ok())
-            != Some("Relaying")
-        {
-            return Err(Failure::Relay(
-                "cloud did not select the Relaying subprotocol".into(),
-            ));
-        }
+        let mut socket = socket::connect(url, auth, "Relaying", deadline)?;
         remaining(deadline).map_err(io_error)?;
-        let Socket::Handshake { stream, .. } = socket_mut(&mut socket) else {
+        let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
             unreachable!()
         };
         stream.set_read_timeout(None).map_err(io_error)?;
@@ -247,79 +184,6 @@ impl Shared {
             }
             let _ = self.wake.wake();
         }
-    }
-}
-
-/// The socket's blocking handshake charges every read and write to one deadline.
-#[derive(Debug)]
-enum Socket {
-    Handshake {
-        stream: TcpStream,
-        deadline: Instant,
-    },
-    Connected(mio::net::TcpStream),
-}
-
-impl Read for Socket {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Handshake { stream, deadline } => {
-                stream.set_read_timeout(Some(remaining(*deadline)?))?;
-                stream.read(bytes)
-            }
-            Self::Connected(stream) => stream.read(bytes),
-        }
-    }
-}
-
-impl Write for Socket {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Handshake { stream, deadline } => {
-                stream.set_write_timeout(Some(remaining(*deadline)?))?;
-                stream.write(bytes)
-            }
-            Self::Connected(stream) => stream.write(bytes),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Handshake { stream, deadline } => {
-                stream.set_write_timeout(Some(remaining(*deadline)?))?;
-                stream.flush()
-            }
-            Self::Connected(stream) => stream.flush(),
-        }
-    }
-}
-
-/// Accesses the readiness adapter under either the cleartext test socket or TLS.
-fn socket_mut(socket: &mut WebSocket<MaybeTlsStream<Socket>>) -> &mut Socket {
-    match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream,
-        MaybeTlsStream::Rustls(stream) => &mut stream.sock,
-        _ => unreachable!("only plain and rustls sockets are enabled"),
-    }
-}
-
-pub(super) fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
-}
-
-pub(super) fn io_error(error: io::Error) -> Failure {
-    match error.kind() {
-        io::ErrorKind::TimedOut => Failure::Wire(protocol::Error::Timeout),
-        _ => Failure::Relay(error.to_string()),
-    }
-}
-
-fn socket_error(error: tungstenite::Error) -> Failure {
-    match error {
-        tungstenite::Error::Io(error) => io_error(error),
-        error => Failure::Relay(error.to_string()),
     }
 }
 
@@ -652,6 +516,7 @@ mod tests {
     use crate::cloud::tests::{TIMEOUT, attach, response};
     use crate::testing::{Peer, answering};
     use crate::{Error, schema::host_to_ark::Content};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tungstenite::handshake::server::{Request, Response};
@@ -758,6 +623,23 @@ mod tests {
             move |session, request, responder| {
                 let deadline = Instant::now() + TIMEOUT;
                 match request {
+                    Content::DeviceInfo(_) => {
+                        let clock = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        responder
+                            .reply(
+                                schema::DeviceInfoResponse {
+                                    cloud_clock: clock,
+                                    cloud_synced: syncs.load(Ordering::SeqCst) > 0,
+                                    ..Default::default()
+                                },
+                                deadline,
+                            )
+                            .unwrap();
+                    }
+
                     Content::CloudSyncStart(request) => {
                         assert_eq!(request.signer, [1]);
                         assert_eq!(request.crypto, [2]);
@@ -1256,7 +1138,7 @@ mod tests {
             let deadline = Instant::now() + TIMEOUT;
             let error = client.call(schema::UnlockRequest {}, deadline).unwrap_err();
             if refused {
-                assert!(matches!(error, Error::Relay(_)));
+                assert!(matches!(error, Error::Cloud(message) if message.contains("503")));
             } else {
                 assert!(
                     matches!(error, Error::Remote(error) if error.code == schema::ReservedErrors::Unavailable as u64)

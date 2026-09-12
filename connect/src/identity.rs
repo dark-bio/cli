@@ -1,5 +1,8 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Device authentication through wire's verifier and the enabled roots of trust.
 //! The returned identity records whether the peer was attested, self-signed or pinned.
@@ -9,6 +12,7 @@ use darkbio_trust as trust;
 use darkbio_trust::Environment;
 use darkbio_trust::device::Device;
 use darkbio_wire::transport::{Attestation, Verifier};
+use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Known environments. Disabled features leave their root sets empty.
@@ -70,6 +74,16 @@ impl Verifier for TrustMode {
 
     /// Verifies the attestation or returns the pinned key selected for recovery.
     fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Identity), String> {
+        self.verify_identity(attestation, &Cell::new(None))
+    }
+}
+
+impl TrustMode {
+    fn verify_identity(
+        &self,
+        attestation: &Attestation,
+        excluded: &Cell<Option<Environment>>,
+    ) -> Result<(xdsa::PublicKey, Identity), String> {
         // Recovery authenticates key possession without consulting the attestation.
         if let TrustMode::Recover(key) = self {
             return Ok((*key.clone(), Identity::Recovered(*key.clone())));
@@ -100,7 +114,7 @@ impl Verifier for TrustMode {
         let key =
             trust::device::verify_self_signed(attestation.as_bytes()).map_err(|err| {
                 match (err, untrusted) {
-                    (trust::Error::NotSelfSigned, Some(err)) => signer_error(err),
+                    (trust::Error::NotSelfSigned, Some(err)) => signer_error(err, excluded),
                     (err, _) => err.to_string(),
                 }
             })?;
@@ -109,7 +123,7 @@ impl Verifier for TrustMode {
 }
 
 /// Gives the required build feature for an excluded device root.
-fn signer_error(error: trust::Error) -> String {
+fn signer_error(error: trust::Error, excluded: &Cell<Option<Environment>>) -> String {
     if let trust::Error::UntrustedSigner {
         root: Some(root), ..
     } = &error
@@ -120,12 +134,41 @@ fn signer_error(error: trust::Error) -> String {
         && trust::roots::hardware(root.env).is_empty()
         && trust::roots::emulator(root.env).is_empty()
     {
+        excluded.set(Some(root.env));
         return format!(
             "{} support is disabled; rebuild with --features {}",
             root.env, root.env,
         );
     }
     error.to_string()
+}
+
+/// Retains the trust outcome across wire's string-only verifier error boundary.
+pub(crate) struct Verification<'a> {
+    policy: &'a TrustMode,
+    excluded: Cell<Option<Environment>>,
+}
+
+impl<'a> Verification<'a> {
+    pub(crate) fn new(policy: &'a TrustMode) -> Self {
+        Self {
+            policy,
+            excluded: Cell::new(None),
+        }
+    }
+
+    pub(crate) fn error(&self, err: crate::Error) -> crate::Error {
+        self.excluded.get().map_or(err, crate::Error::Untrusted)
+    }
+}
+
+impl Verifier for Verification<'_> {
+    type Info = Identity;
+
+    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Identity), String> {
+        self.excluded.set(None);
+        self.policy.verify_identity(attestation, &self.excluded)
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +231,9 @@ mod tests {
             envelope.protected = cbor::encode(&header).unwrap();
             let forged = Attestation::new(cbor::encode(&envelope).unwrap()).unwrap();
             let error = TrustMode::RootOrSelf.verify(&forged).err().unwrap();
+            let verifier = Verification::new(&TrustMode::RootOrSelf);
+            assert!(verifier.verify(&forged).is_err());
+            let typed = verifier.error(crate::Error::Closed);
 
             let trusted = match root.role {
                 trust::roots::Role::DeviceAttester => !trust::roots::hardware(root.env).is_empty(),
@@ -197,14 +243,17 @@ mod tests {
                 _ => false,
             };
             if trusted {
+                assert!(matches!(typed, crate::Error::Closed));
                 assert!(error.starts_with("cwt:"), "{error}");
                 assert!(!error.contains("--features"));
             } else {
                 if root.role == trust::roots::Role::CloudAttester {
+                    assert!(matches!(typed, crate::Error::Closed));
                     assert!(error.contains(fingerprint), "{error}");
                     assert!(error.contains(&root.to_string()), "{error}");
                     assert!(!error.contains("--features"));
                 } else {
+                    assert!(matches!(typed, crate::Error::Untrusted(env) if env == root.env));
                     assert_eq!(
                         error,
                         format!(

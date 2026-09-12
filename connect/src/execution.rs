@@ -1,9 +1,12 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! App uploads, companion authorization and execution results.
 
-use crate::{Error, schema};
+use crate::{Error, Timing, schema};
 use darkbio_wire::protocol::{Message, Promise, Requester};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
@@ -33,10 +36,11 @@ pub(crate) fn execute(
     requester: &Requester,
     size: u64,
     reader: &mut impl Read,
-    deadline: Instant,
+    timing: impl Into<Timing>,
     mut progress: impl FnMut(ExecutionProgress),
     schedule: impl FnOnce(u64) -> Result<(), Error>,
 ) -> Result<schema::ExecutionResultResponse, Error> {
+    let timing = timing.into();
     if size == 0 {
         return Err(Error::Execution("app is empty".into()));
     }
@@ -44,7 +48,7 @@ pub(crate) fn execute(
     let taskid = requester
         .request(
             schema::ExecutionUploadStartRequest { bytes: size },
-            deadline,
+            timing.io(),
         )?
         .wait::<schema::ExecutionUploadStartResponse>()?
         .taskid;
@@ -58,18 +62,18 @@ pub(crate) fn execute(
         let mut uploaded = 0;
         let mut pending: Option<(Promise<Message>, u64)> = None;
         while sent < size {
-            remaining(deadline)?;
+            timing.check()?;
             let bytes = (size - sent).min(CHUNK_SIZE as u64) as usize;
             let mut chunk = vec![0; bytes];
             reader.read_exact(&mut chunk).map_err(read_error)?;
-            remaining(deadline)?;
+            timing.check()?;
             sent += bytes as u64;
             if sent == size {
-                finish_read(reader, deadline)?;
+                finish_read(reader, timing)?;
             }
             let next = requester.request(
                 schema::ExecutionUploadChunkRequest { taskid, chunk },
-                deadline,
+                timing.io(),
             )?;
             if let Some((previous, bytes)) = pending.take() {
                 previous.wait::<schema::ExecutionUploadChunkResponse>()?;
@@ -97,18 +101,18 @@ pub(crate) fn execute(
                 elapsed: started.elapsed(),
             });
             let status = requester
-                .request(schema::ExecutionStatusRequest { taskid }, deadline)?
+                .request(schema::ExecutionStatusRequest { taskid }, timing.io())?
                 .wait::<schema::ExecutionStatusResponse>()?;
             match (status.pending, status.result) {
                 (false, Some(result)) => return Ok(result),
                 (true, None) => {}
                 _ => return Err(Error::Execution("invalid execution status".into())),
             }
-            std::thread::sleep(POLL_INTERVAL.min(remaining(deadline)?));
+            timing.pause(POLL_INTERVAL)?;
         }
     })();
     if result.is_err() {
-        let cleanup = deadline.min(Instant::now() + Duration::from_secs(1));
+        let cleanup = timing.io().min(Instant::now() + Duration::from_secs(1));
         let _ = requester
             .request(schema::ExecutionCancelRequest { taskid }, cleanup)
             .and_then(|pending| pending.wait::<schema::ExecutionCancelResponse>());
@@ -116,18 +120,11 @@ pub(crate) fn execute(
     result
 }
 
-fn remaining(deadline: Instant) -> Result<Duration, Error> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or(Error::Timeout)
-}
-
 /// Check EOF before the final chunk so a growing or misdeclared source never
 /// reaches scheduling. Interrupted reads do not indicate the end of a file.
-fn finish_read(reader: &mut impl Read, deadline: Instant) -> Result<(), Error> {
+fn finish_read(reader: &mut impl Read, timing: Timing) -> Result<(), Error> {
     loop {
-        remaining(deadline)?;
+        timing.check()?;
         match reader.read(&mut [0]) {
             Ok(0) => break,
             Ok(_) => return Err(Error::Execution("app exceeds its advertised size".into())),
@@ -135,7 +132,7 @@ fn finish_read(reader: &mut impl Read, deadline: Instant) -> Result<(), Error> {
             Err(error) => return Err(read_error(error)),
         }
     }
-    remaining(deadline)?;
+    timing.check()?;
     Ok(())
 }
 

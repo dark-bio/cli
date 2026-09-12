@@ -1,5 +1,8 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Arks over USB, the wire's byte stream on the bulk endpoints of the vendor
 //! interface a plugged in Ark enumerates with. The host claims the interface

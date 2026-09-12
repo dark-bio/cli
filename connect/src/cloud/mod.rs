@@ -1,24 +1,46 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Cloud prerequisites and registry checks for an Ark connection.
 
 mod dns;
 mod firmware;
 mod http;
+mod pairing;
+pub use pairing::PairingProgress;
 mod relay;
+mod socket;
 
 pub use firmware::{Firmware, UpdateProgress};
-pub(crate) use http::PackageAuth;
 pub use http::Registration;
 
 use crate::schema::{
     GenuinityProofRequest, RelayArkToAppRequest, RelayJoinRequest, RelayJoinResponse,
 };
-use crate::{Error, Identity};
+use crate::{Error, Identity, Timing};
 use darkbio_wire::protocol::{self, Requester, Responder};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Whether the reported cloud identity and clock can be reused for a request.
+/// Sync is needed before the first use or at 15 seconds of clock drift, leaving
+/// margin within the cloud's 30-second signature skew allowance. Key rotation
+/// is detected by a refused proof; the marker only records setup since boot.
+pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    synced_at(info, now)
+}
+
+fn synced_at(info: &crate::schema::DeviceInfoResponse, now: u64) -> bool {
+    info.cloud_synced && info.cloud_clock.abs_diff(now) < 15
+}
 
 /// Setup state shared by every client of one connection. Network and device I/O
 /// run outside its lock so independent requests and closure remain available.
@@ -32,23 +54,26 @@ pub(crate) struct Services {
 /// Initialization progresses once at a time and becomes reusable only on success.
 #[derive(Debug, Default)]
 struct State {
-    synced: bool,                   // Whether an automatic sync completed on this connection
-    error: Option<protocol::Error>, // Why the owning wire session ended
-    syncing: Option<Arc<Attempt>>,  // Cloud sync joined by concurrent callers
-    relay: Option<relay::Relay>,    // Relay attached lazily to this connection
-    joining: Option<Arc<Attempt>>,  // Relay attachment joined by concurrent callers
+    synced: Option<(Instant, bool)>, // Last sync decision and when it was observed
+    error: Option<protocol::Error>,  // Why the owning wire session ended
+    syncing: Option<Arc<Attempt>>,   // Cloud sync joined by concurrent callers
+    relay: Option<relay::Relay>,     // Relay attached lazily to this connection
+    joining: Option<Arc<Attempt>>,   // Relay attachment joined by concurrent callers
 }
 
 /// One attempt's outcome, retained by its waiters even after a retry starts.
 #[derive(Debug, Default)]
 struct Attempt {
     result: Mutex<Option<Result<(), Failure>>>, // Shared success or the original failure
+    refreshed: AtomicBool,                      // This attempt exchanged keys and signed time
     ready: Condvar,                             // Wakes waiters on completion or closure
 }
 
 /// Failures shareable between callers joining the same initialization attempt.
 #[derive(Clone, Debug)]
 enum Failure {
+    MissingEnvironment,
+    ProofRejected,
     Cloud(String),         // HTTP or response decoding failure
     Relay(String),         // Relay connection or envelope failure
     Wire(protocol::Error), // Device failure, retaining remote codes and disconnect reasons
@@ -69,6 +94,8 @@ impl From<protocol::Error> for Failure {
 impl From<Failure> for Error {
     fn from(error: Failure) -> Self {
         match error {
+            Failure::MissingEnvironment => Self::MissingEnvironment,
+            Failure::ProofRejected => Self::ProofRejected,
             Failure::Cloud(error) => Self::Cloud(error),
             Failure::Relay(error) => Self::Relay(error),
             Failure::Wire(error) => error.into(),
@@ -100,39 +127,67 @@ impl Services {
         }
     }
 
-    /// Synchronizes once per connection. Each caller bounds its own wait, and
-    /// the caller starting the exchange supplies its I/O deadline.
-    pub(crate) fn sync(&self, requester: &Requester, deadline: Instant) -> Result<(), Error> {
-        self.ensure(requester, Step::Sync, deadline)
+    /// Reuses fresh device state, caching that decision for one minute. Each
+    /// caller bounds its own wait; only one exchange runs at a time.
+    pub(crate) fn sync(
+        &self,
+        requester: &Requester,
+        timing: impl Into<Timing>,
+    ) -> Result<(), Error> {
+        self.ensure(requester, Step::Sync, timing.into())
+            .map_err(Into::into)
+    }
+
+    /// An explicit diagnostic refresh invalidates the reused setup, joining an
+    /// exchange already in flight if another caller is synchronizing.
+    pub(crate) fn resync(&self, requester: &Requester, timing: Timing) -> Result<(), Error> {
+        self.ensure(requester, Step::Refresh, timing)
+            .map_err(Into::into)
     }
 
     /// Attaches the relay after cloud sync, reusing a healthy connection. A
     /// failed relay is replaced on the next call without replaying any operation.
-    pub(crate) fn relay(&self, requester: &Requester, deadline: Instant) -> Result<(), Error> {
-        self.sync(requester, deadline)?;
-        self.ensure(requester, Step::Relay, deadline)
+    pub(crate) fn relay(
+        &self,
+        requester: &Requester,
+        timing: impl Into<Timing>,
+    ) -> Result<(), Error> {
+        let timing = timing.into();
+        self.sync(requester, timing)?;
+        self.ensure(requester, Step::Relay, timing)
+            .map_err(Into::into)
     }
 
     /// Serializes one prerequisite while allowing unrelated device traffic.
-    fn ensure(&self, requester: &Requester, step: Step, deadline: Instant) -> Result<(), Error> {
+    fn ensure(&self, requester: &Requester, step: Step, timing: Timing) -> Result<(), Failure> {
+        let deadline = timing.io();
         let (attempt, leader) = {
             let mut state = self.state.lock().expect("cloud setup not poisoned");
             if let Some(error) = &state.error {
                 return Err(error.clone().into());
             }
             match step {
-                _ if self.cloud.is_none() => return Err(Error::MissingEnvironment),
-                Step::Sync if state.synced => return Ok(()),
+                _ if self.cloud.is_none() => return Err(Failure::MissingEnvironment),
+                Step::Sync
+                    if state.synced.is_some_and(|(at, synced)| {
+                        synced && at.elapsed() < Duration::from_secs(60)
+                    }) =>
+                {
+                    return Ok(());
+                }
                 Step::Relay if state.relay.as_ref().is_some_and(relay::Relay::connected) => {
                     return Ok(());
                 }
                 _ => {}
             }
             if Instant::now() >= deadline {
-                return Err(Error::Timeout);
+                return Err(protocol::Error::Timeout.into());
+            }
+            if matches!(step, Step::Refresh) {
+                state.synced = None;
             }
             let pending = match step {
-                Step::Sync => &mut state.syncing,
+                Step::Sync | Step::Refresh => &mut state.syncing,
                 Step::Relay => &mut state.joining,
             };
             match pending {
@@ -145,11 +200,21 @@ impl Services {
             }
         };
         if !leader {
-            return attempt.wait(deadline).map_err(Into::into);
+            attempt.wait(deadline)?;
+            return if matches!(step, Step::Refresh) && !attempt.refreshed.load(Ordering::Acquire) {
+                self.ensure(requester, step, timing)
+            } else {
+                Ok(())
+            };
         }
         let result = match step {
-            Step::Sync => self.synchronize(requester, deadline).map(|()| None),
-            Step::Relay => self.join(requester, deadline).map(Some),
+            Step::Sync | Step::Refresh => self
+                .synchronize(requester, timing, matches!(step, Step::Refresh))
+                .map(|refreshed| {
+                    attempt.refreshed.store(refreshed, Ordering::Release);
+                    None
+                }),
+            Step::Relay => self.join(requester, timing).map(Some),
         };
         let mut state = self.state.lock().expect("cloud setup not poisoned");
         let result = if let Some(error) = &state.error {
@@ -157,36 +222,58 @@ impl Services {
         } else {
             result.and_then(|relay| {
                 match step {
-                    Step::Sync => state.synced = true,
+                    Step::Sync | Step::Refresh => {
+                        state.synced = Some((Instant::now(), true));
+                    }
                     Step::Relay => {
                         let mut relay = relay.expect("relay setup returned an attachment");
                         relay.start()?;
                         state.relay = Some(relay);
+                        tracing::info!(target: "darkbio_connect::setup", "relay attached");
                     }
                 }
                 Ok(())
             })
         };
         match step {
-            Step::Sync => state.syncing = None,
+            Step::Sync | Step::Refresh => state.syncing = None,
             Step::Relay => state.joining = None,
         }
         attempt.finish(result.clone());
-        result.map_err(Into::into)
+        result
     }
 
     /// Authenticates relay attachment with a fresh authorization from the Ark.
-    fn join(&self, requester: &Requester, deadline: Instant) -> Result<relay::Relay, Failure> {
+    fn join(&self, requester: &Requester, timing: Timing) -> Result<relay::Relay, Failure> {
         let cloud = self.cloud.as_ref().expect("cloud route available");
-        let joined = requester
-            .request(RelayJoinRequest {}, deadline)?
-            .wait::<RelayJoinResponse>()?;
-        relay::Relay::connect(
-            &cloud.relay_url(),
-            &joined.auth,
-            requester.clone(),
-            deadline,
-        )
+        self.authenticate(requester, timing, || {
+            let joined = requester
+                .request(RelayJoinRequest {}, timing.io())?
+                .wait::<RelayJoinResponse>()?;
+            relay::Relay::connect(
+                &cloud.relay_url(),
+                &joined.auth,
+                requester.clone(),
+                timing.io(),
+            )
+        })
+    }
+
+    /// A cloud key can rotate while the Ark still reports sync. Refresh once
+    /// after a refused proof, then obtain a new proof for the same authentication.
+    /// Callers must stop here before any pairing, approval or transfer begins.
+    fn authenticate<T>(
+        &self,
+        requester: &Requester,
+        timing: Timing,
+        mut attempt: impl FnMut() -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let result = attempt();
+        if matches!(result, Err(Failure::ProofRejected)) {
+            self.ensure(requester, Step::Refresh, timing)?;
+            return attempt();
+        }
+        result
     }
 
     /// Attaches on demand when the Ark conditionally needs authorization. Wire
@@ -220,29 +307,79 @@ impl Services {
     pub(crate) fn genuine(
         &self,
         requester: &Requester,
-        deadline: Instant,
+        timing: Timing,
     ) -> Result<Registration, Error> {
         let cloud = self.cloud.as_ref().ok_or(Error::MissingEnvironment)?;
-        self.sync(requester, deadline)?;
-        let proof = requester
-            .request(GenuinityProofRequest {}, deadline)?
-            .wait::<crate::schema::GenuinityProofResponse>()?;
-        cloud.genuine(&proof.proof, deadline).map_err(Into::into)
+        self.sync(requester, timing)?;
+        self.authenticate(requester, timing, || {
+            let proof = requester
+                .request(GenuinityProofRequest {}, timing.io())?
+                .wait::<crate::schema::GenuinityProofResponse>()?;
+            cloud.genuine(&proof.proof, timing.io())
+        })
+        .map_err(Into::into)
     }
 
     /// Exchanges cloud keys and signed time with raw wire requests, bypassing
     /// the prerequisite gate that this exchange is completing.
-    fn synchronize(&self, requester: &Requester, deadline: Instant) -> Result<(), Failure> {
+    fn synchronize(
+        &self,
+        requester: &Requester,
+        timing: Timing,
+        force: bool,
+    ) -> Result<bool, Failure> {
+        if !force {
+            let reported = self
+                .state
+                .lock()
+                .expect("cloud setup not poisoned")
+                .synced
+                .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
+                .map(|(_, synced)| synced);
+            let synced = match reported {
+                Some(synced) => synced,
+                None => self.synced(requester, timing)?,
+            };
+            if synced {
+                tracing::debug!(target: "darkbio_connect::setup", "reusing device cloud synchronization");
+                return Ok(false);
+            }
+        }
         let cloud = self.cloud.as_ref().expect("cloud route available");
-        let identity = cloud.identity(deadline)?;
+        let identity = cloud.identity(timing.io())?;
         let started = requester
-            .request(identity, deadline)?
+            .request(identity, timing.io())?
             .wait::<crate::schema::CloudSyncStartResponse>()?;
-        let time = cloud.time(&started.challenge, deadline)?;
+        let time = cloud.time(&started.challenge, timing.io())?;
         requester
-            .request(time, deadline)?
+            .request(time, timing.io())?
             .wait::<crate::schema::CloudSyncFinishResponse>()?;
-        Ok(())
+        tracing::info!(target: "darkbio_connect::setup", "cloud synchronized");
+        Ok(true)
+    }
+
+    /// Checks device state without a cloud request or a cached host decision.
+    pub(crate) fn synced(
+        &self,
+        requester: &Requester,
+        timing: Timing,
+    ) -> Result<bool, protocol::Error> {
+        let info = requester
+            .request(crate::schema::DeviceInfoRequest {}, timing.io())?
+            .wait::<crate::schema::DeviceInfoResponse>()?;
+        Ok(cloud_synced(&info))
+    }
+
+    /// Reuses device info already requested by the caller. A delayed response
+    /// must not overwrite a newer observation or an active sync exchange.
+    pub(crate) fn reported(&self, info: &crate::schema::DeviceInfoResponse, requested: Instant) {
+        let mut state = self.state.lock().expect("cloud setup not poisoned");
+        if state.error.is_none()
+            && state.syncing.is_none()
+            && state.synced.is_none_or(|(at, _)| at < requested)
+        {
+            state.synced = Some((requested, cloud_synced(info)));
+        }
     }
 
     /// Ends setup and relay traffic when the owning connection closes.
@@ -273,6 +410,7 @@ impl Services {
 #[derive(Clone, Copy)]
 enum Step {
     Sync,
+    Refresh,
     Relay,
 }
 
@@ -635,6 +773,8 @@ pub(crate) mod tests {
                 let mut responses = sync_responses();
                 responses.push((Duration::ZERO, response(200, r#"{"serial":"registry-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)));
                 responses.push((Duration::ZERO, response(403, "registry refused proof")));
+                responses.extend(sync_responses());
+                responses.push((Duration::ZERO, response(403, "registry refused proof")));
                 let (url, requests) = serve(responses);
                 let (mut peer, starts, proofs) = peer(false);
                 let policy = if recover {
@@ -665,9 +805,12 @@ pub(crate) mod tests {
                 let registration = client.genuine(deadline).unwrap();
                 assert_eq!(registration.serial, "registry-serial");
                 assert!(registration.active());
-                assert!(matches!(client.genuine(deadline), Err(Error::Cloud(_))));
-                assert_eq!(starts.load(Ordering::SeqCst), 1);
-                assert_eq!(proofs.load(Ordering::SeqCst), 2);
+                assert!(matches!(
+                    client.genuine(deadline),
+                    Err(Error::ProofRejected)
+                ));
+                assert_eq!(starts.load(Ordering::SeqCst), 2);
+                assert_eq!(proofs.load(Ordering::SeqCst), 3);
 
                 let registry = match realm {
                     Realm::Hardware => "/v1/genuine",
@@ -678,11 +821,337 @@ pub(crate) mod tests {
                     "/v1/cloudsync/time?challenge=03",
                     registry,
                     registry,
+                    "/v1/cloudsync/identity",
+                    "/v1/cloudsync/time?challenge=03",
+                    registry,
                 ] {
                     let request = requests.recv_timeout(TIMEOUT).unwrap();
                     assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_sync_freshness() {
+        use crate::schema::DeviceInfoResponse;
+        for (synced, clock, expected) in [
+            (false, 0, false),
+            (false, 1000, false),
+            (true, 0, false),
+            (true, 1000, true),
+            (true, 985, false),
+            (true, 986, true),
+            (true, 1014, true),
+            (true, 1015, false),
+        ] {
+            assert_eq!(
+                synced_at(
+                    &DeviceInfoResponse {
+                        cloud_synced: synced,
+                        cloud_clock: clock,
+                        ..Default::default()
+                    },
+                    1000
+                ),
+                expected,
+                "synced {synced}, clock {clock}"
+            );
+        }
+    }
+
+    /// A refused authentication refreshes the cloud identity and obtains a new
+    /// proof once. Other HTTP failures and a second refusal keep their errors.
+    #[test]
+    fn test_authentication_refresh() {
+        use crate::schema;
+        for operation in ["genuine", "relaying", "pairing"] {
+            for (status, retried) in [(400, 400), (403, 403), (403, 200), (503, 503)] {
+                if retried == 200 && operation != "genuine" {
+                    continue;
+                }
+                let mut responses = vec![(Duration::ZERO, response(status, "refused"))];
+                if status == 403 {
+                    responses.extend(sync_responses());
+                    responses.push((Duration::ZERO, response(retried, if retried == 200 {
+                        r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#
+                    } else { "still refused" })));
+                }
+                let (url, requests) = serve(responses);
+                let proofs = Arc::new(AtomicUsize::new(0));
+                let mut peer = Peer::spawn(Box::new({
+                    let proofs = proofs.clone();
+                    let mut refreshed = false;
+                    move |_, request, responder| {
+                        let deadline = Instant::now() + TIMEOUT;
+                        let proof = vec![u8::from(refreshed)];
+                        let response: protocol::Message = match request {
+                            Content::DeviceInfo(_) => schema::DeviceInfoResponse {
+                                cloud_synced: true,
+                                cloud_clock: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                ..Default::default()
+                            }
+                            .into(),
+                            Content::CloudSyncStart(_) => {
+                                schema::CloudSyncStartResponse { challenge: vec![3] }.into()
+                            }
+                            Content::CloudSyncFinish(_) => {
+                                refreshed = true;
+                                schema::CloudSyncFinishResponse { accepted: 123 }.into()
+                            }
+                            Content::GenuinityProof(_) => {
+                                proofs.fetch_add(1, Ordering::SeqCst);
+                                schema::GenuinityProofResponse { proof }.into()
+                            }
+                            Content::RelayJoin(_) => {
+                                proofs.fetch_add(1, Ordering::SeqCst);
+                                schema::RelayJoinResponse { auth: proof }.into()
+                            }
+                            Content::PairingAuth(_) => {
+                                proofs.fetch_add(1, Ordering::SeqCst);
+                                schema::PairingAuthResponse {
+                                    auth: proof,
+                                    fprint: vec![8; 32],
+                                }
+                                .into()
+                            }
+                            other => panic!("unexpected request: {other:?}"),
+                        };
+                        responder.reply(response, deadline).unwrap();
+                        true
+                    }
+                }));
+                let ark = attach(&mut peer, url);
+                let client = ark.client();
+                let deadline = Instant::now() + TIMEOUT;
+                let result = match operation {
+                    "genuine" => client.genuine(deadline).map(drop),
+                    "relaying" => client.attach_relay(deadline),
+                    "pairing" => {
+                        client.pair(deadline, |_| panic!("pairing began before authentication"))
+                    }
+                    _ => unreachable!(),
+                };
+                if retried == 200 {
+                    result.unwrap();
+                } else if status == 403 {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, Error::ProofRejected), "{error:?}");
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, Error::Cloud(_)), "{error:?}");
+                }
+                let requests: Vec<_> = requests.try_iter().collect();
+                assert!(requests[0].starts_with(&format!("GET /v1/{operation} ")));
+                assert_eq!(
+                    proofs.load(Ordering::SeqCst),
+                    if status == 403 { 2 } else { 1 }
+                );
+                assert_eq!(requests.len(), if status == 403 { 4 } else { 1 });
+                if status == 403 {
+                    assert!(requests[1].contains("/cloudsync/identity"));
+                    assert!(requests[2].contains("/cloudsync/time"));
+                    assert!(requests[3].starts_with(&format!("GET /v1/{operation} ")));
+                    let auth = if operation == "genuine" {
+                        "dark-auth: "
+                    } else {
+                        "Dark-Auth|"
+                    };
+                    assert!(
+                        requests[0].contains(&format!("{auth}AA")),
+                        "{}",
+                        requests[0]
+                    );
+                    assert!(
+                        requests[3].contains(&format!("{auth}AQ")),
+                        "{}",
+                        requests[3]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reusing device state needs no HTTP, while explicit diagnostics always
+    /// refresh it. Dataset paths remain the exact text produced by the Ark.
+    #[test]
+    fn test_reported_sync_and_explicit_refresh() {
+        use crate::schema;
+        for initially_synced in [false, true] {
+            let mut responses = sync_responses();
+            if !initially_synced {
+                responses.extend(sync_responses());
+            }
+            let (url, requests) = serve(responses);
+            let infos = Arc::new(AtomicUsize::new(0));
+            let mut peer = Peer::spawn(Box::new({
+                let infos = infos.clone();
+                let mut synced = initially_synced;
+                move |session, request, responder| {
+                    let deadline = Instant::now() + TIMEOUT;
+                    let response: protocol::Message = match request {
+                        Content::DeviceInfo(_) => {
+                            infos.fetch_add(1, Ordering::SeqCst);
+                            let clock = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            schema::DeviceInfoResponse {
+                                cloud_clock: clock,
+                                cloud_synced: synced,
+                                ..Default::default()
+                            }
+                            .into()
+                        }
+                        Content::DatasetPaths(_) => {
+                            assert!(synced, "request served before sync");
+                            schema::DatasetPathsResponse {
+                                readme: "# Paths\n\n/v1/README.md\n".into(),
+                            }
+                            .into()
+                        }
+                        Content::CloudSyncStart(_) => {
+                            schema::CloudSyncStartResponse { challenge: vec![3] }.into()
+                        }
+                        Content::CloudSyncFinish(_) => {
+                            synced = true;
+                            schema::CloudSyncFinishResponse { accepted: 123 }.into()
+                        }
+                        other => return answering(session, other, responder),
+                    };
+                    responder.reply(response, deadline).unwrap();
+                    true
+                }
+            }));
+            let ark = attach(&mut peer, url);
+            let client = ark.client();
+            let deadline = Instant::now() + TIMEOUT;
+            let info = client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
+            assert_eq!(info.cloud_synced, initially_synced);
+            for _ in 0..2 {
+                let paths = client
+                    .call(schema::DatasetPathsRequest {}, deadline)
+                    .unwrap();
+                assert_eq!(paths.readme, "# Paths\n\n/v1/README.md\n");
+            }
+            assert_eq!(infos.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                requests.try_iter().count(),
+                if initially_synced { 0 } else { 2 }
+            );
+            client.sync(deadline).unwrap();
+            assert!(
+                requests
+                    .recv_timeout(TIMEOUT)
+                    .unwrap()
+                    .contains("/cloudsync/identity")
+            );
+            assert!(
+                requests
+                    .recv_timeout(TIMEOUT)
+                    .unwrap()
+                    .contains("/cloudsync/time")
+            );
+            assert_eq!(infos.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// Waiting on an older status response must not undo a completed refresh.
+    #[test]
+    fn test_delayed_device_info_retains_newer_sync() {
+        let (url, requests) = serve(sync_responses());
+        let (mut peer, starts, _) = peer(false);
+        let ark = attach(&mut peer, url);
+        let client = ark.client();
+        let deadline = Instant::now() + TIMEOUT;
+        let pending = client.send(DeviceInfoRequest {}, deadline).unwrap();
+        client.sync(deadline).unwrap();
+        assert!(!pending.wait().unwrap().cloud_synced);
+        client
+            .call(crate::schema::SlotListRequest {}, deadline)
+            .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.try_iter().count(), 2);
+    }
+
+    /// A core restart can invalidate setup without losing the wire session.
+    /// Retry only its reserved refusal and only with evidence of lost sync.
+    #[test]
+    fn test_unavailable_retry_requires_lost_sync() {
+        use crate::schema::{self, ReservedErrors};
+        for (code, reset, repeat, retries) in [
+            (ReservedErrors::Unavailable as u64, true, false, 1),
+            (ReservedErrors::Unavailable as u64, true, true, 1),
+            (ReservedErrors::Unavailable as u64, false, false, 0),
+            (ReservedErrors::Unauthorized as u64, true, false, 0),
+            (0x1234, true, false, 0),
+        ] {
+            let (url, requests) = serve(if retries == 1 {
+                sync_responses()
+            } else {
+                vec![]
+            });
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut peer = Peer::spawn(Box::new({
+                let count = count.clone();
+                let mut synced = true;
+                move |session, request, responder| {
+                    let deadline = Instant::now() + TIMEOUT;
+                    let response: protocol::Message = match request {
+                        Content::DeviceInfo(_) => {
+                            let clock = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            schema::DeviceInfoResponse {
+                                cloud_clock: clock,
+                                cloud_synced: synced,
+                                ..Default::default()
+                            }
+                            .into()
+                        }
+                        Content::SlotList(_) => {
+                            let attempt = count.fetch_add(1, Ordering::SeqCst);
+                            if attempt == 0 || repeat {
+                                if reset {
+                                    synced = false;
+                                }
+                                responder
+                                    .fail(schema::Error::new(code, "original refusal"), deadline)
+                                    .unwrap();
+                                return true;
+                            }
+                            schema::SlotListResponse::default().into()
+                        }
+                        Content::CloudSyncStart(_) => {
+                            schema::CloudSyncStartResponse { challenge: vec![3] }.into()
+                        }
+                        Content::CloudSyncFinish(_) => {
+                            synced = true;
+                            schema::CloudSyncFinishResponse { accepted: 123 }.into()
+                        }
+                        other => return answering(session, other, responder),
+                    };
+                    responder.reply(response, deadline).unwrap();
+                    true
+                }
+            }));
+            let ark = attach(&mut peer, url);
+            let result = ark
+                .client()
+                .call(schema::SlotListRequest {}, Instant::now() + TIMEOUT);
+            assert_eq!(count.load(Ordering::SeqCst), 1 + retries);
+            if retries == 1 && !repeat {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Remote(error)) if error.code == code && error.msg == "original refusal")
+                );
+            }
+            assert_eq!(requests.try_iter().count(), 2 * retries);
         }
     }
 }

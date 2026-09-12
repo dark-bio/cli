@@ -1,5 +1,8 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Discovery of emulated Arks running on the host.
 //! Connect through [`Device::connect`] to authenticate a discovered Ark.

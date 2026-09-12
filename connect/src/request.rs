@@ -1,11 +1,16 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Request/response pairings used by typed client calls.
 //! Wire checks message direction and content; this table selects the response type.
 
+use crate::timing::{APPROVAL_WINDOW, PAIRING_WINDOW};
 use darkbio_wire::protocol::schema::*;
 use darkbio_wire::protocol::{self, Message};
+use std::time::Duration;
 
 /// Prerequisites established before a request is sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,31 +32,35 @@ pub trait Request: Into<Message> {
 
     /// Setup required before sending. Wrappers default to cloud synchronization.
     const SETUP: Setup = Setup::Cloud;
+
+    /// Protocol wait window, including a reply margin, for requests that wait
+    /// on a person or device formatting. Replaces an inactivity allowance only;
+    /// an absolute caller deadline still applies.
+    const WINDOW: Option<Duration> = None;
 }
 
 /// Pairs each request body with its response body.
 macro_rules! pairs {
-    ($setup:expr; $($request:ident => $response:ident,)*) => {
+    ($setup:expr, $window:expr; $($request:ident => $response:ident,)*) => {
         $(
             impl Request for $request {
                 type Response = $response;
                 const SETUP: Setup = $setup;
+                const WINDOW: Option<Duration> = $window;
             }
         )*
     };
 }
 
-pairs! { Setup::None;
+pairs! { Setup::None, None;
     DeviceInfoRequest => DeviceInfoResponse,
     OnboardingRequest => OnboardingResponse,
     CloudSyncStartRequest => CloudSyncStartResponse,
     CloudSyncFinishRequest => CloudSyncFinishResponse,
-    PairingStatusRequest => PairingStatusResponse,
 }
 
-pairs! { Setup::Cloud;
+pairs! { Setup::Cloud, None;
     GenuinityProofRequest => GenuinityProofResponse,
-    FirmwareUpdatePrepRequest => FirmwareUpdatePrepResponse,
     FirmwareUpdateInitRequest => FirmwareUpdateInitResponse,
     FirmwareUpdateUploadRequest => FirmwareUpdateUploadResponse,
     FirmwareUpdateVerifyRequest => FirmwareUpdateVerifyResponse,
@@ -60,8 +69,6 @@ pairs! { Setup::Cloud;
     PairingSetAppIdentityRequest => PairingSetAppIdentityResponse,
     PairingSetAppStorageRequest => PairingSetAppStorageResponse,
     PairingAckArkStorageRequest => PairingAckArkStorageResponse,
-    PairingAcceptanceRequest => PairingAcceptanceResponse,
-    PairingCompletionRequest => PairingCompletionResponse,
     RelayJoinRequest => RelayJoinResponse,
     RelayAppToArkRequest => RelayArkToAppResponse,
     ExecutionUploadStartRequest => ExecutionUploadStartResponse,
@@ -69,16 +76,26 @@ pairs! { Setup::Cloud;
     ExecutionStatusRequest => ExecutionStatusResponse,
     ExecutionCancelRequest => ExecutionCancelResponse,
     SlotListRequest => SlotListResponse,
-    SlotUploadPeekRequest => SlotUploadPeekResponse,
-    SlotUploadStartRequest => SlotUploadStartResponse,
+    DatasetPathsRequest => DatasetPathsResponse,
+    SlotIdentifyRequest => SlotIdentifyResponse,
     SlotUploadChunkRequest => SlotUploadChunkResponse,
     SlotUploadCancelRequest => SlotUploadCancelResponse,
     SlotUploadProcessRequest => SlotUploadProcessResponse,
 }
 
-pairs! { Setup::Relay;
+pairs! { Setup::Cloud, Some(APPROVAL_WINDOW);
+    FirmwareUpdatePrepRequest => FirmwareUpdatePrepResponse,
+    SlotUploadStartRequest => SlotUploadStartResponse,
+}
+
+pairs! { Setup::Relay, Some(APPROVAL_WINDOW);
     UnlockRequest => UnlockResponse,
     ExecutionScheduleRequest => ExecutionScheduleResponse,
     SlotRepairRequest => SlotRepairResponse,
     SlotDeleteRequest => SlotDeleteResponse,
+}
+
+pairs! { Setup::Cloud, Some(PAIRING_WINDOW);
+    PairingAcceptanceRequest => PairingAcceptanceResponse,
+    PairingCompletionRequest => PairingCompletionResponse,
 }

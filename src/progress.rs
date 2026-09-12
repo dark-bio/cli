@@ -1,5 +1,8 @@
-// ark: command line interface for Ark enclaves
+// ark: command line for Dark Bio Arks
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Transfer rates and per-step estimates for terminal progress.
 
@@ -10,17 +13,24 @@ use std::time::{Duration, Instant};
 const MIB: f64 = 1024.0 * 1024.0;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 const WARMUP: Duration = Duration::from_secs(1);
+const HUMAN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Samples only acknowledged bytes, starting with the first upload report so
 /// cloud setup and approval do not enter the rate estimate.
-#[derive(Default)]
 pub(super) struct Transfer {
     rate: Rate,
     report: Report,
 }
 
 impl Transfer {
+    pub(super) fn new(human: bool) -> Self {
+        Self {
+            rate: Rate::default(),
+            report: Report::new(human),
+        }
+    }
+
     pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<String> {
         self.update_at(uploaded, total, Instant::now())
     }
@@ -36,13 +46,13 @@ impl Transfer {
                 if uploaded >= total {
                     "speed unavailable".into()
                 } else {
-                    "speed estimating…".into()
+                    "speed estimating...".into()
                 }
             },
             speed,
         );
         Some(format!(
-            "Uploading: {percent}% ({:.1}/{:.1} MiB) · {speed} · ETA {}",
+            "Uploading: {percent}% ({:.1}/{:.1} MiB) | {speed} | ETA {}",
             uploaded as f64 / MIB,
             total as f64 / MIB,
             eta(total.saturating_sub(uploaded), rate),
@@ -52,7 +62,6 @@ impl Transfer {
 
 /// Progress percentages belong to individual steps. Device timestamps identify
 /// a restarted step; elapsed time is measured by the host's monotonic clock.
-#[derive(Default)]
 pub(super) struct Processing {
     phase: Option<(u64, u64, u64)>, // Processing start, step number and step start
     rate: Rate,
@@ -60,6 +69,14 @@ pub(super) struct Processing {
 }
 
 impl Processing {
+    pub(super) fn new(human: bool) -> Self {
+        Self {
+            phase: None,
+            rate: Rate::default(),
+            report: Report::new(human),
+        }
+    }
+
     pub(super) fn update(&mut self, status: &SlotUploadProcessResponse) -> Option<String> {
         self.update_at(status, Instant::now())
     }
@@ -69,7 +86,7 @@ impl Processing {
         if self.phase != Some(phase) {
             self.phase = Some(phase);
             self.rate = Rate::default();
-            self.report = Report::default();
+            self.report.last = None;
         }
         let rate = self.rate.sample(status.phase_progress, now);
         let percent = percent(status.phase_progress, 10_000);
@@ -80,13 +97,13 @@ impl Processing {
             .phase_in
             .checked_sub(1)
             .and_then(|index| usize::try_from(index).ok())
-            .and_then(|index| status.phase_names.get(index))
+            .and_then(|index| status.phases.get(index).map(|phase| &phase.name))
             .map(String::as_str)
             .unwrap_or("Processing");
         Some(format!(
-            "Processing [{}/{}] {name}: {percent}% · step ETA {}",
+            "Processing [{}/{}] {name}: {percent}% | step ETA {}",
             status.phase_in,
-            status.phase_names.len(),
+            status.phases.len(),
             eta(10_000_u64.saturating_sub(status.phase_progress), rate),
         ))
     }
@@ -118,17 +135,27 @@ impl Rate {
     }
 }
 
-/// Print at ten-percent boundaries and at least every few seconds when reports
-/// arrive, so slow steps keep refreshing without printing every chunk or poll.
-#[derive(Default)]
+/// Refresh terminal progress once a second as reports arrive. Line output uses
+/// ten-percent boundaries or five seconds to keep logs readable.
 struct Report {
+    human: bool,
     last: Option<(Instant, u64)>,
 }
 
 impl Report {
+    fn new(human: bool) -> Self {
+        Self { human, last: None }
+    }
+
     fn due(&mut self, percent: u64, now: Instant) -> bool {
         if self.last.is_none_or(|(time, previous)| {
-            percent / 10 != previous / 10 || now.saturating_duration_since(time) >= REPORT_INTERVAL
+            if self.human {
+                (percent == 100 && previous != 100)
+                    || now.saturating_duration_since(time) >= HUMAN_REPORT_INTERVAL
+            } else {
+                percent / 10 != previous / 10
+                    || now.saturating_duration_since(time) >= REPORT_INTERVAL
+            }
         }) {
             self.last = Some((now, percent));
             true
@@ -164,7 +191,7 @@ fn eta(remaining: u64, rate: Option<f64>) -> String {
         .and_then(|rate| Duration::try_from_secs_f64((remaining as f64 / rate).ceil()).ok())
         .map(|duration| duration.as_secs())
     else {
-        return "estimating…".into();
+        return "estimating...".into();
     };
     if seconds >= 3600 {
         format!("~{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
@@ -184,16 +211,16 @@ mod tests {
     #[test]
     fn test_transfer_estimate() {
         let start = Instant::now();
-        let mut transfer = Transfer::default();
+        let mut transfer = Transfer::new(false);
         let mib = 1024 * 1024;
         let first = transfer.update_at(25 * mib, 100 * mib, start).unwrap();
-        assert!(first.contains("speed estimating… · ETA estimating…"));
+        assert!(first.contains("speed estimating... | ETA estimating..."));
         let next = transfer
             .update_at(50 * mib, 100 * mib, start + Duration::from_secs(5))
             .unwrap();
         assert_eq!(
             next,
-            "Uploading: 50% (50.0/100.0 MiB) · 5.0 MiB/s · ETA ~10s"
+            "Uploading: 50% (50.0/100.0 MiB) | 5.0 MiB/s | ETA ~10s"
         );
         let done = transfer
             .update_at(100 * mib, 100 * mib, start + Duration::from_secs(10))
@@ -205,7 +232,12 @@ mod tests {
         SlotUploadProcessResponse {
             proc_start: 100,
             phase_start: 100 + phase,
-            phase_names: vec!["Validate".into(), "Index".into()],
+            phases: ["Validate", "Index"]
+                .map(|name| darkbio_connect::schema::SlotPhase {
+                    name: name.into(),
+                    desc: String::new(),
+                })
+                .into(),
             phase_in: phase,
             phase_progress: progress,
             ..Default::default()
@@ -217,30 +249,30 @@ mod tests {
     #[test]
     fn test_step_estimate() {
         let start = Instant::now();
-        let mut processing = Processing::default();
+        let mut processing = Processing::new(false);
         assert!(
             processing
                 .update_at(&status(1, 1000), start)
                 .unwrap()
-                .ends_with("step ETA estimating…")
+                .ends_with("step ETA estimating...")
         );
         assert_eq!(
             processing
                 .update_at(&status(1, 3000), start + Duration::from_secs(5))
                 .unwrap(),
-            "Processing [1/2] Validate: 30% · step ETA ~18s"
+            "Processing [1/2] Validate: 30% | step ETA ~18s"
         );
         assert_eq!(
             processing
                 .update_at(&status(2, 4000), start + Duration::from_secs(6))
                 .unwrap(),
-            "Processing [2/2] Index: 40% · step ETA estimating…"
+            "Processing [2/2] Index: 40% | step ETA estimating..."
         );
         assert_eq!(
             processing
                 .update_at(&status(2, 5000), start + Duration::from_secs(11))
                 .unwrap(),
-            "Processing [2/2] Index: 50% · step ETA ~25s"
+            "Processing [2/2] Index: 50% | step ETA ~25s"
         );
         let restarted = SlotUploadProcessResponse {
             phase_start: 999,
@@ -250,7 +282,7 @@ mod tests {
             processing
                 .update_at(&restarted, start + Duration::from_secs(12))
                 .unwrap()
-                .ends_with("step ETA estimating…")
+                .ends_with("step ETA estimating...")
         );
         let done = SlotUploadProcessResponse {
             phase_progress: 10_000,
@@ -280,7 +312,7 @@ mod tests {
         }
         let stopped = rate.sample(100, start + Duration::from_secs(12));
         assert_eq!(stopped, Some(0.0));
-        assert_eq!(eta(100, stopped), "estimating…");
+        assert_eq!(eta(100, stopped), "estimating...");
         assert_eq!(rate.sample(50, start + Duration::from_secs(13)), None);
         assert_eq!(rate.sample(75, start + Duration::from_secs(14)), Some(25.0));
     }
@@ -290,11 +322,54 @@ mod tests {
     #[test]
     fn test_report_cadence() {
         let start = Instant::now();
-        let mut report = Report::default();
+        let mut report = Report::new(false);
         assert!(report.due(91, start));
         assert!(!report.due(92, start + Duration::from_secs(1)));
         assert!(report.due(92, start + REPORT_INTERVAL));
         assert!(report.due(100, start + REPORT_INTERVAL + Duration::from_millis(1)));
         assert!(!report.due(100, start + REPORT_INTERVAL + Duration::from_millis(2)));
+    }
+
+    #[test]
+    fn test_human_transfer_cadence() {
+        let start = Instant::now();
+        let mut transfer = Transfer::new(true);
+        assert!(transfer.update_at(0, 100, start).is_some());
+        assert!(
+            transfer
+                .update_at(90, 100, start + Duration::from_millis(500))
+                .is_none()
+        );
+        let next = start + Duration::from_secs(1);
+        assert!(transfer.update_at(90, 100, next).is_some());
+        assert!(
+            transfer
+                .update_at(100, 100, next + Duration::from_millis(1))
+                .is_some()
+        );
+        assert!(
+            transfer
+                .update_at(100, 100, next + Duration::from_millis(2))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_human_step_cadence() {
+        let start = Instant::now();
+        let mut processing = Processing::new(true);
+        assert!(processing.update_at(&status(1, 1000), start).is_some());
+        let next = start + Duration::from_millis(500);
+        assert!(processing.update_at(&status(2, 1000), next).is_some());
+        assert!(
+            processing
+                .update_at(&status(2, 9000), next + Duration::from_millis(500))
+                .is_none()
+        );
+        assert!(
+            processing
+                .update_at(&status(2, 9000), next + Duration::from_secs(1))
+                .is_some()
+        );
     }
 }

@@ -1,12 +1,15 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! HTTP routes and payloads of the Ark cloud API.
 
 use super::Failure;
+use crate::Identity;
 use crate::schema::{CloudSyncFinishRequest, CloudSyncStartRequest};
 use crate::trust::{Environment, Realm};
-use crate::{Error, Identity};
 use base64::{
     Engine,
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
@@ -14,30 +17,6 @@ use base64::{
 use darkbio_wire::protocol;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::time::Instant;
-
-type Authenticate =
-    dyn Fn(&str, Option<&str>, Instant) -> Result<Option<(String, String)>, Error> + Send + Sync;
-
-/// Caller-owned authentication for the package origin. Credentials never enter
-/// the agent's defaults, where cloud API requests could inherit them.
-pub(crate) struct PackageAuth(Box<Authenticate>);
-
-impl PackageAuth {
-    pub(crate) fn new(
-        auth: impl Fn(&str, Option<&str>, Instant) -> Result<Option<(String, String)>, Error>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self(Box::new(auth))
-    }
-}
-
-impl std::fmt::Debug for PackageAuth {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PackageAuth")
-    }
-}
 
 /// Maximum JSON response, enough for cloud certificates, signed time or registry state.
 const MAX_RESPONSE: u64 = 64 * 1024;
@@ -47,58 +26,29 @@ const MAX_RESPONSE: u64 = 64 * 1024;
 pub(super) struct Api {
     pub(super) agent: ureq::Agent, // HTTP connections reused across the cloud exchange
     pub(super) url: String,        // API of the selected environment
-    pub(super) packages: String,   // Package repository of the same environment
     pub(super) realm: Realm,       // Realm selecting the device registry
     serial: Option<String>,        // Attested serial, when available, checked against the registry
 }
 
 impl Api {
-    /// Retries a package GET once with caller-supplied authentication. The login
-    /// redirect is only a challenge; the retry always uses the original URL.
-    pub(super) fn package(
-        &self,
-        path: &str,
-        auth: Option<&PackageAuth>,
-        deadline: Instant,
-    ) -> Result<ureq::http::Response<ureq::Body>, Error> {
-        let request = |header: Option<(String, String)>| {
-            let mut request = self.agent.get(format!("{}/{path}", self.packages));
-            if let Some((name, value)) = header {
-                let mut value = ureq::http::HeaderValue::from_str(&value)
-                    .map_err(|_| Failure::Cloud("invalid package authentication header".into()))?;
-                value.set_sensitive(true);
-                request = request.header(name, value);
-            }
-            send(request, deadline)
-        };
-        let header = match auth {
-            Some(auth) => (auth.0)(&self.packages, None, deadline)?,
-            None => None,
-        };
-        let response = request(header)?;
-        if response.status().is_redirection()
-            && let Some(auth) = auth
-            && let Some(redirect) = response
-                .headers()
-                .get("Location")
-                .and_then(|value| value.to_str().ok())
-            && let Some(header) = (auth.0)(&self.packages, Some(redirect), deadline)?
-        {
-            drop(response);
-            return Ok(request(Some(header))?);
-        }
-        Ok(response)
-    }
-
     /// Uses the selected environment and realm for relay attachment.
     pub(super) fn relay_url(&self) -> String {
+        self.socket_url("relaying")
+    }
+
+    /// Uses the same realm for the companion pairing rendezvous.
+    pub(super) fn pairing_url(&self) -> String {
+        self.socket_url("pairing")
+    }
+
+    fn socket_url(&self, route: &str) -> String {
         let url = self
             .url
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1);
         match self.realm {
-            Realm::Hardware => format!("{url}/relaying"),
-            Realm::Emulator => format!("{url}/sandbox/relaying"),
+            Realm::Hardware => format!("{url}/{route}"),
+            Realm::Emulator => format!("{url}/sandbox/{route}"),
         }
     }
 
@@ -119,7 +69,6 @@ impl Api {
         Some(Self {
             agent: agent(),
             url: api_url(*env).into(),
-            packages: package_url(*env).into(),
             realm,
             serial,
         })
@@ -181,15 +130,6 @@ fn api_url(env: Environment) -> &'static str {
         Environment::Release => "https://api.dark.bio/v1",
         Environment::Staging => "https://api.darkbio.xyz/v1",
         Environment::Develop => "https://api.darkbio.dev/v1",
-    }
-}
-
-/// Firmware archives live on the package host of the selected environment.
-fn package_url(env: Environment) -> &'static str {
-    match env {
-        Environment::Release => "https://pkg.dark.bio",
-        Environment::Staging => "https://pkg.darkbio.xyz",
-        Environment::Develop => "https://pkg.darkbio.dev",
     }
 }
 
@@ -283,13 +223,25 @@ fn fetch_registration(
         Realm::Hardware => "genuine",
         Realm::Emulator => "sandbox/genuine",
     };
-    get(
+    get_authenticated(
         agent
             .get(format!("{url}/{route}"))
             .header("Dark-Auth", BASE64_URL_SAFE_NO_PAD.encode(proof)),
         deadline,
     )
     .map_err(|err| err.context("genuinity check failed"))
+}
+
+/// Reads a proof-authenticated response, retaining refusal as a typed error.
+pub(super) fn get_authenticated<T: DeserializeOwned>(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    deadline: Instant,
+) -> Result<T, Failure> {
+    let response = send(request, deadline)?;
+    if response.status() == 403 {
+        return Err(Failure::ProofRejected);
+    }
+    json(response)
 }
 
 /// Reads one successful JSON response under the remaining deadline and size limit.
@@ -344,7 +296,6 @@ pub(super) mod tests {
     pub(in crate::cloud) fn api(url: String, realm: Realm) -> Api {
         Api {
             agent: http(),
-            packages: url.trim_end_matches("/v1").to_owned(),
             url,
             realm,
             serial: Some("test-serial".into()),
@@ -377,7 +328,6 @@ pub(super) mod tests {
             for &selected in crate::identity::ENVIRONMENTS {
                 let cloud = Api::new(&identity, Some((selected, Realm::Hardware))).unwrap();
                 assert_eq!(cloud.url, api_url(selected));
-                assert_eq!(cloud.packages, package_url(selected));
                 assert_eq!(cloud.realm, Realm::Emulator);
                 assert!(cloud.relay_url().ends_with("/sandbox/relaying"));
                 assert_eq!(cloud.serial.as_deref(), Some("attested-serial"));
@@ -390,7 +340,6 @@ pub(super) mod tests {
                 for realm in [Realm::Hardware, Realm::Emulator] {
                     let cloud = Api::new(&identity, Some((env, realm))).unwrap();
                     assert_eq!(cloud.url, api_url(env));
-                    assert_eq!(cloud.packages, package_url(env));
                     assert_eq!(cloud.realm, realm);
                     assert_eq!(cloud.serial, None);
                     assert_eq!(
@@ -400,102 +349,6 @@ pub(super) mod tests {
                     assert_eq!(identity.realm(), None);
                 }
             }
-        }
-    }
-
-    /// Login retries stay on the package origin. Cached credentials reach the
-    /// archive, while cloud API requests through the same agent remain separate.
-    #[test]
-    fn test_package_auth() {
-        let redirect = "https://login.invalid/session?secret=redacted";
-        let (url, requests) = serve(vec![
-            (
-                Duration::ZERO,
-                format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {redirect}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                ),
-            ),
-            (Duration::ZERO, response(200, "catalog")),
-            (Duration::ZERO, response(200, "archive")),
-            (
-                Duration::ZERO,
-                response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
-            ),
-        ]);
-        let cloud = api(url, Realm::Hardware);
-        let origin = cloud.packages.clone();
-        let cached = std::sync::Mutex::new(false);
-        let auth = PackageAuth::new(move |host, challenge, _| {
-            assert_eq!(host, origin);
-            let mut cached = cached.lock().unwrap();
-            if let Some(challenge) = challenge {
-                assert_eq!(challenge, redirect);
-                assert!(!*cached);
-                *cached = true;
-            }
-            Ok(cached.then(|| ("test-auth".into(), "private-token".into())))
-        });
-        let deadline = Instant::now() + TIMEOUT;
-        for path in ["imgs/arkos.pkgs", "imgs/archive.arch"] {
-            assert_eq!(
-                cloud.package(path, Some(&auth), deadline).unwrap().status(),
-                200
-            );
-        }
-        cloud.identity(deadline).unwrap();
-        for (path, authenticated) in [
-            ("/imgs/arkos.pkgs", false),
-            ("/imgs/arkos.pkgs", true),
-            ("/imgs/archive.arch", true),
-            ("/v1/cloudsync/identity", false),
-        ] {
-            let request = requests.recv_timeout(TIMEOUT).unwrap().to_ascii_lowercase();
-            assert!(request.starts_with(&format!("get {path} http/1.1\r\n")));
-            assert_eq!(
-                request.contains("test-auth: private-token\r\n"),
-                authenticated
-            );
-        }
-        assert_eq!(format!("{auth:?}"), "PackageAuth");
-    }
-
-    /// An ignored or repeated redirect stops the request. Authentication cannot
-    /// extend the deadline or trigger a chain of retries.
-    #[test]
-    fn test_package_auth_failure() {
-        for mode in ["decline", "repeat", "expire", "error"] {
-            let redirect = "HTTP/1.1 302 Found\r\nLocation: https://login.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let count = if mode == "repeat" { 2 } else { 1 };
-            let (url, requests) = serve(vec![(Duration::ZERO, redirect.into()); count]);
-            let cloud = api(url, Realm::Hardware);
-            let auth = PackageAuth::new(move |_, redirect, deadline| {
-                if redirect.is_none() || mode == "decline" {
-                    return Ok(None);
-                }
-                if mode == "error" {
-                    return Err(Error::Cloud("login refused".into()));
-                }
-                if mode == "expire" {
-                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                }
-                Ok(Some(("test-auth".into(), "private-token".into())))
-            });
-            let result = cloud.package(
-                "imgs/arkos.pkgs",
-                Some(&auth),
-                Instant::now() + Duration::from_millis(100),
-            );
-            match mode {
-                "expire" => assert!(matches!(result, Err(Error::Timeout))),
-                "error" => {
-                    assert!(matches!(result, Err(Error::Cloud(error)) if error == "login refused"))
-                }
-                _ => assert_eq!(result.unwrap().status(), 302),
-            }
-            for _ in 0..count {
-                requests.recv_timeout(TIMEOUT).unwrap();
-            }
-            assert!(requests.recv_timeout(TIMEOUT).is_err());
         }
     }
 

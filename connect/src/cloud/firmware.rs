@@ -1,10 +1,13 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Published firmware and the authenticated update sequence for Arks.
 
-use super::{Failure, PackageAuth, Services, http, relay};
-use crate::{Error, schema};
+use super::{Failure, Services, http};
+use crate::{Error, Timing, schema};
 use base64::{
     Engine,
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
@@ -13,6 +16,7 @@ use darkbio_wire::protocol::Requester;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
+#[cfg(test)]
 use std::time::Instant;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -22,30 +26,8 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct Firmware {
     pub version: String,
-    pub summary: String,
-    pub published: String, // Publication time supplied by the package repository
     pub size: u64,
     pub sha256: [u8; 32],
-}
-
-impl Firmware {
-    /// Whether this is a newer candidate for the installed version. Stable
-    /// builds require a semantic version bump; develop builds may be replaced.
-    /// The Ark decides whether it accepts an update.
-    pub fn is_update_for(&self, installed: &str) -> Result<bool, Error> {
-        let current = Version::parse(installed)?;
-        let proposed = Version::parse(&self.version)?;
-        Ok(proposed.numbers > current.numbers
-            || (proposed.numbers == current.numbers && !current.stable))
-    }
-
-    fn path(&self) -> String {
-        format!(
-            "imgs/arkos-{}-{}.arch",
-            self.version,
-            hex::encode(self.sha256)
-        )
-    }
 }
 
 /// Update stages reported on the caller's thread. Uploaded bytes have been
@@ -62,92 +44,6 @@ pub enum UpdateProgress {
     Installing,
 }
 
-/// Ark versions carry three u16 components and a seven-character build suffix.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct Version {
-    numbers: [u16; 3],
-    stable: bool, // A stable build follows develop at the same semantic version
-    commit: String,
-}
-
-impl Version {
-    fn parse(value: &str) -> Result<Self, Error> {
-        let invalid = || Error::Firmware(format!("invalid firmware version {value:?}"));
-        let (version, commit) = value.split_once('-').ok_or_else(invalid)?;
-        let mut parts = version.split('.');
-        let mut numbers = [0; 3];
-        for number in &mut numbers {
-            let part = parts.next().ok_or_else(invalid)?;
-            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(invalid());
-            }
-            *number = part.parse().map_err(|_| invalid())?;
-        }
-        if parts.next().is_some()
-            || commit.len() != 7
-            || (commit != "develop" && !commit.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            return Err(invalid());
-        }
-        Ok(Self {
-            numbers,
-            stable: commit != "develop",
-            commit: commit.to_owned(),
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct Listing {
-    package: String,
-    artifacts: Vec<Artifact>,
-}
-
-#[derive(Deserialize)]
-struct Artifact {
-    version: String,
-    summary: String,
-    published: String,
-    size: u64,
-    sha256: String,
-    path: String,
-}
-
-impl Listing {
-    /// Validate routing before any archive or device access. Archive paths must
-    /// name the same version and hash as the cloud access-key request.
-    fn firmwares(self) -> Result<Vec<Firmware>, Error> {
-        if self.package != "arkos" {
-            return Err(Error::Firmware("package listing is not arkos".into()));
-        }
-        let mut firmwares = Vec::new();
-        for artifact in self.artifacts {
-            let version = Version::parse(&artifact.version)?;
-            let mut sha256 = [0; 32];
-            hex::decode_to_slice(&artifact.sha256, &mut sha256)
-                .map_err(|_| Error::Firmware("invalid firmware SHA-256".into()))?;
-            let firmware = Firmware {
-                version: artifact.version,
-                summary: artifact.summary,
-                published: artifact.published,
-                size: artifact.size,
-                sha256,
-            };
-            if firmware.size == 0 || artifact.path.trim_start_matches('/') != firmware.path() {
-                return Err(Error::Firmware(
-                    "invalid firmware size or archive path".into(),
-                ));
-            }
-            firmwares.push((version, firmware));
-        }
-        firmwares.sort_by(|(a, _), (b, _)| b.cmp(a));
-        Ok(firmwares
-            .into_iter()
-            .map(|(_, firmware)| firmware)
-            .collect())
-    }
-}
-
 #[derive(Deserialize)]
 struct Access {
     access: String, // Cloud response sealed to the Ark's ephemeral update key
@@ -161,28 +57,17 @@ impl Services {
         self.cloud.as_ref().ok_or(Error::MissingEnvironment)
     }
 
-    pub(crate) fn firmwares(
-        &self,
-        deadline: Instant,
-        auth: Option<&PackageAuth>,
-    ) -> Result<Vec<Firmware>, Error> {
-        let cloud = self.firmware_cloud()?;
-        let listing: Listing = http::json(cloud.package("imgs/arkos.pkgs", auth, deadline)?)?;
-        listing.firmwares()
-    }
-
     /// Holds one update across its cloud requests and wire calls. A failure ends
     /// the sequence; upload chunks and installation are never retried implicitly.
     pub(crate) fn update_firmware(
         &self,
         requester: &Requester,
         firmware: &Firmware,
-        deadline: Instant,
+        reader: &mut impl Read,
+        timing: Timing,
         mut progress: impl FnMut(UpdateProgress),
-        auth: Option<&PackageAuth>,
     ) -> Result<(), Error> {
         let cloud = self.firmware_cloud()?;
-        Version::parse(&firmware.version)?;
         if firmware.size == 0 {
             return Err(Error::Firmware("firmware archive is empty".into()));
         }
@@ -190,7 +75,7 @@ impl Services {
             .updating
             .try_lock()
             .map_err(|_| Error::Firmware("another firmware update is already running".into()))?;
-        self.sync(requester, deadline)?;
+        self.sync(requester, timing)?;
         progress(UpdateProgress::Preparing);
         let prepared = requester
             .request(
@@ -199,51 +84,46 @@ impl Services {
                     sha256: firmware.sha256.to_vec(),
                     bytes: firmware.size,
                 },
-                deadline,
+                timing.approval(),
             )?
             .wait::<schema::FirmwareUpdatePrepResponse>()?;
-        let access: Access = http::get(
+        let access: Access = match http::get_authenticated(
             cloud
                 .agent
                 .get(format!("{}/firmware", cloud.url))
                 .query("version", &firmware.version)
                 .query("sha256", hex::encode(firmware.sha256))
                 .header("Dark-Auth", BASE64_URL_SAFE_NO_PAD.encode(prepared.auth)),
-            deadline,
-        )?;
+            timing.io(),
+        ) {
+            Err(Failure::ProofRejected) => {
+                // Preparation may already have required approval. Refresh keys
+                // for the next attempt, leaving the caller to start it explicitly.
+                self.resync(requester, timing)?;
+                return Err(Error::ProofRejected);
+            }
+            result => result?,
+        };
         let access = BASE64_STANDARD.decode(access.access).map_err(|error| {
             Error::Firmware(format!("invalid firmware access encoding: {error}"))
         })?;
         requester
-            .request(schema::FirmwareUpdateInitRequest { access }, deadline)?
+            .request(schema::FirmwareUpdateInitRequest { access }, timing.io())?
             .wait::<schema::FirmwareUpdateInitResponse>()?;
 
         progress(UpdateProgress::Uploading {
             uploaded: 0,
             total: firmware.size,
         });
-        let mut response = cloud.package(&firmware.path(), auth, deadline)?;
-        if !response.status().is_success() {
-            return Err(Error::Cloud(format!(
-                "firmware download returned HTTP {}",
-                response.status()
-            )));
-        }
-        upload(
-            requester,
-            &mut response.body_mut().as_reader(),
-            firmware,
-            deadline,
-            &mut progress,
-        )?;
+        upload(requester, reader, firmware, timing, &mut progress)?;
 
         progress(UpdateProgress::Verifying);
         requester
-            .request(schema::FirmwareUpdateVerifyRequest {}, deadline)?
+            .request(schema::FirmwareUpdateVerifyRequest {}, timing.io())?
             .wait::<schema::FirmwareUpdateVerifyResponse>()?;
         progress(UpdateProgress::Installing);
         requester
-            .request(schema::FirmwareUpdateInstallRequest {}, deadline)?
+            .request(schema::FirmwareUpdateInstallRequest {}, timing.io())?
             .wait::<schema::FirmwareUpdateInstallResponse>()?;
         Ok(())
     }
@@ -255,21 +135,19 @@ fn upload(
     requester: &Requester,
     reader: &mut impl Read,
     firmware: &Firmware,
-    deadline: Instant,
+    timing: Timing,
     progress: &mut impl FnMut(UpdateProgress),
 ) -> Result<(), Error> {
     let mut uploaded = 0;
     let mut hash = Sha256::new();
     while uploaded < firmware.size {
-        relay::remaining(deadline).map_err(relay::io_error)?;
+        timing.check()?;
         let size = (firmware.size - uploaded).min(CHUNK_SIZE as u64) as usize;
         let mut chunk = vec![0; size];
-        reader
-            .read_exact(&mut chunk)
-            .map_err(|error| Failure::from(ureq::Error::from(error)))?;
+        reader.read_exact(&mut chunk).map_err(Error::FirmwareRead)?;
         hash.update(&chunk);
         requester
-            .request(schema::FirmwareUpdateUploadRequest { chunk }, deadline)?
+            .request(schema::FirmwareUpdateUploadRequest { chunk }, timing.io())?
             .wait::<schema::FirmwareUpdateUploadResponse>()?;
         uploaded += size as u64;
         progress(UpdateProgress::Uploading {
@@ -277,18 +155,14 @@ fn upload(
             total: firmware.size,
         });
     }
-    relay::remaining(deadline).map_err(relay::io_error)?;
-    if reader
-        .read(&mut [0])
-        .map_err(|error| Failure::from(ureq::Error::from(error)))?
-        != 0
-    {
-        return Err(Error::Firmware(
+    timing.check()?;
+    if reader.read(&mut [0]).map_err(Error::FirmwareRead)? != 0 {
+        return Err(Error::Integrity(
             "archive exceeds its advertised size".into(),
         ));
     }
     if hash.finalize().as_slice() != firmware.sha256 {
-        return Err(Error::Firmware(
+        return Err(Error::Integrity(
             "archive SHA-256 does not match the published firmware".into(),
         ));
     }
@@ -302,7 +176,6 @@ mod tests {
     use crate::schema::host_to_ark::Content;
     use crate::testing::{Peer, answering};
     use crate::trust::Realm;
-    use serde_json::json;
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex, mpsc};
@@ -312,15 +185,9 @@ mod tests {
     fn firmware(bytes: &[u8]) -> Firmware {
         Firmware {
             version: "2.0.0-1234567".into(),
-            summary: "Test firmware".into(),
-            published: "2026-09-11T00:00:00Z".into(),
             size: bytes.len() as u64,
             sha256: Sha256::digest(bytes).into(),
         }
-    }
-
-    fn listing(firmware: &Firmware) -> serde_json::Value {
-        json!({"package": "arkos", "artifacts": [{"version": firmware.version, "summary": firmware.summary, "published": firmware.published, "size": firmware.size, "sha256": hex::encode(firmware.sha256), "path": firmware.path()}]})
     }
 
     /// Stops accepting when the test finishes, including when a refused device
@@ -332,12 +199,10 @@ mod tests {
     }
 
     impl Cloud {
-        fn start(firmware: &Firmware, bytes: Vec<u8>, access_status: u16) -> Self {
+        fn start(firmware: &Firmware, _bytes: Vec<u8>, access_status: u16) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://{}/v1", listener.local_addr().unwrap());
-            let catalog = listing(firmware).to_string();
-            let archive = format!("/{}", firmware.path());
             let key = format!(
                 "/v1/firmware?version={}&sha256={}",
                 firmware.version,
@@ -368,12 +233,10 @@ mod tests {
                         "/v1/cloudsync/time?challenge=03" => {
                             (200, br#"{"unixmilli":123,"signature":"BA=="}"#.as_slice())
                         }
-                        "/imgs/arkos.pkgs" => (200, catalog.as_bytes()),
                         path if path == key => {
                             assert!(headers.to_lowercase().contains("dark-auth: -_8\r\n"));
                             (access_status, br#"{"access":"/w=="}"#.as_slice())
                         }
-                        path if path == archive => (200, bytes.as_slice()),
                         other => panic!("unexpected HTTP request: {other}"),
                     };
                     paths.push(path.to_owned());
@@ -498,30 +361,18 @@ mod tests {
     fn test_update() {
         let bytes = vec![42; CHUNK_SIZE + 17];
         let expected = firmware(&bytes);
-        let cloud = Cloud::start(&expected, bytes, 200);
+        let cloud = Cloud::start(&expected, bytes.clone(), 200);
         let (mut peer, stages) = peer(&expected, None);
         let ark = attach(&mut peer, cloud.url.clone());
-        let authentications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = authentications.clone();
-        let client = ark.client().with_package_auth(move |_, redirect, _| {
-            assert!(redirect.is_none());
-            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Some(("test-auth".into(), "private-token".into())))
-        });
+        let client = ark.client();
         let deadline = Instant::now() + TIMEOUT;
-        let firmwares = client.firmwares(deadline).unwrap();
-        assert_eq!(firmwares[0].sha256, expected.sha256);
-        assert!(
-            stages.lock().unwrap().is_empty(),
-            "listing must not initialize the device"
-        );
         let mut progress = Vec::new();
         client
             .clone()
-            .update_firmware(&firmwares[0], deadline, |stage| {
+            .update_firmware(&expected, &mut bytes.as_slice(), deadline, |stage| {
                 if stage == UpdateProgress::Preparing {
                     assert!(matches!(
-                        client.update_firmware(&expected, deadline, |_| {}),
+                        client.update_firmware(&expected, &mut bytes.as_slice(), deadline, |_| {}),
                         Err(Error::Firmware(_))
                     ));
                 }
@@ -561,8 +412,7 @@ mod tests {
                 UpdateProgress::Installing
             ]
         );
-        assert_eq!(cloud.finish().len(), 5);
-        assert_eq!(authentications.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(cloud.finish().len(), 3);
     }
 
     /// Refusal at any stage prevents later stages, and losing the install reply
@@ -579,12 +429,17 @@ mod tests {
         ] {
             let bytes = vec![42; 17];
             let firmware = firmware(&bytes);
-            let cloud = Cloud::start(&firmware, bytes, 200);
+            let cloud = Cloud::start(&firmware, bytes.clone(), 200);
             let (mut peer, stages) = peer(&firmware, Some(failure));
             let ark = attach(&mut peer, cloud.url.clone());
             let error = ark
                 .client()
-                .update_firmware(&firmware, Instant::now() + TIMEOUT, |_| {})
+                .update_firmware(
+                    &firmware,
+                    &mut bytes.as_slice(),
+                    Instant::now() + TIMEOUT,
+                    |_| {},
+                )
                 .unwrap_err();
             if failure != "disconnect" {
                 assert!(matches!(error, Error::Remote(error) if error.code == 0x777));
@@ -612,12 +467,17 @@ mod tests {
     fn test_download_integrity() {
         for bytes in [vec![42; 16], vec![42; 18], vec![43; 17]] {
             let firmware = firmware(&[42; 17]);
-            let cloud = Cloud::start(&firmware, bytes, 200);
+            let cloud = Cloud::start(&firmware, bytes.clone(), 200);
             let (mut peer, stages) = peer(&firmware, None);
             let ark = attach(&mut peer, cloud.url.clone());
             assert!(
                 ark.client()
-                    .update_firmware(&firmware, Instant::now() + TIMEOUT, |_| {})
+                    .update_firmware(
+                        &firmware,
+                        &mut bytes.as_slice(),
+                        Instant::now() + TIMEOUT,
+                        |_| {}
+                    )
                     .is_err()
             );
             assert!(!stages.lock().unwrap().contains(&"verify"));
@@ -625,20 +485,20 @@ mod tests {
         }
     }
 
-    /// A rejected access request cannot initialize an update. Expiring the shared
-    /// deadline after transfer prevents verification from reaching the Ark.
+    /// A rejected proof refreshes keys without repeating preparation or starting
+    /// an upload. Expiring the deadline after transfer also prevents verification.
     #[test]
     fn test_access_and_deadline() {
         for expire in [false, true] {
             let bytes = vec![42; 17];
             let firmware = firmware(&bytes);
-            let cloud = Cloud::start(&firmware, bytes, if expire { 200 } else { 403 });
+            let cloud = Cloud::start(&firmware, bytes.clone(), if expire { 200 } else { 403 });
             let (mut peer, stages) = peer(&firmware, None);
             let ark = attach(&mut peer, cloud.url.clone());
             let deadline = Instant::now() + Duration::from_secs(1);
             let error = ark
                 .client()
-                .update_firmware(&firmware, deadline, |stage| {
+                .update_firmware(&firmware, &mut bytes.as_slice(), deadline, |stage| {
                     if expire && stage == UpdateProgress::Verifying {
                         thread::sleep(deadline.saturating_duration_since(Instant::now()));
                     }
@@ -647,66 +507,29 @@ mod tests {
             if expire {
                 assert!(matches!(error, Error::Timeout));
             } else {
-                assert!(matches!(error, Error::Cloud(_)));
+                assert!(matches!(error, Error::ProofRejected));
             }
             let stages = stages.lock().unwrap().clone();
             assert!(!stages.contains(if expire { &"verify" } else { &"init" }));
-            cloud.finish();
+            let paths = cloud.finish();
+            if !expire {
+                assert_eq!(
+                    stages,
+                    [
+                        "sync-start",
+                        "sync-finish",
+                        "prepare",
+                        "sync-start",
+                        "sync-finish"
+                    ]
+                );
+                assert_eq!(paths.len(), 5);
+                assert_eq!(
+                    &paths[3..],
+                    ["/v1/cloudsync/identity", "/v1/cloudsync/time?challenge=03"]
+                );
+            }
         }
-    }
-
-    #[test]
-    fn test_listing_and_versions() {
-        let firmware = firmware(&[42]);
-        for mutate in [
-            |value: &mut serde_json::Value| value["package"] = json!("foreign"),
-            |value: &mut serde_json::Value| {
-                value["artifacts"][0]["version"] = json!("1.2.3.4-develop")
-            },
-            |value: &mut serde_json::Value| value["artifacts"][0]["sha256"] = json!("aa"),
-            |value: &mut serde_json::Value| value["artifacts"][0]["size"] = json!(0),
-            |value: &mut serde_json::Value| {
-                value["artifacts"][0]["path"] = json!("https://foreign.invalid/firmware")
-            },
-        ] {
-            let mut value = listing(&firmware);
-            mutate(&mut value);
-            assert!(
-                serde_json::from_value::<Listing>(value)
-                    .unwrap()
-                    .firmwares()
-                    .is_err()
-            );
-        }
-        let mut value = listing(&firmware);
-        for version in ["1.0.0-develop", "3.0.0-develop", "3.0.0-1234567"] {
-            let mut next = firmware.clone();
-            next.version = version.into();
-            value["artifacts"]
-                .as_array_mut()
-                .unwrap()
-                .push(listing(&next)["artifacts"][0].clone());
-        }
-        let sorted = serde_json::from_value::<Listing>(value)
-            .unwrap()
-            .firmwares()
-            .unwrap();
-        assert_eq!(
-            sorted
-                .iter()
-                .map(|firmware| firmware.version.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "3.0.0-1234567",
-                "3.0.0-develop",
-                "2.0.0-1234567",
-                "1.0.0-develop"
-            ]
-        );
-        assert!(firmware.is_update_for("1.0.0-fffffff").unwrap());
-        assert!(!firmware.is_update_for("2.0.0-0000000").unwrap());
-        assert!(firmware.is_update_for("2.0.0-develop").unwrap());
-        assert!(firmware.is_update_for("not-a-version").is_err());
     }
 
     /// An emulator receives the update request and supplies its own refusal.
@@ -715,7 +538,7 @@ mod tests {
     fn test_emulator_refusal() {
         let bytes = vec![42];
         let expected = firmware(&bytes);
-        let cloud = Cloud::start(&expected, bytes, 200);
+        let cloud = Cloud::start(&expected, bytes.clone(), 200);
         let (mut peer, stages) = peer(&expected, Some("prepare"));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, identity) =
@@ -725,9 +548,8 @@ mod tests {
         let ark = crate::Ark::start(session, Arc::new(services)).unwrap();
         let client = ark.client();
         let deadline = Instant::now() + TIMEOUT;
-        let firmwares = client.firmwares(deadline).unwrap();
         let error = client
-            .update_firmware(&firmwares[0], deadline, |_| {})
+            .update_firmware(&expected, &mut bytes.as_slice(), deadline, |_| {})
             .unwrap_err();
         assert!(matches!(
             error,
@@ -739,11 +561,7 @@ mod tests {
         );
         assert_eq!(
             cloud.finish(),
-            [
-                "/imgs/arkos.pkgs",
-                "/v1/cloudsync/identity",
-                "/v1/cloudsync/time?challenge=03"
-            ]
+            ["/v1/cloudsync/identity", "/v1/cloudsync/time?challenge=03"]
         );
     }
 
@@ -758,16 +576,34 @@ mod tests {
         let firmware = firmware(&[42]);
         let deadline = Instant::now() + TIMEOUT;
         assert!(matches!(
-            services.firmwares(deadline, None),
+            services.update_firmware(
+                &session.requester(),
+                &firmware,
+                &mut [42].as_slice(),
+                deadline.into(),
+                |_| {}
+            ),
             Err(Error::MissingEnvironment)
         ));
         assert!(matches!(
-            services.update_firmware(&session.requester(), &firmware, deadline, |_| {}, None),
+            services.update_firmware(
+                &session.requester(),
+                &firmware,
+                &mut [42].as_slice(),
+                deadline.into(),
+                |_| {}
+            ),
             Err(Error::MissingEnvironment)
         ));
         services.close();
         assert!(matches!(
-            services.firmwares(deadline, None),
+            services.update_firmware(
+                &session.requester(),
+                &firmware,
+                &mut [42].as_slice(),
+                deadline.into(),
+                |_| {}
+            ),
             Err(Error::Closed)
         ));
     }

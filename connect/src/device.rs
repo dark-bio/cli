@@ -1,5 +1,8 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Discovered Arks, their reported details and authenticated connections.
 //! Discovery metadata is unverified. Connecting establishes the peer's identity.
@@ -7,7 +10,7 @@
 use crate::emulator::Instance;
 use crate::trust::{Environment, Realm};
 use crate::{Ark, Error, Identity, emulator, hardware};
-use darkbio_wire::transport::Verifier;
+use crate::{TrustMode, identity::Verification};
 use std::fmt;
 
 /// Kind of Ark reported by discovery. Authentication establishes its identity
@@ -143,10 +146,7 @@ impl Device {
     /// with the supplied verifier. Does not repeat discovery or label selection.
     /// The verifier's identity selects cloud routing for later operations;
     /// connecting itself does not contact the cloud.
-    pub fn connect<V: Verifier<Info = Identity>>(
-        &self,
-        verifier: &V,
-    ) -> Result<(Ark, Identity), Error> {
+    pub fn connect(&self, verifier: &TrustMode) -> Result<(Ark, Identity), Error> {
         self.open(verifier, None)
     }
 
@@ -155,18 +155,18 @@ impl Device {
     /// Self-signed and recovery peers use the discovered kind to select a registry;
     /// attested peers retain their verified realm. The Ark verifies the cloud's
     /// certificates, and the cloud verifies device proofs against its registry.
-    pub fn connect_with_env<V: Verifier<Info = Identity>>(
+    pub fn connect_with_env(
         &self,
-        verifier: &V,
+        verifier: &TrustMode,
         env: Environment,
     ) -> Result<(Ark, Identity), Error> {
         self.open(verifier, Some(env))
     }
 
     /// Opens the retained transport with any caller-supplied cloud route.
-    fn open<V: Verifier<Info = Identity>>(
+    fn open(
         &self,
-        verifier: &V,
+        verifier: &TrustMode,
         env: Option<Environment>,
     ) -> Result<(Ark, Identity), Error> {
         let cloud = env.map(|env| {
@@ -176,10 +176,12 @@ impl Device {
             };
             (env, realm)
         });
+        let verifier = Verification::new(verifier);
         match &self.source {
-            Source::Usb(info) => hardware::connect(info, verifier, cloud),
-            Source::Registry(instance) => emulator::connect(&instance.url(), verifier, cloud),
+            Source::Usb(info) => hardware::connect(info, &verifier, cloud),
+            Source::Registry(instance) => emulator::connect(&instance.url(), &verifier, cloud),
         }
+        .map_err(|err| verifier.error(err))
     }
 }
 

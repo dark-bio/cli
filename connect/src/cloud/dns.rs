@@ -1,9 +1,12 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
-//! Shares unfinished DNS lookups across relay attachment attempts.
+//! Shares unfinished DNS lookups across cloud socket attempts.
 
-use super::{Failure, relay};
+use super::{Failure, socket};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -29,7 +32,7 @@ pub(super) fn resolve(
     port: u16,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, Failure> {
-    relay::remaining(deadline).map_err(relay::io_error)?;
+    socket::remaining(deadline).map_err(socket::io_error)?;
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -38,7 +41,7 @@ pub(super) fn resolve(
         (name.as_str(), port)
             .to_socket_addrs()
             .map(|addresses| addresses.collect())
-            .map_err(relay::io_error)
+            .map_err(socket::io_error)
     })
 }
 
@@ -51,7 +54,7 @@ impl Resolver {
         deadline: Instant,
         lookup: impl FnOnce() -> Result<Vec<SocketAddr>, Failure> + Send + 'static,
     ) -> Result<Vec<SocketAddr>, Failure> {
-        relay::remaining(deadline).map_err(relay::io_error)?;
+        socket::remaining(deadline).map_err(socket::io_error)?;
         let mut pending = self.pending.lock().expect("DNS lookups not poisoned");
         let attempt = match pending.get(&key) {
             Some(attempt) => attempt.clone(),
@@ -72,7 +75,7 @@ impl Resolver {
                             attempt.ready.notify_all();
                         }
                     })
-                    .map_err(relay::io_error)?;
+                    .map_err(socket::io_error)?;
                 pending.insert(key, attempt.clone());
                 attempt
             }
@@ -83,7 +86,7 @@ impl Resolver {
             if let Some(result) = &*result {
                 return result.clone();
             }
-            let left = relay::remaining(deadline).map_err(relay::io_error)?;
+            let left = socket::remaining(deadline).map_err(socket::io_error)?;
             result = attempt
                 .ready
                 .wait_timeout(result, left)

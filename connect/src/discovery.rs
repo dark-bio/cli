@@ -1,9 +1,12 @@
 // connect-rs: connections to Ark enclaves from host processes
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Hardware and emulator discovery, with selection by locator or reported label.
 
-use crate::{Device, Error, emulator, hardware};
+use crate::{Device, DeviceKind, Error, emulator, hardware};
 
 /// Devices found and errors reported by independent discovery sources.
 #[derive(Debug, Default)]
@@ -44,6 +47,11 @@ impl Discovery {
             .iter()
             .filter(|device| {
                 selector.is_none_or(|selector| {
+                    match selector {
+                        "hardware" => return device.kind() == DeviceKind::Hardware,
+                        "emulator" => return device.kind() == DeviceKind::Emulator,
+                        _ => {}
+                    }
                     [device.serial(), device.name(), device.image()]
                         .into_iter()
                         .flatten()
