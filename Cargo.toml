@@ -13,6 +13,11 @@ homepage = "https://dark.bio"
 name = "ark"
 path = "src/main.rs"
 
+[[example]]
+name = "winget"
+path = ".packaging/winget/main.rs"
+test = true
+
 [workspace]
 members = ["connect"]
 
@@ -47,3 +52,6 @@ signal-hook = "0.3"
 # crates stay unoptimized for debugging.
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.release]
+lto = "thin"

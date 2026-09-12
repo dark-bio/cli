@@ -1,0 +1,15 @@
+Ark includes the following third-party software and certificate data.
+Corresponding source for each crate version is available at the links below.
+
+{{#each licenses}}
+================================================================================
+{{name}} ({{id}})
+{{#each used_by}}
+
+{{crate.name}} {{crate.version}}
+Source: https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

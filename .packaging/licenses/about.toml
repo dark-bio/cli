@@ -1,0 +1,18 @@
+# Generate notices for the licenses permitted by .cargo/deny.toml.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+workarounds = ["ring"]
+
+[option-ext]
+accepted = ["MPL-2.0"]

@@ -156,7 +156,7 @@ impl From<ConnectError> for Error {
 pub(crate) fn usb_hint() -> String {
     format!(
         "create /etc/udev/rules.d/70-darkbio-ark.rules containing: {}; then run `sudo udevadm control --reload-rules` and reconnect the Ark",
-        include_str!("../packaging/70-darkbio-ark.rules").trim()
+        include_str!("../.packaging/linux/70-darkbio-ark.rules").trim()
     )
 }
 

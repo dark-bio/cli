@@ -1,0 +1,86 @@
+name: tests
+
+on:
+  workflow_call:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macOS-latest ]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked --verbose
+
+      - name: Install cargo-hack
+        run: cargo install cargo-hack
+
+      - name: Build individual features
+        run: cargo hack build -p darkbio-connect --each-feature --locked
+
+      - name: Test individual features
+        run: cargo hack test -p darkbio-connect --each-feature --locked
+
+      - name: Test with all features
+        run: cargo test --workspace --all-features --locked
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo doc --workspace --all-features --locked --no-deps
+
+  semver:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Look for a published baseline
+        id: baseline
+        run: |
+          status=$(curl --silent --show-error --retry 3 --output /dev/null --write-out '%{http_code}' \
+            https://index.crates.io/da/rk/darkbio-connect)
+          case "$status" in
+            200) echo 'published=true' >> "$GITHUB_OUTPUT" ;;
+            404) echo 'No published connect release to compare yet.' ;;
+            *) echo "Registry lookup failed: HTTP $status" >&2; exit 1 ;;
+          esac
+
+      - name: Check the public API against the published release
+        if: steps.baseline.outputs.published == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: darkbio-connect
+          feature-group: all-features

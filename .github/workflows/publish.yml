@@ -1,0 +1,244 @@
+name: Publish
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+
+  audit:
+    uses: ./.github/workflows/audit.yml
+
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macOS-latest
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+            suffix: ''
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos-amd64
+            suffix: ''
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            suffix: ''
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
+            suffix: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-amd64
+            suffix: '.exe'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the release version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo metadata --no-deps --format-version 1 --locked | jq -e --arg version "$version" \
+            '[.packages[] | select(.name == "darkbio-ark" or .name == "darkbio-connect") | .version] == [$version, $version]'
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked --bin ark --target ${{ matrix.target }}
+
+      - name: Check the executable
+        shell: bash
+        run: target/${{ matrix.target }}/release/ark${{ matrix.suffix }} --version
+
+      - name: Prepare the executable
+        shell: bash
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/ark${{ matrix.suffix }} release/ark-${{ steps.version.outputs.version }}-${{ matrix.platform }}${{ matrix.suffix }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.platform }}
+          path: release/ark-${{ steps.version.outputs.version }}-${{ matrix.platform }}${{ matrix.suffix }}
+          if-no-files-found: error
+
+  prepare:
+    needs: [ build, audit ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check crate packaging
+        run: cargo publish --workspace --dry-run --locked
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: release
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: release
+
+      - name: Generate release metadata
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          arm64=$(sha256sum "release/ark-$version-macos-arm64" | cut -d ' ' -f 1)
+          amd64=$(sha256sum "release/ark-$version-macos-amd64" | cut -d ' ' -f 1)
+          licenses=$(sha256sum release/LICENSES.txt | cut -d ' ' -f 1)
+          mkdir -p metadata
+          sed "s/@VERSION@/$version/g" .packaging/shell/install.sh > metadata/ark-installer.sh
+          sh -n metadata/ark-installer.sh
+          sed -e "s/@VERSION@/$version/g" -e "s/@ARM64_SHA256@/$arm64/g" -e "s/@AMD64_SHA256@/$amd64/g" \
+            -e "s/@LICENSES_SHA256@/$licenses/g" .packaging/homebrew/ark-cli.rb > metadata/ark-cli.rb
+          ruby -c metadata/ark-cli.rb
+          cargo run --locked --example winget -- "$version" "release/ark-$version-windows-amd64.exe" --output metadata/winget
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-metadata
+          path: metadata/
+          if-no-files-found: error
+
+  publish:
+    needs: [ tests, prepare ]
+    # Enable after the crates are published manually and OIDC is configured.
+    if: ${{ false && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write # Required for OIDC token exchange
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          packages=()
+          for package in darkbio-connect darkbio-ark; do
+            status=$(curl --silent --show-error --retry 3 --output /dev/null --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/$package/${GITHUB_REF_NAME#v}")
+            case "$status" in
+              200) echo "$package is already published." ;;
+              404) packages+=(-p "$package") ;;
+              *) echo "Registry lookup failed: HTTP $status" >&2; exit 1 ;;
+            esac
+          done
+          if [ "${#packages[@]}" -gt 0 ]; then
+            cargo publish "${packages[@]}" --locked
+          fi
+
+  release:
+    needs: [ tests, prepare ]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: release
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: release
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: metadata
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" release/* metadata/ark-installer.sh --verify-tag --generate-notes \
+            --title "ark ${GITHUB_REF_NAME#v}" "${flags[@]}"
+
+  homebrew:
+    needs: [ release ]
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    environment: github-action-releaser
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: dark-bio/homebrew-tap
+          # Write deploy key on the tap repository.
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/metadata
+
+      - name: Commit the formula
+        run: |
+          mkdir -p Formula
+          cp "$RUNNER_TEMP/metadata/ark-cli.rb" Formula/ark-cli.rb
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/ark-cli.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "ark-cli ${GITHUB_REF_NAME#v}"
+            git push
+          fi
+
+  winget:
+    needs: [ release ]
+    # Enable in the follow-up after configuring the submission bot's OAuth token.
+    if: ${{ false && !contains(github.ref_name, '-') }}
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: metadata
+
+      - name: Install the manifest submitter
+        run: Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile "$env:RUNNER_TEMP/wingetcreate.exe"
+
+      - name: Validate and submit the manifests
+        env:
+          # OAuth access for the bot. Deploy keys cannot call the pull request API.
+          WINGET_SUBMISSION_TOKEN: ${{ secrets.WINGET_SUBMISSION_TOKEN }}
+        run: |
+          if (-not $env:WINGET_SUBMISSION_TOKEN) {
+            throw 'WINGET_SUBMISSION_TOKEN is required'
+          }
+          & "$env:RUNNER_TEMP/wingetcreate.exe" submit --no-open --token $env:WINGET_SUBMISSION_TOKEN metadata/winget
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

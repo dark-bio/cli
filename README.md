@@ -22,7 +22,11 @@ cargo install --path . --locked
 ark help agents
 ```
 
-The Cargo package is `darkbio-ark`; its executable is `ark`.
+The Cargo package is `darkbio-ark`; its executable is `ark`. GitHub releases
+provide plain executables and a shell installer. The macOS Homebrew formula is
+`dark-bio/tap/ark-cli`. Executables use `ark-<version>-<os>-<arch>`, with `arm64`
+or `amd64` and `.exe` on Windows. A version tag runs the
+[release workflow](.github/workflows/publish.yml).
 
 ## Commands
 

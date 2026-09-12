@@ -1,0 +1,9 @@
+# Settings for cargo-audit, which the audit CI job runs against Cargo.lock.
+
+[advisories]
+# RUSTSEC-2023-0071 is the Marvin timing attack on private key operations in
+# rsa 0.9, which reaches this crate through the trust crate's secure boot
+# roots. Only public key verification is ever performed with it, which is
+# unaffected. The upstream fix arrives with rsa 0.10, still a release
+# candidate. Drop this entry when it ships.
+ignore = ["RUSTSEC-2023-0071"]

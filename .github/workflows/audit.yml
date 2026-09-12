@@ -1,0 +1,52 @@
+name: audit
+
+on:
+  workflow_call:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Check dependencies against the RustSec advisory database
+        run: cargo audit
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check dependency licenses against the allowlist
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features --config .cargo/deny.toml
+          command: check licenses
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked
+
+      - name: Generate dependency notices
+        run: cargo about generate --workspace --all-features --locked --fail --config .packaging/licenses/about.toml .packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"
+
+      - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: licenses
+          path: ${{ runner.temp }}/LICENSES.txt
+          if-no-files-found: error
