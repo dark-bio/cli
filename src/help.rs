@@ -228,8 +228,8 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         help
     };
     let help = if parent.is_empty() {
-        "Scripts and AI agents: use --format json for structured results.
-Read `ark help agents` first. Topics: agents, states, output, devices, datasets, apps."
+        "Scripts and AI agents: read `ark help agents` first.
+Topics: agents, states, output, devices, datasets, apps."
             .to_string()
     } else {
         let advanced = if matches!(key, "status" | "enroll") {
@@ -250,7 +250,11 @@ Read `ark help agents` first. Topics: agents, states, output, devices, datasets,
     } else {
         help
     };
-    *command = command.clone().after_long_help(format!("{help}\n"));
+    let mut decorated = command.clone().after_long_help(format!("{help}\n"));
+    if parent.is_empty() {
+        decorated = decorated.after_help(format!("{help}\n"));
+    }
+    *command = decorated;
     for child in command.get_subcommands_mut() {
         decorate(child, &path, theme);
     }
@@ -278,7 +282,7 @@ pub(crate) fn run(path: &[String], all: bool, format: Format) -> Result<(), Erro
         }
         print_command(&mut root)?;
         for name in ["agents", "states", "output", "devices", "datasets", "apps"] {
-            println!("\n{}", topic(name).unwrap());
+            println!("\n{}", topic(name).unwrap().trim_end());
         }
         return Ok(());
     }
@@ -290,7 +294,7 @@ pub(crate) fn run(path: &[String], all: bool, format: Format) -> Result<(), Erro
             if theme.human {
                 markdown(&theme, topic)
             } else {
-                topic.to_string()
+                topic.trim_end().to_string()
             }
         );
         return Ok(());
@@ -341,24 +345,50 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
     lines.join("\n")
 }
 
+/// Renders the topic dialect: headings, bullets with their continuation lines,
+/// and code that is either fenced or indented by four spaces or more. Indented
+/// code drops the block's own indent so long commands stay on one line.
 fn markdown(theme: &Theme, text: &str) -> String {
-    let mut code = false;
+    let mut fenced = false;
+    let mut bullet = false;
+    let mut block = None;
     let mut lines = Vec::new();
     for line in text.lines() {
         if line.starts_with("```") {
-            code = !code;
+            fenced = !fenced;
             continue;
         }
-        let line = if code {
-            format!("  {}", theme.paint(Role::Accent, line))
-        } else if line.starts_with('#') {
-            theme.paint(Role::Heading, line.trim_start_matches('#').trim_start())
-        } else if line.starts_with("- ") {
-            format!("  {}", theme.inline(line))
+        let content = line.trim_start();
+        let indent = line.len() - content.len();
+        let (line, hanging) = if fenced {
+            (format!("  {}", theme.paint(Role::Accent, line)), 2)
+        } else if indent >= 4 && !content.is_empty() {
+            let base = *block.get_or_insert(indent);
+            let code = &line[base.min(indent)..];
+            let pad = if bullet { 4 } else { 2 };
+            (
+                format!("{}{}", " ".repeat(pad), theme.paint(Role::Accent, code)),
+                pad,
+            )
         } else {
-            theme.inline(line)
+            block = None;
+            if content.is_empty() {
+                (String::new(), 0)
+            } else if line.starts_with('#') {
+                bullet = false;
+                let heading = content.trim_start_matches('#').trim_start();
+                (theme.paint(Role::Heading, heading), 0)
+            } else if line.starts_with("- ") {
+                bullet = true;
+                (format!("  {}", theme.inline(line)), 4)
+            } else if bullet && indent > 0 {
+                (format!("    {}", theme.inline(content)), 4)
+            } else {
+                bullet = false;
+                (theme.inline(line), 0)
+            }
         };
-        lines.push(style::wrap(&line, theme.width, if code { 2 } else { 0 }));
+        lines.push(style::wrap(&line, theme.width, hanging));
     }
     lines.join("\n").trim_end().to_string()
 }
@@ -437,5 +467,17 @@ mod tests {
         );
         assert!(console::strip_ansi_codes(&rendered).contains("ark data fetch --all --unlock"));
         assert!(rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn markdown_aligns_bullets_and_dedents_indented_code() {
+        let theme = Theme::test(80, Color::Basic, true);
+        assert_eq!(
+            markdown(
+                &theme,
+                "- First line of a bullet\n  continues here.\n\n      ark status\n\n  Back in the bullet.\nPlain again.\n"
+            ),
+            "  - First line of a bullet\n    continues here.\n\n    \x1b[1mark status\x1b[0m\n\n    Back in the bullet.\nPlain again."
+        );
     }
 }

@@ -17,10 +17,13 @@ sync state, then firmware-outdated. Update hardware with `ark firmware update`;
 for an emulator, update the emulator app.
 
 An unpaired Ark becomes paired through `ark pair`, then can be unlocked through
-`ark unlock`. Unlocking lasts until power is cut. Data commands and app uploads require unlocked state.
---unlock authorizes that extra step; --dry-run never unlocks, and conflicts
-with --unlock. A dry run requiring unlocked state asks you to unlock separately.
+`ark unlock`. Unlocking lasts until power is cut. Data commands and app uploads
+require unlocked state. --unlock authorizes that extra step; --dry-run never
+unlocks, and conflicts with --unlock. A dry run requiring unlocked state asks
+you to unlock separately.
 
-Firmware updates work unpaired; paired and locked updates use the device button,
-while unlocked updates use the phone. --unlock can switch a locked update to the
-phone path. The Ark makes the final decision about every operation.
+Firmware updates on unpaired Arks need no phone or button approval. Paired,
+locked Arks use the device button; unlocked Arks use the phone. --unlock can
+switch a locked update to the phone path. The CLI still requires confirmation
+of installation and reboot; use --yes noninteractively. The Ark makes the
+final decision about every operation.

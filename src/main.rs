@@ -110,7 +110,6 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
         None => {
             help::command(&style::Theme::new(context.options.format, false)).print_help()?;
-            println!();
             Ok(())
         }
         Some(Command::Devices) => device::devices(context),

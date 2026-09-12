@@ -248,7 +248,7 @@ pub(super) fn table(
 pub(super) fn checklist(theme: &Theme, rows: &[Value]) -> String {
     let labels = rows
         .iter()
-        .map(|row| row["name"].as_str().unwrap_or("").len())
+        .map(|row| console::measure_text_width(row["name"].as_str().unwrap_or("")))
         .max()
         .unwrap_or(0);
     rows.iter()
@@ -267,10 +267,12 @@ pub(super) fn checklist(theme: &Theme, rows: &[Value]) -> String {
             } else {
                 detail.to_string()
             };
+            let name = theme.mark(role, name);
+            let width = labels + if theme.unicode { 2 } else { 3 };
             let line = format!(
                 "  {}{}  {}",
-                theme.mark(role, name),
-                " ".repeat(labels - name.len()),
+                name,
+                " ".repeat(width.saturating_sub(console::measure_text_width(&name))),
                 theme.paint(Role::Muted, detail)
             );
             let mut line = style::wrap(&line, theme.width, 4);

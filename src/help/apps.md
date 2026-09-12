@@ -21,9 +21,10 @@ datasets = ["v1/genome/rsids/rs72921001"]
 develop = false
 ```
 
-Name and version are required. Dataset paths are relative to the data root;
-the Ark mounts only those paths, read-only. Absolute paths, traversal with
-`..` and the entire root are refused. An empty dataset list is allowed.
+Name, version and datasets are required; the dataset list may be empty and
+`develop` defaults to false. Dataset paths are relative to the data root; the
+Ark mounts only those paths, read-only. Absolute paths, traversal with `..`
+and the entire root are refused.
 
 The manifest pass has about 16 MiB of memory, a 250 ms limit and 1 KiB for
 each output stream. The run pass has 100 MiB of memory and 1 MiB per output
