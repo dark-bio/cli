@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+# The release workflow pins this installer to the artifacts of one version.
 version='@VERSION@'
 release="https://github.com/dark-bio/cli/releases/download/v$version"
 case "$(uname -s)/$(uname -m)" in
@@ -15,6 +16,7 @@ temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
 trap 'exit 1' HUP INT TERM
 
+# Fetch the executable and notices before replacing the installed command.
 curl --fail --location --silent --show-error --retry 3 \
     "$release/ark-$version-$platform" \
     --output "$temporary/ark"

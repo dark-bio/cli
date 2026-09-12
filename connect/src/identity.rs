@@ -39,8 +39,10 @@ pub enum TrustMode {
 pub enum Identity {
     /// Attested under the roots of an environment.
     Attested {
-        env: Environment, // Environment whose root signed the attestation
-        device: Device,   // Verified device details from the attestation
+        /// Environment whose root verified the device attestation.
+        env: Environment,
+        /// Signed identity and provisioning details, independent of cloud status.
+        device: Device,
     },
 
     /// Self-attested key possession. Provisioning and genuineness are unverified.
@@ -70,6 +72,7 @@ impl Identity {
 }
 
 impl Verifier for TrustMode {
+    /// Trust outcome returned alongside the authenticated handshake key.
     type Info = Identity;
 
     /// Verifies the attestation or returns the pinned key selected for recovery.
@@ -79,6 +82,8 @@ impl Verifier for TrustMode {
 }
 
 impl TrustMode {
+    /// Checks enabled roots before self-signing, retaining an excluded root's
+    /// environment separately from wire's printable handshake diagnostic.
     fn verify_identity(
         &self,
         attestation: &Attestation,
@@ -145,11 +150,14 @@ fn signer_error(error: trust::Error, excluded: &Cell<Option<Environment>>) -> St
 
 /// Retains the trust outcome across wire's string-only verifier error boundary.
 pub(crate) struct Verification<'a> {
+    /// Caller-selected attestation or pinned-key policy.
     policy: &'a TrustMode,
+    /// Known environment omitted from this build, if verification found one.
     excluded: Cell<Option<Environment>>,
 }
 
 impl<'a> Verification<'a> {
+    /// Starts a handshake with no recorded feature mismatch.
     pub(crate) fn new(policy: &'a TrustMode) -> Self {
         Self {
             policy,
@@ -157,20 +165,24 @@ impl<'a> Verification<'a> {
         }
     }
 
+    /// Restores a typed feature mismatch without parsing the wire diagnostic.
     pub(crate) fn error(&self, err: crate::Error) -> crate::Error {
         self.excluded.get().map_or(err, crate::Error::Untrusted)
     }
 }
 
 impl Verifier for Verification<'_> {
+    /// Same identity outcome as the policy, with feature failures retained separately.
     type Info = Identity;
 
+    /// Clears the previous outcome before checking this handshake's attestation.
     fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Identity), String> {
         self.excluded.set(None);
         self.policy.verify_identity(attestation, &self.excluded)
     }
 }
 
+/// Attestation policy and excluded-root diagnostics.
 #[cfg(test)]
 mod tests {
     use super::*;

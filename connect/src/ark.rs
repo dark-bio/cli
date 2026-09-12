@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 /// Connect dispatches relay traffic internally when a cloud is selected. Other requests
 /// wait in a bounded queue for [`Self::recv`] while clients issue outgoing calls.
 pub struct Ark {
-    /// Request and closure handles of the wire session owned by the dispatcher.
+    /// Request handle of the wire session owned by the dispatcher.
     requester: Requester,
+    /// Stops wire, cloud setup and application receives together.
     closer: Closer,
     /// Requests not claimed by cloud services.
     incoming: Arc<Incoming>,
@@ -95,7 +96,8 @@ impl Ark {
     }
 
     /// Blocks for a request not handled by cloud services, or returns the
-    /// session's ending reason. Wire answers unknown request types automatically.
+    /// session's ending reason. Closing discards any queued requests.
+    /// Wire answers unknown request types automatically.
     /// The responder retains wire's reply completion and automatic reply semantics.
     pub fn recv(&mut self) -> Result<(schema::ark_to_host::Content, Responder), Error> {
         Ok(self.incoming.recv()?)
@@ -192,6 +194,7 @@ impl Client {
     /// Establishes the request's prerequisites, then queues it without waiting for
     /// output or a response. The first cloud-dependent send may wait for sync
     /// and relay attachment, according to the request's prerequisites.
+    /// Unlike [`Self::call`], a refusal is returned without retrying lost setup.
     /// Waiting on the promise does not refresh the deadline; dropping
     /// it does not cancel the request. Wire's output queue has no capacity limit,
     /// so the caller bounds the number of outstanding requests.
@@ -203,6 +206,8 @@ impl Client {
         self.send_message::<R>(request.into(), timing.into())
     }
 
+    /// Establishes typed prerequisites before starting the wire response window.
+    /// Device-info results retain their request time for clock observations.
     fn send_message<R: Request>(
         &self,
         request: Message,
@@ -248,7 +253,8 @@ impl Client {
     }
 
     /// Authorizes, streams, verifies and installs firmware under the chosen timing.
-    /// The callback runs on this caller's thread. Success acknowledges installation;
+    /// Reads and callbacks run on this thread and must return promptly; a blocking
+    /// reader cannot be interrupted by the deadline. Success acknowledges installation;
     /// the Ark then reboots, and this call does not verify the subsequent boot.
     /// Failed updates are never replayed automatically. Raw firmware requests
     /// must not run concurrently with this operation.
@@ -269,6 +275,8 @@ impl Client {
     /// the rendezvous to the owner; the Ark authenticates every opaque exchange.
     /// Authentication may refresh cloud keys and retry once. The pairing
     /// exchange itself is never retried automatically.
+    /// Progress callbacks run on this thread and must return promptly so the
+    /// rendezvous and approval windows can be serviced.
     pub fn pair(
         &self,
         timing: impl Into<Timing>,
@@ -290,6 +298,8 @@ impl Client {
 
     /// Identifies a dataset from its first MiB without opening an upload session.
     /// Consumes that prefix from the reader; rewind it before uploading.
+    /// A shorter source is an error. The reader must enforce its own read timeout;
+    /// the operation deadline is checked before and after reading.
     pub fn identify_dataset(
         &self,
         name: &str,
@@ -339,7 +349,8 @@ impl Client {
     /// Uploads an app, obtains companion approval and waits for its result.
     /// The source must contain exactly `size` bytes. The Ark validates the app
     /// and its dataset requirements. An unsuccessful app still returns its
-    /// result, including stdout and stderr; inspect the result's `success` flag.
+    /// result; inspect its `success` flag. Output is retained as returned by the
+    /// Ark. Failed apps only retain their streams when developer output is enabled.
     ///
     /// Setup, upload, approval and execution share the deadline. Reads and
     /// progress callbacks run on this thread and must return promptly. A blocking
@@ -423,6 +434,7 @@ mod tests {
     struct ManualUnlock;
 
     impl From<ManualUnlock> for Message {
+        /// Encodes an unlock while leaving setup to the test's reverse handler.
         fn from(_: ManualUnlock) -> Self {
             UnlockRequest {}.into()
         }
@@ -443,6 +455,7 @@ mod tests {
         struct Denied;
 
         impl crate::CodedError for Denied {
+            /// Uses an application code outside wire's reserved error range.
             fn code(&self) -> u64 {
                 0x100
             }
@@ -512,8 +525,10 @@ mod tests {
         #[derive(prost::Message)]
         #[prost(prost_path = "darkbio_wire::prost")]
         struct FutureRequest {
+            /// Correlation ID echoed by wire's automatic refusal.
             #[prost(uint64, tag = "1")]
             id: u64,
+            /// Payload under a tag unknown to the current schema.
             #[prost(bytes = "vec", tag = "2047")]
             content: Vec<u8>,
         }
@@ -776,6 +791,7 @@ mod tests {
     fn test_thread_capabilities() {
         // Request completion handles remain Send even when a user's response wrapper
         // isn't Send. The conversion runs in the caller that waits.
+        /// Fails compilation if a handle loses its cross-thread guarantee.
         fn assert_send<T: Send>() {}
         assert_send::<Pending<std::rc::Rc<()>>>();
         assert_send::<Client>();

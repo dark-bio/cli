@@ -5,6 +5,11 @@
 // license that can be found in the LICENSE file.
 
 //! Cloud prerequisites and registry checks for an Ark connection.
+//!
+//! Clients share one setup state per wire session. The caller that starts an
+//! attempt performs its I/O; concurrent callers wait on that attempt with their
+//! own deadlines. Only successful setup is reused. Closure releases waiters,
+//! while an outstanding blocking I/O retains the initiating caller's deadline.
 
 mod dns;
 mod firmware;
@@ -28,8 +33,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Whether the reported cloud identity and clock can be reused for a request.
 /// Sync is needed before the first use or at 15 seconds of clock drift, leaving
-/// margin within the cloud's 30-second signature skew allowance. Key rotation
-/// is detected by a refused proof; the marker only records setup since boot.
+/// headroom for proof verification. Key rotation is detected by a refused proof;
+/// the marker only records setup since boot.
 pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -38,6 +43,7 @@ pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse) -> bool {
     synced_at(info, now)
 }
 
+/// Compares the boot marker and device clock with host time in Unix seconds.
 fn synced_at(info: &crate::schema::DeviceInfoResponse, now: u64) -> bool {
     info.cloud_synced && info.cloud_clock.abs_diff(now) < 15
 }
@@ -72,7 +78,9 @@ struct Attempt {
 /// Failures shareable between callers joining the same initialization attempt.
 #[derive(Clone, Debug)]
 enum Failure {
+    /// The identity and caller supplied no route for cloud operations.
     MissingEnvironment,
+    /// The cloud refused the Ark's proof, possibly after a key rotation.
     ProofRejected,
     Cloud(String),         // HTTP or response decoding failure
     Relay(String),         // Relay connection or envelope failure
@@ -80,18 +88,21 @@ enum Failure {
 }
 
 impl From<String> for Failure {
+    /// Retains a cloud decoding or validation diagnostic for all setup waiters.
     fn from(error: String) -> Self {
         Self::Cloud(error)
     }
 }
 
 impl From<protocol::Error> for Failure {
+    /// Preserves wire's typed refusal, timeout or session ending reason.
     fn from(error: protocol::Error) -> Self {
         Self::Wire(error)
     }
 }
 
 impl From<Failure> for Error {
+    /// Restores the public error category after a shared attempt completes.
     fn from(error: Failure) -> Self {
         match error {
             Failure::MissingEnvironment => Self::MissingEnvironment,
@@ -159,6 +170,7 @@ impl Services {
     }
 
     /// Serializes one prerequisite while allowing unrelated device traffic.
+    /// Waiters retain the attempt they joined, even if a later caller retries it.
     fn ensure(&self, requester: &Requester, step: Step, timing: Timing) -> Result<(), Failure> {
         let deadline = timing.io();
         let (attempt, leader) = {
@@ -201,12 +213,16 @@ impl Services {
         };
         if !leader {
             attempt.wait(deadline)?;
+            // A joined freshness check may have reused device state. An explicit
+            // refresh still needs an exchange that actually replaces cloud keys.
             return if matches!(step, Step::Refresh) && !attempt.refreshed.load(Ordering::Acquire) {
                 self.ensure(requester, step, timing)
             } else {
                 Ok(())
             };
         }
+        // Run setup without the state lock, then publish only if the session
+        // remains open. Closure wins over a late successful network response.
         let result = match step {
             Step::Sync | Step::Refresh => self
                 .synchronize(requester, timing, matches!(step, Step::Refresh))
@@ -406,11 +422,14 @@ impl Services {
     }
 }
 
-/// Prerequisites are initialized independently and always in this order.
+/// Setup action to join or start. Relay callers establish cloud sync first.
 #[derive(Clone, Copy)]
 enum Step {
+    /// Reuse fresh device state or exchange cloud keys and signed time.
     Sync,
+    /// Exchange keys and time even if the device reports usable setup.
     Refresh,
+    /// Authenticate and start a relay worker, reusing a healthy attachment.
     Relay,
 }
 

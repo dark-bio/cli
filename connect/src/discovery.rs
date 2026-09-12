@@ -30,6 +30,8 @@ impl Discovery {
     /// Without a selector, requires exactly one device. The `hardware:` and
     /// `emulator:` prefixes are reserved for locators; a missing locator never
     /// falls back to a device name. Display formatting does not determine selection.
+    /// The bare names `hardware` and `emulator` require one device of that kind.
+    /// Label matches are exact and case-sensitive.
     pub fn select(&self, selector: Option<&str>) -> Result<&Device, Error> {
         // A reported name must not shadow a locator, including an absent one.
         if let Some(selector) = selector

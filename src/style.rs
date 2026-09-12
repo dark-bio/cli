@@ -10,37 +10,60 @@ use crate::args::Format;
 use clap::builder::styling::{Ansi256Color, RgbColor, Style, Styles};
 use std::io::{self, IsTerminal};
 
+/// Semantic emphasis shared by help, diagnostics and human result layouts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Role {
+    /// Unstyled content whose meaning needs no emphasis.
     Default,
+    /// Section titles and help headings.
     Heading,
+    /// Completed or verified states.
     Success,
+    /// Pending approval, warnings and states needing action.
     Attention,
+    /// Errors, damage and failed checks.
     Failure,
+    /// Labels and secondary context.
     Muted,
+    /// Commands, identifiers and links the user may act on.
     Accent,
+    /// Staging environment label.
     Staging,
+    /// Develop environment label.
     Develop,
 }
 
+/// Terminal color capability, separate from Unicode and interactive cursor control.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Color {
+    /// No ANSI styling, including bold emphasis.
     Off,
+    /// Bold emphasis without palette colors.
     Basic,
+    /// Palette colors approximated on the terminal's 256-color cube.
     Ansi256,
+    /// Exact RGB palette colors.
     True,
 }
 
+/// Presentation capabilities resolved once for one output stream.
 #[derive(Clone, Debug)]
 pub(crate) struct Theme {
+    /// Whether this stream uses human layouts.
     pub human: bool,
+    /// Whether this stream permits cursor control and live line updates.
     pub interactive: bool,
+    /// Whether terminal and locale permit decorative Unicode glyphs.
     pub unicode: bool,
+    /// Available style depth after honoring color opt-out settings.
     pub color: Color,
+    /// Terminal width in display cells, with an 80-column fallback.
     pub width: usize,
 }
 
 impl Theme {
+    /// Combines explicit format, stream attendance, locale and color preferences.
+    /// Forced human mode keeps layouts in pipes, but never enables cursor control there.
     pub fn new(format: Format, stderr: bool) -> Self {
         let attended = if stderr {
             io::stderr().is_terminal()
@@ -90,6 +113,7 @@ impl Theme {
         }
     }
 
+    /// Maps semantic emphasis to supported styling, degrading to bold or plain text.
     pub fn style(&self, role: Role) -> Style {
         if self.color == Color::Off || matches!(role, Role::Default) {
             return Style::new();
@@ -122,15 +146,18 @@ impl Theme {
         }
     }
 
+    /// Wraps text in a role's style and its reset, or leaves it plain when disabled.
     pub fn paint(&self, role: Role, text: impl AsRef<str>) -> String {
         let style = self.style(role);
         format!("{style}{}{style:#}", text.as_ref())
     }
 
+    /// Chooses a decorative glyph without changing the surrounding message.
     pub fn glyph<'a>(&self, unicode: &'a str, ascii: &'a str) -> &'a str {
         if self.unicode { unicode } else { ascii }
     }
 
+    /// Prefixes a state marker so meaning survives without color.
     pub fn mark(&self, role: Role, text: &str) -> String {
         let icon = match role {
             Role::Success => self.glyph("\u{2713}", "ok"),
@@ -141,10 +168,12 @@ impl Theme {
         self.paint(role, format!("{icon} {text}"))
     }
 
+    /// Returns the muted separator used between related human facts.
     pub fn separator(&self) -> String {
         self.paint(Role::Muted, format!(" {} ", self.glyph("\u{00b7}", "-")))
     }
 
+    /// Truncates by terminal cells, preserving ANSI sequences and fitting the tail.
     pub fn truncate(&self, text: &str, width: usize) -> String {
         if console::measure_text_width(text) <= width {
             return text.to_string();
@@ -158,6 +187,7 @@ impl Theme {
         console::truncate_str(text, width, tail).into_owned()
     }
 
+    /// Styles paired backtick spans as commands; unmatched backticks remain literal.
     pub fn inline(&self, text: &str) -> String {
         let mut result = String::new();
         let mut remaining = text;
@@ -173,6 +203,7 @@ impl Theme {
         result
     }
 
+    /// Applies the same semantic palette to clap's generated help and errors.
     pub fn clap(&self) -> Styles {
         Styles::plain()
             .header(self.style(Role::Heading))
@@ -188,6 +219,7 @@ impl Theme {
 /// Terminal control sequences belong to the writer, never to result content.
 pub(crate) const CLEAR_LINE: &str = "\r\x1b[2K";
 
+/// Formats a byte count in binary units up to GiB with one decimal place.
 pub(crate) fn bytes(bytes: u64) -> String {
     for (unit, divisor) in [("GiB", 1_u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
         if bytes >= divisor {

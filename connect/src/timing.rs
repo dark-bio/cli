@@ -8,7 +8,9 @@
 
 use std::time::{Duration, Instant};
 
+/// Device approval window with time for relay forwarding and the final reply.
 pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(40);
+/// Pairing approval window with time for the cloud and device exchanges.
 pub(crate) const PAIRING_WINDOW: Duration = Duration::from_secs(70);
 
 /// An absolute deadline, an inactivity limit, or both. Each expected I/O wait
@@ -16,7 +18,9 @@ pub(crate) const PAIRING_WINDOW: Duration = Duration::from_secs(70);
 /// Approval requests use their protocol window instead of the inactivity limit.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
+    /// Fixed bound shared by every step of an operation, when supplied.
     deadline: Option<Instant>,
+    /// Renewed allowance for each expected machine response, when supplied.
     inactivity: Option<Duration>,
 }
 
@@ -55,6 +59,8 @@ impl Timing {
         self.window(APPROVAL_WINDOW)
     }
 
+    /// Replaces an inactivity allowance with a protocol-specific wait window.
+    /// An absolute-only timing retains its original deadline.
     pub(crate) fn window(self, window: Duration) -> Instant {
         self.bound(self.inactivity.map(|_| window))
     }
@@ -92,6 +98,7 @@ impl Timing {
         Ok(())
     }
 
+    /// Chooses the earlier bound, treating duration overflow as immediate expiry.
     fn bound(self, timeout: Option<Duration>) -> Instant {
         let wait = timeout.map(|timeout| {
             let now = Instant::now();
@@ -107,11 +114,13 @@ impl Timing {
 }
 
 impl From<Instant> for Timing {
+    /// Uses an absolute deadline without adding an inactivity allowance.
     fn from(deadline: Instant) -> Self {
         Self::until(deadline)
     }
 }
 
+/// Deadline clipping and protocol window regressions.
 #[cfg(test)]
 mod tests {
     use super::*;

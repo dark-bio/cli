@@ -30,6 +30,8 @@ use error::Error;
 use serde_json::{Value, json};
 use std::process::ExitCode;
 
+/// Parses the invocation, installs output and interruption, then reports one outcome.
+/// Help and usage failures honor stream formatting even before typed parsing succeeds.
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args_os().collect();
     let format = requested_format(&arguments);
@@ -93,6 +95,8 @@ fn main() -> ExitCode {
     } else {
         run(&context, cli.command)
     };
+    // Wait for interruption cleanup already in progress. Stop the live line
+    // before printing an error, preserving a result already emitted by a command.
     context.interrupt.finished();
     context.output.finish();
     match result {
@@ -106,6 +110,7 @@ fn main() -> ExitCode {
         }
     }
 }
+/// Dispatches one command; an absent command prints top-level help without discovery.
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
         None => {
@@ -134,6 +139,7 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         }
     }
 }
+/// Reports compiled crate versions and the firmware compatibility baseline.
 pub(crate) fn versions() -> Value {
     json!({
         "tool": env!("CARGO_PKG_VERSION"),
@@ -150,6 +156,7 @@ fn json_requested(arguments: &[std::ffi::OsString]) -> bool {
     requested_format(arguments) == args::Format::Json
 }
 
+/// Finds the last explicit format before --, without requiring valid command syntax.
 fn requested_format(arguments: &[std::ffi::OsString]) -> args::Format {
     let mut format = args::Format::Auto;
     let mut arguments = arguments.iter().skip(1);

@@ -17,11 +17,15 @@ use tungstenite::{
     stream::MaybeTlsStream,
 };
 
+/// Bounds cloud frames and assembled messages to wire's transport capacity.
 const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
 
+/// Cloud WebSocket retaining its TLS state when switched to readiness polling.
 pub(super) type Connection = WebSocket<MaybeTlsStream<Socket>>;
 
 /// Opens a cloud socket and requires the requested application subprotocol.
+/// DNS, TCP, TLS and upgrade share one deadline. A 403 remains a proof rejection
+/// so setup can refresh cloud keys before any application exchange begins.
 pub(super) fn connect(
     url: &str,
     auth: &[u8],
@@ -102,14 +106,19 @@ pub(super) fn connect(
 /// Blocking reads and writes share a deadline; attached relays use readiness.
 #[derive(Debug)]
 pub(super) enum Socket {
+    /// Handshake or pairing stream with a shared read and write bound.
     Blocking {
+        /// Connected TCP socket, optionally wrapped by TLS above this adapter.
         stream: TcpStream,
+        /// Absolute bound checked again before each blocking I/O.
         deadline: Instant,
     },
+    /// Attached relay socket serviced by the worker's readiness loop.
     Connected(mio::net::TcpStream),
 }
 
 impl Read for Socket {
+    /// Applies the remaining blocking deadline or returns readiness-based I/O.
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Blocking { stream, deadline } => {
@@ -122,6 +131,7 @@ impl Read for Socket {
 }
 
 impl Write for Socket {
+    /// Applies the remaining blocking deadline or writes through the relay socket.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Blocking { stream, deadline } => {
@@ -131,6 +141,7 @@ impl Write for Socket {
             Self::Connected(stream) => stream.write(bytes),
         }
     }
+    /// Flushes the underlying stream under the same bound as a write.
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Blocking { stream, deadline } => {
@@ -151,6 +162,7 @@ pub(super) fn socket_mut(socket: &mut WebSocket<MaybeTlsStream<Socket>>) -> &mut
     }
 }
 
+/// Returns a positive OS timeout; zero would mean an unbounded wait on some APIs.
 pub(super) fn remaining(deadline: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -158,6 +170,7 @@ pub(super) fn remaining(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
 }
 
+/// Preserves timeout classification across blocking socket error conventions.
 pub(super) fn io_error(error: io::Error) -> Failure {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
@@ -167,6 +180,7 @@ pub(super) fn io_error(error: io::Error) -> Failure {
     }
 }
 
+/// Separates expired I/O and rejected proofs from other cloud socket failures.
 pub(super) fn socket_error(error: tungstenite::Error) -> Failure {
     match error {
         tungstenite::Error::Io(error) => io_error(error),

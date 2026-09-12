@@ -30,9 +30,17 @@ pub enum DeviceKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Locator {
     /// Host bus and device address assigned during hardware enumeration.
-    Hardware { bus: String, address: u8 },
+    Hardware {
+        /// Host bus identifier, meaningful only on this host.
+        bus: String,
+        /// Address assigned to the device on that bus.
+        address: u8,
+    },
     /// Host port assigned by the emulator's launcher.
-    Emulator { port: u16 },
+    Emulator {
+        /// Loopback port published by the local launcher.
+        port: u16,
+    },
 }
 
 impl fmt::Display for Locator {
@@ -55,7 +63,9 @@ pub struct Device {
 /// Origin of the discovery record, independent of the Ark's authenticated realm.
 #[derive(Clone)]
 enum Source {
+    /// USB descriptors and the platform handle needed to open the device.
     Usb(nusb::DeviceInfo),
+    /// Launcher metadata and the port of its emulated device.
     Registry(Instance),
 }
 

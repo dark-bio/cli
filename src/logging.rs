@@ -15,6 +15,8 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
+/// Installs an allowlisted subscriber when verbose output is requested.
+/// An existing process subscriber is retained if installation is unavailable.
 pub(crate) fn init(output: Output, verbosity: u8) {
     if verbosity == 0 {
         return;
@@ -32,8 +34,10 @@ pub(crate) fn init(output: Output, verbosity: u8) {
         .try_init();
 }
 
+/// Tracing layer that routes selected events through the CLI's stderr policy.
 struct Log(Output);
 impl<S: Subscriber> Layer<S> for Log {
+    /// Renders setup messages as steps and other selected events as structured or text logs.
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
         let mut fields = Fields(Map::new());
         event.record(&mut fields);
@@ -72,12 +76,15 @@ impl<S: Subscriber> Layer<S> for Log {
     }
 }
 
+/// Collected tracing fields, preserving string values for message rendering.
 struct Fields(Map<String, Value>);
 impl Visit for Fields {
+    /// Stores a debug-only field as its printable representation.
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.0
             .insert(field.name().into(), json!(format!("{value:?}")));
     }
+    /// Retains a string field without adding debug quotes.
     fn record_str(&mut self, field: &Field, value: &str) {
         self.0.insert(field.name().into(), json!(value));
     }

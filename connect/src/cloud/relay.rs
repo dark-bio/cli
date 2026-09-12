@@ -5,6 +5,11 @@
 // license that can be found in the LICENSE file.
 
 //! Carries opaque companion messages between the cloud socket and the Ark.
+//!
+//! One worker owns the WebSocket and both directions of exchange bookkeeping.
+//! The wire dispatcher only admits reverse requests to a bounded queue. Relay
+//! failure refuses retained Ark requests; a later operation may attach again,
+//! but no request is replayed and the underlying wire session stays independent.
 
 use super::{
     Failure,
@@ -24,16 +29,23 @@ use tungstenite::{Message, WebSocket};
 
 /// Relay bodies fit inside a wire message. Queues and requests also have limits.
 const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
+/// Byte allowance for each queued direction, excluding in-flight wire messages.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Request count limit applied to admission, active exchanges and output queues.
 const MAX_INFLIGHT: usize = 128;
 
 /// The firmware bounds its relay requests by sixty seconds. This also bounds
 /// retained responders when a companion never answers, independently of callers.
 pub(super) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum time to flush an outgoing frame through a backlogged cloud socket.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Idle interval between a valid pong and the next liveness probe.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Maximum wait for the pong matching the current probe.
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Readiness token for incoming traffic and pending socket writes.
 const SOCKET: Token = Token(0);
+/// Readiness token for queued Ark requests or local closure.
 const WAKE: Token = Token(1);
 
 /// An attached relay. Dropping it ends its worker and outstanding forwarding.
@@ -43,14 +55,20 @@ pub(super) struct Relay {
     worker: Option<Worker>, // Started when dispatch can see this attachment
 }
 
+/// Connected resources moved into the worker only after services publishes the relay.
 #[derive(Debug)]
 struct Worker {
+    /// Sole owner of WebSocket framing and TLS state.
     socket: WebSocket<MaybeTlsStream<Socket>>,
+    /// Waits for socket readiness, admission wakeups and exchange deadlines.
     poll: Poll,
+    /// Issues companion requests through the original Ark session.
     requester: Requester,
+    /// Cloud liveness probes, independent of companion availability.
     heartbeat: Heartbeat,
 }
 
+/// Admission and shutdown handles shared by the dispatcher and relay worker.
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>, // Admission and closure are atomic with respect to each other
@@ -58,8 +76,10 @@ struct Shared {
     socket: TcpStream,   // Interrupts reads even inside WebSocket message assembly
 }
 
+/// Reverse requests awaiting admission and the first attachment failure.
 #[derive(Debug, Default)]
 struct State {
+    /// Ark requests, unanswered responders and their fixed exchange deadlines.
     queue: VecDeque<(schema::RelayArkToAppRequest, Responder, Instant)>,
     bytes: usize,          // Opaque bytes waiting for the socket worker
     error: Option<String>, // First reason this relay ended
@@ -127,7 +147,8 @@ impl Relay {
         Ok(())
     }
 
-    /// Whether this particular attachment has ended. A new call may replace it.
+    /// Whether this attachment has no recorded failure. This is a local snapshot;
+    /// a dead peer may remain undetected until I/O or the next heartbeat expires.
     pub(super) fn connected(&self) -> bool {
         self.shared
             .state
@@ -159,12 +180,14 @@ impl Relay {
         }
     }
 
+    /// Refuses queued work and wakes the worker without waiting for it to join.
     pub(super) fn close(&self) {
         self.shared.end("relay closed".into());
     }
 }
 
 impl Drop for Relay {
+    /// Ends this attachment even if the owning wire connection remains open.
     fn drop(&mut self) {
         self.close();
     }
@@ -187,6 +210,7 @@ impl Shared {
     }
 }
 
+/// Recognizes an incomplete nonblocking operation that the poll loop can resume.
 fn would_block(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
 }
@@ -204,21 +228,32 @@ pub(super) fn fail(responder: Responder, reason: &str) {
 #[derive(Cbor, Default)]
 #[cbor(array)]
 struct Envelope {
+    /// Envelope version; the current cloud protocol requires one.
     darkrpc: u64,
+    /// Correlation ID present only on requests and responses.
     id: Option<u64>,
+    /// Sealed notification body, currently ignored after envelope validation.
     notify: Option<Vec<u8>>,
+    /// Sealed request body forwarded without interpretation.
     request: Option<Vec<u8>>,
+    /// Sealed response body matched to an outstanding request.
     response: Option<Vec<u8>>,
+    /// Presence body, currently ignored because wire has no corresponding input.
     presence: Option<Vec<u8>>,
 }
 
+/// Validated envelope shape. The host only originates requests and responses.
 enum Frame {
+    /// Correlation ID and opaque request bytes.
     Request(u64, Vec<u8>),
+    /// Correlation ID and opaque response bytes.
     Response(u64, Vec<u8>),
+    /// Recognized notification or presence envelope with no wire destination.
     Notice,
 }
 
 impl Frame {
+    /// Requires the current version and exactly one payload with the proper ID shape.
     fn decode(bytes: &[u8]) -> Result<Self, Failure> {
         let envelope: Envelope = cbor::decode(bytes)
             .map_err(|error| Failure::Relay(format!("invalid relay envelope: {error}")))?;
@@ -241,6 +276,8 @@ impl Frame {
         }
     }
 
+    /// Encodes a forwarded exchange without changing its ID or sealed payload.
+    /// Notifications cannot be originated by the host.
     fn encode(self) -> Vec<u8> {
         let mut envelope = Envelope {
             darkrpc: 1,
@@ -265,14 +302,20 @@ impl Frame {
 /// pong echoing our current ping proves liveness; other traffic cannot defer it.
 #[derive(Debug)]
 struct Heartbeat {
+    /// Delay before probing again after a matching pong.
     interval: Duration,
+    /// Time allowed for the next probe's matching pong.
     timeout: Duration,
+    /// Next probe time when no ping is awaiting a pong.
     next: Instant,
+    /// Wrapping probe ID, encoded in network byte order.
     sequence: u64,
+    /// Probe ID and fixed expiry while awaiting a matching pong.
     pending: Option<(u64, Instant)>,
 }
 
 impl Heartbeat {
+    /// Schedules the first probe without sending traffic during attachment.
     fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
             interval,
@@ -297,6 +340,7 @@ impl Heartbeat {
         Ok(None)
     }
 
+    /// Acknowledges only a timely pong echoing the outstanding probe exactly.
     fn pong(&mut self, bytes: &[u8], now: Instant) {
         if let Some((sequence, deadline)) = self.pending
             && now < deadline
@@ -307,6 +351,7 @@ impl Heartbeat {
         }
     }
 
+    /// Next instant the worker must wake to send a probe or detect its expiry.
     fn deadline(&self) -> Instant {
         self.pending.map_or(self.next, |(_, deadline)| deadline)
     }
@@ -322,6 +367,8 @@ fn pump(
     mut heartbeat: Heartbeat,
 ) {
     let mut events = Events::with_capacity(8);
+    // The two directions have independent ID spaces. Only the worker changes
+    // these maps, so completions never need the shared admission lock.
     let mut pending: HashMap<u64, (Responder, Instant)> = HashMap::new();
     let mut inbound: HashMap<u64, Promise<protocol::Message>> = HashMap::new();
     let (answered, answers) = mpsc::channel();
@@ -401,6 +448,8 @@ fn pump(
                     Err(error) => return Err(socket_error(error)),
                 }
             }
+            // Bound each read batch so a busy companion cannot starve writes,
+            // expired Ark requests or the heartbeat.
             let mut batch_full = false;
             for index in 0..32 {
                 match socket.read() {
@@ -467,6 +516,8 @@ fn pump(
             {
                 continue;
             }
+            // Wire completions arrive on a channel without a mio wakeup. Poll
+            // briefly only while those requests exist; otherwise wait for I/O.
             let deadline = pending
                 .values()
                 .map(|(_, deadline)| *deadline)

@@ -16,6 +16,7 @@ use crate::{
 use darkbio_connect::{DeviceKind, Identity, schema};
 use serde_json::{Value, json};
 
+/// Lists discovery metadata without opening devices, retaining useful partial results.
 pub(crate) fn devices(context: &Context) -> Result<(), Error> {
     let found = context.discover();
     if found.devices.is_empty() && !found.errors.is_empty() {
@@ -49,6 +50,7 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
+/// Prints offline device state before reporting an outdated firmware error.
 pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), Error> {
     let connection = context.connect_recovery(recovery.pubkey.as_deref())?;
     let value = status_value(&connection);
@@ -58,6 +60,9 @@ pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), 
     Ok(())
 }
 
+/// Combines authenticated identity with reported hardware and firmware snapshots.
+/// Fields absent from older protocols stay unknown; routing overrides do not become
+/// attested environment labels.
 fn status_value(connection: &Connection) -> Value {
     let current = connection.require_current().is_ok();
     let info = &connection.info;
@@ -95,12 +100,14 @@ fn status_value(connection: &Connection) -> Value {
         "pubkey":hex::encode(connection.identity.key().to_bytes()),"mismatch":mismatch})
 }
 
+/// Uses the compact human status layout with the same complete machine document.
 fn print_status(context: &Context, value: &Value) -> Result<(), Error> {
     context
         .output
         .document_with(value, |theme, verbose| status_block(theme, value, verbose))
 }
 
+/// Groups identity and state facts, expanding full keys only at verbose detail.
 fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
     let field = |key: &str| human::value(theme, key, &value[key]);
     let flag = |key: &str, yes: &str, no: &str| match value[key].as_bool() {
@@ -177,6 +184,7 @@ fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
     human::block(theme, &rows)
 }
 
+/// Suggests the next enrollment, pairing or unlock action from the reported state.
 fn status_hints(context: &Context, connection: &Connection, value: &Value) {
     if matches!(connection.identity, Identity::SelfSigned(_))
         && connection.device.kind() == DeviceKind::Emulator
@@ -192,6 +200,7 @@ fn status_hints(context: &Context, connection: &Connection, value: &Value) {
     }
 }
 
+/// Unlocks a paired Ark when needed and reports whether this invocation changed it.
 pub(crate) fn unlock(context: &Context) -> Result<(), Error> {
     let connection = context.connect(None)?;
     let state = &connection.info;
@@ -208,6 +217,7 @@ pub(crate) fn unlock(context: &Context) -> Result<(), Error> {
         .document(&json!({"unlocked":true,"changed":!state.unlocked}))
 }
 
+/// Forces cloud synchronization and reports registry state before failing an inactive check.
 pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
     let connection = context.connect(None)?;
     connection.client.sync(context.timing())?;
@@ -242,6 +252,9 @@ pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
+/// Installs a supplied attestation or directs online enrollment to the Ark Hub.
+/// After installation, reconnects without recovery pinning to verify the new identity;
+/// a reconnect failure still reports that enrollment was acknowledged.
 pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error> {
     let certificate = args
         .cwt
@@ -309,6 +322,7 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
     }
 }
 
+/// Formats Unix seconds as UTC RFC 3339, leaving unrepresentable dates absent.
 pub(crate) fn timestamp(seconds: u64) -> Option<String> {
     i64::try_from(seconds)
         .ok()
@@ -316,6 +330,7 @@ pub(crate) fn timestamp(seconds: u64) -> Option<String> {
         .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
+/// Selects the browser enrollment origin for the chosen cloud route.
 pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
     use darkbio_connect::trust::Environment::*;
     match env {

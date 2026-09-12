@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-connect"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Client library for Ark enclaves"
 repository = "https://github.com/dark-bio/cli"

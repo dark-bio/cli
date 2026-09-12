@@ -9,11 +9,10 @@
 //! exclusively, so an Ark held by another program, a browser tab included,
 //! cannot be opened until that lets go.
 //!
-//! Each direction is a ring of transfers queued with the system, the shape
-//! the firmware drives its own end of the bus with: transfers of 64 KiB,
-//! sixteen in flight, a zero length packet closing a frame that ended on a
-//! packet boundary, and flushes that take back the transfers already finished
-//! rather than drain the ring, so consecutive frames overlap on the bus.
+//! Each direction queues a ring of host transfers to keep the bus occupied.
+//! A zero length packet closes a frame that ended on a packet boundary. Flushes
+//! reap finished transfers without draining the ring, so consecutive frames
+//! can overlap on the bus.
 //! Every wait is bounded by the deadline the wire installed and ends early
 //! once the connection is closed.
 
@@ -41,13 +40,11 @@ const VENDOR_INTERFACE: (u8, u8, u8) = (0xff, 1, 2);
 /// only when a name was given.
 const PRODUCT_SEPARATOR: &str = " \u{00b7} ";
 
-/// Bytes per transfer in either direction, the chunk the firmware moves over
-/// the bus and the size the bench found saturating it. A multiple of the
-/// packet size of any bulk endpoint.
+/// Bytes per host transfer in either direction. A multiple of every supported
+/// bulk endpoint's packet size, keeping partial packets at frame boundaries.
 const TRANSFER_SIZE: usize = 64 * 1024;
 
-/// Transfers kept in flight per direction, the queue the firmware keeps on
-/// its end of the bus and the depth the bench found saturating it.
+/// Host transfers kept in flight per direction to overlap USB and protocol work.
 const TRANSFERS: usize = 16;
 
 /// Name the Ark was given, carried in its product string after the carrier
@@ -159,18 +156,22 @@ trait Transfers {
 }
 
 impl<D: EndpointDirection> Transfers for nusb::Endpoint<Bulk, D> {
+    /// Reads the active endpoint descriptor's maximum packet size.
     fn packet_size(&self) -> usize {
         self.max_packet_size()
     }
 
+    /// Counts submitted transfers whose completions have not been reaped.
     fn in_flight(&self) -> usize {
         self.pending()
     }
 
+    /// Transfers ownership of the buffer to the system USB queue.
     fn queue(&mut self, buffer: Buffer) {
         self.submit(buffer);
     }
 
+    /// Reaps the next system completion or registers the direction's waker.
     fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
         self.poll_next_complete(cx)
     }
@@ -193,10 +194,12 @@ impl Notifier {
 }
 
 impl Wake for Notifier {
+    /// Records a wake before releasing the transfer's notifier reference.
     fn wake(self: Arc<Self>) {
         self.notify();
     }
 
+    /// Records a wake while retaining the notifier for later transfers.
     fn wake_by_ref(self: &Arc<Self>) {
         self.notify();
     }
@@ -296,6 +299,8 @@ impl<T: Transfers> Reader<T> {
 }
 
 impl<T: Transfers> Read for Reader<T> {
+    /// Serves completed bytes before waiting for another transfer. Empty USB
+    /// packets delimit frames; only closure ends the stream.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -344,6 +349,7 @@ impl<T: Transfers> Read for Reader<T> {
 }
 
 impl<T: Transfers> transport::Read for Reader<T> {
+    /// Bounds future waits without discarding bytes from a completed transfer.
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
         Ok(())
@@ -432,6 +438,8 @@ impl<T: Transfers> Writer<T> {
 }
 
 impl<T: Transfers> Write for Writer<T> {
+    /// Queues bytes in order, reporting partial acceptance if a later wait fails.
+    /// Acceptance means submission to USB; a later reap may report its failure.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed());
@@ -453,6 +461,8 @@ impl<T: Transfers> Write for Writer<T> {
         Ok(accepted)
     }
 
+    /// Terminates an aligned frame and surfaces completed transfer errors.
+    /// Transfers still in flight remain queued so consecutive frames can overlap.
     fn flush(&mut self) -> io::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed());
@@ -474,6 +484,7 @@ impl<T: Transfers> Write for Writer<T> {
 }
 
 impl<T: Transfers> transport::Write for Writer<T> {
+    /// Installs one bound for subsequent writes, queue waits and frame flushes.
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
         Ok(())

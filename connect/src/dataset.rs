@@ -12,9 +12,12 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
+/// Prefix supplied to the Ark for file identification and upload preparation.
 const IDENTIFY_SIZE: usize = 1024 * 1024;
 const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024; // Leave room for sealing and framing
+/// Flushes partial chunks from slow sources before the device upload window expires.
 const CHUNK_INTERVAL: Duration = Duration::from_secs(1);
+/// Delay between processing reports, independent of each response's deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Upload stages reported on the caller's thread. Acknowledged bytes may still
@@ -28,9 +31,17 @@ pub enum UploadProgress {
     /// Opening an upload session. The Ark may request companion approval.
     Preparing,
     /// The upload session is available for explicit cancellation.
-    Started { session: u64 },
+    Started {
+        /// Upload ID accepted by [`schema::SlotUploadCancelRequest`].
+        session: u64,
+    },
     /// Dataset bytes acknowledged by the Ark so far.
-    Uploading { uploaded: u64, total: u64 },
+    Uploading {
+        /// Bytes acknowledged so far, including the identification prefix.
+        uploaded: u64,
+        /// Declared source length in bytes.
+        total: u64,
+    },
     /// Validation and indexing progress reported by the Ark.
     Processing(schema::SlotUploadProcessResponse),
 }
@@ -39,7 +50,9 @@ pub enum UploadProgress {
 /// slot and carries the hash advertised alongside the download.
 #[derive(Clone, Debug)]
 pub struct Dataset {
+    /// Source filename sent to the Ark for identification and display.
     pub name: String,
+    /// Exact source length in bytes; truncation and trailing bytes are errors.
     pub size: u64,
     /// Target slot, or None to let the Ark identify the file.
     pub slot: Option<i32>,
@@ -248,6 +261,7 @@ fn finish_read(
     Ok(())
 }
 
+/// Keeps source timeouts distinct from other dataset read failures.
 fn read_error(error: io::Error) -> Error {
     if error.kind() == io::ErrorKind::TimedOut {
         Error::Timeout

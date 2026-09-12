@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-ark"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Command line interface to Ark enclaves"
 repository = "https://github.com/dark-bio/cli"
@@ -26,7 +26,7 @@ members = ["connect"]
 [dependencies]
 chrono = "0.4.41"
 clap = { version = "4.5.60", features = ["derive"] }
-darkbio-connect = { version = "0.1.0", path = "connect", features = ["release", "staging", "develop"] }
+darkbio-connect = { version = "0.1.1", path = "connect", features = ["release", "staging", "develop"] }
 hex = "0.4.3"
 console = "0.15.11"
 base64 = "0.23.1"

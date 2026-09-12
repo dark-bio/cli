@@ -10,6 +10,9 @@ use crate::{context::Context, error::Error, firmware::Packages};
 use darkbio_connect::schema;
 use serde_json::{Value, json};
 
+/// Collects independent diagnostics, skipping checks whose prerequisites failed.
+/// Cloud sync is explicit; doctor never pairs or unlocks the Ark to complete checks.
+/// The full checklist is printed before the first failure determines the exit class.
 pub(crate) fn run(context: &Context) -> Result<(), Error> {
     let mut checks = Checks {
         context,
@@ -181,18 +184,25 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     context.output.checklist(&document, &checks.rows)?;
     checks.failure.map_or(Ok(()), Err)
 }
+/// Ordered diagnostic results and the first failure used for command status.
 struct Checks<'a> {
+    /// Invocation output used to emit optional step diagnostics.
     context: &'a Context,
+    /// Checks in execution order, including explicit skips and local hints.
     rows: Vec<Value>,
+    /// First failed check, retained while later independent checks continue.
     failure: Option<Error>,
 }
 impl Checks<'_> {
+    /// Records a successful diagnostic with its observed detail.
     fn ok(&mut self, name: &str, detail: &str) {
         self.add(name, "ok", detail, None);
     }
+    /// Records an unmet prerequisite without making the command fail by itself.
     fn skip(&mut self, name: &str, detail: &str) {
         self.add(name, "skip", detail, None);
     }
+    /// Records the failure and first hint, preserving the earliest command error.
     fn fail(&mut self, name: &str, error: Error) {
         self.add(
             name,
@@ -204,6 +214,7 @@ impl Checks<'_> {
             self.failure = Some(error);
         }
     }
+    /// Appends one structured check and its optional verbose event.
     fn add(&mut self, name: &str, result: &str, detail: &str, hint: Option<&str>) {
         self.context
             .output

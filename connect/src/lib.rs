@@ -7,10 +7,15 @@
 //! Authenticated connections and protocol workflows for Ark hosts.
 //!
 //! Discovery lists hardware and local emulators without authenticating them.
-//! [`Device::connect`] establishes an encrypted session and returns its verified
-//! [`Identity`]. [`Ark`] owns the session; its clonable [`Client`] handles issue
+//! [`Device::connect`] establishes an encrypted session and returns its
+//! [`Identity`], distinguishing root attestation, self-signing and a caller-pinned
+//! recovery key. [`Ark`] owns the session; its clonable [`Client`] handles issue
 //! requests without keeping it open. Dropping or closing the owner ends the
 //! connection and its companion relay.
+//!
+//! The `release`, `staging` and `develop` Cargo features select trusted device
+//! roots. None is enabled by default. Self-signed and pinned connections remain
+//! available; choosing a cloud route does not enable a missing attestation root.
 //!
 //! ```no_run
 //! use darkbio_connect::{Error, TrustMode, schema};
@@ -49,7 +54,10 @@
 //! [`Client::update_firmware`] streams a [`Firmware`], obtains cloud access keys,
 //! verifies and installs it; success acknowledges installation, not the later
 //! reboot. [`Client::execute`] uploads an app, obtains approval and retrieves its
-//! result. A failed app still returns its output with `success: false`.
+//! result. A failed app returns `success: false`, preserving any output the Ark
+//! includes. Failed-app streams require developer output to be enabled in the app.
+//! Firmware preparation may require approval, so a rejected proof refreshes cloud
+//! keys and returns an error for the caller to retry explicitly.
 //!
 //! Downloads, package catalogues, version selection, caches, prompts, signal
 //! handling and reboot waits belong to callers. Connect accepts readers, checks
@@ -59,7 +67,8 @@
 //!
 //! [`Client::pair`] forwards the existing cloud pairing exchange. Its progress
 //! callback supplies the rendezvous for presentation to the owner. Pairing and
-//! relay envelopes stay opaque; the Ark and companion authenticate their content.
+//! relay payloads stay opaque; the Ark and companion authenticate their content.
+//! Connect interprets only rendezvous routing and relay envelope fields.
 //!
 //! [`Client::send`] establishes prerequisites and returns a typed [`Pending`]
 //! without waiting for the response. Waiting later retains the original deadline;

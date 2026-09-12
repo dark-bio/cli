@@ -10,15 +10,22 @@ use crate::error::Error;
 
 use serde::Deserialize;
 
+/// Validated published archive metadata, independent of the installed device state.
 #[derive(Clone, Debug)]
 pub(crate) struct Package {
+    /// Full Ark version, including the build suffix.
     pub version: String,
+    /// Publisher's human description of the build.
     pub summary: String,
+    /// Publisher's timestamp text, rendered as a date when parseable.
     pub published: String,
+    /// Nonzero encrypted archive length in bytes.
     pub size: u64,
+    /// Decoded archive digest used for routing and end-to-end download integrity.
     pub sha256: [u8; 32],
 }
 impl Package {
+    /// Retains only the metadata connect needs to authorize and verify the update.
     pub fn firmware(&self) -> darkbio_connect::Firmware {
         darkbio_connect::Firmware {
             version: self.version.clone(),
@@ -28,6 +35,7 @@ impl Package {
     }
 }
 
+/// Classifies malformed package versions, hashes and routes as rejected input.
 fn invalid(message: String) -> Error {
     Error::new(1, "invalid-version", message)
 }
@@ -35,16 +43,20 @@ fn invalid(message: String) -> Error {
 /// Ark versions carry three u16 components and a seven-character build suffix.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Version {
+    /// Major, minor and patch components compared numerically.
     numbers: [u16; 3],
     stable: bool, // A stable build follows develop at the same semantic version
+    /// Seven-character suffix, breaking ties after semantic version and stability.
     commit: String,
 }
 
 impl Version {
+    /// Whether the suffix names the mutable develop build instead of a commit.
     pub(super) fn is_develop(&self) -> bool {
         !self.stable
     }
 
+    /// Requires three u16 components and either develop or seven hexadecimal characters.
     pub(super) fn parse(value: &str) -> Result<Self, Error> {
         let invalid = || invalid(format!("invalid firmware version {value:?}"));
         let (version, commit) = value.split_once('-').ok_or_else(invalid)?;
@@ -71,19 +83,29 @@ impl Version {
     }
 }
 
+/// Unvalidated package index decoded before artifact routes are accepted.
 #[derive(Deserialize)]
 pub(super) struct Listing {
+    /// Package family, required to be arkos before any artifact is used.
     package: String,
+    /// Published entries awaiting version, length, hash and path checks.
     artifacts: Vec<Artifact>,
 }
 
+/// Raw JSON entry whose fields must agree before becoming a package.
 #[derive(Deserialize)]
 struct Artifact {
+    /// Advertised full version used in both archive path and cloud authorization.
     version: String,
+    /// Publisher's description retained for selection output.
     summary: String,
+    /// Publication timestamp retained as supplied by the index.
     published: String,
+    /// Advertised archive length, rejected when zero.
     size: u64,
+    /// Hexadecimal SHA-256, decoded to exactly 32 bytes.
     sha256: String,
+    /// Archive route that must equal the path derived from version and digest.
     path: String,
 }
 
@@ -120,6 +142,7 @@ impl Listing {
     }
 }
 
+/// Derives the canonical archive route from the validated version and digest.
 pub(super) fn path(firmware: &Package) -> String {
     format!(
         "imgs/arkos-{}-{}.arch",
@@ -127,6 +150,7 @@ pub(super) fn path(firmware: &Package) -> String {
         hex::encode(firmware.sha256)
     )
 }
+/// Accepts a higher semantic version or any build replacing develop at the same version.
 pub(super) fn candidate(firmware: &Package, installed: &str) -> Result<bool, Error> {
     let current = Version::parse(installed)?;
     let proposed = Version::parse(&firmware.version)?;

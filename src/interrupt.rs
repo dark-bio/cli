@@ -12,21 +12,31 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Shared cancellation registration used by commands and platform signal handlers.
 #[derive(Clone)]
 pub(crate) struct Interrupt(Arc<Mutex<State>>);
+/// Active connection and cancellation target, held stable throughout interruption.
 #[derive(Default)]
 struct State {
+    /// Request and shutdown handles for the currently selected Ark session.
     connection: Option<(Client, Closer)>,
+    /// Task or dataset upload whose cancellation can be attempted explicitly.
     target: Option<Target>,
+    /// Latest structured result to preserve if interruption precedes completion.
     partial: Option<Value>,
 }
+/// Device-side work addressable by an explicit cancellation request.
 #[derive(Clone, Copy)]
 pub(crate) enum Target {
+    /// App task ID covering both its upload and execution.
     Task(u64),
+    /// Dataset upload session ID, including processing.
     Upload(u64),
 }
 
 impl Interrupt {
+    /// Registers platform handlers and an initially empty cancellation state.
+    /// Cancellation runs on a worker or OS callback thread, outside a Unix signal handler.
     pub fn install(output: Output) -> Result<Self, Error> {
         let interrupt = Self(Arc::new(Mutex::new(State::default())));
         #[cfg(unix)]
@@ -59,23 +69,30 @@ impl Interrupt {
         }
         Ok(interrupt)
     }
+    /// Registers a new session and clears any cancellation target from the previous one.
     pub fn connection(&self, client: Client, closer: Closer) {
         let mut state = self.0.lock().expect("cancellation not poisoned");
         state.connection = Some((client, closer));
         state.target = None;
     }
+    /// Records device-side work as soon as the Ark returns its cancellation ID.
     pub fn target(&self, target: Target) {
         self.0.lock().expect("cancellation not poisoned").target = Some(target);
     }
+    /// Replaces the result snapshot used if a signal interrupts the command.
     pub fn partial(&self, value: Value) {
         self.0.lock().expect("cancellation not poisoned").partial = Some(value);
     }
+    /// Clears completed work while retaining the session and partial result.
     pub fn clear(&self) {
         self.0.lock().expect("cancellation not poisoned").target = None;
     }
+    /// Synchronizes command completion with a handler already holding cancellation state.
     pub fn finished(&self) {
         drop(self.0.lock().expect("cancellation not poisoned"));
     }
+    /// Attempts bounded cancellation, closes the session and exits with the signal code.
+    /// The state lock prevents commands from replacing the target during cleanup.
     fn cancel(&self, output: Output, code: i32) -> ! {
         let state = self.0.lock().expect("cancellation not poisoned");
         output.event("note", "interrupted; cancelling active work");
@@ -117,9 +134,11 @@ impl Interrupt {
     }
 }
 
+/// Retains callback state for the process lifetime; Windows callbacks have no context pointer.
 #[cfg(windows)]
 static CONSOLE: std::sync::OnceLock<(Interrupt, Output)> = std::sync::OnceLock::new();
 
+/// Handles console interruption on the OS callback thread and leaves unknown events unclaimed.
 #[cfg(windows)]
 unsafe extern "system" fn console_handler(event: u32) -> windows_sys::core::BOOL {
     use windows_sys::Win32::System::Console::{

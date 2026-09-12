@@ -17,8 +17,10 @@ use std::sync::{
     mpsc,
 };
 
+/// Persistence unit for resumable prefixes and the background writer's queue.
 pub(super) const CHUNK: usize = 1024 * 1024;
 
+/// Uses the platform user cache directory, with a temporary-directory fallback.
 pub(crate) fn directory() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.cache_dir().join("ark"))
@@ -27,15 +29,20 @@ pub(crate) fn directory() -> PathBuf {
 
 /// Only a complete digest can name a cache entry; advertised metadata may
 /// contain unknown or malformed values even when no download is requested.
+/// Presence is only a planning hint; replay verifies the file's contents again.
 pub(super) fn cached(directory: &Path, hash: &str) -> bool {
     let mut digest = [0; 32];
     hex::decode_to_slice(hash, &mut digest).is_ok() && directory.join(hex::encode(digest)).is_file()
 }
 
+/// Resume sidecar binding a retained prefix to its source and HTTP validator.
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Metadata {
+    /// Original advertised URL used to detect a changed download source.
     pub url: String,
+    /// ETag or Last-Modified value supplied in a later If-Range request.
     pub validator: Option<String>,
+    /// Advertised full length used to reject an incompatible cached prefix.
     pub size: u64,
 }
 
@@ -43,12 +50,19 @@ pub(super) struct Metadata {
 /// appends. Locking the data file itself would prevent those reads on Windows.
 /// The worker retains the lock until queued writes and the final sync finish.
 pub(super) struct Entry {
+    /// Partial data path named by the validated reference digest.
     pub path: PathBuf,
+    /// Resume metadata loaded or replaced when this entry was opened.
     pub meta: Metadata,
+    /// Data file owned by the append worker after streaming begins.
     file: File,
+    /// Separate exclusive lock retained through queued writes and final publication.
     lock: File,
 }
 impl Entry {
+    /// Locks a digest-named entry without waiting and retains only complete cache chunks.
+    /// The caller supplies a validated hex digest. Missing or incompatible resume metadata
+    /// resets the data; an entry already in use is left to its current owner.
     pub fn open(directory: &Path, hash: &str, url: &str, size: u64) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         let path = directory.join(format!("{hash}.part"));
@@ -88,14 +102,17 @@ impl Entry {
             lock,
         })
     }
+    /// Returns the retained prefix length after any incomplete tail was discarded.
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
+    /// Discards the prefix and rewinds the file while retaining its exclusive lock.
     pub fn reset(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.rewind()?;
         Ok(())
     }
+    /// Replaces the resume sidecar through a temporary file in the same directory.
     pub fn save(&self) -> io::Result<()> {
         let data = serde_json::to_vec(&self.meta).map_err(io::Error::other)?;
         let sidecar = self.path.with_extension("meta");
@@ -103,9 +120,12 @@ impl Entry {
         fs::write(&temporary, data)?;
         fs::rename(temporary, sidecar)
     }
+    /// Opens an independent read cursor before the original handle moves to the writer.
     pub fn prefix(&self) -> io::Result<File> {
         File::open(&self.path)
     }
+    /// Moves data and lock ownership to a bounded append worker that syncs each chunk.
+    /// Write failures warn and discard the partial copy without failing the upload.
     pub fn writer(mut self, output: Output) -> io::Result<Writer> {
         self.file.seek(io::SeekFrom::End(0))?;
         let failed = Arc::new(AtomicBool::new(false));
@@ -147,6 +167,7 @@ impl Entry {
 }
 
 impl Drop for Entry {
+    /// Releases the entry lock explicitly, including when a child inherited its descriptor.
     fn drop(&mut self) {
         // Release explicitly: a concurrently spawned child may briefly inherit
         // the descriptor before exec closes it.
@@ -154,14 +175,22 @@ impl Drop for Entry {
     }
 }
 
+/// Buffers cache chunks and hands them to one append worker.
+/// A full queue backpressures the reader; dropping joins outstanding writes.
 pub(super) struct Writer {
+    /// Bounded chunk queue, closed before joining the worker.
     sender: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// Worker returning the locked entry if every queued write succeeded.
     worker: Option<std::thread::JoinHandle<Option<Entry>>>,
+    /// Incomplete cache chunk retained locally until filled or successful completion.
     buffer: Vec<u8>,
+    /// Worker failure signal allowing subsequent cache appends to be skipped.
     failed: Arc<AtomicBool>,
+    /// Partial path retained for cleanup after the worker has been joined.
     pub path: PathBuf,
 }
 impl Writer {
+    /// Accumulates network bytes and queues full chunks, waiting if the worker is behind.
     pub fn append(&mut self, mut bytes: &[u8]) {
         if self.failed.load(Ordering::SeqCst) {
             return;
@@ -175,6 +204,7 @@ impl Writer {
             }
         }
     }
+    /// Queues the current nonempty buffer and starts a fresh persistence chunk.
     fn flush(&mut self) {
         if self.buffer.is_empty() {
             return;
@@ -184,6 +214,8 @@ impl Writer {
             let _ = sender.send(bytes);
         }
     }
+    /// Joins queued writes and returns the locked entry when persistence succeeded.
+    /// Only a verified complete source retains the final partial chunk.
     pub fn finish(mut self, complete: bool) -> Option<Entry> {
         if complete {
             self.flush();
@@ -195,6 +227,7 @@ impl Writer {
     }
 }
 impl Drop for Writer {
+    /// Drops the unfinished tail, drains queued writes and releases the worker's lock.
     fn drop(&mut self) {
         self.sender.take();
         if let Some(worker) = self.worker.take() {
@@ -203,6 +236,8 @@ impl Drop for Writer {
     }
 }
 
+/// Publishes a verified source under its digest while retaining the entry lock.
+/// The caller has already checked the full length and SHA-256.
 pub(super) fn complete(entry: Entry, hash: &str) -> io::Result<()> {
     let target = entry.path.parent().expect("cache parent").join(hash);
     fs::rename(&entry.path, target)?;
@@ -210,6 +245,7 @@ pub(super) fn complete(entry: Entry, hash: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Totals immediate cache entries for diagnostics, including sidecars and partial files.
 pub(crate) fn size(path: &Path) -> io::Result<u64> {
     if !path.exists() {
         return Ok(0);

@@ -14,6 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Asks cloudflared for a cached application token, treating failure as no credentials.
 pub(super) fn cached(context: &Context, origin: &str) -> Option<String> {
     token(
         Command::new("cloudflared").args(["access", "token", "--app", origin]),
@@ -22,6 +23,8 @@ pub(super) fn cached(context: &Context, origin: &str) -> Option<String> {
     .ok()
 }
 
+/// Starts browser login only when stdin prompts are permitted, under a separate
+/// human login window. Noninteractive callers receive the manual login command.
 pub(super) fn authenticate(context: &Context, origin: &str) -> Result<String, Error> {
     let required = || {
         Error::new(4, "login-required", "package access requires login")
@@ -44,6 +47,7 @@ pub(super) fn authenticate(context: &Context, origin: &str) -> Result<String, Er
     })
 }
 
+/// Recognizes only this tenant's Access login path for the selected package host.
 pub(super) fn challenge(origin: &str, redirect: &str) -> bool {
     let Some(host) = origin.strip_prefix("https://") else {
         return false;
@@ -131,6 +135,7 @@ fn token(command: &mut Command, deadline: Instant) -> Result<String, ConnectErro
     Ok(token.to_owned())
 }
 
+/// Requires a positive remaining helper budget before spawning, polling or receiving.
 fn remaining(deadline: Instant) -> Result<Duration, ConnectError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -138,9 +143,11 @@ fn remaining(deadline: Instant) -> Result<Duration, ConnectError> {
         .ok_or(ConnectError::Timeout)
 }
 
+/// Owned helper process, killed and reaped on every exit path.
 struct Child(std::process::Child);
 
 impl Drop for Child {
+    /// Reaps the helper even when output collection, validation or the deadline failed.
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();

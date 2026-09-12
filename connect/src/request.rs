@@ -39,7 +39,8 @@ pub trait Request: Into<Message> {
     const WINDOW: Option<Duration> = None;
 }
 
-/// Pairs each request body with its response body.
+/// Pairs request and response bodies with their setup and reply-window policy.
+/// Protocol direction checks remain in wire; caller convenience belongs here.
 macro_rules! pairs {
     ($setup:expr, $window:expr; $($request:ident => $response:ident,)*) => {
         $(
@@ -83,6 +84,8 @@ pairs! { Setup::Cloud, None;
     SlotUploadProcessRequest => SlotUploadProcessResponse,
 }
 
+// These requests only need a relay if the Ark asks for companion authorization.
+// The reverse-request dispatcher attaches it then, while retaining this window.
 pairs! { Setup::Cloud, Some(APPROVAL_WINDOW);
     FirmwareUpdatePrepRequest => FirmwareUpdatePrepResponse,
     SlotUploadStartRequest => SlotUploadStartResponse,

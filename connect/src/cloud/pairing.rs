@@ -20,27 +20,43 @@ use tungstenite::Message;
 /// identity and storage messages remain opaque and are verified by the Ark.
 #[derive(Clone, Debug)]
 pub enum PairingProgress {
+    /// Rendezvous ready to present to the owner for scanning.
     Rendezvous {
+        /// Cloud location used by the companion to join this rendezvous.
         colo: String,
+        /// Rendezvous secret shared with the companion through the pairing code.
         secret: [u8; 32],
+        /// End of the scan window in Unix seconds.
         deadline: u64,
+        /// Pairing encryption key fingerprint conveyed to the companion out of band.
         fingerprint: Vec<u8>,
     },
+    /// Companion identity received and about to be submitted to the Ark.
     Identity,
+    /// Companion storage key received; storage key exchange is starting.
     Storage,
+    /// Storage exchange acknowledged; waiting for physical pairing approval.
     Approval,
+    /// Pairing accepted; waiting for the Ark to finish storage setup.
     Formatting,
 }
 
+/// Cloud rendezvous claims read for presentation, without host-side verification.
 #[derive(Cbor)]
 #[cbor(array)]
 struct Rendezvous {
+    /// Location where the companion must join the rendezvous.
     colo: String,
+    /// Secret carried in the pairing code, never logged by connect.
     secret: [u8; 32],
+    /// Cloud scan expiry in Unix seconds, converted once to a monotonic bound.
     deadline: u64,
 }
 
 impl Services {
+    /// Authenticates the rendezvous, then forwards each opaque pairing exchange.
+    /// Only initial authentication can retry. Once pairing starts, a failure
+    /// returns to the caller without replaying approvals or storage changes.
     pub(crate) fn pair(
         &self,
         requester: &Requester,
@@ -56,6 +72,8 @@ impl Services {
             let socket = socket::connect(&cloud.pairing_url(), &auth.auth, "Pairing", timing.io())?;
             Ok((socket, auth.fprint))
         })?;
+        // These claims locate the rendezvous and bound scanning. The Ark verifies
+        // the companion identity and storage messages forwarded below.
         let rendezvous: Rendezvous = cose::peek(&receive(&mut socket, timing.io())?)
             .map_err(|err| Error::Pairing(err.to_string()))?;
         let expires = scan_deadline(rendezvous.deadline)?;
@@ -137,6 +155,8 @@ fn bound(socket: &mut Connection, deadline: Instant) {
     *bound = deadline;
 }
 
+/// Waits for one binary payload, answering control frames without renewing time.
+/// The cloud's scan timeout remains distinct from a caller's earlier deadline.
 fn receive(socket: &mut Connection, deadline: Instant) -> Result<Vec<u8>, Error> {
     bound(socket, deadline);
     loop {
@@ -157,6 +177,7 @@ fn receive(socket: &mut Connection, deadline: Instant) -> Result<Vec<u8>, Error>
     }
 }
 
+/// Sends one opaque Ark reply before advancing to the next pairing stage.
 fn send(socket: &mut Connection, bytes: Vec<u8>, deadline: Instant) -> Result<(), Error> {
     bound(socket, deadline);
     socket

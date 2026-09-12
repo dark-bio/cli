@@ -11,21 +11,31 @@ use darkbio_connect::schema::SlotUploadProcessResponse;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// Binary megabyte divisor used for byte-rate formatting.
 const MIB: f64 = 1024.0 * 1024.0;
+/// Rolling rate history, retaining one sample before the boundary.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Minimum observation span before publishing an estimate.
 const WARMUP: Duration = Duration::from_secs(1);
+/// Minimum interval between ordinary human progress observations.
 const HUMAN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// Maximum silence between machine progress lines when reports keep arriving.
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One observation, with the established log line and facts for the terminal.
 pub(crate) struct Update {
+    /// Stable text observation used by plain text and JSON events.
     pub text: String,
+    /// Human stage label and live-line identity.
     pub stage: String,
+    /// Completion percentage for this stage, not for the entire workflow.
     pub percent: u64,
+    /// Human facts in discard order; the leftmost is dropped first on narrow terminals.
     pub details: Vec<String>,
 }
 
 impl Update {
+    /// Fits a stage, progress bar and optional facts into one terminal line.
     pub fn render(&self, theme: &Theme) -> String {
         let width = theme.width.saturating_sub(1);
         let stage = theme.truncate(&self.stage, (width / 2).max(8));
@@ -69,11 +79,14 @@ impl Update {
 /// Samples only acknowledged bytes, starting with the first upload report so
 /// cloud setup and approval do not enter the rate estimate.
 pub(super) struct Transfer {
+    /// Rolling counter samples, in bytes for uploads and basis points for processing.
     rate: Rate,
+    /// Emission cadence, independent of the sampling cadence.
     report: Report,
 }
 
 impl Transfer {
+    /// Starts without rate history so setup and approval cannot skew the first estimate.
     pub(super) fn new(human: bool) -> Self {
         Self {
             rate: Rate::default(),
@@ -81,10 +94,12 @@ impl Transfer {
         }
     }
 
+    /// Samples acknowledged bytes and emits an observation only when reporting is due.
     pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<Update> {
         self.update_at(uploaded, total, Instant::now())
     }
 
+    /// Updates byte-rate history at the supplied host time, even if output is throttled.
     fn update_at(&mut self, uploaded: u64, total: u64, now: Instant) -> Option<Update> {
         let rate = self.rate.sample(uploaded, now);
         let percent = percent(uploaded, total);
@@ -133,11 +148,14 @@ impl Transfer {
 /// a restarted step; elapsed time is measured by the host's monotonic clock.
 pub(super) struct Processing {
     phase: Option<(u64, u64, u64)>, // Processing start, step number and step start
+    /// Basis-point progress samples for the current processing step only.
     rate: Rate,
+    /// Reporting cadence reset whenever a step starts or restarts.
     report: Report,
 }
 
 impl Processing {
+    /// Starts without a step identity or estimate; the first report establishes both.
     pub(super) fn new(human: bool) -> Self {
         Self {
             phase: None,
@@ -146,10 +164,12 @@ impl Processing {
         }
     }
 
+    /// Samples the current processing step, resetting estimates when its identity changes.
     pub(super) fn update(&mut self, status: &SlotUploadProcessResponse) -> Option<Update> {
         self.update_at(status, Instant::now())
     }
 
+    /// Builds a step-specific estimate from basis points and monotonic host time.
     fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<Update> {
         let phase = (status.proc_start, status.phase_in, status.phase_start);
         if self.phase != Some(phase) {
@@ -195,10 +215,12 @@ impl Processing {
 /// stalled or sparse counter does not retain an old, optimistic speed.
 #[derive(Default)]
 struct Rate {
+    /// Time and monotonically increasing counter observations around the rolling window.
     samples: VecDeque<(Instant, u64)>,
 }
 
 impl Rate {
+    /// Returns units per second after warmup; counter or clock regression resets history.
     fn sample(&mut self, value: u64, now: Instant) -> Option<f64> {
         if self
             .samples
@@ -220,15 +242,19 @@ impl Rate {
 /// Refresh terminal progress once a second as reports arrive. Line output uses
 /// ten-percent boundaries or five seconds to keep logs readable.
 struct Report {
+    /// Selects one-second human cadence instead of sparse log boundaries.
     human: bool,
+    /// Time and percentage of the last emitted observation.
     last: Option<(Instant, u64)>,
 }
 
 impl Report {
+    /// Starts a cadence that always emits the first observation.
     fn new(human: bool) -> Self {
         Self { human, last: None }
     }
 
+    /// Claims an emission slot for elapsed cadence or a required completion boundary.
     fn due(&mut self, percent: u64, now: Instant) -> bool {
         if self.last.is_none_or(|(time, previous)| {
             if self.human {
@@ -247,6 +273,7 @@ impl Report {
     }
 }
 
+/// Computes a clamped integer percentage without overflowing 64-bit counters.
 fn percent(done: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
@@ -254,6 +281,7 @@ fn percent(done: u64, total: u64) -> u64 {
     (u128::from(done.min(total)) * 100 / u128::from(total)) as u64
 }
 
+/// Formats bytes per second in the smallest useful binary unit.
 fn speed(bytes: f64) -> String {
     if bytes >= MIB {
         format!("{:.1} MiB/s", bytes / MIB)
@@ -264,6 +292,7 @@ fn speed(bytes: f64) -> String {
     }
 }
 
+/// Estimates rounded-up remaining time, withholding nonpositive or nonfinite rates.
 fn eta(remaining: u64, rate: Option<f64>) -> String {
     if remaining == 0 {
         return "0s".into();
@@ -284,6 +313,7 @@ fn eta(remaining: u64, rate: Option<f64>) -> String {
     }
 }
 
+/// Adds human spacing and an ETA label to the shared remaining-time estimate.
 fn human_eta(remaining: u64, rate: Option<f64>) -> String {
     let eta = eta(remaining, rate);
     if eta == "estimating..." {

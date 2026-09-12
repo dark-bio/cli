@@ -14,8 +14,10 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Manifest generation failure reported by the standalone release helper.
 type Error = Box<dyn std::error::Error>;
 
+// Inputs supplied by the release workflow; clap doc comments remain user-facing.
 #[derive(Parser)]
 #[command(about = "Generate winget manifests from a released Windows executable")]
 struct Args {
@@ -29,6 +31,7 @@ struct Args {
     output: PathBuf,
 }
 
+/// Generates local manifest files and prints their directory for the publisher.
 fn main() -> ExitCode {
     let args = Args::parse();
     match generate(&args) {
@@ -43,6 +46,7 @@ fn main() -> ExitCode {
     }
 }
 
+/// Accepts a Cargo release version without a tag prefix or local build metadata.
 fn parse_version(value: &str) -> Result<Version, String> {
     let version = Version::parse(value).map_err(|error| error.to_string())?;
     if !version.build.is_empty() {
@@ -51,6 +55,8 @@ fn parse_version(value: &str) -> Result<Version, String> {
     Ok(version)
 }
 
+/// Checks the executable name, hashes its bytes and writes the three winget manifests.
+/// Generation performs no network requests or repository publication.
 fn generate(args: &Args) -> Result<(), Error> {
     let binary = format!("ark-{}-windows-amd64.exe", args.version);
     if args.binary.file_name().and_then(|name| name.to_str()) != Some(binary.as_str()) {

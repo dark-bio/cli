@@ -13,16 +13,21 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::Instant;
 
+/// Process-wide sharing of system lookups that cannot be cancelled on timeout.
 static RESOLVER: LazyLock<Arc<Resolver>> = LazyLock::new(|| Arc::new(Resolver::default()));
 
+/// Coalesces unfinished lookups by host and port, without caching completed DNS.
 #[derive(Default)]
 struct Resolver {
     pending: Mutex<HashMap<(String, u16), Arc<Lookup>>>, // Only unfinished system calls
 }
 
+/// One system lookup retained until every attached waiter releases it.
 #[derive(Default)]
 struct Lookup {
+    /// Addresses or failure, published once by the resolver worker.
     result: Mutex<Option<Result<Vec<SocketAddr>, Failure>>>,
+    /// Wakes all callers when the shared system lookup returns.
     ready: Condvar,
 }
 

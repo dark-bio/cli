@@ -41,6 +41,7 @@ impl Api {
         self.socket_url("pairing")
     }
 
+    /// Converts the API origin to WebSocket and selects the realm-specific route.
     fn socket_url(&self, route: &str) -> String {
         let url = self
             .url
@@ -116,6 +117,7 @@ impl Failure {
 }
 
 impl From<ureq::Error> for Failure {
+    /// Keeps HTTP timeouts actionable without treating other failures as wire loss.
     fn from(error: ureq::Error) -> Self {
         match error {
             ureq::Error::Timeout(_) => Self::Wire(protocol::Error::Timeout),
@@ -161,11 +163,16 @@ struct SignedTime {
 /// device may still be disabled, expired or superseded.
 #[derive(Debug, Deserialize)]
 pub struct Registration {
-    pub serial: String,   // Serial of the registered device
-    pub enrolled: i64,    // Attestation issuance time in Unix seconds
-    pub disabled: bool,   // Whether the registry disabled the device
-    pub expired: bool,    // Whether an emulator attestation expired
-    pub superseded: bool, // Whether another emulator replaced this one
+    /// Serial registered for the identity that produced the proof.
+    pub serial: String,
+    /// Attestation issuance time in Unix seconds.
+    pub enrolled: i64,
+    /// Whether the registry disabled this device.
+    pub disabled: bool,
+    /// Whether this emulator's attestation expired.
+    pub expired: bool,
+    /// Whether a newer emulator registration replaced this one.
+    pub superseded: bool,
 }
 
 impl Registration {

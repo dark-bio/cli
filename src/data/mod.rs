@@ -23,6 +23,9 @@ use serde_json::{Value, json};
 use std::io::Seek;
 use std::time::Instant;
 
+/// Dispatches dataset commands after applying CLI unlock and dry-run policy.
+/// Slot metadata and refusal messages come from the Ark; the CLI does not predict
+/// whether a requested delete, repair or upload will be accepted.
 pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
     if let args::Data::Upload {
         file,
@@ -157,6 +160,8 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
     }
 }
 
+/// Identifies a local file, checks an optional target constraint and either plans
+/// or uploads it. Rewinds the consumed prefix and preserves progress on failure.
 fn upload(
     context: &Context,
     path: &std::path::Path,
@@ -258,15 +263,23 @@ fn upload(
     result.map_err(Into::into)
 }
 
+/// Upload presentation and partial-result facts shared by local and reference sources.
 pub(crate) struct Progress<'a> {
+    /// Output and interruption handles for this invocation.
     context: &'a Context,
+    /// Identified or advertised target used for approval guidance.
     slot: i32,
+    /// Rate history beginning at the first acknowledged upload observation.
     transfer: Transfer,
+    /// Independent rate history for each device processing step.
     processing: Processing,
+    /// Most recent byte count acknowledged by the Ark.
     pub uploaded: u64,
+    /// Processing phase names from the latest report, in device order.
     pub phases: Vec<String>,
 }
 impl<'a> Progress<'a> {
+    /// Starts a new dataset's progress without inheriting a previous transfer's estimates.
     pub fn new(context: &'a Context, slot: i32) -> Self {
         Self {
             context,
@@ -277,6 +290,7 @@ impl<'a> Progress<'a> {
             phases: Vec::new(),
         }
     }
+    /// Updates cancellation and result facts on every callback, throttling only presentation.
     pub fn update(&mut self, stage: UploadProgress) {
         match stage {
             UploadProgress::Identifying => {
@@ -327,6 +341,8 @@ impl<'a> Progress<'a> {
     }
 }
 
+/// Predicts whether to show a phone approval prompt; known public references need none.
+/// This is presentation only. The Ark remains responsible for authorization.
 fn upload_approval(slot: i32) -> bool {
     !matches!(
         schema::SlotKind::try_from(slot),
@@ -336,6 +352,7 @@ fn upload_approval(slot: i32) -> bool {
     )
 }
 
+/// Names known confidence levels while retaining future numeric values.
 fn confidence(value: i32) -> String {
     schema::SlotConfidence::try_from(value)
         .map(|value| {
@@ -347,6 +364,7 @@ fn confidence(value: i32) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
+/// Requires the selected ID to appear in this Ark's advertised inventory.
 pub(crate) fn select(slots: &[SlotStatus], id: i32) -> Result<&SlotStatus, Error> {
     slots.iter().find(|slot| slot.kind == id).ok_or_else(|| {
         Error::new(
@@ -356,9 +374,11 @@ pub(crate) fn select(slots: &[SlotStatus], id: i32) -> Result<&SlotStatus, Error
         )
     })
 }
+/// Whether the Ark explicitly reports usable, filled data in this slot.
 pub(crate) fn filled(slot: &SlotStatus) -> bool {
     slot.state == SlotState::StateFilled as i32
 }
+/// Names known slot states while retaining future state numbers.
 pub(crate) fn state(slot: &SlotStatus) -> String {
     SlotState::try_from(slot.state)
         .map(|state| {
@@ -369,6 +389,7 @@ pub(crate) fn state(slot: &SlotStatus) -> String {
         })
         .unwrap_or_else(|_| slot.state.to_string())
 }
+/// Lists advertised direct dependents, regardless of whether their slots are filled.
 fn required_by(slots: &[SlotStatus], id: i32) -> Vec<String> {
     slots
         .iter()
@@ -376,6 +397,7 @@ fn required_by(slots: &[SlotStatus], id: i32) -> Vec<String> {
         .map(|slot| slot_name(slot.kind))
         .collect()
 }
+/// Borrows the advertised URL, length and digest without validating or fetching them.
 pub(crate) fn download(slot: &SlotStatus) -> Option<(&str, u64, &str)> {
     slot.download.as_ref().map(|download| {
         (
@@ -385,6 +407,7 @@ pub(crate) fn download(slot: &SlotStatus) -> Option<(&str, u64, &str)> {
         )
     })
 }
+/// Builds generic slot output, preserving future IDs and optional advertised details.
 pub(crate) fn metadata(slot: &SlotStatus) -> Value {
     let origin = schema::SlotOrigin::try_from(slot.origin)
         .map(|origin| {

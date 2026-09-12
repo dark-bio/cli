@@ -12,15 +12,18 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-/// Requests not claimed by cloud services, followed by the session's ending reason.
+/// Bounded application queue. Closure discards requests and retains the first
+/// ending reason for every subsequent receive.
 #[derive(Debug, Default)]
 pub(crate) struct Incoming {
     state: Mutex<State>, // Queue and closure change under the same lock
     ready: Condvar,      // Wakes the application for a request or closure
 }
 
+/// Queue accounting and closure, changed together under the incoming lock.
 #[derive(Debug, Default)]
 struct State {
+    /// Requests in arrival order, each retaining its unanswered responder.
     queue: VecDeque<(schema::ark_to_host::Content, Responder)>,
     bytes: usize,                   // Decoded messages charged by their protobuf size
     error: Option<protocol::Error>, // First reason the original session ended
@@ -59,6 +62,7 @@ impl Incoming {
     }
 
     /// Keeps application backlog bounded without holding up relay traffic.
+    /// Overflow refuses this request with UNAVAILABLE and leaves the session open.
     fn push(&self, request: schema::ark_to_host::Content, responder: Responder) {
         let mut state = self.state.lock().expect("incoming requests not poisoned");
         if state.error.is_some() {

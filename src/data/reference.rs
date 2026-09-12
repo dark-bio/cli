@@ -23,6 +23,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// Validates the whole reference plan before mutation, then installs in dependency order.
+/// Stops at the first failure and reports completed, failed and unattempted slots.
 pub(super) fn fetch(
     context: &Context,
     connection: &Connection,
@@ -151,11 +153,16 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
     Ok(ordered)
 }
 
+/// Validated reference offer used by both protocol upload and HTTP/cache handling.
 struct Source {
+    /// Exact length, target slot and binary digest passed to connect.
     dataset: Dataset,
+    /// Advertised HTTPS download URL without embedded credentials.
     url: String,
+    /// Canonical lowercase SHA-256 used as a cache basename.
     hash: String,
 }
+/// Validates a nonempty HTTPS offer and its complete digest before any download or upload.
 fn offer(slot: &SlotStatus) -> Result<Source, Error> {
     let (url, size, hash) = download(slot).ok_or_else(|| {
         Error::new(
@@ -207,6 +214,9 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
     })
 }
 
+/// Replays a complete cache or streams a download through a fresh Ark upload.
+/// At most three network attempts resume retained bytes when possible. Protocol
+/// refusals are returned; only source failures or a corrupt prefix permit replay.
 fn install(
     context: &Context,
     connection: &Connection,
@@ -293,6 +303,8 @@ fn install(
             }
             Err(error) => return Err(error),
         };
+        // A server may ignore Range or invalidate If-Range. Never append that
+        // response to the old prefix; restart both the request and cache at zero.
         if offset > 0 && !valid_range(&response, offset, source.dataset.size) {
             if let Some(entry) = &mut entry {
                 entry.reset()?;
@@ -366,6 +378,8 @@ fn install(
             },
         );
         context.interrupt.clear();
+        // A verified download is reusable even if the Ark later rejects processing.
+        // Cache completion describes the source, not the slot's resulting state.
         let valid = reader.read == source.dataset.size
             && reader.hash.clone().finalize().as_slice() == source.dataset.sha256.unwrap();
         let failed = reader.failed;
@@ -420,6 +434,7 @@ fn install(
     unreachable!("last attempt returns its result")
 }
 
+/// Requires a partial response covering exactly the advertised remaining byte range.
 fn valid_range(response: &ureq::http::Response<ureq::Body>, offset: u64, size: u64) -> bool {
     if response.status() != 206 {
         return false;
@@ -445,17 +460,29 @@ fn valid_range(response: &ureq::http::Response<ureq::Body>, offset: u64, size: u
             .is_some_and(|last| end.parse::<u64>() == Ok(last))
 }
 
+/// Replays a retained prefix, then tees network bytes into a best-effort cache.
+/// Hashes both sources together and marks network failures for download retry policy.
 struct Reader<R> {
+    /// Latest upload acknowledgement, shared with callbacks on the same thread.
     last_upload: Rc<Cell<Option<Instant>>>,
+    /// Retained prefix with an independent cursor capped at the resume offset.
     prefix: Option<io::Take<File>>,
+    /// HTTP body beginning at the requested resume offset.
     network: R,
+    /// Optional append worker receiving only newly downloaded bytes.
     writer: Option<cache::Writer>,
+    /// Digest of all bytes replayed or downloaded in this attempt.
     hash: Sha256,
+    /// Combined prefix and network byte count consumed by connect.
     read: u64,
+    /// Whether a source failure permits another download attempt.
     failed: bool,
+    /// Full advertised length, used to detect premature network EOF.
     expected: u64,
 }
 impl<R: Read> Read for Reader<R> {
+    /// Serves prefix bytes first, then records and caches network bytes.
+    /// After a network read, detects an upload window already lost to a source stall.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);

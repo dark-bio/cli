@@ -20,37 +20,61 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime};
 
+/// Clonable output handle for one invocation. Result emission is claimed once;
+/// events and live stderr lines share terminal state across clones.
 #[derive(Clone)]
 pub(crate) struct Output(Arc<State>);
+/// Immutable stream policy and synchronization shared by output handles.
 struct State {
+    /// Whether stdout uses a JSON document and stderr uses JSON events.
     json: bool,
+    /// Capabilities of stdout, resolved independently of stderr.
     out: Theme,
+    /// Capabilities of stderr, including live progress support.
     err: Theme,
+    /// Suppresses optional events while retaining approvals, errors and hints.
     quiet: bool,
+    /// Detail level for step events and command-specific human rendering.
     verbose: u8,
+    /// Whether a caller already claimed the sole result, even if its write failed.
     printed: AtomicBool,
+    /// Whether a non-release route was announced during this command.
     environment_noted: AtomicBool,
+    /// Serializes result claims and writes; acquired before the terminal lock.
     result: Mutex<()>,
+    /// Serializes stderr line changes and spacing around human result blocks.
     terminal: Mutex<Terminal>,
 }
 
+/// Current terminal layout, guarded independently of the result claim.
 #[derive(Default)]
 struct Terminal {
+    /// Stage key and whether the unterminated stderr line is temporary.
     live: Option<(String, bool)>,
+    /// Active elapsed-time or countdown display, if any.
     waiting: Option<Waiting>,
+    /// Monotonic timer generation used to retire previous wait workers.
     generation: u64,
+    /// Whether stderr has printed content that needs spacing before a result.
     err_printed: bool,
+    /// Whether a human stdout block needs separation from the next stderr event.
     out_block: bool,
 }
 
+/// Presentation-only wait state; it never controls an operation's deadline.
 struct Waiting {
+    /// Identifies the worker allowed to redraw this wait after each timer tick.
     generation: u64,
+    /// Short activity name displayed beside the elapsed or remaining time.
     label: String,
+    /// Host time when this wait display began.
     started: Instant,
+    /// Fixed countdown bound, absent for an elapsed-time display.
     until: Option<Instant>,
 }
 
 impl Output {
+    /// Resolves each stream's capabilities and starts with no claimed result.
     pub fn new(options: &Options) -> Self {
         Self(Arc::new(State {
             json: options.format == Format::Json,
@@ -64,12 +88,15 @@ impl Output {
             terminal: Mutex::new(Terminal::default()),
         }))
     }
+    /// Whether the caller requested JSON for both output streams.
     pub fn json(&self) -> bool {
         self.0.json
     }
+    /// Whether stderr uses human presentation, independently of stdout.
     pub fn human(&self) -> bool {
         self.0.err.human
     }
+    /// Whether a result was claimed, so failure reporting must not emit another.
     pub fn printed(&self) -> bool {
         self.0.printed.load(Ordering::SeqCst)
     }
@@ -81,6 +108,7 @@ impl Output {
         }
     }
 
+    /// Claims the invocation's first non-release note unless quiet suppresses it.
     fn environment_note(&self, env: Environment) -> Option<String> {
         if self.0.quiet
             || env == Environment::Release
@@ -91,10 +119,13 @@ impl Output {
         Some(format!("using the {env} environment"))
     }
 
+    /// Emits the sole result using the generic human, plain text or JSON rendering.
     pub fn document(&self, value: &Value) -> Result<(), Error> {
         self.document_with(value, |theme, _| human::document(theme, value))
     }
 
+    /// Emits the sole result, invoking the custom renderer only for human stdout.
+    /// Later result attempts are ignored, including after an earlier write failed.
     pub fn document_with(
         &self,
         value: &Value,
@@ -120,6 +151,7 @@ impl Output {
         self.write_result(&text)
     }
 
+    /// Renders rows as a table, retaining the complete supplied document for JSON.
     pub fn table(
         &self,
         document: &Value,
@@ -129,6 +161,7 @@ impl Output {
         self.grouped_table(document, rows, columns, &[])
     }
 
+    /// Adds human group labels parallel to rows; text and JSON keep their layouts.
     pub fn grouped_table(
         &self,
         document: &Value,
@@ -141,6 +174,7 @@ impl Output {
         })
     }
 
+    /// Renders diagnostic rows with local hints, or the equivalent machine result.
     pub fn checklist(&self, document: &Value, rows: &[Value]) -> Result<(), Error> {
         self.list(
             document,
@@ -155,6 +189,7 @@ impl Output {
         )
     }
 
+    /// Claims one result and selects human rows, a text table or the JSON document.
     fn list(
         &self,
         document: &Value,
@@ -176,6 +211,8 @@ impl Output {
         })
     }
 
+    /// Ends live stderr activity and writes a complete stdout result block.
+    /// The caller holds the result lock; terminal state is acquired second.
     fn write_result(&self, text: &str) -> Result<(), Error> {
         let mut terminal = self.0.terminal.lock().expect("output not poisoned");
         terminal.waiting = None;
@@ -211,6 +248,8 @@ impl Output {
         Ok(())
     }
 
+    /// Writes a best-effort stderr event under quiet and verbosity policy.
+    /// Single-line approvals start a presentation timer on interactive terminals.
     pub fn event(&self, kind: &str, message: impl AsRef<str>) {
         if self.0.quiet && matches!(kind, "progress" | "note" | "warning" | "step") {
             return;
@@ -252,6 +291,7 @@ impl Output {
         }
     }
 
+    /// Selects a live human observation or the established machine progress line.
     pub fn progress(&self, update: &crate::progress::Update) {
         if self.human() {
             self.progress_line(&update.stage, &update.render(&self.0.err));
@@ -260,6 +300,8 @@ impl Output {
         }
     }
 
+    /// Replaces the same live stage in place, preserving a completed previous stage.
+    /// Redirected human output appends lines without terminal control sequences.
     fn progress_line(&self, key: &str, line: &str) {
         if self.0.quiet {
             return;
@@ -299,6 +341,7 @@ impl Output {
         }
     }
 
+    /// Starts an optional human stderr section after finishing prior live activity.
     pub fn title(&self, title: &str) {
         if !self.human() || self.0.quiet {
             return;
@@ -321,6 +364,7 @@ impl Output {
         terminal.err_printed = true;
     }
 
+    /// Shows a pairing stage, retaining its final line when the stage completes.
     pub fn stage(&self, name: &str, done: bool) {
         if !self.human() {
             return;
@@ -343,6 +387,8 @@ impl Output {
         }
     }
 
+    /// Presents a scan URL and a QR code when terminal width and Unicode permit.
+    /// The caller uses this renderer only outside JSON, where the URL is structured.
     pub fn pairing(&self, url: &str, deadline: SystemTime) {
         self.event("approve", "scan in Ark Companion");
         self.finish();
@@ -410,6 +456,8 @@ impl Output {
                 Instant::now(),
             );
         }
+        // A replacement wait invalidates this generation. The weak reference
+        // also lets the worker exit when the invocation releases its output.
         let state = Arc::downgrade(&self.0);
         std::thread::spawn(move || {
             loop {
@@ -433,6 +481,7 @@ impl Output {
         });
     }
 
+    /// Prints and flushes a prompt without reading stdin or deciding whether to ask.
     pub fn prompt(&self, message: &str, default: bool) -> Result<(), Error> {
         self.finish();
         let choices = if default { "Y/n" } else { "y/N" };
@@ -456,6 +505,7 @@ impl Output {
         Ok(())
     }
 
+    /// Reports a failure and its hints on stderr without claiming a stdout result.
     pub fn error(&self, error: &Error) {
         self.finish();
         if self.json() {
@@ -488,11 +538,14 @@ impl Output {
         }
     }
 
+    /// Writes one preassembled JSON event after ending live terminal activity.
+    /// The caller is responsible for selecting this path only in JSON mode.
     pub fn event_value(&self, value: Value) {
         self.finish();
         let _ = writeln!(io::stderr().lock(), "{value}");
     }
 
+    /// Stops the active timer and closes its live line; safe to call repeatedly.
     pub fn finish(&self) {
         let mut terminal = self.0.terminal.lock().expect("output not poisoned");
         terminal.waiting = None;
@@ -502,6 +555,7 @@ impl Output {
     }
 }
 
+/// Styles and wraps one human event while preserving its recognizable prefix.
 fn event_line(theme: &Theme, kind: &str, message: &str) -> String {
     let role = match kind {
         "error" => Role::Failure,
@@ -521,6 +575,7 @@ fn event_line(theme: &Theme, kind: &str, message: &str) -> String {
     style::wrap(&format!("{prefix} {message}"), theme.width, kind.len() + 2)
 }
 
+/// Erases a temporary timer or terminates persistent progress with a newline.
 fn close_line(terminal: &mut Terminal, output: &mut impl Write) {
     if let Some((_, temporary)) = terminal.live.take() {
         if temporary {
@@ -531,6 +586,7 @@ fn close_line(terminal: &mut Terminal, output: &mut impl Write) {
     }
 }
 
+/// Separates the first stderr event after a human stdout block, once.
 fn separate_result(terminal: &mut Terminal, output: &mut impl Write) {
     if terminal.out_block {
         let _ = writeln!(output);
@@ -538,6 +594,7 @@ fn separate_result(terminal: &mut Terminal, output: &mut impl Write) {
     }
 }
 
+/// Redraws the active wait within terminal width without changing its deadline.
 fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: Instant) {
     let Some(wait) = &terminal.waiting else {
         return;
@@ -567,6 +624,7 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
     let _ = output.flush();
 }
 
+/// Formats stable plain text columns without truncating values to terminal width.
 fn text_table(rows: &[Value], columns: &[(&str, &str)]) -> String {
     let cells: Vec<Vec<_>> = rows
         .iter()
@@ -614,6 +672,7 @@ fn text_table(rows: &[Value], columns: &[(&str, &str)]) -> String {
     lines.join("\n")
 }
 
+/// Flattens objects and object arrays into dotted paths; scalar arrays stay joined.
 fn fields(prefix: &str, value: &Value, lines: &mut Vec<(String, String)>, human: bool) {
     if let Value::Object(object) = value {
         for (key, value) in object {
@@ -635,6 +694,7 @@ fn fields(prefix: &str, value: &Value, lines: &mut Vec<(String, String)>, human:
     }
 }
 
+/// Formats a plain field with units and explicit absence; human dates use local time.
 pub(crate) fn display(key: &str, value: &Value, human: bool) -> String {
     if key == "serial" && value.is_null() {
         return "unverified".into();
@@ -671,6 +731,7 @@ pub(crate) fn display(key: &str, value: &Value, human: bool) -> String {
     scalar(value)
 }
 
+/// Formats scalar values and lists without terminal styling or field-specific units.
 pub(crate) fn scalar(value: &Value) -> String {
     match value {
         Value::Null => "-".into(),

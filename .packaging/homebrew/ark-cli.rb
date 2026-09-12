@@ -1,3 +1,4 @@
+# Release template filled with the version and downloaded artifact digests.
 class ArkCli < Formula
   desc "Command line interface to Ark enclaves"
   homepage "https://dark.bio"
@@ -7,12 +8,12 @@ class ArkCli < Formula
   depends_on :macos
 
   on_arm do
-    url "https://github.com/dark-bio/cli/releases/download/v#{version}/ark-#{version}-macos-arm64", using: :nounzip
+    url "https://github.com/dark-bio/cli/releases/download/v@VERSION@/ark-@VERSION@-macos-arm64", using: :nounzip
     sha256 "@ARM64_SHA256@"
   end
 
   on_intel do
-    url "https://github.com/dark-bio/cli/releases/download/v#{version}/ark-#{version}-macos-amd64", using: :nounzip
+    url "https://github.com/dark-bio/cli/releases/download/v@VERSION@/ark-@VERSION@-macos-amd64", using: :nounzip
     sha256 "@AMD64_SHA256@"
   end
 
@@ -21,6 +22,7 @@ class ArkCli < Formula
     sha256 "@LICENSES_SHA256@"
   end
 
+  # Keep the command name stable and retain dependency notices beside the package.
   def install
     bin.install Dir["ark-#{version}-macos-*"].fetch(0) => "ark"
     chmod 0755, bin/"ark"

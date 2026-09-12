@@ -19,14 +19,18 @@ use std::io::Read;
 #[cfg(test)]
 use std::time::Instant;
 
+/// Archive bytes per acknowledged transfer, amortizing USB and device write latency.
 const CHUNK_SIZE: usize = 1024 * 1024;
 
 /// A published encrypted archive. The Ark verifies its signature, contents and
 /// version before installation; the host checks the download's length and hash.
 #[derive(Clone, Debug)]
 pub struct Firmware {
+    /// Published version authorized by the cloud and checked by the Ark.
     pub version: String,
+    /// Exact encrypted archive length in bytes.
     pub size: u64,
+    /// Expected SHA-256 of the encrypted archive, checked before verification.
     pub sha256: [u8; 32],
 }
 
@@ -37,19 +41,26 @@ pub enum UpdateProgress {
     /// Synchronization has completed; the Ark may now request approval.
     Preparing,
     /// Downloaded archive bytes acknowledged by the Ark so far.
-    Uploading { uploaded: u64, total: u64 },
+    Uploading {
+        /// Archive bytes acknowledged so far.
+        uploaded: u64,
+        /// Declared encrypted archive length in bytes.
+        total: u64,
+    },
     /// The complete archive passed the host checks and is being verified by the Ark.
     Verifying,
     /// The verified firmware is being installed; success will reboot the Ark.
     Installing,
 }
 
+/// Firmware authorization returned by the cloud for this prepared update.
 #[derive(Deserialize)]
 struct Access {
     access: String, // Cloud response sealed to the Ark's ephemeral update key
 }
 
 impl Services {
+    /// Requires a cloud route and preserves the owning session's ending reason.
     fn firmware_cloud(&self) -> Result<&http::Api, Error> {
         if let Some(error) = &self.state.lock().expect("cloud setup not poisoned").error {
             return Err(error.clone().into());

@@ -116,7 +116,9 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
 enum Socket {
     /// TCP stream whose individual I/O calls share the upgrade deadline.
     Handshake {
+        /// TCP connection being upgraded, before readiness registration.
         stream: TcpStream,
+        /// Shared absolute bound for every HTTP upgrade read and write.
         deadline: Instant,
     },
     /// Registered socket whose I/O rearms readiness through mio.
@@ -124,6 +126,7 @@ enum Socket {
 }
 
 impl Read for Socket {
+    /// Applies the upgrade deadline or delegates to the registered socket.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Handshake { stream, deadline } => {
@@ -136,6 +139,7 @@ impl Read for Socket {
 }
 
 impl Write for Socket {
+    /// Applies the upgrade deadline or writes through readiness-aware I/O.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Handshake { stream, deadline } => {
@@ -146,6 +150,7 @@ impl Write for Socket {
         }
     }
 
+    /// Flushes the underlying TCP adapter; WebSocket buffering lives above it.
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Handshake { stream, .. } => stream.flush(),
@@ -416,6 +421,8 @@ struct Reader {
 }
 
 impl Read for Reader {
+    /// Drains buffered binary bytes before reporting closure or the worker error.
+    /// Consuming input wakes the worker to resume reads after backpressure.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -462,6 +469,7 @@ impl Read for Reader {
 }
 
 impl transport::Read for Reader {
+    /// Bounds future input waits, leaving already buffered bytes available.
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
         Ok(())
@@ -477,6 +485,7 @@ struct Writer {
 }
 
 impl Write for Writer {
+    /// Accumulates a frame locally; [`Self::flush`] submits it to the worker.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(closed());
@@ -488,6 +497,8 @@ impl Write for Writer {
         Ok(bytes.len())
     }
 
+    /// Submits accumulated bytes and waits for local socket completion under the
+    /// original write deadline. Success does not acknowledge receipt by the Ark.
     fn flush(&mut self) -> io::Result<()> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(closed());
@@ -517,6 +528,7 @@ impl Write for Writer {
 }
 
 impl transport::Write for Writer {
+    /// Installs the shared bound for accumulating and flushing the next frame.
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
         Ok(())

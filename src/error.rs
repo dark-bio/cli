@@ -9,16 +9,24 @@
 use darkbio_connect::{Error as ConnectError, schema, wire};
 use serde_json::{Value, json};
 
+/// CLI failure with a stable exit class and machine code, plus actionable hints.
+/// Application error numbers and messages remain opaque and are retained verbatim.
 #[derive(Debug)]
 pub(crate) struct Error {
+    /// Process exit class, shared by errors requiring the same caller action.
     pub class: u8,
+    /// Stable machine-readable CLI error name.
     pub code: &'static str,
+    /// Primary diagnostic shown in every output format.
     pub message: String,
+    /// Follow-up actions emitted separately from the diagnostic.
     pub hints: Vec<String>,
+    /// Original Ark refusal, including its full 64-bit code, when available.
     pub remote: Option<schema::Error>,
 }
 
 impl Error {
+    /// Creates a local failure without hints or an Ark refusal.
     pub fn new(class: u8, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             class,
@@ -28,10 +36,12 @@ impl Error {
             remote: None,
         }
     }
+    /// Appends a caller action in the order it should be presented.
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hints.push(hint.into());
         self
     }
+    /// Encodes the result error; hints travel as stderr events instead.
     pub fn json(&self) -> Value {
         let mut value = json!({"code": self.code, "message": self.message});
         if let Some(remote) = &self.remote {
@@ -42,6 +52,7 @@ impl Error {
 }
 
 impl std::fmt::Display for Error {
+    /// Shows only the primary diagnostic, leaving prefixes and hints to output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
@@ -49,10 +60,14 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<ConnectError> for Error {
+    /// Maps connector failures to caller actions without interpreting app codes.
+    /// Download adapters can carry an existing CLI error through a reader failure.
     fn from(error: ConnectError) -> Self {
         use ConnectError::*;
         match error {
             Remote(remote) => {
+                // A large application code can share the low bits of a reserved
+                // code. Only a full-width match carries protocol-level meaning.
                 let code = match schema::ReservedErrors::try_from(remote.code as i32)
                     .ok()
                     .filter(|kind| *kind as u64 == remote.code)
@@ -153,6 +168,7 @@ impl From<ConnectError> for Error {
     }
 }
 
+/// Gives Linux users the exact shipped udev rule and how to activate it.
 pub(crate) fn usb_hint() -> String {
     format!(
         "create /etc/udev/rules.d/70-darkbio-ark.rules containing: {}; then run `sudo udevadm control --reload-rules` and reconnect the Ark",
@@ -161,6 +177,7 @@ pub(crate) fn usb_hint() -> String {
 }
 
 impl From<std::io::Error> for Error {
+    /// Classifies otherwise unhandled local I/O as an invocation failure.
     fn from(error: std::io::Error) -> Self {
         Self::new(1, "io", error.to_string())
     }

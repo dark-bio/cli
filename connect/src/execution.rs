@@ -12,6 +12,7 @@ use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
 const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024; // Leave room for sealing and framing
+/// Delay between status requests while the Ark retains a pending task.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Execution stages reported on the caller's thread. A task ID identifies
@@ -21,13 +22,24 @@ pub enum ExecutionProgress {
     /// Allocating an app upload on the Ark.
     Preparing,
     /// The Ark allocated this task; cancellation can now address it.
-    Started { taskid: u64 },
+    Started {
+        /// Task ID accepted by [`schema::ExecutionCancelRequest`].
+        taskid: u64,
+    },
     /// App bytes acknowledged by the Ark so far.
-    Uploading { uploaded: u64, total: u64 },
+    Uploading {
+        /// App bytes acknowledged so far.
+        uploaded: u64,
+        /// Declared app length in bytes.
+        total: u64,
+    },
     /// Requesting companion approval to run the uploaded app.
     Authorizing,
     /// The app is running. Elapsed time starts at the scheduling acknowledgement.
-    Running { elapsed: Duration },
+    Running {
+        /// Host time since scheduling succeeded, including status polling waits.
+        elapsed: Duration,
+    },
 }
 
 /// Streams at most two outstanding chunks, waits for authorization and retrieves
@@ -71,6 +83,8 @@ pub(crate) fn execute(
             if sent == size {
                 finish_read(reader, timing)?;
             }
+            // Submit the next chunk before waiting for the previous one, keeping
+            // at most two outstanding while device writes overlap transport I/O.
             let next = requester.request(
                 schema::ExecutionUploadChunkRequest { taskid, chunk },
                 timing.io(),
@@ -95,6 +109,8 @@ pub(crate) fn execute(
         }
         progress(ExecutionProgress::Authorizing);
         schedule(taskid)?;
+        // Retrieving a completed status consumes the result on the Ark. This
+        // workflow is the sole poller and never retries a completed retrieval.
         let started = Instant::now();
         loop {
             progress(ExecutionProgress::Running {
@@ -136,6 +152,7 @@ fn finish_read(reader: &mut impl Read, timing: Timing) -> Result<(), Error> {
     Ok(())
 }
 
+/// Separates an expired source read from other local app read failures.
 fn read_error(error: io::Error) -> Error {
     if error.kind() == io::ErrorKind::TimedOut {
         Error::Timeout

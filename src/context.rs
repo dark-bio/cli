@@ -18,22 +18,35 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Invocation policy and shared output, kept outside the reusable connector.
 pub(crate) struct Context {
+    /// Parsed global flags controlling selection, prompts and wait allowances.
     pub options: Options,
+    /// Result and event streams shared with progress and signal handlers.
     pub output: Output,
+    /// Tracks the active session and cancellable work for process interruption.
     pub interrupt: crate::interrupt::Interrupt,
 }
 
+/// Owned session and snapshots used by one command's policy checks.
+/// Device info is not refreshed automatically after mutations.
 pub(crate) struct Connection {
+    /// Keeps the wire session and its lazy cloud services alive.
     pub ark: Ark,
+    /// Typed request handle bound to the owned session.
     pub client: Client,
+    /// Trust outcome established during the handshake.
     pub identity: Identity,
+    /// Device state captured when the session opened.
     pub info: schema::DeviceInfoResponse,
+    /// Discovery record retained for labels and reconnecting after reboot.
     pub device: Device,
+    /// Selected cloud route, independent of the attestation's trust outcome.
     pub env: Option<Environment>,
 }
 
 impl Connection {
+    /// Enforces the CLI protocol minimum with a hardware or emulator upgrade hint.
     pub fn require_current(&self) -> Result<(), Error> {
         crate::firmware::check_compatibility(&self.info).map_err(|err| {
             err.hint(match self.device.kind() {
@@ -45,16 +58,20 @@ impl Connection {
 }
 
 impl Context {
+    /// Gives each machine wait the CLI allowance without bounding the full command.
     pub fn timing(&self) -> Timing {
         Timing::inactivity(Duration::from_secs(self.options.timeout))
     }
+    /// Starts one fixed wait budget, for operations that need a single bound.
     pub fn deadline(&self) -> Instant {
         Instant::now() + Duration::from_secs(self.options.timeout)
     }
+    /// Permits stdin prompts only for a terminal outside JSON and no-input modes.
     pub fn interactive(&self) -> bool {
         !self.options.no_input && !self.output.json() && io::stdin().is_terminal()
     }
 
+    /// Enumerates both device kinds and reports partial source failures as warnings.
     pub fn discover(&self) -> darkbio_connect::Discovery {
         let found = darkbio_connect::list();
         for error in &found.errors {
@@ -65,6 +82,7 @@ impl Context {
         found
     }
 
+    /// Selects and opens an Ark, then enforces the CLI's firmware compatibility gate.
     pub fn connect(&self, pubkey: Option<&str>) -> Result<Connection, Error> {
         let connection = self.connect_recovery(pubkey)?;
         connection.require_current()?;
@@ -79,11 +97,14 @@ impl Context {
         self.open(device, pubkey)
     }
 
+    /// Opens an already selected endpoint and reads its state without the version gate.
     pub fn open(&self, device: Device, pubkey: Option<&str>) -> Result<Connection, Error> {
         self.open_until(device, pubkey, None)
     }
 
-    /// Reboot verification also bounds device-info requests by its fixed window.
+    /// Opens an endpoint with CLI routing precedence and records it for interruption.
+    /// An optional reboot deadline bounds device-info I/O; transport establishment
+    /// and the wire handshake retain their own connection timeouts.
     pub fn open_until(
         &self,
         device: Device,
@@ -136,6 +157,9 @@ impl Context {
         })
     }
 
+    /// Requires pairing and unlock, optionally prompting or honoring --unlock.
+    /// A dry run never unlocks implicitly. Successful unlock leaves the original
+    /// device-info snapshot unchanged; callers can continue the requested operation.
     pub fn require_unlocked(&self, connection: &Connection, dry_run: bool) -> Result<(), Error> {
         let state = &connection.info;
         if !state.paired {
@@ -165,6 +189,7 @@ impl Context {
             .hint("run `ark unlock`, or add --unlock to unlock first"))
     }
 
+    /// Attaches the relay before announcing approval and requesting unlock.
     pub fn unlock(&self, connection: &Connection) -> Result<(), Error> {
         connection.client.attach_relay(self.timing())?;
         self.output
@@ -177,6 +202,8 @@ impl Context {
         Ok(())
     }
 
+    /// Prompts for a yes/no answer; EOF and unrecognized input decline.
+    /// The caller must first check whether this invocation permits input.
     pub fn confirm(&self, message: &str, default: bool) -> Result<bool, Error> {
         self.output.prompt(message, default)?;
         let mut answer = String::new();
@@ -207,6 +234,7 @@ fn environment(
         .unwrap_or(Environment::Release)
 }
 
+/// Parses an explicit recovery key, otherwise accepting enabled roots or self-signing.
 fn trust(pubkey: Option<&str>) -> Result<TrustMode, Error> {
     let Some(encoded) = pubkey else {
         return Ok(TrustMode::RootOrSelf);
@@ -222,6 +250,8 @@ fn trust(pubkey: Option<&str>) -> Result<TrustMode, Error> {
     Ok(TrustMode::Recover(Box::new(key)))
 }
 
+/// Opens a nonempty regular file and returns its current size without reading it.
+/// Upload workflows separately detect files that change after this snapshot.
 pub(crate) fn open_file(path: &Path) -> Result<(std::fs::File, u64), Error> {
     let file = std::fs::File::open(path).map_err(|err| {
         Error::new(

@@ -5,11 +5,15 @@
 // license that can be found in the LICENSE file.
 
 //! Command names, arguments and shared options.
+//!
+//! Clap consumes doc comments on arguments and variants as public help text.
+//! Developer-only notes beside those declarations use ordinary comments.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use darkbio_connect::trust::Environment;
 use std::path::PathBuf;
 
+// Parsed command and global options; cross-level conflicts are checked afterward.
 #[derive(Parser)]
 #[command(
     name = "ark",
@@ -19,11 +23,13 @@ use std::path::PathBuf;
     propagate_version = false
 )]
 pub(crate) struct Cli {
+    // Options propagated to every command level by clap.
     #[command(flatten)]
     pub options: Options,
     /// Tool, connect and wire versions
     #[arg(short = 'V', long)]
     pub version: bool,
+    // Absent for top-level help or the standalone version flag.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -59,6 +65,7 @@ impl Cli {
     }
 }
 
+// Invocation-wide presentation and device policy, independent of connect's API.
 #[derive(Args, Clone)]
 pub(crate) struct Options {
     /// Which Ark: locator, unique serial, name, image, or hardware/emulator
@@ -90,14 +97,20 @@ pub(crate) struct Options {
     pub verbose: u8,
 }
 
+// Requested presentation mode; auto is resolved independently for each stream.
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub(crate) enum Format {
+    // Detect human output separately for stdout and stderr.
     Auto,
+    // Keep human layouts even when output is redirected.
     Human,
+    // Stable plain text without terminal control sequences.
     Text,
+    // One result document on stdout and structured events on stderr.
     Json,
 }
 
+// Top-level command palette, shared by parsing, help and shell completion.
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Find hardware Arks and running emulators
@@ -133,11 +146,13 @@ pub(crate) enum Command {
         /// Command path or topic name
         #[arg(num_args = 0.., value_name = "COMMAND_OR_TOPIC")]
         path: Vec<String>,
+        // Print all command help and embedded topics as one manual.
         #[arg(long, conflicts_with = "path")]
         all: bool,
     },
 }
 
+// Explicit identity pin accepted by diagnostics and enrollment recovery.
 #[derive(Args)]
 pub(crate) struct Recovery {
     /// Pin an xDSA public key instead of verifying the attestation
@@ -150,15 +165,18 @@ pub(crate) struct Recovery {
     pub pubkey: Option<String>,
 }
 
+// Local attestation input and optional identity pin for enrollment.
 #[derive(Args)]
 pub(crate) struct Enroll {
     /// Install an existing signed attestation
     #[arg(long, value_name = "FILE")]
     pub cwt: Option<PathBuf>,
+    // Recovery can authenticate a device whose stored attestation is unusable.
     #[command(flatten)]
     pub recovery: Recovery,
 }
 
+// Dataset inspection and mutation commands; slot names map to wire IDs below.
 #[derive(Subcommand)]
 pub(crate) enum Data {
     /// Print the Ark's README of paths available to apps
@@ -206,6 +224,7 @@ pub(crate) enum Data {
     Repair(Change),
 }
 
+// Shared selection and planning arguments for slot deletion and repair.
 #[derive(Args)]
 pub(crate) struct Change {
     /// Slot name or id from `ark data list`
@@ -216,6 +235,7 @@ pub(crate) struct Change {
     pub dry_run: bool,
 }
 
+// App execution and explicit cancellation by the task ID returned by the Ark.
 #[derive(Subcommand)]
 pub(crate) enum App {
     /// Run an app, approved on your phone; print its report
@@ -230,6 +250,7 @@ pub(crate) enum App {
     },
 }
 
+// Published firmware selection and installation, including read-only planning.
 #[derive(Subcommand)]
 pub(crate) enum Firmware {
     /// Show the installed build and update candidates
@@ -251,6 +272,7 @@ pub(crate) enum Firmware {
     },
 }
 
+/// Parses the three explicit cloud routes supported by the CLI.
 pub(crate) fn parse_env(value: &str) -> Result<Environment, String> {
     match value {
         "release" => Ok(Environment::Release),
@@ -276,6 +298,7 @@ pub(crate) fn parse_slot(value: &str) -> Result<i32, String> {
         .ok_or_else(|| format!("unknown slot {value:?}; use a name or id from `ark data list`"))
 }
 
+/// Formats known protocol slot names, retaining unknown IDs as decimal selectors.
 pub(crate) fn slot_name(id: i32) -> String {
     darkbio_connect::schema::SlotKind::try_from(id)
         .map(|kind| {

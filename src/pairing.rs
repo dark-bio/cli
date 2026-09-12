@@ -14,6 +14,8 @@ use darkbio_connect::{
 use serde_json::json;
 use std::time::{Duration, UNIX_EPOCH};
 
+/// Pairs an unpaired Ark, translating connector stages into the owner's scan and
+/// approval instructions. Link construction and terminal presentation stay in the CLI.
 pub(crate) fn run(context: &Context) -> Result<(), Error> {
     let connection = context.connect(None)?;
     if connection.info.paired {
@@ -118,6 +120,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         .document(&json!({"serial": serial, "paired": true}))
 }
 
+/// Completes the previous human stage or emits the corresponding plain progress event.
 fn stage(
     context: &Context,
     previous: &mut Option<&'static str>,

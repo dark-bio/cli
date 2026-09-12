@@ -21,6 +21,7 @@ use package::Package;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+/// Verification window covering old-session closure and discovery after installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
 /// First firmware version containing the wire 0.9 protocol batch.
@@ -29,6 +30,8 @@ pub(crate) const MINIMUM_VERSION: &str = "0.11.5";
 /// Bump when current-release changes require developers to rebuild their image.
 pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_231_693; // 2026-09-12 16:48:13 UTC
 
+/// Requires the protocol batch and, for mutable develop builds, its publish cutoff.
+/// This is CLI compatibility guidance based on reported firmware metadata.
 pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(), Error> {
     let minimum = package::Version::parse(&format!("{MINIMUM_VERSION}-develop"))
         .expect("compiled firmware minimum is valid");
@@ -55,6 +58,9 @@ pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(
     Ok(())
 }
 
+/// Lists candidates or plans and installs a selected firmware archive.
+/// The CLI owns package retrieval, consent and reboot verification; connect owns the
+/// authorized update sequence. Partial results distinguish installation from return.
 pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Error> {
     let connection = context.connect_recovery(None)?;
     let mut packages = Packages::new(context, connection.env)?;
@@ -235,6 +241,8 @@ fn verify_reboot(
         > darkbio_connect::wire::transport::DEFAULT_HANDSHAKE_TIMEOUT
     {
         let found = darkbio_connect::list();
+        // Discovery labels narrow the search but do not prove identity. Only a
+        // new handshake with the original key can verify the returning Ark.
         for candidate in found.devices.iter().filter(|candidate| {
             if let Some(serial) = device.serial() {
                 candidate.serial() == Some(serial)
@@ -269,15 +277,20 @@ fn verify_reboot(
     std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
     Err(reboot_timeout())
 }
+/// Reports that installation was not verified within the reboot window.
 fn reboot_timeout() -> Error {
     Error::new(7, "timeout", "the Ark did not return within 120 seconds")
 }
 
+/// Expected device approval method, used for guidance rather than authorization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Approval {
+    /// An unpaired Ark needs no phone or button approval.
     None,
+    /// A paired, unlocked Ark asks its companion for approval.
     Phone,
+    /// A paired, locked Ark asks for physical button approval.
     Button,
 }
 
@@ -293,6 +306,8 @@ fn approval(info: &schema::DeviceInfoResponse) -> Option<Approval> {
         Approval::Button
     })
 }
+/// Finds an exact requested build or the first candidate in a newest-first listing.
+/// Explicit selection permits reinstallation or downgrade requests; the Ark decides.
 fn select<'a>(
     firmwares: &'a [Package],
     requested: Option<&str>,
@@ -319,6 +334,7 @@ fn select<'a>(
     }
     Ok(None)
 }
+/// Shows candidates and the installed build, even when that build is no longer published.
 fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) -> Result<(), Error> {
     let installed = &connection.info.firmware_version;
     let mut rows = Vec::new();
@@ -383,12 +399,17 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
     )
 }
 
+/// Environment-specific package client and optional Access credentials.
 pub(crate) struct Packages {
+    /// HTTPS downloader retaining connections and refusing automatic redirects.
     agent: ureq::Agent,
+    /// Selected package origin; credentials are sent only to this host.
     origin: &'static str,
+    /// Cached Access application token for a protected package host.
     token: Option<String>,
 }
 impl Packages {
+    /// Selects the package host and tries cached credentials without prompting for login.
     pub fn new(context: &Context, env: Option<Environment>) -> Result<Self, Error> {
         let origin = match env.ok_or_else(|| {
             Error::new(4, "environment-unknown", "cloud environment unknown")
@@ -410,6 +431,7 @@ impl Packages {
         };
         Ok(result)
     }
+    /// Fetches a size-bounded listing and validates every artifact before selection.
     pub fn list(&mut self, context: &Context) -> Result<Vec<Package>, Error> {
         let mut response = self.get(context, "imgs/arkos.pkgs")?;
         let bytes = response
@@ -428,6 +450,8 @@ impl Packages {
             })?
             .firmwares()
     }
+    /// Fetches one path and retries once after a recognized Access login challenge.
+    /// An unrelated redirect never changes the destination or receives credentials.
     fn get(
         &mut self,
         context: &Context,
@@ -469,13 +493,19 @@ impl Packages {
     }
 }
 
+/// Lazy archive reader opened only after the Ark accepts update preparation.
 struct Download<'a> {
+    /// Package client retained for the first read and any Access challenge.
     packages: &'a mut Packages,
+    /// CLI timing and input policy for opening the archive request.
     context: &'a Context,
+    /// Validated archive path relative to the selected package origin.
     path: String,
+    /// HTTP body retained after the first read starts the download.
     response: Option<ureq::http::Response<ureq::Body>>,
 }
 impl std::io::Read for Download<'_> {
+    /// Opens once and streams bytes, preserving CLI login errors through connect's reader API.
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.response.is_none() {
             self.response = Some(

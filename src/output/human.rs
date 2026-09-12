@@ -9,6 +9,8 @@
 use crate::style::{self, Role, Theme};
 use serde_json::Value;
 
+/// Styles a field by its final path component, retaining explicit absent values.
+/// Arbitrary strings receive no semantic status color merely because of their text.
 pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
     let key = key.rsplit('.').next().unwrap_or(key);
     if value.is_null() {
@@ -79,6 +81,8 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
     }
 }
 
+/// Aligns label/value rows, stacking them when labels consume the available width.
+/// An empty pair separates groups; an empty label introduces an unlabeled row.
 pub(crate) fn block(theme: &Theme, rows: &[(String, String)]) -> String {
     let labels = rows
         .iter()
@@ -112,6 +116,7 @@ pub(crate) fn block(theme: &Theme, rows: &[(String, String)]) -> String {
         .join("\n")
 }
 
+/// Renders flattened JSON paths as readable labels while preserving original values.
 pub(super) fn document(theme: &Theme, value: &Value) -> String {
     let mut fields = Vec::new();
     super::fields("", value, &mut fields, true);
@@ -141,6 +146,8 @@ pub(super) fn document(theme: &Theme, value: &Value) -> String {
     block(theme, &rows)
 }
 
+/// Fits a table by shrinking one free-text column, then falls back to blocks.
+/// Selectors, hashes and other actionable fields are never ellipsized by the table.
 pub(super) fn table(
     theme: &Theme,
     rows: &[Value],
@@ -245,6 +252,7 @@ pub(super) fn table(
     lines.join("\n")
 }
 
+/// Aligns diagnostic outcomes, keeping skipped checks explicit and hints nearby.
 pub(super) fn checklist(theme: &Theme, rows: &[Value]) -> String {
     let labels = rows
         .iter()

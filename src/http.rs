@@ -13,6 +13,8 @@ use ureq::unversioned::{
     transport::{Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport},
 };
 
+/// Creates an HTTPS download client with bounded network waits and caller-selected
+/// redirect allowance. Active bodies can outlive many inactivity windows.
 pub(crate) fn agent(timeout: Duration, redirects: u32) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .https_only(true)
@@ -30,6 +32,7 @@ pub(crate) fn agent(timeout: Duration, redirects: u32) -> ureq::Agent {
     )
 }
 
+/// Maps request failures to timeout or cloud reachability actions.
 pub(crate) fn error(error: ureq::Error) -> Error {
     match error {
         ureq::Error::Timeout(_) => Error::new(7, "timeout", "a network response timed out"),
@@ -52,6 +55,7 @@ pub(crate) fn normalize_read_error(error: std::io::Error) -> std::io::Error {
     }
 }
 
+/// Classifies an HTTP body read after recovering any wrapped timeout.
 pub(crate) fn read_error(error: std::io::Error) -> Error {
     let error = normalize_read_error(error);
     if error.kind() == std::io::ErrorKind::TimedOut {
@@ -66,7 +70,9 @@ pub(crate) fn read_error(error: std::io::Error) -> Error {
 #[derive(Debug)]
 struct Inactivity(Duration);
 impl<T: Transport> Connector<T> for Inactivity {
+    /// Original transport with a renewed bound on each wait.
     type Out = Idle<T>;
+    /// Wraps an established transport without initiating another connection.
     fn connect(
         &self,
         _: &ConnectionDetails,
@@ -78,12 +84,16 @@ impl<T: Transport> Connector<T> for Inactivity {
         }))
     }
 }
+/// HTTP transport that clips each I/O wait to the download inactivity allowance.
 #[derive(Debug)]
 struct Idle<T> {
+    /// Connected transport retaining the HTTP library's buffers and TLS state.
     inner: T,
+    /// Fresh allowance for each transport wait, independent of body length.
     timeout: Duration,
 }
 impl<T: Transport> Idle<T> {
+    /// Preserves an earlier HTTP deadline, otherwise applying the inactivity limit.
     fn bound(&self, timeout: NextTimeout) -> NextTimeout {
         if timeout.after > self.timeout.into() {
             NextTimeout {
@@ -96,18 +106,23 @@ impl<T: Transport> Idle<T> {
     }
 }
 impl<T: Transport> Transport for Idle<T> {
+    /// Uses the original transport buffers without introducing another body copy.
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.inner.buffers()
     }
+    /// Writes buffered request bytes under the earlier transport bound.
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.inner.transmit_output(amount, self.bound(timeout))
     }
+    /// Waits for more response bytes with a renewed inactivity allowance.
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
         self.inner.await_input(self.bound(timeout))
     }
+    /// Defers pooled-connection liveness checks to the underlying transport.
     fn is_open(&mut self) -> bool {
         self.inner.is_open()
     }
+    /// Preserves the transport's TLS status for HTTPS policy checks.
     fn is_tls(&self) -> bool {
         self.inner.is_tls()
     }

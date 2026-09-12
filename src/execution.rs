@@ -18,6 +18,9 @@ use darkbio_connect::{ExecutionProgress, schema};
 use serde_json::{Value, json};
 use std::time::Instant;
 
+/// Cancels an explicit task or uploads and runs a local app after unlock.
+/// The connector owns protocol sequencing; the CLI owns progress, partial results
+/// and byte-preserving report output. An app failure retains its returned result.
 pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     let args::App::Run { file: path } = command else {
         let args::App::Cancel { task } = command else {
@@ -112,6 +115,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     }
 }
 
+/// Stores valid UTF-8 verbatim; other bytes replace the text key with a base64 sibling.
 fn bytes(value: &mut Value, name: &str, bytes: &[u8]) {
     match std::str::from_utf8(bytes) {
         Ok(text) => value[name] = json!(text),

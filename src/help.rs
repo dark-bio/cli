@@ -13,6 +13,7 @@ use crate::{
 };
 use clap::CommandFactory;
 
+/// Builds the executable command tree with shared styling and command-specific contracts.
 pub(crate) fn command(theme: &Theme) -> clap::Command {
     let mut command = Cli::command();
     decorate(&mut command, "", theme);
@@ -50,6 +51,8 @@ fn compact(command: &mut clap::Command, root: bool, theme: &Theme) {
     }
 }
 
+/// Adds prerequisites, approval guidance, output fields and examples to each command.
+/// The command path selects its contract; clap still owns syntax and argument help.
 fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
     *command = command
         .clone()
@@ -260,6 +263,8 @@ Topics: agents, states, output, devices, datasets, apps."
     }
 }
 
+/// Prints a command page, an embedded topic or the full manual without discovery.
+/// Help remains readable text even when the invocation selects JSON.
 pub(crate) fn run(path: &[String], all: bool, format: Format) -> Result<(), Error> {
     let theme = Theme::new(format, false);
     let mut root = command(&theme);
@@ -313,6 +318,7 @@ pub(crate) fn run(path: &[String], all: bool, format: Format) -> Result<(), Erro
     Ok(())
 }
 
+/// Aligns short contract labels and shell examples within the human terminal width.
 fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
     let mut lines = fields
         .iter()
@@ -393,6 +399,7 @@ fn markdown(theme: &Theme, text: &str) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
+/// Collects human command pages in command-tree order for the complete manual.
 fn collect_help(command: &mut clap::Command, pages: &mut Vec<String>) {
     pages.push(
         command
@@ -406,6 +413,7 @@ fn collect_help(command: &mut clap::Command, pages: &mut Vec<String>) {
         collect_help(child, pages);
     }
 }
+/// Prints this command and its descendants as plain long-help pages.
 fn print_command(command: &mut clap::Command) -> Result<(), Error> {
     command.print_long_help()?;
     println!("\n");
@@ -414,6 +422,7 @@ fn print_command(command: &mut clap::Command) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Returns a compiled-in help topic by its public name.
 fn topic(name: &str) -> Option<&'static str> {
     Some(match name {
         "agents" => include_str!("help/agents.md"),
