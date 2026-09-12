@@ -310,7 +310,7 @@ impl<'a> Progress<'a> {
             UploadProgress::Uploading { uploaded, total } => {
                 self.uploaded = uploaded;
                 if let Some(line) = self.transfer.update(uploaded, total) {
-                    self.context.output.event("progress", line);
+                    self.context.output.progress(&line);
                 }
             }
             UploadProgress::Processing(status) => {
@@ -320,7 +320,7 @@ impl<'a> Progress<'a> {
                     .map(|phase| phase.name.clone())
                     .collect();
                 if let Some(line) = self.processing.update(&status) {
-                    self.context.output.event("progress", line);
+                    self.context.output.progress(&line);
                 }
             }
         }

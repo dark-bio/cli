@@ -78,7 +78,7 @@ PackageName: Ark
 PackageUrl: https://github.com/dark-bio/cli
 License: BSD-3-Clause
 LicenseUrl: https://github.com/dark-bio/cli/blob/main/LICENSE
-ShortDescription: Command line for Dark Bio Arks
+ShortDescription: Command line interface to Ark enclaves
 "
             .to_string(),
         ),

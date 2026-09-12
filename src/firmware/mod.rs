@@ -155,7 +155,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             },
             UpdateProgress::Uploading { uploaded, total } => {
                 if let Some(line) = transfer.update(uploaded, total) {
-                    context.output.event("progress", line);
+                    context.output.progress(&line);
                 }
             }
             UpdateProgress::Verifying => context
@@ -186,7 +186,20 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         context
             .output
             .event("progress", "waiting for the Ark to reboot");
+        context.output.wait("waiting for the Ark to return", None);
+        let started = Instant::now();
         let result = verify_reboot(context, &connection, &target.version, &mut value);
+        context.output.finish();
+        if result.is_ok() {
+            context.output.human_event(
+                "progress",
+                format!(
+                    "returned after {} s; verified {}",
+                    started.elapsed().as_secs(),
+                    target.version
+                ),
+            );
+        }
         context.output.document(&value)?;
         return result;
     }
@@ -344,7 +357,19 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
             .join(", ")
         );
     }
-    context.output.table(
+    let groups: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            row["version"]
+                .as_str()
+                .unwrap_or("unknown")
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .collect();
+    context.output.grouped_table(
         &document,
         &rows,
         &[
@@ -354,6 +379,7 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
             ("FLAGS", "flags"),
             ("SUMMARY", "summary"),
         ],
+        &groups,
     )
 }
 

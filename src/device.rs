@@ -10,6 +10,8 @@ use crate::{
     args,
     context::{Connection, Context},
     error::Error,
+    output::human,
+    style::{Role, Theme},
 };
 use darkbio_connect::{DeviceKind, Identity, schema};
 use serde_json::{Value, json};
@@ -50,7 +52,7 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
 pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), Error> {
     let connection = context.connect_recovery(recovery.pubkey.as_deref())?;
     let value = status_value(&connection);
-    context.output.document(&value)?;
+    print_status(context, &value)?;
     connection.require_current()?;
     status_hints(context, &connection, &value);
     Ok(())
@@ -91,6 +93,88 @@ fn status_value(connection: &Connection) -> Value {
         "trust":trust,"environment":env,"realm":realm,"synced":current.then(|| darkbio_connect::cloud_synced(info)),"paired":current.then_some(info.paired),"unlocked":current.then_some(info.unlocked),
         "identity":hex::encode(connection.identity.key().fingerprint().to_bytes()),
         "pubkey":hex::encode(connection.identity.key().to_bytes()),"mismatch":mismatch})
+}
+
+fn print_status(context: &Context, value: &Value) -> Result<(), Error> {
+    context
+        .output
+        .document_with(value, |theme, verbose| status_block(theme, value, verbose))
+}
+
+fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
+    let field = |key: &str| human::value(theme, key, &value[key]);
+    let flag = |key: &str, yes: &str, no: &str| match value[key].as_bool() {
+        Some(true) => theme.mark(Role::Success, yes),
+        Some(false) => theme.mark(Role::Attention, no),
+        None => theme.paint(Role::Muted, "-"),
+    };
+    let hardware = &value["hardware"];
+    let firmware = &value["firmware"];
+    let mut fingerprint = value["identity"].as_str().unwrap_or("-").to_string();
+    if verbose == 0 && fingerprint.len() > 12 {
+        fingerprint = format!(
+            "{}{}",
+            fingerprint.chars().take(8).collect::<String>(),
+            theme.glyph("\u{2026}", "...")
+        );
+    }
+    let sep = theme.separator();
+    let mut rows = vec![
+        (
+            String::new(),
+            format!(
+                "{}  {}",
+                theme.paint(Role::Heading, value["name"].as_str().unwrap_or("Ark")),
+                theme.paint(
+                    Role::Muted,
+                    crate::output::display("serial", &value["serial"], true)
+                )
+            ),
+        ),
+        (
+            "Hardware".into(),
+            format!(
+                "{}, revision {}, model {}",
+                crate::output::scalar(&hardware["version"]),
+                crate::output::scalar(&hardware["revision"]),
+                crate::output::scalar(&hardware["model"])
+            ),
+        ),
+        (String::new(), String::new()),
+        (
+            "Firmware".into(),
+            format!(
+                "{}, published {}",
+                crate::output::scalar(&firmware["version"]),
+                human::value(theme, "published", &firmware["published"])
+            ),
+        ),
+        (
+            "Trust".into(),
+            [field("trust"), field("environment"), field("realm")].join(&sep),
+        ),
+        (String::new(), String::new()),
+        ("Cloud".into(), flag("synced", "synced", "not synced")),
+        (
+            "Pairing".into(),
+            format!(
+                "{}{sep}{}",
+                flag("paired", "paired", "unpaired"),
+                flag("unlocked", "unlocked", "locked")
+            ),
+        ),
+        ("Identity".into(), theme.paint(Role::Accent, fingerprint)),
+    ];
+    if verbose > 0 {
+        rows.push(("Public key".into(), field("pubkey")));
+    }
+    if !value["mismatch"].is_null() {
+        rows.push(("Mismatch".into(), field("mismatch")));
+    }
+    if value.get("enrolled").is_some() {
+        rows.push(("Enrolled".into(), field("enrolled")));
+    }
+    human::block(theme, &rows)
 }
 
 fn status_hints(context: &Context, connection: &Connection, value: &Value) {
@@ -214,7 +298,7 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
     {
         Ok(mut value) => {
             value["enrolled"] = json!(true);
-            context.output.document(&value)
+            print_status(context, &value)
         }
         Err(error) => {
             context
@@ -238,5 +322,33 @@ pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
         Release => "https://hub.dark.bio",
         Staging => "https://hub.darkbio.xyz",
         Develop => "https://hub.darkbio.dev",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::Color;
+
+    #[test]
+    fn status_distinguishes_unknown_state_and_keeps_mismatches_visible() {
+        let theme = Theme::test(80, Color::Basic, true);
+        let mut value = json!({
+            "name":"Example Ark", "serial":null,
+            "hardware":{"version":"Ark I","revision":"B","model":"01"},
+            "firmware":{"version":"0.11.5","published":null},
+            "trust":"self-signed","environment":null,"realm":null,
+            "synced":null,"paired":true,"unlocked":false,
+            "identity":"0123456789abcdef","pubkey":"abcdef0123456789","mismatch":"Ark II - A",
+        });
+        assert_eq!(
+            status_block(&theme, &value, 0),
+            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware  Ark I, revision B, model 01\n\n  Firmware  0.11.5, published -\n  Trust     \x1b[1m! self-signed\x1b[0m \u{00b7} - \u{00b7} -\n\n  Cloud     -\n  Pairing   \x1b[1m\u{2713} paired\x1b[0m \u{00b7} \x1b[1m! locked\x1b[0m\n  Identity  \x1b[1m01234567\u{2026}\x1b[0m\n  Mismatch  \x1b[1mArk II - A\x1b[0m"
+        );
+        let verbose = status_block(&theme, &value, 1);
+        assert!(verbose.contains("0123456789abcdef"));
+        assert!(verbose.contains("abcdef0123456789"));
+        value["synced"] = json!(false);
+        assert!(status_block(&theme, &value, 0).contains("! not synced"));
     }
 }

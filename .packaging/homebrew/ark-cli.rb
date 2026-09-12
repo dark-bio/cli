@@ -1,5 +1,5 @@
 class ArkCli < Formula
-  desc "Command line for Dark Bio Arks"
+  desc "Command line interface to Ark enclaves"
   homepage "https://dark.bio"
   version "@VERSION@"
   license "BSD-3-Clause"

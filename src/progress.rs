@@ -6,6 +6,7 @@
 
 //! Transfer rates and per-step estimates for terminal progress.
 
+use crate::style::{Role, Theme};
 use darkbio_connect::schema::SlotUploadProcessResponse;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -15,6 +16,55 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 const WARMUP: Duration = Duration::from_secs(1);
 const HUMAN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One observation, with the established log line and facts for the terminal.
+pub(crate) struct Update {
+    pub text: String,
+    pub stage: String,
+    pub percent: u64,
+    pub details: Vec<String>,
+}
+
+impl Update {
+    pub fn render(&self, theme: &Theme) -> String {
+        let width = theme.width.saturating_sub(1);
+        let stage = theme.truncate(&self.stage, (width / 2).max(8));
+        let prefix = theme.paint(Role::Muted, "progress:");
+        let percent = format!("{:3} %", self.percent);
+        let mut details = self.details.clone();
+        let facts = loop {
+            let facts = if details.is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", theme.separator(), details.join(&theme.separator()))
+            };
+            let reserve = if width >= 60 { 9 } else { 0 };
+            if console::measure_text_width(&format!("progress: {stage} {percent}{facts}")) + reserve
+                <= width
+                || details.is_empty()
+            {
+                break facts;
+            }
+            details.remove(0);
+        };
+        let used = console::measure_text_width(&format!("progress: {stage} {percent}{facts}"));
+        let size = width.saturating_sub(used + 1).min(40);
+        let bar = if size >= 8 {
+            let filled = (size as u64 * self.percent.min(100) / 100) as usize;
+            format!(
+                "{}{} ",
+                theme.paint(Role::Success, theme.glyph("\u{2501}", "=").repeat(filled)),
+                theme.paint(
+                    Role::Muted,
+                    theme.glyph("\u{2500}", "-").repeat(size - filled)
+                )
+            )
+        } else {
+            String::new()
+        };
+        theme.truncate(&format!("{prefix} {stage} {bar}{percent}{facts}"), width)
+    }
+}
 
 /// Samples only acknowledged bytes, starting with the first upload report so
 /// cloud setup and approval do not enter the rate estimate.
@@ -31,11 +81,11 @@ impl Transfer {
         }
     }
 
-    pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<String> {
+    pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<Update> {
         self.update_at(uploaded, total, Instant::now())
     }
 
-    fn update_at(&mut self, uploaded: u64, total: u64, now: Instant) -> Option<String> {
+    fn update_at(&mut self, uploaded: u64, total: u64, now: Instant) -> Option<Update> {
         let rate = self.rate.sample(uploaded, now);
         let percent = percent(uploaded, total);
         if !self.report.due(percent, now) {
@@ -51,12 +101,31 @@ impl Transfer {
             },
             speed,
         );
-        Some(format!(
+        let text = format!(
             "Uploading: {percent}% ({:.1}/{:.1} MiB) | {speed} | ETA {}",
             uploaded as f64 / MIB,
             total as f64 / MIB,
             eta(total.saturating_sub(uploaded), rate),
-        ))
+        );
+        let (divisor, unit) = if total >= 1 << 30 {
+            ((1_u64 << 30) as f64, "GiB")
+        } else {
+            (MIB, "MiB")
+        };
+        Some(Update {
+            text,
+            stage: "uploading".into(),
+            percent,
+            details: vec![
+                format!(
+                    "{:.1}/{:.1} {unit}",
+                    uploaded as f64 / divisor,
+                    total as f64 / divisor
+                ),
+                speed,
+                human_eta(total.saturating_sub(uploaded), rate),
+            ],
+        })
     }
 }
 
@@ -77,11 +146,11 @@ impl Processing {
         }
     }
 
-    pub(super) fn update(&mut self, status: &SlotUploadProcessResponse) -> Option<String> {
+    pub(super) fn update(&mut self, status: &SlotUploadProcessResponse) -> Option<Update> {
         self.update_at(status, Instant::now())
     }
 
-    fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<String> {
+    fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<Update> {
         let phase = (status.proc_start, status.phase_in, status.phase_start);
         if self.phase != Some(phase) {
             self.phase = Some(phase);
@@ -100,12 +169,25 @@ impl Processing {
             .and_then(|index| status.phases.get(index).map(|phase| &phase.name))
             .map(String::as_str)
             .unwrap_or("Processing");
-        Some(format!(
+        let text = format!(
             "Processing [{}/{}] {name}: {percent}% | step ETA {}",
             status.phase_in,
             status.phases.len(),
             eta(10_000_u64.saturating_sub(status.phase_progress), rate),
-        ))
+        );
+        Some(Update {
+            text,
+            stage: format!(
+                "processing [{}/{}] {name}",
+                status.phase_in,
+                status.phases.len()
+            ),
+            percent,
+            details: vec![human_eta(
+                10_000_u64.saturating_sub(status.phase_progress),
+                rate,
+            )],
+        })
     }
 }
 
@@ -202,9 +284,54 @@ fn eta(remaining: u64, rate: Option<f64>) -> String {
     }
 }
 
+fn human_eta(remaining: u64, rate: Option<f64>) -> String {
+    let eta = eta(remaining, rate);
+    if eta == "estimating..." {
+        return format!("eta {eta}");
+    }
+    format!(
+        "eta {}",
+        eta.replace('h', " h").replace('m', " m").replace('s', " s")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_keeps_speed_and_eta_in_the_available_width() {
+        use crate::style::Color;
+        let update = Update {
+            text: String::new(),
+            stage: "uploading".into(),
+            percent: 50,
+            details: vec![
+                "50.0/100.0 MiB".into(),
+                "10.0 MiB/s".into(),
+                "eta 5 s".into(),
+            ],
+        };
+        let theme = Theme::test(120, Color::Basic, false);
+        assert_eq!(
+            update.render(&theme),
+            "progress: uploading \x1b[1m====================\x1b[0m--------------------  50 % - 50.0/100.0 MiB - 10.0 MiB/s - eta 5 s"
+        );
+        for width in [32, 60, 80, 120] {
+            let theme = Theme::test(width, Color::True, true);
+            let rendered = update.render(&theme);
+            assert!(
+                console::measure_text_width(&rendered) < width,
+                "{width}: {rendered}"
+            );
+            assert!(rendered.contains("50 %"));
+            if width >= 60 {
+                assert!(rendered.contains('\u{2501}'));
+                assert!(rendered.contains("10.0 MiB/s"));
+                assert!(rendered.contains("eta 5 s"), "{width}: {rendered:?}");
+            }
+        }
+    }
 
     /// The initial bytes were accepted before sampling began. Counting them as
     /// newly transferred would inflate speed and shorten the ETA.
@@ -213,18 +340,20 @@ mod tests {
         let start = Instant::now();
         let mut transfer = Transfer::new(false);
         let mib = 1024 * 1024;
-        let first = transfer.update_at(25 * mib, 100 * mib, start).unwrap();
+        let first = transfer.update_at(25 * mib, 100 * mib, start).unwrap().text;
         assert!(first.contains("speed estimating... | ETA estimating..."));
         let next = transfer
             .update_at(50 * mib, 100 * mib, start + Duration::from_secs(5))
-            .unwrap();
+            .unwrap()
+            .text;
         assert_eq!(
             next,
             "Uploading: 50% (50.0/100.0 MiB) | 5.0 MiB/s | ETA ~10s"
         );
         let done = transfer
             .update_at(100 * mib, 100 * mib, start + Duration::from_secs(10))
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(done.ends_with("ETA 0s"));
     }
 
@@ -254,24 +383,28 @@ mod tests {
             processing
                 .update_at(&status(1, 1000), start)
                 .unwrap()
+                .text
                 .ends_with("step ETA estimating...")
         );
         assert_eq!(
             processing
                 .update_at(&status(1, 3000), start + Duration::from_secs(5))
-                .unwrap(),
+                .unwrap()
+                .text,
             "Processing [1/2] Validate: 30% | step ETA ~18s"
         );
         assert_eq!(
             processing
                 .update_at(&status(2, 4000), start + Duration::from_secs(6))
-                .unwrap(),
+                .unwrap()
+                .text,
             "Processing [2/2] Index: 40% | step ETA estimating..."
         );
         assert_eq!(
             processing
                 .update_at(&status(2, 5000), start + Duration::from_secs(11))
-                .unwrap(),
+                .unwrap()
+                .text,
             "Processing [2/2] Index: 50% | step ETA ~25s"
         );
         let restarted = SlotUploadProcessResponse {
@@ -282,6 +415,7 @@ mod tests {
             processing
                 .update_at(&restarted, start + Duration::from_secs(12))
                 .unwrap()
+                .text
                 .ends_with("step ETA estimating...")
         );
         let done = SlotUploadProcessResponse {
@@ -292,6 +426,7 @@ mod tests {
             processing
                 .update_at(&done, start + Duration::from_secs(13))
                 .unwrap()
+                .text
                 .ends_with("step ETA 0s")
         );
     }

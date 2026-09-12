@@ -6,36 +6,59 @@
 
 //! Help is generated from the commands this build actually serves.
 
-use crate::{args::Cli, error::Error};
+use crate::{
+    args::{Cli, Format},
+    error::Error,
+    style::{self, Color, Role, Theme},
+};
 use clap::CommandFactory;
 
-pub(crate) fn command() -> clap::Command {
+pub(crate) fn command(theme: &Theme) -> clap::Command {
     let mut command = Cli::command();
-    decorate(&mut command, "");
+    decorate(&mut command, "", theme);
     command.build();
-    compact(&mut command, true);
+    compact(&mut command, true, theme);
     command
 }
 
 /// Clap normally expands long help onto two lines per option. Render its short
 /// layout once, then let the help action select the short or long footer.
-fn compact(command: &mut clap::Command, root: bool) {
+fn compact(command: &mut clap::Command, root: bool, theme: &Theme) {
     let mut display = command.clone().after_help(None).after_long_help(None);
     if !root {
         for arg in command.get_arguments().filter(|arg| arg.is_global_set()) {
             display = display.mut_arg(arg.get_id().clone(), |arg| arg.hide(true));
         }
     }
-    let scan = display.render_help().to_string();
+    let rendered = display.render_help();
+    let scan = if theme.human {
+        rendered
+            .ansi()
+            .to_string()
+            .lines()
+            .map(|line| style::wrap(&theme.inline(line), theme.width, 6))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        rendered.to_string()
+    };
     *command = command
         .clone()
         .help_template(format!("{}{{after-help}}", scan.trim_end()));
     for child in command.get_subcommands_mut() {
-        compact(child, false);
+        compact(child, false, theme);
     }
 }
 
-fn decorate(command: &mut clap::Command, parent: &str) {
+fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
+    *command = command
+        .clone()
+        .styles(theme.clap())
+        .color(if theme.color == Color::Off {
+            clap::ColorChoice::Never
+        } else {
+            clap::ColorChoice::Always
+        });
     let path = if parent.is_empty() {
         command.get_name().to_string()
     } else {
@@ -189,6 +212,21 @@ fn decorate(command: &mut clap::Command, parent: &str) {
         "Requires: {requires}\nApproval: {approval}\nTime:     {time}\nPrints:   {prints}\nExit:     {exits}; 130/143 interrupted\n\nExamples:\n  {}\n\nGlobal options: ark --help",
         examples.replace('\n', "\n  ")
     );
+    let help = if theme.human {
+        footer(
+            theme,
+            &[
+                ("Requires", requires),
+                ("Approval", approval),
+                ("Time", time),
+                ("Prints", prints),
+                ("Exit", &format!("{exits}; 130/143 interrupted")),
+            ],
+            examples,
+        )
+    } else {
+        help
+    };
     let help = if parent.is_empty() {
         "Scripts and AI agents: use --format json for structured results.
 Read `ark help agents` first. Topics: agents, states, output, devices, datasets, apps."
@@ -204,15 +242,40 @@ Read `ark help agents` first. Topics: agents, states, output, devices, datasets,
         };
         format!("{advanced}{help}")
     };
+    let help = if theme.human {
+        help.lines()
+            .map(|line| style::wrap(&theme.inline(line), theme.width, 0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        help
+    };
     *command = command.clone().after_long_help(format!("{help}\n"));
     for child in command.get_subcommands_mut() {
-        decorate(child, &path);
+        decorate(child, &path, theme);
     }
 }
 
-pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
-    let mut root = command();
+pub(crate) fn run(path: &[String], all: bool, format: Format) -> Result<(), Error> {
+    let theme = Theme::new(format, false);
+    let mut root = command(&theme);
     if all {
+        if theme.human {
+            let mut pages = Vec::new();
+            collect_help(&mut root, &mut pages);
+            pages.extend(
+                ["agents", "states", "output", "devices", "datasets", "apps"]
+                    .map(|name| markdown(&theme, topic(name).unwrap())),
+            );
+            println!(
+                "{}",
+                pages.join(&format!(
+                    "\n\n{}\n\n",
+                    theme.paint(Role::Muted, "-".repeat(theme.width.min(80)))
+                ))
+            );
+            return Ok(());
+        }
         print_command(&mut root)?;
         for name in ["agents", "states", "output", "devices", "datasets", "apps"] {
             println!("\n{}", topic(name).unwrap());
@@ -222,7 +285,14 @@ pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
     if path.len() == 1
         && let Some(topic) = topic(&path[0])
     {
-        println!("{topic}");
+        println!(
+            "{}",
+            if theme.human {
+                markdown(&theme, topic)
+            } else {
+                topic.to_string()
+            }
+        );
         return Ok(());
     }
     let mut command = &mut root;
@@ -237,6 +307,74 @@ pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
     }
     command.print_long_help()?;
     Ok(())
+}
+
+fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
+    let mut lines = fields
+        .iter()
+        .map(|(label, text)| {
+            style::wrap(
+                &format!(
+                    "{}{}{}",
+                    theme.paint(Role::Muted, label),
+                    " ".repeat(11 - label.len()),
+                    theme.inline(text)
+                ),
+                theme.width,
+                11,
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!("\n{}", theme.paint(Role::Heading, "Examples")));
+    lines.extend(examples.lines().map(|line| {
+        style::wrap(
+            &format!("  $ {}", theme.paint(Role::Accent, line)),
+            theme.width,
+            4,
+        )
+    }));
+    lines.push(format!(
+        "\n{} {}",
+        theme.paint(Role::Muted, "Global options:"),
+        theme.paint(Role::Accent, "ark --help")
+    ));
+    lines.join("\n")
+}
+
+fn markdown(theme: &Theme, text: &str) -> String {
+    let mut code = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("```") {
+            code = !code;
+            continue;
+        }
+        let line = if code {
+            format!("  {}", theme.paint(Role::Accent, line))
+        } else if line.starts_with('#') {
+            theme.paint(Role::Heading, line.trim_start_matches('#').trim_start())
+        } else if line.starts_with("- ") {
+            format!("  {}", theme.inline(line))
+        } else {
+            theme.inline(line)
+        };
+        lines.push(style::wrap(&line, theme.width, if code { 2 } else { 0 }));
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
+fn collect_help(command: &mut clap::Command, pages: &mut Vec<String>) {
+    pages.push(
+        command
+            .render_long_help()
+            .ansi()
+            .to_string()
+            .trim_end()
+            .to_string(),
+    );
+    for child in command.get_subcommands_mut() {
+        collect_help(child, pages);
+    }
 }
 fn print_command(command: &mut clap::Command) -> Result<(), Error> {
     command.print_long_help()?;
@@ -256,4 +394,48 @@ fn topic(name: &str) -> Option<&'static str> {
         "apps" => include_str!("help/apps.md"),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footer_uses_aligned_labels_and_styled_examples() {
+        let theme = Theme::test(80, Color::Basic, true);
+        assert_eq!(
+            footer(
+                &theme,
+                &[("Requires", "a paired Ark"), ("Approval", "on your phone")],
+                "ark unlock"
+            ),
+            "Requires   a paired Ark\nApproval   on your phone\n\n\x1b[1mExamples\x1b[0m\n  $ \x1b[1mark unlock\x1b[0m\n\nGlobal options: \x1b[1mark --help\x1b[0m"
+        );
+        assert_eq!(
+            markdown(
+                &theme,
+                "# States\n\nUse `ark status`.\n\n- Keep the phone nearby.\n\n```sh\nark unlock\n```\n"
+            ),
+            "\x1b[1mStates\x1b[0m\n\nUse \x1b[1mark status\x1b[0m.\n\n  - Keep the phone nearby.\n\n  \x1b[1mark unlock\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn help_fits_narrow_terminals_without_losing_commands() {
+        let theme = Theme::test(60, Color::True, true);
+        let mut command = command(&theme);
+        let fetch = command
+            .find_subcommand_mut("data")
+            .unwrap()
+            .find_subcommand_mut("fetch")
+            .unwrap();
+        let rendered = fetch.render_long_help().ansi().to_string();
+        assert!(
+            rendered
+                .lines()
+                .all(|line| console::measure_text_width(line) <= theme.width)
+        );
+        assert!(console::strip_ansi_codes(&rendered).contains("ark data fetch --all --unlock"));
+        assert!(rendered.contains("\x1b["));
+    }
 }

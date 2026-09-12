@@ -19,15 +19,10 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     checks.ok(
         "tool",
         &format!(
-            "ark {}; connect {}; wire {}; environments {}",
+            "ark {}; connect {}; wire {}",
             env!("CARGO_PKG_VERSION"),
             darkbio_connect::VERSION,
             darkbio_connect::wire::VERSION,
-            crate::args::environments()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
         ),
     );
     let mut discovered = 0;
@@ -183,16 +178,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     }
     let mut document = crate::versions();
     document["checks"] = json!(checks.rows);
-    context.output.table(
-        &document,
-        &checks.rows,
-        &[
-            ("CHECK", "name"),
-            ("RESULT", "result"),
-            ("DETAIL", "detail"),
-            ("HINT", "hint"),
-        ],
-    )?;
+    context.output.checklist(&document, &checks.rows)?;
     checks.failure.map_or(Ok(()), Err)
 }
 struct Checks<'a> {

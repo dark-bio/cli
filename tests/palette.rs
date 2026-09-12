@@ -72,6 +72,48 @@ fn version_is_a_single_structured_result() {
 }
 
 #[test]
+fn explicit_human_pipes_have_layout_without_terminal_escapes() {
+    let output = ark(&["--version", "--format", "human"]);
+    assert!(output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .starts_with("  Tool")
+    );
+    let output = ark(&["--format", "human", "help", "states"]);
+    assert!(output.status.success());
+    let topic = String::from_utf8(output.stdout).unwrap();
+    assert!(!topic.contains('\x1b'));
+    assert!(!topic.starts_with('#'));
+    assert!(!topic.contains('`'));
+}
+
+#[test]
+fn format_selection_applies_before_help_and_usage_errors() {
+    let text = ark(&["data", "fetch", "--help", "--format", "text"]);
+    assert_eq!(
+        text.stdout,
+        ark(&["--format=text", "data", "fetch", "--help"]).stdout
+    );
+    assert!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .contains("Requires:")
+    );
+    let human = ark(&["data", "fetch", "--help", "--format=human"]);
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("Requires   ")
+    );
+    let output = ark(&["--format", "text", "app", "cancel", "invalid"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.contains(&0x1b));
+}
+
+#[test]
 fn help_matches_the_supported_palette() {
     let output = ark(&["--help"]);
     assert!(output.status.success());

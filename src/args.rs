@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "ark",
-    about = "Command line for Dark Bio Arks",
+    about = "Command line interface to Ark enclaves",
     disable_help_subcommand = true,
     disable_version_flag = true,
     propagate_version = false
@@ -124,9 +124,13 @@ pub(crate) enum Command {
     /// Check this computer, the Ark and the cloud, with fixes
     Doctor,
     /// Generate shell completions
-    Completions { shell: clap_complete::Shell },
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
     /// Help for a command or a topic; --all prints the manual
     Help {
+        /// Command path or topic name
         #[arg(num_args = 0.., value_name = "COMMAND_OR_TOPIC")]
         path: Vec<String>,
         #[arg(long, conflicts_with = "path")]
@@ -163,11 +167,13 @@ pub(crate) enum Data {
     List,
     /// Show one slot's metadata, download and dependencies
     Show {
+        /// Slot name or id from `ark data list`
         #[arg(value_parser = parse_slot)]
         slot: i32,
     },
     /// Upload a local dataset, approved on your phone
     Upload {
+        /// Local dataset file to identify and upload
         file: PathBuf,
         /// Require the Ark to identify this target slot
         #[arg(long, value_parser = parse_slot)]
@@ -178,6 +184,7 @@ pub(crate) enum Data {
     },
     /// Download and install public reference data
     Fetch {
+        /// Slot name or id from `ark data list`
         #[arg(value_parser = parse_slot, required_unless_present = "all", conflicts_with = "all")]
         slot: Option<i32>,
         /// Fill empty reference slots in dependency order
@@ -201,6 +208,7 @@ pub(crate) enum Data {
 
 #[derive(Args)]
 pub(crate) struct Change {
+    /// Slot name or id from `ark data list`
     #[arg(value_parser = parse_slot)]
     pub slot: i32,
     /// Show state and dependents without changing the Ark
@@ -211,9 +219,15 @@ pub(crate) struct Change {
 #[derive(Subcommand)]
 pub(crate) enum App {
     /// Run an app, approved on your phone; print its report
-    Run { file: PathBuf },
+    Run {
+        /// Local WebAssembly app
+        file: PathBuf,
+    },
     /// Cancel a running app or unfinished upload
-    Cancel { task: u64 },
+    Cancel {
+        /// Task id printed by `ark app run`
+        task: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,19 +251,15 @@ pub(crate) enum Firmware {
     },
 }
 
-pub(crate) fn environments() -> [Environment; 3] {
-    [
-        Environment::Release,
-        Environment::Staging,
-        Environment::Develop,
-    ]
-}
-
 pub(crate) fn parse_env(value: &str) -> Result<Environment, String> {
-    environments()
-        .into_iter()
-        .find(|env| env.to_string() == value)
-        .ok_or_else(|| format!("unknown environment {value:?}; use release, staging or develop"))
+    match value {
+        "release" => Ok(Environment::Release),
+        "staging" => Ok(Environment::Staging),
+        "develop" => Ok(Environment::Develop),
+        _ => Err(format!(
+            "unknown environment {value:?}; use release, staging or develop"
+        )),
+    }
 }
 
 /// Protocol names remain exact; numeric IDs keep future slots addressable.

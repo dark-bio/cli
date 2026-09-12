@@ -55,7 +55,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                 }
                 ExecutionProgress::Uploading { uploaded, total } => {
                     if let Some(line) = transfer.update(uploaded, total) {
-                        context.output.event("progress", line);
+                        context.output.progress(&line);
                     }
                 }
                 ExecutionProgress::Authorizing => context.output.event(

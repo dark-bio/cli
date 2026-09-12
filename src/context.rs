@@ -14,7 +14,7 @@ use crate::{
 use darkbio_connect::{
     Ark, Client, Device, Identity, Timing, TrustMode, schema, trust::Environment,
 };
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -151,7 +151,11 @@ impl Context {
         if self.options.unlock
             || (self.interactive()
                 && self.confirm(
-                    "The Ark is locked. Unlock it now? You will approve on your phone.",
+                    if self.output.human() {
+                        "Unlock the Ark first?"
+                    } else {
+                        "The Ark is locked. Unlock it now? You will approve on your phone."
+                    },
                     true,
                 )?)
         {
@@ -168,13 +172,13 @@ impl Context {
         connection
             .client
             .call(schema::UnlockRequest {}, self.timing())?;
+        self.output.finish();
+        self.output.human_event("progress", "unlocked");
         Ok(())
     }
 
     pub fn confirm(&self, message: &str, default: bool) -> Result<bool, Error> {
-        self.output.finish();
-        eprint!("{message} {} ", if default { "[Y/n]" } else { "[y/N]" });
-        io::stderr().flush()?;
+        self.output.prompt(message, default)?;
         let mut answer = String::new();
         if io::stdin().read_line(&mut answer)? == 0 {
             return Ok(false);

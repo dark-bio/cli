@@ -12,6 +12,7 @@ use darkbio_connect::{
     trust::{Environment, Realm},
 };
 use serde_json::json;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub(crate) fn run(context: &Context) -> Result<(), Error> {
     let connection = context.connect(None)?;
@@ -36,13 +37,14 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             darkbio_connect::DeviceKind::Hardware => Realm::Hardware,
             darkbio_connect::DeviceKind::Emulator => Realm::Emulator,
         });
-    connection
+    let mut previous = None;
+    let result = connection
         .client
-        .pair(context.timing(), |stage| match stage {
+        .pair(context.timing(), |event| match event {
             PairingProgress::Rendezvous {
                 colo,
                 secret,
-                deadline: _,
+                deadline,
                 fingerprint,
             } => {
                 // Colo is routing supplied by the cloud, never a URL or a host name.
@@ -66,32 +68,47 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                         ""
                     }
                 );
-                context
-                    .output
-                    .event("approve", format!("scan with Ark Companion: {url}"));
-                if context.output.human()
-                    && let Ok(qr) = qrcode::QrCode::new(url.as_bytes())
-                {
-                    context.output.event(
-                        "approve",
-                        format!(
-                            "\n{}",
-                            qr.render::<qrcode::render::unicode::Dense1x2>()
-                                .quiet_zone(true)
-                                .build()
-                        ),
-                    );
+                if context.output.human() {
+                    context
+                        .output
+                        .pairing(&url, UNIX_EPOCH + Duration::from_secs(deadline));
+                    previous = Some("rendezvous");
+                } else {
+                    context
+                        .output
+                        .event("approve", format!("scan with Ark Companion: {url}"));
                 }
             }
-            PairingProgress::Identity => context.output.event("progress", "exchanging identities"),
-            PairingProgress::Storage => context.output.event("progress", "exchanging storage keys"),
-            PairingProgress::Approval => context
-                .output
-                .event("approve", "confirm the colours on the Ark and your phone"),
-            PairingProgress::Formatting => context
-                .output
-                .event("progress", "preparing encrypted storage"),
-        })?;
+            PairingProgress::Identity => {
+                stage(context, &mut previous, "identity", "exchanging identities")
+            }
+            PairingProgress::Storage => {
+                stage(context, &mut previous, "storage", "exchanging storage keys")
+            }
+            PairingProgress::Approval => {
+                if let Some(name) = previous.take() {
+                    context.output.stage(name, true);
+                }
+                context
+                    .output
+                    .event("approve", "confirm the colours on the Ark and your phone");
+                if context.output.human() {
+                    previous = Some("approval");
+                }
+            }
+            PairingProgress::Formatting => stage(
+                context,
+                &mut previous,
+                "formatting",
+                "preparing encrypted storage",
+            ),
+        });
+    if result.is_ok()
+        && let Some(name) = previous
+    {
+        context.output.stage(name, true);
+    }
+    result?;
     let serial = match &connection.identity {
         darkbio_connect::Identity::Attested { device, .. } => Some(&device.serial),
         _ => None,
@@ -99,4 +116,21 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     context
         .output
         .document(&json!({"serial": serial, "paired": true}))
+}
+
+fn stage(
+    context: &Context,
+    previous: &mut Option<&'static str>,
+    name: &'static str,
+    message: &str,
+) {
+    if context.output.human() {
+        if let Some(name) = previous.take() {
+            context.output.stage(name, true);
+        }
+        context.output.stage(name, false);
+        *previous = Some(name);
+    } else {
+        context.output.event("progress", message);
+    }
 }

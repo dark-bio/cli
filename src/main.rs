@@ -21,6 +21,7 @@ mod logging;
 mod output;
 mod pairing;
 mod progress;
+mod style;
 
 use args::{Cli, Command};
 use clap::{FromArgMatches, Parser};
@@ -30,8 +31,9 @@ use serde_json::{Value, json};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let mut command = help::command();
     let arguments: Vec<_> = std::env::args_os().collect();
+    let format = requested_format(&arguments);
+    let mut command = help::command(&style::Theme::new(format, false));
     let matches = match command.try_get_matches_from_mut(&arguments) {
         Ok(matches) => matches,
         Err(error) => {
@@ -50,6 +52,12 @@ fn main() -> ExitCode {
                 let error = Error::new(2, "usage", message);
                 let _ = output.document(&json!({"error":error.json()}));
                 output.error(&error);
+            } else if code != 0 {
+                // Usage errors follow stderr's capabilities, independently of help.
+                let mut command = help::command(&style::Theme::new(format, true));
+                if let Err(error) = command.try_get_matches_from_mut(&arguments) {
+                    let _ = error.print();
+                }
             } else {
                 let _ = error.print();
             }
@@ -101,7 +109,7 @@ fn main() -> ExitCode {
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
         None => {
-            help::command().print_help()?;
+            help::command(&style::Theme::new(context.options.format, false)).print_help()?;
             println!();
             Ok(())
         }
@@ -115,9 +123,14 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         Some(Command::Firmware(command)) => firmware::run(context, command),
         Some(Command::Pair) => pairing::run(context),
         Some(Command::Doctor) => doctor::run(context),
-        Some(Command::Help { path, all }) => help::run(&path, all),
+        Some(Command::Help { path, all }) => help::run(&path, all, context.options.format),
         Some(Command::Completions { shell }) => {
-            clap_complete::generate(shell, &mut help::command(), "ark", &mut std::io::stdout());
+            clap_complete::generate(
+                shell,
+                &mut help::command(&style::Theme::new(args::Format::Text, false)),
+                "ark",
+                &mut std::io::stdout(),
+            );
             Ok(())
         }
     }
@@ -135,20 +148,31 @@ pub(crate) fn versions() -> Value {
 /// Parsing can fail before clap produces matches. Only the explicit format
 /// selection is needed to report that failure in the requested stream format.
 fn json_requested(arguments: &[std::ffi::OsString]) -> bool {
-    let mut json = false;
+    requested_format(arguments) == args::Format::Json
+}
+
+fn requested_format(arguments: &[std::ffi::OsString]) -> args::Format {
+    let mut format = args::Format::Auto;
     let mut arguments = arguments.iter().skip(1);
     while let Some(argument) = arguments.next() {
         if argument == "--" {
             break;
         }
-        if argument == "--format" {
-            json = arguments.next().is_some_and(|value| value == "json");
-        } else if let Some(value) = argument
-            .to_str()
-            .and_then(|value| value.strip_prefix("--format="))
-        {
-            json = value == "json";
+        let value = if argument == "--format" {
+            arguments.next().and_then(|value| value.to_str())
+        } else {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--format="))
+        };
+        if let Some(value) = value {
+            format = match value {
+                "human" => args::Format::Human,
+                "text" => args::Format::Text,
+                "json" => args::Format::Json,
+                _ => args::Format::Auto,
+            };
         }
     }
-    json
+    format
 }

@@ -21,7 +21,8 @@ use std::time::Duration;
 const ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18180);
 
 /// Overall timeout for fetching a listing from the local registry.
-const TIMEOUT: Duration = Duration::from_secs(1);
+/// Windows retries refused loopback connections before reporting the error.
+const TIMEOUT: Duration = Duration::from_secs(if cfg!(windows) { 5 } else { 1 });
 
 /// Largest accepted listing body, before JSON decoding.
 const MAX_LISTING: u64 = 1024 * 1024;

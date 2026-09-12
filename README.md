@@ -76,6 +76,12 @@ colours and progress bars; `text` uses plain key blocks and tables. `NO_COLOR`
 disables colour. App reports and app stderr are exact bytes in human and text
 mode; JSON uses strings or base64 fields when bytes are not UTF-8.
 
+Human output uses aligned blocks, tables and diagnostic checklists. Progress
+keeps completed stages visible and shows transfer speed and an estimate for
+the current processing step. Approval waits show elapsed time; pairing uses
+the scan deadline supplied by the cloud. Narrow terminals wrap full locators
+and links. `CLICOLOR=0` also disables colour.
+
 `--timeout` defaults to 60 seconds per expected machine response. It does not
 limit an entire transfer or app run. Phone, button and pairing waits use the
 protocol's own window with a reply margin. Rust callers can also pass absolute

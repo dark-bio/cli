@@ -59,6 +59,9 @@ pub(super) fn fetch(
             if dry_run {
                 Ok(())
             } else {
+                context
+                    .output
+                    .title(&format!("Fetching {}", slot_name(slot.kind)));
                 install(
                     context,
                     connection,
