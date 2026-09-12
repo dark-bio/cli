@@ -26,6 +26,7 @@ class ArkCli < Formula
   def install
     bin.install Dir["ark-#{version}-macos-*"].fetch(0) => "ark"
     chmod 0755, bin/"ark"
+    generate_completions_from_executable(bin/"ark", "completions")
     resource("licenses").stage { pkgshare.install "LICENSES.txt" }
   end
 

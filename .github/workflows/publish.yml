@@ -179,7 +179,7 @@ jobs:
             flags+=(--prerelease)
           fi
           gh release create "$GITHUB_REF_NAME" release/* metadata/ark-installer.sh --verify-tag --generate-notes \
-            --title "ark ${GITHUB_REF_NAME#v}" "${flags[@]}"
+            --title "Ark CLI $GITHUB_REF_NAME" "${flags[@]}"
 
   homebrew:
     needs: [ release ]
