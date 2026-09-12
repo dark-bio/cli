@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Device authentication through wire's verifier and the enabled roots of trust.
+//! Device authentication through wire's verifier and the CLI's roots of trust.
 //! The returned identity records whether the peer was attested, self-signed or pinned.
 
 use darkbio_crypto::xdsa;
@@ -12,10 +12,9 @@ use darkbio_trust as trust;
 use darkbio_trust::Environment;
 use darkbio_trust::device::Device;
 use darkbio_wire::transport::{Attestation, Verifier};
-use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Known environments. Disabled features leave their root sets empty.
+/// Environments whose roots the CLI trusts.
 pub(crate) const ENVIRONMENTS: &[Environment] = &[
     Environment::Release,
     Environment::Staging,
@@ -24,8 +23,8 @@ pub(crate) const ENVIRONMENTS: &[Environment] = &[
 
 /// Controls which device attestations are accepted during the handshake.
 pub enum TrustMode {
-    /// Accept Arks attested under the hardware or emulator roots of any
-    /// environment the build trusts, or peers presenting a self-signed
+    /// Accept Arks attested under the release, staging or develop hardware or
+    /// emulator roots, or peers presenting a self-signed
     /// attestation. Self-signing proves key possession, not provisioning history.
     RootOrSelf,
 
@@ -77,18 +76,6 @@ impl Verifier for TrustMode {
 
     /// Verifies the attestation or returns the pinned key selected for recovery.
     fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Identity), String> {
-        self.verify_identity(attestation, &Cell::new(None))
-    }
-}
-
-impl TrustMode {
-    /// Checks enabled roots before self-signing, retaining an excluded root's
-    /// environment separately from wire's printable handshake diagnostic.
-    fn verify_identity(
-        &self,
-        attestation: &Attestation,
-        excluded: &Cell<Option<Environment>>,
-    ) -> Result<(xdsa::PublicKey, Identity), String> {
         // Recovery authenticates key possession without consulting the attestation.
         if let TrustMode::Recover(key) = self {
             return Ok((*key.clone(), Identity::Recovered(*key.clone())));
@@ -96,7 +83,7 @@ impl TrustMode {
         // Look the signer up in the roots of every environment. An attestation
         // from a known root that fails to verify is a hard error, only unknown
         // signers fall through to the self-signed check. Retain their diagnostic
-        // so a missing root is not obscured by the self-signed fallback.
+        // so an unknown signer is not obscured by the self-signed fallback.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
@@ -119,7 +106,7 @@ impl TrustMode {
         let key =
             trust::device::verify_self_signed(attestation.as_bytes()).map_err(|err| {
                 match (err, untrusted) {
-                    (trust::Error::NotSelfSigned, Some(err)) => signer_error(err, excluded),
+                    (trust::Error::NotSelfSigned, Some(err)) => err.to_string(),
                     (err, _) => err.to_string(),
                 }
             })?;
@@ -127,62 +114,7 @@ impl TrustMode {
     }
 }
 
-/// Gives the required build feature for an excluded device root.
-fn signer_error(error: trust::Error, excluded: &Cell<Option<Environment>>) -> String {
-    if let trust::Error::UntrustedSigner {
-        root: Some(root), ..
-    } = &error
-        && matches!(
-            root.role,
-            trust::roots::Role::DeviceAttester | trust::roots::Role::EmulatorAttester
-        )
-        && trust::roots::hardware(root.env).is_empty()
-        && trust::roots::emulator(root.env).is_empty()
-    {
-        excluded.set(Some(root.env));
-        return format!(
-            "{} support is disabled; rebuild with --features {}",
-            root.env, root.env,
-        );
-    }
-    error.to_string()
-}
-
-/// Retains the trust outcome across wire's string-only verifier error boundary.
-pub(crate) struct Verification<'a> {
-    /// Caller-selected attestation or pinned-key policy.
-    policy: &'a TrustMode,
-    /// Known environment omitted from this build, if verification found one.
-    excluded: Cell<Option<Environment>>,
-}
-
-impl<'a> Verification<'a> {
-    /// Starts a handshake with no recorded feature mismatch.
-    pub(crate) fn new(policy: &'a TrustMode) -> Self {
-        Self {
-            policy,
-            excluded: Cell::new(None),
-        }
-    }
-
-    /// Restores a typed feature mismatch without parsing the wire diagnostic.
-    pub(crate) fn error(&self, err: crate::Error) -> crate::Error {
-        self.excluded.get().map_or(err, crate::Error::Untrusted)
-    }
-}
-
-impl Verifier for Verification<'_> {
-    /// Same identity outcome as the policy, with feature failures retained separately.
-    type Info = Identity;
-
-    /// Clears the previous outcome before checking this handshake's attestation.
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Identity), String> {
-        self.excluded.set(None);
-        self.policy.verify_identity(attestation, &self.excluded)
-    }
-}
-
-/// Attestation policy and excluded-root diagnostics.
+/// Attestation policy and invalid-signer diagnostics.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +153,7 @@ mod tests {
         assert_eq!(info.realm(), None);
     }
 
-    /// A claimed known signer identifies the missing feature. Enabling that root must
-    /// verify the signature instead of accepting the claimed fingerprint.
+    /// Known device roots verify signatures instead of accepting claimed fingerprints.
     #[test]
     fn test_known_signer() {
         let key = xdsa::SecretKey::generate();
@@ -243,43 +174,17 @@ mod tests {
             envelope.protected = cbor::encode(&header).unwrap();
             let forged = Attestation::new(cbor::encode(&envelope).unwrap()).unwrap();
             let error = TrustMode::RootOrSelf.verify(&forged).err().unwrap();
-            let verifier = Verification::new(&TrustMode::RootOrSelf);
-            assert!(verifier.verify(&forged).is_err());
-            let typed = verifier.error(crate::Error::Closed);
-
-            let trusted = match root.role {
-                trust::roots::Role::DeviceAttester => !trust::roots::hardware(root.env).is_empty(),
-                trust::roots::Role::EmulatorAttester => {
-                    !trust::roots::emulator(root.env).is_empty()
-                }
-                _ => false,
-            };
-            if trusted {
-                assert!(matches!(typed, crate::Error::Closed));
-                assert!(error.starts_with("cwt:"), "{error}");
-                assert!(!error.contains("--features"));
+            if root.role == trust::roots::Role::CloudAttester {
+                assert!(error.contains(fingerprint), "{error}");
+                assert!(error.contains(&root.to_string()), "{error}");
             } else {
-                if root.role == trust::roots::Role::CloudAttester {
-                    assert!(matches!(typed, crate::Error::Closed));
-                    assert!(error.contains(fingerprint), "{error}");
-                    assert!(error.contains(&root.to_string()), "{error}");
-                    assert!(!error.contains("--features"));
-                } else {
-                    assert!(matches!(typed, crate::Error::Untrusted(env) if env == root.env));
-                    assert_eq!(
-                        error,
-                        format!(
-                            "{} support is disabled; rebuild with --features {}",
-                            root.env, root.env
-                        ),
-                    );
-                }
+                assert!(error.starts_with("cwt:"), "{error}");
             }
+            assert!(!error.contains("--features"));
         }
     }
 
-    /// Invalid self-signatures retain their cryptographic error instead of being
-    /// mislabeled as excluded roots.
+    /// Invalid self-signatures retain their cryptographic error.
     #[test]
     fn test_invalid_attestation() {
         let key = xdsa::SecretKey::generate();

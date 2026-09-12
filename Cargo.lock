@@ -385,17 +385,23 @@ dependencies = [
  "clap",
  "clap_complete",
  "console",
- "darkbio-connect",
+ "darkbio-crypto",
+ "darkbio-trust",
+ "darkbio-wire",
  "directories",
  "hex",
+ "mio",
+ "nusb",
  "qrcode",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "signal-hook",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "ureq",
  "windows-sys 0.61.2",
 ]
@@ -408,26 +414,6 @@ checksum = "fb1c8fd159d655841568f7990c30cfc97de19283b263555ff601429ad744a0df"
 dependencies = [
  "memchr",
  "thiserror",
-]
-
-[[package]]
-name = "darkbio-connect"
-version = "0.1.1"
-dependencies = [
- "base64",
- "darkbio-crypto",
- "darkbio-trust",
- "darkbio-wire",
- "hex",
- "mio",
- "nusb",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror",
- "tracing",
- "tungstenite",
- "ureq",
 ]
 
 [[package]]

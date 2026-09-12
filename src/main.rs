@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Command dispatch; protocol workflows live in darkbio-connect.
+//! Command dispatch; protocol workflows live in the internal connection library.
 
 mod args;
 mod context;

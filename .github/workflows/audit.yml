@@ -42,7 +42,7 @@ jobs:
         run: cargo install cargo-about --locked --features cli
 
       - name: Generate dependency notices
-        run: cargo about generate --workspace --all-features --locked --fail --config .packaging/licenses/about.toml .packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"
+        run: cargo about generate --locked --fail --config .packaging/licenses/about.toml .packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"
 
       - uses: actions/upload-artifact@v7
         if: startsWith(github.ref, 'refs/tags/v')

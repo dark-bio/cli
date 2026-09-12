@@ -784,7 +784,6 @@ pub(crate) mod tests {
 
     /// Explicit routing lets self-signed and recovery peers sync and query slots.
     /// Registry authentication uses their opaque proofs without an attested serial.
-    #[cfg(any(feature = "release", feature = "staging", feature = "develop"))]
     #[test]
     fn test_unattested_cloud() {
         for recover in [false, true] {

@@ -311,7 +311,6 @@ pub(super) mod tests {
 
     /// Overrides select the cloud without replacing a verified realm or serial.
     /// Without attestation, the supplied discovery realm selects the registry.
-    #[cfg(any(feature = "release", feature = "staging", feature = "develop"))]
     #[test]
     fn test_cloud_routing() {
         let key = darkbio_crypto::xdsa::SecretKey::generate().public_key();

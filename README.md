@@ -106,6 +106,8 @@ One Ark is picked automatically. With several, select one with `-d` by locator, 
 
 The Ark, its protocols and this tool are still evolving quickly. Command names and JSON fields are meant to stay stable, but every release may change behaviour, and firmware, cloud and tool versions are expected to move together.
 
+The connection library in `connect/` is internal to this CLI package. Its Rust API is unstable and is not a supported integration interface.
+
 ## License
 
 Licensed under the [BSD 3-Clause License](https://github.com/dark-bio/cli/blob/main/LICENSE).

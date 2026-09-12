@@ -9,8 +9,7 @@
 
 use crate::emulator::Instance;
 use crate::trust::{Environment, Realm};
-use crate::{Ark, Error, Identity, emulator, hardware};
-use crate::{TrustMode, identity::Verification};
+use crate::{Ark, Error, Identity, TrustMode, emulator, hardware};
 use std::fmt;
 
 /// Kind of Ark reported by discovery. Authentication establishes its identity
@@ -144,7 +143,7 @@ impl Device {
     }
 
     /// Returns the launcher's unverified environment string, independently of
-    /// which trust roots this build enables.
+    /// the identity established by attestation.
     pub fn env(&self) -> Option<&str> {
         match &self.source {
             Source::Usb(_) => None,
@@ -186,12 +185,10 @@ impl Device {
             };
             (env, realm)
         });
-        let verifier = Verification::new(verifier);
         match &self.source {
-            Source::Usb(info) => hardware::connect(info, &verifier, cloud),
-            Source::Registry(instance) => emulator::connect(&instance.url(), &verifier, cloud),
+            Source::Usb(info) => hardware::connect(info, verifier, cloud),
+            Source::Registry(instance) => emulator::connect(&instance.url(), verifier, cloud),
         }
-        .map_err(|err| verifier.error(err))
     }
 }
 

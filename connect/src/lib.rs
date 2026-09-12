@@ -5,6 +5,8 @@
 // license that can be found in the LICENSE file.
 
 //! Authenticated connections and protocol workflows for Ark hosts.
+//! Internal library target of the CLI package. Its Rust API is unstable and is
+//! not a supported integration interface.
 //!
 //! Discovery lists hardware and local emulators without authenticating them.
 //! [`Device::connect`] establishes an encrypted session and returns its
@@ -13,9 +15,9 @@
 //! requests without keeping it open. Dropping or closing the owner ends the
 //! connection and its companion relay.
 //!
-//! The `release`, `staging` and `develop` Cargo features select trusted device
-//! roots. None is enabled by default. Self-signed and pinned connections remain
-//! available; choosing a cloud route does not enable a missing attestation root.
+//! The CLI compiles the release, staging and develop device roots. Self-signed
+//! and pinned connections remain available; choosing a cloud route does not
+//! change which roots authenticate an attestation.
 //!
 //! ```no_run
 //! use darkbio_connect::{Error, TrustMode, schema};
@@ -111,7 +113,7 @@ pub use identity::{Identity, TrustMode};
 pub use request::{Request, Setup};
 pub use timing::Timing;
 
-/// Version of the connect crate compiled into this process.
+/// Version of the CLI package containing this connection library.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use darkbio_wire::protocol;
@@ -217,10 +219,6 @@ pub enum Error {
     /// the exchange itself broken.
     #[error("handshake failed: {0}")]
     Handshake(protocol::Error),
-
-    /// The attestation names a known root excluded from this build.
-    #[error("{0} support is disabled; rebuild with --features {0}")]
-    Untrusted(trust::Environment),
 
     /// A device or cloud request ran past its deadline, or the handshake past
     /// the wire's budget.

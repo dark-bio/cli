@@ -1,4 +1,7 @@
-# darkbio-connect
+# Connection library
+
+Internal library target of the `darkbio-ark` package. Its Rust API is unstable
+and is not a supported integration interface. It is not published separately.
 
 Authenticated connections to Dark Bio Arks from Rust. Discovery returns hardware
 and local emulators through one `Device` API. `Ark` owns a session; clonable
@@ -20,8 +23,9 @@ the next update attempt explicitly because preparation can require approval.
 Callers supply dataset and firmware readers. Downloading, caching, firmware
 selection, prompts and signal handlers belong to the application.
 
-The crate defaults to no built-in trust roots. Enable `release`, `staging` or
-`develop` for the environments the application trusts. Cloud routing is explicit
-or established by attestation; connect does not infer it from launcher metadata.
+The CLI compiles the release, staging and develop trust roots. Cloud routing is
+explicit or established by attestation; connect does not infer it from launcher
+metadata.
 
-See the crate documentation for API examples and ownership semantics.
+Run `cargo doc --lib --no-deps` from the repository root for API examples and
+ownership semantics.

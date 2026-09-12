@@ -27,19 +27,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Build
-        run: cargo build --workspace --all-targets --locked --verbose
+        run: cargo build --all-targets --locked --verbose
 
-      - name: Install cargo-hack
-        run: cargo install cargo-hack
-
-      - name: Build individual features
-        run: cargo hack build -p darkbio-connect --each-feature --locked
-
-      - name: Test individual features
-        run: cargo hack test -p darkbio-connect --each-feature --locked
-
-      - name: Test with all features
-        run: cargo test --workspace --all-features --locked
+      - name: Test
+        run: cargo test --locked
 
   format:
     runs-on: ubuntu-latest
@@ -51,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   docs:
     runs-on: ubuntu-latest
@@ -59,28 +50,5 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
-      - run: cargo doc --workspace --all-features --locked --no-deps
-
-  semver:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Look for a published baseline
-        id: baseline
-        run: |
-          status=$(curl --silent --show-error --retry 3 --output /dev/null --write-out '%{http_code}' \
-            https://index.crates.io/da/rk/darkbio-connect)
-          case "$status" in
-            200) echo 'published=true' >> "$GITHUB_OUTPUT" ;;
-            404) echo 'No published connect release to compare yet.' ;;
-            *) echo "Registry lookup failed: HTTP $status" >&2; exit 1 ;;
-          esac
-
-      - name: Check the public API against the published release
-        if: steps.baseline.outputs.published == 'true'
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: darkbio-connect
-          feature-group: all-features
+      # Check internal library docs even though they are omitted by default.
+      - run: cargo doc --lib --bins --locked --no-deps

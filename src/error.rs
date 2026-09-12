@@ -124,11 +124,6 @@ impl From<ConnectError> for Error {
                 error
             }
             Closed | Disconnected(_) => Self::new(3, "disconnected", error.to_string()),
-            Untrusted(env) => Self::new(
-                3,
-                "handshake-failed",
-                format!("attestation signer for {env} is not trusted"),
-            ),
             Handshake(wire::protocol::Error::Transport(cause)) => {
                 if let wire::transport::Error::HandshakeFailed(reason) = cause.as_ref() {
                     Self::new(3, "handshake-failed", reason.clone())
@@ -188,13 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_trust_and_pairing_errors_retain_caller_actions() {
-        let err = Error::from(ConnectError::Untrusted(
-            darkbio_connect::trust::Environment::Develop,
-        ));
-        assert_eq!((err.class, err.code), (3, "handshake-failed"));
-        assert_eq!(err.message, "attestation signer for develop is not trusted");
-        assert!(err.hints.is_empty());
+    fn handshake_and_pairing_errors_retain_caller_actions() {
         let err = Error::from(ConnectError::Handshake(
             wire::transport::Error::HandshakeFailed("attestation signed by an unknown key".into())
                 .into(),
