@@ -35,15 +35,19 @@ use std::process::ExitCode;
 /// Help and usage failures honor stream formatting even before typed parsing succeeds.
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args_os().collect();
-    let format = requested_format(&arguments);
-    let mut command = help::command(&style::Theme::new(format, false));
+    let json = arguments
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json");
+    let mut command = help::command(&help::theme(false));
     let matches = match command.try_get_matches_from_mut(&arguments) {
         Ok(matches) => matches,
         Err(error) => {
             let code = error.exit_code() as u8;
-            if code != 0 && !style::Theme::new(format, true).human {
+            if code != 0 {
                 let mut options = Cli::parse_from(["ark"]).options;
-                options.format = format;
+                options.json = json;
                 let output = output::Output::new(&options);
                 let message = error.to_string();
                 let message = message
@@ -57,12 +61,6 @@ fn main() -> ExitCode {
                     let _ = output.document(&json!({"error":error.json()}));
                 }
                 output.error(&error);
-            } else if code != 0 {
-                // Usage errors follow stderr's capabilities, independently of help.
-                let mut command = help::command(&style::Theme::new(format, true));
-                if let Err(error) = command.try_get_matches_from_mut(&arguments) {
-                    let _ = error.print();
-                }
             } else {
                 let _ = error.print();
             }
@@ -77,7 +75,7 @@ fn main() -> ExitCode {
         }
     };
     let output = output::Output::new(&cli.options);
-    logging::init(output.clone(), cli.options.verbose);
+    logging::init(output.clone(), cli.options.verbose, cli.options.log);
     let interrupt = match interrupt::Interrupt::install(output.clone()) {
         Ok(interrupt) => interrupt,
         Err(error) => {
@@ -94,7 +92,7 @@ fn main() -> ExitCode {
     let result = if let Err(error) = validation {
         Err(error)
     } else if cli.help {
-        help::run(&[], cli.all, context.options.format)
+        help::run(&[], cli.all)
     } else if cli.version {
         context.output.document(&versions())
     } else {
@@ -119,7 +117,7 @@ fn main() -> ExitCode {
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
         None => {
-            help::command(&style::Theme::new(context.options.format, false)).print_help()?;
+            help::command(&help::theme(false)).print_help()?;
             Ok(())
         }
         Some(Command::Devices) => device::devices(context),
@@ -132,11 +130,11 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         Some(Command::Firmware(command)) => firmware::run(context, command),
         Some(Command::Pair) => pairing::run(context),
         Some(Command::Doctor) => doctor::run(context),
-        Some(Command::Help { path, all }) => help::run(&path, all, context.options.format),
+        Some(Command::Help { path, all }) => help::run(&path, all),
         Some(Command::Completions { shell }) => {
             clap_complete::generate(
                 shell,
-                &mut help::command(&style::Theme::new(args::Format::Text, false)),
+                &mut help::command(&help::theme(false)),
                 "ark",
                 &mut std::io::stdout(),
             );
@@ -153,31 +151,4 @@ pub(crate) fn versions() -> Value {
         "minimum_firmware": firmware::MINIMUM_VERSION,
         "minimum_develop_publish": device::timestamp(firmware::MINIMUM_DEVELOP_PUBLISH),
     })
-}
-
-/// Finds the last explicit format before --, without requiring valid command syntax.
-fn requested_format(arguments: &[std::ffi::OsString]) -> args::Format {
-    let mut format = args::Format::Auto;
-    let mut arguments = arguments.iter().skip(1);
-    while let Some(argument) = arguments.next() {
-        if argument == "--" {
-            break;
-        }
-        let value = if argument == "--format" {
-            arguments.next().and_then(|value| value.to_str())
-        } else {
-            argument
-                .to_str()
-                .and_then(|value| value.strip_prefix("--format="))
-        };
-        if let Some(value) = value {
-            format = match value {
-                "human" => args::Format::Human,
-                "text" => args::Format::Text,
-                "json" => args::Format::Json,
-                _ => args::Format::Auto,
-            };
-        }
-    }
-    format
 }

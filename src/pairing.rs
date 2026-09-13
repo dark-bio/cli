@@ -70,7 +70,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                         ""
                     }
                 );
-                if context.output.human() {
+                if context.output.terminal() {
                     context
                         .output
                         .pairing(&url, UNIX_EPOCH + Duration::from_secs(deadline));
@@ -94,7 +94,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                 context
                     .output
                     .event("approve", "confirm the colours on the Ark and your phone");
-                if context.output.human() {
+                if context.output.terminal() {
                     previous = Some("approval");
                 }
             }
@@ -127,7 +127,7 @@ fn stage(
     name: &'static str,
     message: &str,
 ) {
-    if context.output.human() {
+    if context.output.terminal() {
         if let Some(name) = previous.take() {
             context.output.stage(name, true);
         }

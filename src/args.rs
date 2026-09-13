@@ -59,7 +59,7 @@ impl Cli {
         );
         let message = if dry && self.options.unlock {
             Some("--dry-run cannot be combined with --unlock")
-        } else if self.options.quiet && self.options.verbose > 0 {
+        } else if self.options.quiet && self.options.verbose {
             Some("--quiet cannot be combined with --verbose")
         } else if self.version && self.command.is_some() {
             Some("--version cannot be combined with a command")
@@ -78,9 +78,9 @@ pub(crate) struct Options {
     /// Which Ark: locator, unique serial, name, image, or hardware/emulator
     #[arg(short = 'd', long, global = true, value_name = "SELECTOR")]
     pub device: Option<String>,
-    /// Output style; each stream chooses its own style under auto
-    #[arg(long, global = true, value_enum, default_value = "auto")]
-    pub format: Format,
+    /// Print the complete result as JSON and stderr events as JSON Lines
+    #[arg(long, global = true)]
+    pub json: bool,
     /// Seconds to wait for each reply or network chunk, not an approval or the whole run
     #[arg(long, global = true, default_value_t = 60, value_parser = parse_timeout, value_name = "SECONDS")]
     pub timeout: u64,
@@ -99,22 +99,19 @@ pub(crate) struct Options {
     /// Hide progress, notes and warnings; keep errors, hints and approvals
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
-    /// Show steps; -vv connect debug logs, -vvv wire trace
-    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
-    pub verbose: u8,
+    /// Show steps
+    #[arg(short = 'v', long, global = true)]
+    pub verbose: bool,
+    /// Diagnostic logs: debug for connect, trace for connect and wire
+    #[arg(long, global = true, value_enum)]
+    pub log: Option<Log>,
 }
 
-// Requested presentation mode; auto is resolved independently for each stream.
+// Diagnostic detail, independent of step narration.
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-pub(crate) enum Format {
-    // Detect human output separately for stdout and stderr.
-    Auto,
-    // Keep human layouts even when output is redirected.
-    Human,
-    // Stable plain text without terminal control sequences.
-    Text,
-    // One result document on stdout and structured events on stderr.
-    Json,
+pub(crate) enum Log {
+    Debug,
+    Trace,
 }
 
 // Top-level command palette, shared by parsing, help and shell completion.
@@ -132,7 +129,7 @@ pub(crate) enum Command {
     Unlock,
     /// Give the Ark its attested identity
     Enroll(Enroll),
-    /// Datasets: list, show, paths, upload, fetch, delete, repair
+    /// Datasets: read with list/show/paths; change with upload/fetch/delete/repair
     #[command(subcommand)]
     Data(Data),
     /// Apps: run, cancel
@@ -327,10 +324,7 @@ fn parse_timeout(value: &str) -> Result<u64, String> {
             .checked_add(std::time::Duration::from_secs(seconds))
             .is_none()
     {
-        return Err(
-            "timeout must be a positive number of seconds"
-                .into(),
-        );
+        return Err("timeout must be a positive number of seconds".into());
     }
     Ok(seconds)
 }
@@ -374,6 +368,23 @@ mod tests {
             "2147483648",
         ] {
             assert!(parse_slot(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn narration_and_diagnostics_are_independent() {
+        let cli = Cli::try_parse_from(["ark", "-v", "status", "--log", "debug"]).unwrap();
+        assert!(cli.options.verbose);
+        assert_eq!(cli.options.log, Some(Log::Debug));
+        let cli = Cli::try_parse_from(["ark", "--log", "trace", "status"]).unwrap();
+        assert!(!cli.options.verbose);
+        assert_eq!(cli.options.log, Some(Log::Trace));
+        for args in [
+            vec!["ark", "-vv"],
+            vec!["ark", "-vvv"],
+            vec!["ark", "--log", "info"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 

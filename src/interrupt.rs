@@ -127,10 +127,6 @@ impl Interrupt {
         if output.json() {
             let fallback = json!({"error":error.json()});
             let _ = output.document(state.partial.as_ref().unwrap_or(&fallback));
-        } else if output.structured()
-            && let Some(partial) = &state.partial
-        {
-            let _ = output.document(partial);
         }
         output.error(&error);
         output.finish();
@@ -157,4 +153,96 @@ unsafe extern "system" fn console_handler(event: u32) -> windows_sys::core::BOOL
         interrupt.cancel(output.clone(), code);
     }
     0
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A signal before a task exists still produces a complete JSON failure and
+    /// the shell's conventional exit class. Wait for a step event before signalling
+    /// so this exercises our handler rather than process startup.
+    #[cfg(unix)]
+    #[test]
+    fn signals_finish_the_json_document() {
+        use clap::Parser;
+        if std::env::var_os("ARK_TEST_SIGNAL_CHILD").is_some() {
+            let options = crate::args::Cli::parse_from(["ark", "--json", "-v"]).options;
+            let output = Output::new(&options);
+            let _interrupt = Interrupt::install(output.clone()).unwrap();
+            for kind in ["progress", "note", "warning", "approve", "hint", "step"] {
+                output.event(kind, "first line\nsecond line");
+            }
+            output.event_value(json!({"event":"log", "level":"debug", "target":"darkbio_connect", "fields":{"message":"first line\nsecond line"}}));
+            output.event("step", "ready for signal");
+            let _ = std::io::stdin().read_to_end(&mut Vec::new());
+            panic!("child input closed before signal");
+        }
+        use std::{
+            io::{BufRead, BufReader, Read},
+            process::{Command, Stdio},
+        };
+        for (signal, expected) in [("-INT", 130), ("-TERM", 143)] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interrupt::tests::signals_finish_the_json_document",
+                    "--nocapture",
+                ])
+                .env("ARK_TEST_SIGNAL_CHILD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stderr = BufReader::new(child.stderr.take().unwrap());
+            let mut event = String::new();
+            for kind in [
+                "progress", "note", "warning", "approve", "hint", "step", "log", "step",
+            ] {
+                event.clear();
+                assert!(stderr.read_line(&mut event).unwrap() > 0);
+                let event: Value = serde_json::from_str(&event).unwrap();
+                assert_eq!(event["event"], kind);
+            }
+            assert_eq!(
+                serde_json::from_str::<Value>(&event).unwrap()["message"],
+                "ready for signal"
+            );
+            assert!(
+                Command::new("kill")
+                    .args([signal, &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut stdout = Vec::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_end(&mut stdout)
+                .unwrap();
+            let start = stdout.iter().position(|byte| *byte == b'{').unwrap();
+            let document: Value = serde_json::from_slice(&stdout[start..]).unwrap();
+            assert_eq!(
+                &stdout[start..],
+                format!("{}\n", serde_json::to_string_pretty(&document).unwrap()).as_bytes()
+            );
+            assert_eq!(
+                document["error"]["code"],
+                if expected == 143 {
+                    "terminated"
+                } else {
+                    "interrupted"
+                }
+            );
+            assert_eq!(child.wait().unwrap().code(), Some(expected));
+            let events: Vec<Value> = stderr
+                .lines()
+                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+                .collect();
+            assert_eq!(events.last().unwrap()["event"], "error");
+        }
+    }
 }

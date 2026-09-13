@@ -7,7 +7,6 @@
 //! Process-level contracts that require no device or network access.
 
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::process::{Command, Output};
 use std::sync::Mutex;
 
@@ -28,7 +27,7 @@ fn commands() -> Vec<(Vec<String>, String)> {
     let mut commands = Vec::new();
     while let Some(path) = pending.pop() {
         let mut args: Vec<_> = path.iter().map(String::as_str).collect();
-        args.extend(["--help", "--format", "text"]);
+        args.push("--help");
         let output = ark(&args);
         assert!(output.status.success(), "{args:?}: {output:?}");
         let page = String::from_utf8(output.stdout).unwrap();
@@ -48,98 +47,51 @@ fn commands() -> Vec<(Vec<String>, String)> {
     commands
 }
 
-/// Collects JSON leaf paths; scalar arrays remain one field in text.
-fn fields<'a>(path: &str, value: &'a Value, fields: &mut BTreeMap<String, &'a Value>) {
-    match value {
-        Value::Object(object) if !object.is_empty() => {
-            for (key, value) in object {
-                fields_insert(path, key, value, fields);
-            }
-        }
-        Value::Array(array)
-            if array
-                .iter()
-                .any(|value| value.is_object() || value.is_array()) =>
-        {
-            for (index, value) in array.iter().enumerate() {
-                fields_insert(path, &index.to_string(), value, fields);
-            }
-        }
-        _ => {
-            fields.insert(path.to_string(), value);
-        }
-    }
-}
-
-fn fields_insert<'a>(
-    path: &str,
-    key: &str,
-    value: &'a Value,
-    result: &mut BTreeMap<String, &'a Value>,
-) {
-    fields(
-        &if path.is_empty() {
-            key.to_string()
-        } else {
-            format!("{path}.{key}")
-        },
-        value,
-        result,
+/// Checks stdout indentation and the one-event-per-line stderr contract.
+fn json_output(output: &Output) -> Value {
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{}\n", serde_json::to_string_pretty(&document).unwrap())
     );
+    assert!(!output.stdout.contains(&0x1b));
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert!(event["event"].is_string(), "{event}");
+    }
+    document
 }
 
 fn conformance(args: &[&str]) {
     let mut invocation = args.to_vec();
-    invocation.extend(["--format", "json"]);
+    invocation.push("--json");
     let json = ark(&invocation);
-    *invocation.last_mut().unwrap() = "text";
-    let text = ark(&invocation);
-    assert_eq!(text.status.code(), json.status.code(), "{args:?}");
-    let document: Value = serde_json::from_slice(&json.stdout).unwrap();
-    let mut expected = BTreeMap::new();
-    fields("", &document, &mut expected);
-    let mut actual = BTreeMap::<String, String>::new();
-    let mut key = String::new();
-    let output = String::from_utf8(text.stdout).unwrap();
+    let human = ark(args);
+    assert_eq!(human.status.code(), json.status.code(), "{args:?}");
+    json_output(&json);
+    let output = String::from_utf8(human.stdout).unwrap();
+    assert!(!output.contains('\x1b'));
     for line in output.lines() {
-        if let Some(continuation) = line.strip_prefix("  ") {
-            let value = actual.get_mut(&key).unwrap();
-            value.push('\n');
-            value.push_str(continuation);
-        } else {
-            let (name, value) = line.split_once(": ").unwrap();
-            key = name.to_string();
-            assert!(actual.insert(key.clone(), value.to_string()).is_none());
+        let label = line.trim_start().split("  ").next().unwrap();
+        let label = label.to_ascii_lowercase();
+        for suffix in ["_bytes", "_seconds", " bytes", " seconds"] {
+            assert!(!label.ends_with(suffix), "{args:?}: {line}");
         }
-    }
-    assert_eq!(
-        actual.keys().collect::<Vec<_>>(),
-        expected.keys().collect::<Vec<_>>(),
-        "{args:?}: {output}"
-    );
-    for (key, value) in expected {
-        let text = &actual[&key];
-        if (key.ends_with("_bytes") || key.ends_with("_seconds")) && !value.is_null() {
-            assert_eq!(
-                text.parse::<u64>().unwrap(),
-                value.as_u64().unwrap(),
-                "{args:?}: {key}"
-            );
-        }
-        let expected = match value {
-            Value::Null => "-".to_string(),
-            Value::Bool(value) => if *value { "yes" } else { "no" }.to_string(),
-            Value::String(value) => value.clone(),
-            value => value.to_string(),
-        };
-        assert_eq!(text, &expected, "{args:?}: {key}");
     }
 }
 
 #[test]
-fn device_free_results_have_text_json_parity() {
+fn command_tree_output_conforms() {
     for (path, page) in commands() {
         let args: Vec<_> = path.iter().map(String::as_str).collect();
+        assert!(page.contains("--json"), "{path:?}");
+        assert!(!page.contains("--format"), "{path:?}");
+        assert!(page.contains("--log"), "{path:?}");
+        let mut rejected = args.clone();
+        rejected.extend(["--json", "--format", "json"]);
+        let output = ark(&rejected);
+        assert_eq!(output.status.code(), Some(2), "{path:?}");
+        assert_eq!(json_output(&output)["error"]["code"], "usage");
         if path.is_empty() {
             conformance(&["--version"]);
         } else if page.contains("Requires: nothing") {
@@ -149,23 +101,23 @@ fn device_free_results_have_text_json_parity() {
                         "agents", "states", "output", "devices", "datasets", "apps", "--all",
                     ] {
                         assert_eq!(
-                            ark(&["help", topic, "--format", "text"]).stdout,
-                            ark(&["help", topic, "--format", "json"]).stdout
+                            ark(&["help", topic]).stdout,
+                            ark(&["help", topic, "--json"]).stdout
                         );
                     }
                 }
                 ["completions"] => {
                     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
                         assert_eq!(
-                            ark(&["completions", shell, "--format", "text"]).stdout,
-                            ark(&["completions", shell, "--format", "json"]).stdout
+                            ark(&["completions", shell]).stdout,
+                            ark(&["completions", shell, "--json"]).stdout
                         );
                     }
                 }
                 _ => {
                     let mut args = args;
-                    // An invalid locator prevents doctor from opening any attached Ark.
-                    args.extend(["--device", "hardware:palette-no-device", "--no-input"]);
+                    // Never open an attached Ark during conformance tests.
+                    args.extend(["--device", "hardware:palette-no-device", "--no-input", "-v"]);
                     conformance(&args);
                 }
             }
@@ -177,7 +129,7 @@ fn device_free_results_have_text_json_parity() {
 fn help_differs_exactly_where_it_promises_more() {
     for (path, long) in commands() {
         let mut args: Vec<_> = path.iter().map(String::as_str).collect();
-        args.extend(["-h", "--format", "text"]);
+        args.push("-h");
         let output = ark(&args);
         assert!(output.status.success(), "{args:?}: {output:?}");
         let short = String::from_utf8(output.stdout).unwrap();
@@ -208,27 +160,14 @@ fn documented_usage_errors_keep_the_text_prefix() {
         vec!["--version", "status"],
         vec!["help", "no-such-topic"],
     ] {
-        for format in ["text", "auto"] {
-            let mut invocation = args.clone();
-            invocation.extend(["--format", format]);
-            let output = ark(&invocation);
-            assert_eq!(output.status.code(), Some(2), "{invocation:?}: {output:?}");
-            assert!(output.stdout.is_empty());
-            let stderr = String::from_utf8(output.stderr).unwrap();
-            assert!(
-                stderr.starts_with("error[usage]: "),
-                "{invocation:?}: {stderr}"
-            );
-            assert!(!stderr.contains('\x1b'));
-        }
+        let output = ark(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with("error[usage]: "), "{args:?}: {stderr}");
+        assert!(!stderr.contains('\x1b'));
     }
-    let output = ark(&[
-        "status",
-        "--device",
-        "hardware:palette-no-device",
-        "--format",
-        "text",
-    ]);
+    let output = ark(&["status", "--device", "hardware:palette-no-device"]);
     assert_eq!(output.status.code(), Some(3));
     assert!(help.contains("`no-device`"));
     assert!(
@@ -242,26 +181,12 @@ fn documented_usage_errors_keep_the_text_prefix() {
 #[test]
 fn usage_errors_are_json_in_both_streams() {
     for args in [
-        vec![
-            "data",
-            "fetch",
-            "--all",
-            "reference-genome",
-            "--format",
-            "json",
-        ],
-        vec![
-            "--format=json",
-            "data",
-            "upload",
-            "x",
-            "--dry-run",
-            "--unlock",
-        ],
-        vec!["--format", "json", "--timeout", "0", "status"],
-        vec!["--format", "json", "app", "cancel", "18446744073709551616"],
-        vec!["--format", "json", "--version", "status"],
-        vec!["--format", "json", "help", "missing"],
+        vec!["data", "fetch", "--all", "reference-genome", "--json"],
+        vec!["--json", "data", "upload", "x", "--dry-run", "--unlock"],
+        vec!["--json", "--timeout", "0", "status"],
+        vec!["--json", "app", "cancel", "18446744073709551616"],
+        vec!["--json", "--version", "status"],
+        vec!["--json", "help", "missing"],
     ] {
         let output = ark(&args);
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
@@ -280,7 +205,7 @@ fn usage_errors_are_json_in_both_streams() {
 
 #[test]
 fn version_is_a_single_structured_result() {
-    let output = ark(&["--version", "--format", "json"]);
+    let output = ark(&["--version", "--json"]);
     assert!(output.status.success());
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["tool"], env!("CARGO_PKG_VERSION"));
@@ -294,8 +219,8 @@ fn version_is_a_single_structured_result() {
 }
 
 #[test]
-fn explicit_human_pipes_have_layout_without_terminal_escapes() {
-    let output = ark(&["--version", "--format", "human"]);
+fn default_pipes_have_layout_without_terminal_escapes() {
+    let output = ark(&["--version"]);
     assert!(output.status.success());
     assert!(!output.stdout.contains(&0x1b));
     assert!(
@@ -303,36 +228,48 @@ fn explicit_human_pipes_have_layout_without_terminal_escapes() {
             .unwrap()
             .starts_with("  Tool")
     );
-    let output = ark(&["--format", "human", "help", "states"]);
-    assert!(output.status.success());
-    let topic = String::from_utf8(output.stdout).unwrap();
-    assert!(!topic.contains('\x1b'));
-    assert!(!topic.starts_with('#'));
-    assert!(!topic.contains('`'));
 }
 
 #[test]
-fn format_selection_applies_before_help_and_usage_errors() {
-    let text = ark(&["data", "fetch", "--help", "--format", "text"]);
-    assert_eq!(
-        text.stdout,
-        ark(&["--format=text", "data", "fetch", "--help"]).stdout
-    );
-    assert!(
-        String::from_utf8(text.stdout)
-            .unwrap()
-            .contains("Requires:")
-    );
-    let human = ark(&["data", "fetch", "--help", "--format=human"]);
-    assert!(
-        String::from_utf8(human.stdout)
-            .unwrap()
-            .contains("Requires   ")
-    );
-    let output = ark(&["--format", "text", "app", "cancel", "invalid"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+fn pipes_cannot_force_color() {
+    let _process = PROCESS.lock().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ark"))
+        .args(["--version"])
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .env("FORCE_COLOR", "1")
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
     assert!(!output.stderr.contains(&0x1b));
+}
+
+#[test]
+fn json_selection_applies_before_help_and_usage_errors() {
+    let help = ark(&["data", "fetch", "--help", "--json"]);
+    assert_eq!(
+        help.stdout,
+        ark(&["--json", "data", "fetch", "--help"]).stdout
+    );
+    assert_eq!(help.stdout, ark(&["data", "fetch", "--help"]).stdout);
+    for flag in [
+        "--format",
+        "--format=json",
+        "--format=text",
+        "--format=auto",
+        "--format=human",
+        "-vv",
+        "-vvv",
+    ] {
+        let output = ark(&[flag]);
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).starts_with("error[usage]: "));
+    }
 }
 
 #[test]
@@ -340,7 +277,7 @@ fn help_matches_the_supported_palette() {
     let output = ark(&["--help"]);
     assert!(output.status.success());
     let root = String::from_utf8(output.stdout).unwrap();
-    assert!(root.lines().count() <= 40, "{root}");
+    assert!(root.lines().count() <= 42, "{root}");
     for path in [
         "status",
         "data paths",
@@ -364,7 +301,7 @@ fn help_matches_the_supported_palette() {
         ] {
             assert!(long.contains(field), "{path}: {long}");
         }
-        assert!(!long.contains("--timeout <SECONDS>"));
+        assert!(long.contains("--timeout <SECONDS>"));
         let mut command = vec!["help"];
         command.extend(path.split(' '));
         assert_eq!(ark(&command).stdout, long.as_bytes());
@@ -398,58 +335,5 @@ fn completions_are_generated_for_the_binary_name() {
         assert!(output.status.success());
         assert!(String::from_utf8(output.stdout).unwrap().contains("ark"));
         assert!(output.stderr.is_empty());
-    }
-}
-
-/// A signal before a task exists still produces a complete JSON failure and
-/// the shell's conventional exit class. Wait for a step event before signalling
-/// so this exercises our handler rather than process startup.
-#[cfg(unix)]
-#[test]
-fn signals_finish_the_json_document() {
-    let _process = PROCESS.lock().unwrap();
-    use std::{
-        io::{BufRead, BufReader, Read},
-        process::Stdio,
-    };
-    for (signal, expected) in [("-INT", 130), ("-TERM", 143)] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ark"))
-            .args(["enroll", "--cwt", "/dev/stdin", "--format", "json", "-v"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let mut event = String::new();
-        stderr.read_line(&mut event).unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&event).unwrap()["message"],
-            "reading attestation"
-        );
-        assert!(
-            Command::new("kill")
-                .args([signal, &child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let mut stdout = Vec::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_end(&mut stdout)
-            .unwrap();
-        let document: Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(
-            document["error"]["code"],
-            if expected == 143 {
-                "terminated"
-            } else {
-                "interrupted"
-            }
-        );
-        assert_eq!(child.wait().unwrap().code(), Some(expected));
     }
 }

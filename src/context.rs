@@ -178,7 +178,7 @@ impl Context {
         if self.options.unlock
             || (self.interactive()
                 && self.confirm(
-                    if self.output.human() {
+                    if self.output.terminal() {
                         "Unlock the Ark first?"
                     } else {
                         "The Ark is locked. Unlock it now? You will approve on your phone."

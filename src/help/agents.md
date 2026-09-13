@@ -6,81 +6,76 @@ in Ark Companion. You cannot approve for them.
 
 ## Running
 
-- Output is text without colour when a stream is not a terminal. Pass
-  --format text to force it. Text carries every JSON field with exact values,
-  so read it directly. Use --format json to parse programmatically, with one
-  JSON document on stdout and JSON events on stderr. If your tool merges the
-  two streams, add -q: it drops optional events, leaving hints, approvals and
-  errors, so trust the exit code rather than an empty stderr.
-- Nothing prompts when stdin is not a terminal, under --no-input, or in JSON
-  mode. --yes confirms firmware installation; without it the command fails
-  with `confirmation-required`. A develop or staging cloud or package host may
-  need a browser login; without a terminal the command fails with `login-required`
-  and the command to run. The owner still approves operations on the Ark when
-  required.
+- Use --json for complete, exact data: one indented JSON document on stdout,
+  JSON Lines events on stderr. Default output is formatted for reading and
+  may scale values or omit fields. If your tool merges the streams, add -q
+  to drop optional events; hints, approvals and errors remain, so check the
+  exit code. `ark help output` defines the stream and error contracts.
+- Run ark commands one at a time, including reads. Concurrent commands to the
+  same Ark collide with device-busy; wait for your earlier command to finish.
+  One Ark is selected automatically. With several, select an exact locator or
+  unique label with --device. A browser tab can also hold the USB session.
+- Nothing prompts when stdin is not a terminal, under --no-input, or with
+  --json. --yes confirms firmware installation; without it the command fails
+  with confirmation-required. Develop and staging hosts may need browser
+  login; without a terminal, login-required gives the command to run.
+  The owner still approves operations on the Ark when required.
 - Every command blocks until done and its exit code is the outcome. Run long
-  ones in the background and follow stderr:
+  ones in the background and follow stderr, without starting another ark:
 
-      ark data fetch --all --unlock --format json > result.json 2> progress.log &
+      ark data fetch --all --json > result.json 2> progress.log &
       tail -n 2 progress.log
       wait $!
 
-  Expect seconds for status, up to a minute for an approval, up to ten
-  minutes for the owner to scan a pairing, minutes for an app run, minutes to
-  an hour for an upload, and an hour or more for a reference catalog.
-  --timeout bounds each machine reply or network chunk wait, not an approval
-  or the total command runtime. It must be positive and cannot be disabled.
-  A repeated processing percentage counts as a reply. Use your shell's timeout utility
-  for a workflow ceiling. Ctrl-C and SIGTERM attempt cancellation; the task id
-  printed by `app run` also works with `app cancel`.
-- Three flags say what may happen beyond the command itself: --unlock, --yes,
-  --dry-run. Nothing happens that you did not name.
-- Run ark commands one at a time, including reads. Concurrent commands to the
-  same Ark collide with device-busy; wait for your earlier command to finish.
-- One Ark is selected automatically. With several, select an exact locator or
-  unique label with --device. A browser tab or another ark process can hold
-  the USB session; close it on `device-busy`.
+  Expect seconds for status, up to a minute for an approval, up to ten minutes
+  to scan a pairing, minutes for an app run, minutes to an hour for an upload,
+  and an hour or more for a reference catalog. --timeout bounds each machine
+  reply or network chunk wait, not approval or total runtime. It must be
+  positive and cannot be disabled. A repeated processing percentage counts
+  as a reply. Use your shell's timeout utility for a workflow ceiling.
+  Ctrl-C and SIGTERM attempt cancellation; the task id from app run also
+  works with app cancel.
+- --unlock authorizes unlocking first, --yes confirms firmware installation,
+  and --dry-run plans supported changes without applying them. -v adds step
+  narration; --log debug or --log trace enables diagnostics independently.
 
 ## Reading results
 
-stdout is the result. stderr carries error[code]:, hint:, warning:, note:,
-approve: and progress: lines. An approve: line means the owner needs to act.
-The app's own stderr after `app run` is unprefixed and announced by a note.
-In JSON mode both app streams are in the result document.
+An approve event means the owner needs to act. CLI error codes are stable;
+`ark help output` lists them with next steps. error[ark]: passes through the
+Ark's own verdict; read its message, never match its number or wording.
+Partial results survive errors. JSON also preserves the latest partial result
+on interruption.
 
-CLI error codes are stable; `ark help output` lists them with their next
-steps. error[ark]: passes through the Ark's own verdict; read its message,
-never match its number or wording. Partial results survive errors and
-interruption. Text field names match the JSON keys.
+Without --json, app reports and the dataset README stream raw to stdout.
+The app's own stderr is announced, then written unprefixed. With --json both
+app streams are in the result document.
 
 Exit codes: 0 done, 1 local input or confirmation, 2 usage, 3 device access,
 4 cloud, 5 Ark state or refusal, 6 approval denied or expired, 7 machine
 timeout, 8 app failure, 130 Ctrl-C, 143 SIGTERM.
 
-## The device's states
+## Checking state
 
-unpaired -> paired (locked) -> unlocked. `status` shows paired and unlocked.
-Pairing needs the owner's phone and `ark pair`. Unlocking needs the phone and
-`ark unlock`, and lasts until power is cut. Data commands and `app run` need
-an unlocked Ark; they fail with `locked` and a hint, or unlock first when you
-pass --unlock. A dry run never unlocks; run `ark unlock` before it.
+Start with `ark devices` and `ark status`. Status works offline and shows
+paired and unlocked state. If unpaired, `ark pair` needs the owner's phone.
+If locked, `ark unlock` needs phone approval and lasts until power is cut.
+Data commands and app run need an unlocked Ark. Pass --unlock only when status
+reports locked and unlocking is authorized. A dry run never unlocks; unlock
+separately if needed. Do not add --unlock to a read-only task.
 
 Nothing bypasses the phone. Deleting the pairing in Ark Companion discards the
 unlock key, and the reset button on the Ark erases all data. Neither recovers
-a locked Ark; never propose them as a way around `locked`.
+a locked Ark; never propose them as a way around locked.
+
+`ark genuine` checks the registry; `ark doctor` checks this computer, the Ark
+and the cloud, and suggests fixes without applying them. `ark data list` shows the
+inventory; `ark data show SLOT` adds its description. Read `ark help datasets`
+for build, version, dependency and cache meanings, and `ark help states` for
+sync, identity and firmware fields.
 
 Unpaired Arks can receive firmware updates without phone or button approval.
 The CLI still requires installation confirmation; use --yes noninteractively.
-
-## A first session
-
-    ark devices                      # find the Ark
-    ark status                       # trust, firmware, paired, unlocked
-    ark pair                         # owner scans, if not already paired
-    ark unlock                       # owner approves on the phone
-    ark data list                    # what is loaded
-    ark data paths                   # paths available to apps
-    ark app run my.wasm > report.md  # owner approves; report on stdout
 
 ## Writing an app
 

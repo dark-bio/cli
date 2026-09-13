@@ -4,11 +4,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Three renderings of one result, with diagnostics confined to stderr.
+//! A reading view or a JSON result, with diagnostics confined to stderr.
 
 pub(crate) mod human;
 
-use crate::args::{Format, Options};
+use crate::args::Options;
 use crate::error::Error;
 use crate::style::{self, Role, Theme};
 use darkbio_connect::trust::Environment;
@@ -34,8 +34,8 @@ struct State {
     err: Theme,
     /// Suppresses optional events while retaining approvals, errors and hints.
     quiet: bool,
-    /// Detail level for step events and command-specific human rendering.
-    verbose: u8,
+    /// Whether step narration is enabled.
+    verbose: bool,
     /// Whether a caller already claimed the sole result, even if its write failed.
     printed: AtomicBool,
     /// Whether a non-release route was announced during this command.
@@ -77,9 +77,9 @@ impl Output {
     /// Resolves each stream's capabilities and starts with no claimed result.
     pub fn new(options: &Options) -> Self {
         Self(Arc::new(State {
-            json: options.format == Format::Json,
-            out: Theme::new(options.format, false),
-            err: Theme::new(options.format, true),
+            json: options.json,
+            out: Theme::new(options.json, false),
+            err: Theme::new(options.json, true),
             quiet: options.quiet,
             verbose: options.verbose,
             printed: AtomicBool::new(false),
@@ -92,9 +92,9 @@ impl Output {
     pub fn json(&self) -> bool {
         self.0.json
     }
-    /// Whether stderr uses human presentation, independently of stdout.
-    pub fn human(&self) -> bool {
-        self.0.err.human
+    /// Whether stderr supports live progress.
+    pub fn terminal(&self) -> bool {
+        self.0.err.interactive
     }
     /// Whether a result was claimed, so failure reporting must not emit another.
     pub fn printed(&self) -> bool {
@@ -119,9 +119,9 @@ impl Output {
         Some(format!("using the {env} environment"))
     }
 
-    /// Emits the sole result using the generic human, plain text or JSON rendering.
+    /// Emits the sole result as a reading view or JSON.
     pub fn document(&self, value: &Value) -> Result<(), Error> {
-        self.document_with(value, |theme, _| human::document(theme, value))
+        self.document_with(value, |theme| human::document(theme, value))
     }
 
     /// Emits the sole result, invoking the custom renderer only for human stdout.
@@ -129,23 +129,21 @@ impl Output {
     pub fn document_with(
         &self,
         value: &Value,
-        render: impl FnOnce(&Theme, u8) -> String,
+        render: impl FnOnce(&Theme) -> String,
     ) -> Result<(), Error> {
         let _result = self.0.result.lock().expect("output not poisoned");
         if self.0.printed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let text = if self.json() {
-            value.to_string()
-        } else if self.0.out.human {
-            render(&self.0.out, self.0.verbose)
+            serde_json::to_string_pretty(value).expect("JSON value serializes")
         } else {
-            text_document(value)
+            render(&self.0.out)
         };
         self.write_result(&text)
     }
 
-    /// Renders human rows as a table; text and JSON retain the complete document.
+    /// Renders rows as a table; JSON retains the complete document.
     pub fn table(
         &self,
         document: &Value,
@@ -155,7 +153,7 @@ impl Output {
         self.grouped_table(document, rows, columns, &[])
     }
 
-    /// Adds human group labels parallel to rows; text and JSON keep all fields.
+    /// Adds group labels parallel to rows; JSON keeps all fields.
     pub fn grouped_table(
         &self,
         document: &Value,
@@ -163,14 +161,12 @@ impl Output {
         columns: &[(&str, &str)],
         groups: &[String],
     ) -> Result<(), Error> {
-        self.document_with(document, |theme, _| {
-            human::table(theme, rows, columns, groups)
-        })
+        self.document_with(document, |theme| human::table(theme, rows, columns, groups))
     }
 
     /// Renders diagnostic rows with local hints, or the equivalent machine result.
     pub fn checklist(&self, document: &Value, rows: &[Value]) -> Result<(), Error> {
-        self.document_with(document, |theme, _| human::checklist(theme, rows))
+        self.document_with(document, |theme| human::checklist(theme, rows))
     }
 
     /// Ends live stderr activity and writes a complete stdout result block.
@@ -180,18 +176,13 @@ impl Output {
         terminal.waiting = None;
         close_line(&mut terminal, &mut io::stderr().lock());
         let mut stdout = io::stdout().lock();
-        if self.0.out.human && self.0.err.human && terminal.err_printed {
+        if self.0.out.interactive && self.0.err.interactive && terminal.err_printed {
             writeln!(stdout)?;
         }
         writeln!(stdout, "{text}")?;
         stdout.flush()?;
-        terminal.out_block = self.0.out.human;
+        terminal.out_block = self.0.out.interactive;
         Ok(())
-    }
-
-    /// Whether stdout uses a complete document instead of a human byte stream.
-    pub fn structured(&self) -> bool {
-        !self.0.out.human
     }
 
     /// App reports and dataset READMEs are payloads that bypass every layout rule.
@@ -221,11 +212,11 @@ impl Output {
         if self.0.quiet && matches!(kind, "progress" | "note" | "warning" | "step") {
             return;
         }
-        if kind == "step" && self.0.verbose == 0 {
+        if kind == "step" && !self.0.verbose {
             return;
         }
         let message = message.as_ref();
-        if kind == "progress" && self.human() {
+        if kind == "progress" && self.terminal() {
             let theme = &self.0.err;
             let line = format!(
                 "{} {}",
@@ -244,7 +235,7 @@ impl Output {
             close_line(&mut terminal, &mut stderr);
             if self.json() {
                 let _ = writeln!(stderr, "{}", json!({"event":kind,"message":message}));
-            } else if self.human() {
+            } else if self.terminal() {
                 separate_result(&mut terminal, &mut stderr);
                 let _ = writeln!(stderr, "{}", event_line(&self.0.err, kind, message));
             } else {
@@ -260,7 +251,7 @@ impl Output {
 
     /// Selects a live human observation or the established machine progress line.
     pub fn progress(&self, update: &crate::progress::Update) {
-        if self.human() {
+        if self.terminal() {
             self.progress_line(&update.stage, &update.render(&self.0.err));
         } else {
             self.event("progress", &update.text);
@@ -303,14 +294,14 @@ impl Output {
 
     /// Optional human detail has no counterpart in the machine event stream.
     pub fn human_event(&self, kind: &str, message: impl AsRef<str>) {
-        if self.human() {
+        if self.terminal() {
             self.event(kind, message);
         }
     }
 
     /// Starts an optional human stderr section after finishing prior live activity.
     pub fn title(&self, title: &str) {
-        if !self.human() || self.0.quiet {
+        if !self.terminal() || self.0.quiet {
             return;
         }
         self.finish();
@@ -333,7 +324,7 @@ impl Output {
 
     /// Shows a pairing stage, retaining its final line when the stage completes.
     pub fn stage(&self, name: &str, done: bool) {
-        if !self.human() {
+        if !self.terminal() {
             return;
         }
         let theme = &self.0.err;
@@ -453,7 +444,7 @@ impl Output {
         self.finish();
         let choices = if default { "Y/n" } else { "y/N" };
         let mut stderr = io::stderr().lock();
-        if self.human() {
+        if self.terminal() {
             let line = format!(
                 "{} {} {}",
                 self.0.err.paint(Role::Attention, "?"),
@@ -485,7 +476,7 @@ impl Output {
                 .unwrap_or_default();
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
             let mut stderr = io::stderr().lock();
-            if self.human() {
+            if self.terminal() {
                 separate_result(&mut terminal, &mut stderr);
                 let theme = &self.0.err;
                 let line = format!(
@@ -591,87 +582,6 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
     let _ = output.flush();
 }
 
-/// Renders every document field without terminal layout or scaled units.
-pub(crate) fn text_document(value: &Value) -> String {
-    let mut lines = Vec::new();
-    fields("", value, &mut lines, false);
-    lines
-        .into_iter()
-        .map(|(key, value)| format!("{key}: {}", value.replace('\n', "\n  ")))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Flattens nested fields into dotted paths; scalar arrays remain single fields.
-fn fields(prefix: &str, value: &Value, lines: &mut Vec<(String, String)>, human: bool) {
-    if let Value::Object(object) = value
-        && (human || !object.is_empty())
-    {
-        for (key, value) in object {
-            let key = if prefix.is_empty() {
-                key.clone()
-            } else {
-                format!("{prefix}.{key}")
-            };
-            fields(&key, value, lines, human);
-        }
-    } else if let Value::Array(values) = value
-        && values
-            .iter()
-            .any(|value| value.is_object() || (!human && value.is_array()))
-    {
-        for (index, value) in values.iter().enumerate() {
-            fields(&format!("{prefix}.{index}"), value, lines, human);
-        }
-    } else {
-        lines.push((prefix.to_string(), display(prefix, value, human)));
-    }
-}
-
-/// Formats a plain field with units and explicit absence; human dates use local time.
-pub(crate) fn display(key: &str, value: &Value, human: bool) -> String {
-    if !human {
-        return if value.is_array() {
-            value.to_string()
-        } else {
-            scalar(value)
-        };
-    }
-    if key == "serial" && value.is_null() {
-        return "unverified".into();
-    }
-    if key.ends_with("_bytes")
-        && let Some(bytes) = value.as_u64()
-    {
-        return if bytes >= 1024 * 1024 {
-            format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-        } else if bytes >= 1024 {
-            format!("{:.1} KiB", bytes as f64 / 1024.0)
-        } else {
-            format!("{bytes} B")
-        };
-    }
-    if key.ends_with("_seconds")
-        && let Some(seconds) = value.as_u64()
-    {
-        return if human && seconds >= 60 {
-            format!("{}m {}s", seconds / 60, seconds % 60)
-        } else {
-            format!("{seconds} s")
-        };
-    }
-    if human
-        && let Some(value) = value.as_str()
-        && let Ok(time) = chrono::DateTime::parse_from_rfc3339(value)
-    {
-        return time
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S %:z")
-            .to_string();
-    }
-    scalar(value)
-}
-
 /// Formats scalar values and lists without terminal styling or field-specific units.
 pub(crate) fn scalar(value: &Value) -> String {
     match value {
@@ -761,19 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn text_keeps_the_complete_document() {
-        let value = json!({"slots":[
-            {"slot":"reference-genome","description":"A paragraph.\nAnother line.","size_bytes":6263252307_u64,"requires":["snp-indel-calls"]},
-            {"slot":"variant-catalog","size_bytes":null,"requires":[]}
-        ],"empty":{},"duration_seconds":120});
-        assert_eq!(
-            text_document(&value),
-            "slots.0.slot: reference-genome\nslots.0.description: A paragraph.\n  Another line.\nslots.0.size_bytes: 6263252307\nslots.0.requires: [\"snp-indel-calls\"]\nslots.1.slot: variant-catalog\nslots.1.size_bytes: -\nslots.1.requires: []\nempty: {}\nduration_seconds: 120"
-        );
-        assert_eq!(text_document(&json!({"devices":[]})), "devices: []");
-    }
-
-    #[test]
     fn nonrelease_environment_is_noted_once_unless_quiet() {
         for env in [Environment::Develop, Environment::Staging] {
             for quiet in [false, true] {
@@ -788,37 +685,5 @@ mod tests {
                 assert_eq!(output.clone().environment_note(env), None);
             }
         }
-    }
-
-    #[test]
-    fn units_and_absent_fields_are_explicit() {
-        assert_eq!(display("serial", &Value::Null, false), "-");
-        assert_eq!(display("size_bytes", &json!(13002342), false), "13002342");
-        assert_eq!(display("duration_seconds", &json!(72), false), "72");
-        assert_eq!(display("duration_seconds", &json!(72), true), "1m 12s");
-        assert_eq!(display("size_bytes", &Value::Null, false), "-");
-        for key in ["size_bytes", "duration_seconds"] {
-            assert_eq!(display(key, &json!(u64::MAX), false), u64::MAX.to_string());
-        }
-        assert_eq!(display("paired", &json!(true), false), "yes");
-        assert_eq!(
-            display("published", &json!("2026-09-12T17:49:41.024Z"), false),
-            "2026-09-12T17:49:41.024Z"
-        );
-        let mut lines = Vec::new();
-        fields(
-            "",
-            &json!({"firmware":{"version":"1.0.0-1234567","published":null},"unlocked":false}),
-            &mut lines,
-            false,
-        );
-        assert_eq!(
-            lines,
-            [
-                ("firmware.version".into(), "1.0.0-1234567".into()),
-                ("firmware.published".into(), "-".into()),
-                ("unlocked".into(), "no".into())
-            ]
-        );
     }
 }

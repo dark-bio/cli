@@ -40,8 +40,8 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     context.require_unlocked(&connection, false)?;
     let mut value = json!({"task":null,"app":{"name":null,"version":null},"success":null,"stdout":null,"stderr":null,"duration_seconds":null});
     let mut started = None;
-    let mut transfer = Transfer::new(context.output.human());
-    let report_interval = if context.output.human() { 1 } else { 5 };
+    let mut transfer = Transfer::new(context.output.terminal());
+    let report_interval = if context.output.terminal() { 1 } else { 5 };
     let mut reported = None;
     let result =
         connection
@@ -120,8 +120,17 @@ fn bytes(value: &mut Value, name: &str, bytes: &[u8]) {
     match std::str::from_utf8(bytes) {
         Ok(text) => value[name] = json!(text),
         Err(_) => {
-            value.as_object_mut().expect("result object").remove(name);
-            value[format!("{name}_base64")] = json!(BASE64_STANDARD.encode(bytes));
+            let fields = value.as_object_mut().expect("result object");
+            let index = fields
+                .keys()
+                .position(|key| key == name)
+                .expect("stream field");
+            fields.shift_remove(name);
+            fields.shift_insert(
+                index,
+                format!("{name}_base64"),
+                json!(BASE64_STANDARD.encode(bytes)),
+            );
         }
     }
 }
@@ -138,5 +147,14 @@ mod tests {
         assert!(result.get("stdout").is_none());
         assert_eq!(result["stdout_base64"], "AP+A");
         assert_eq!(result["stderr"], "hello\n\0");
+        assert_eq!(
+            result
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["task", "stdout_base64", "stderr"]
+        );
     }
 }

@@ -9,15 +9,17 @@
 use crate::style::{self, Role, Theme};
 use serde_json::Value;
 
-/// Styles a field by its final path component, retaining explicit absent values.
+/// Styles a field, retaining explicit absent values.
 /// Arbitrary strings receive no semantic status color merely because of their text.
 pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
-    let key = key.rsplit('.').next().unwrap_or(key);
     if value.is_null() {
         return theme.paint(
             Role::Muted,
             if key == "serial" { "unverified" } else { "-" },
         );
+    }
+    if value.as_array().is_some_and(Vec::is_empty) {
+        return theme.paint(Role::Muted, "none");
     }
     if key.ends_with("_bytes")
         && let Some(bytes) = value.as_u64()
@@ -34,7 +36,16 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
             theme.paint(Role::Muted, local.format("%H:%M:%S %:z").to_string())
         );
     }
-    let text = super::display(key, value, true);
+    if key.ends_with("_seconds")
+        && let Some(seconds) = value.as_u64()
+    {
+        return if seconds >= 60 {
+            format!("{}m {}s", seconds / 60, seconds % 60)
+        } else {
+            format!("{seconds} s")
+        };
+    }
+    let text = super::scalar(value);
     match key {
         "trust" | "state" | "outcome" | "result" => {
             let role = match text.as_str() {
@@ -116,34 +127,51 @@ pub(crate) fn block(theme: &Theme, rows: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// Renders flattened JSON paths as readable labels while preserving original values.
-pub(super) fn document(theme: &Theme, value: &Value) -> String {
-    let mut fields = Vec::new();
-    super::fields("", value, &mut fields, true);
-    let rows = fields
-        .into_iter()
-        .map(|(key, _)| {
-            let mut current = value;
-            for part in key.split('.') {
-                current = if current.is_array() {
-                    part.parse::<usize>()
-                        .ok()
-                        .and_then(|index| current.get(index))
-                        .unwrap_or(&Value::Null)
-                } else {
-                    &current[part]
-                };
+/// Renders nested fields as readable labels with units in their values.
+pub(crate) fn document(theme: &Theme, value: &Value) -> String {
+    let mut rows = Vec::new();
+    fields(theme, "", "", value, &mut rows);
+    block(theme, &rows)
+}
+
+/// Keeps nesting in labels without exposing machine paths or unit suffixes.
+fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<(String, String)>) {
+    let name = if key == "requires" {
+        "dependencies"
+    } else {
+        key
+    };
+    let name = name
+        .strip_suffix("_bytes")
+        .or_else(|| name.strip_suffix("_seconds"))
+        .unwrap_or(name);
+    let label = format!("{prefix} {}", name.replace('_', " "))
+        .trim()
+        .to_string();
+    match value {
+        Value::Object(object) if !object.is_empty() => {
+            for (key, value) in object {
+                fields(theme, &label, key, value, rows);
             }
-            let label = key.replace(['_', '.'], " ");
+        }
+        Value::Array(values)
+            if values
+                .iter()
+                .any(|value| value.is_object() || value.is_array()) =>
+        {
+            for (index, value) in values.iter().enumerate() {
+                fields(theme, &label, &(index + 1).to_string(), value, rows);
+            }
+        }
+        _ => {
             let mut chars = label.chars();
             let label = chars
                 .next()
                 .map(|first| first.to_uppercase().to_string() + chars.as_str())
                 .unwrap_or_default();
-            (label, self::value(theme, &key, current))
-        })
-        .collect::<Vec<_>>();
-    block(theme, &rows)
+            rows.push((label, self::value(theme, key, value)));
+        }
+    }
 }
 
 /// Fits a table by shrinking one free-text column, then falls back to blocks.
@@ -159,7 +187,7 @@ pub(super) fn table(
         .map(|(_, key)| {
             let largest = rows.iter().filter_map(|row| row[*key].as_u64()).max()?;
             key.ends_with("_bytes").then(|| {
-                [("GiB", 1_u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)]
+                [("MiB", 1_u64 << 20), ("KiB", 1 << 10)]
                     .into_iter()
                     .find(|(_, divisor)| largest >= *divisor)
                     .unwrap_or(("B", 1))
@@ -210,14 +238,15 @@ pub(super) fn table(
             .max(columns[index].0.len().max(8));
     }
     if total(&widths) > theme.width {
-        return rows
+        return cells
             .iter()
             .map(|row| {
                 block(
                     theme,
                     &columns
                         .iter()
-                        .map(|(label, key)| (label.to_string(), value(theme, key, &row[*key])))
+                        .zip(row)
+                        .map(|((label, _), cell)| (label.to_string(), cell.clone()))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -347,6 +376,28 @@ mod tests {
     }
 
     #[test]
+    fn transformed_values_use_reading_labels() {
+        for width in [32, 80, 160] {
+            let theme = Theme::test(width, Color::Off, false);
+            let rendered = document(
+                &theme,
+                &json!({
+                    "size_bytes": 1022427344_u64,
+                    "duration_seconds": 120,
+                    "download": {"size_bytes": u64::MAX},
+                    "items": [{"uploaded_bytes": 1024, "duration_seconds": 72}],
+                }),
+            );
+            assert!(rendered.contains("975.1 MiB"));
+            assert!(rendered.contains("2m 0s"));
+            assert!(!rendered.contains("bytes"));
+            assert!(!rendered.contains("seconds"));
+            assert!(!rendered.contains("download."));
+            assert!(rendered.contains("Download size"));
+        }
+    }
+
+    #[test]
     fn table_aligns_sizes_and_marks_states() {
         let theme = Theme::test(80, Color::Basic, true);
         let rows = [
@@ -361,8 +412,26 @@ mod tests {
                 &[("SLOT", "slot"), ("STATE", "state"), ("SIZE", "size_bytes")],
                 &[]
             ),
-            "  SLOT              STATE        SIZE\n  \x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m  3.0 GiB\n  \x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty         -\n  \x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m  0.2 GiB"
+            "  SLOT              STATE           SIZE\n  \x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m  3072.0 MiB\n  \x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty            -\n  \x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m   256.0 MiB"
         );
+    }
+
+    #[test]
+    fn stacked_tables_keep_the_shared_byte_unit() {
+        let theme = Theme::test(25, Color::Off, false);
+        let rows = [
+            json!({"slot":"reference-genome","size_bytes":1_u64 << 28}),
+            json!({"slot":"variant-catalog","size_bytes":3_u64 << 30}),
+        ];
+        let rendered = table(
+            &theme,
+            &rows,
+            &[("DATASET SLOT", "slot"), ("SIZE", "size_bytes")],
+            &[],
+        );
+        assert!(rendered.contains("256.0 MiB"));
+        assert!(rendered.contains("3072.0"));
+        assert!(!rendered.contains("GiB"));
     }
 
     #[test]

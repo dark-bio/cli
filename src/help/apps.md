@@ -6,12 +6,20 @@ paths and prints a report. The Ark owns manifest validation, sandboxing and
 permission enforcement. Use a hardware Ark or emulator; the CLI has no local
 execution sandbox.
 
+## Running and collecting results
+
 `ark app run FILE` uploads, asks for owner approval and waits for the result.
 The task ID is printed as soon as allocated. Ctrl-C or SIGTERM attempts to
 cancel it; `ark app cancel TASK` can clean up a run whose CLI process died.
-Results arrive whole. Use `ark app run FILE > report.md` to
-preserve the exact report bytes. Text and JSON include the report alongside
-task, app, success, stderr and duration_seconds; see `ark help output`.
+Results arrive whole. `ark app run FILE > report.md` preserves the exact report
+bytes. --json includes task, app, success, stdout, stderr and duration_seconds;
+non-UTF-8 streams use base64 fields as described in `ark help output`.
+
+A finished result is retained by the Ark for 60 seconds. There is no detached
+mode or later result retrieval after the CLI consumed it. Background the whole
+command to keep its connection and companion relay alive.
+
+## Manifest and sandbox
 
 The manifest contains four fields, all under `[package]`:
 
@@ -36,9 +44,4 @@ counters, so apps must not depend on wall-clock time or randomness.
 
 By default only a successful run's stdout is returned. `develop = true`
 returns stdout on failure and stderr too; leave it out of shipped apps.
-
 See https://github.com/dark-bio/examples for working apps and the data tree.
-
-A finished result is retained by the Ark for 60 seconds. There is no detached
-mode or later result retrieval after the CLI consumed it. Background the whole
-command to keep its connection and companion relay alive.

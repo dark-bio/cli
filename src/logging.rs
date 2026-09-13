@@ -7,7 +7,7 @@
 //! Only connect and wire diagnostics enter the CLI's log stream. HTTP and
 //! subprocess logging is excluded so authorization headers cannot appear.
 
-use crate::output::Output;
+use crate::{args::Log as Level, output::Output};
 use serde_json::{Map, Value, json};
 use tracing::{
     Event, Subscriber,
@@ -15,23 +15,38 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-/// Installs an allowlisted subscriber when verbose output is requested.
+/// Installs an allowlisted subscriber for steps and requested diagnostics.
 /// An existing process subscriber is retained if installation is unavailable.
-pub(crate) fn init(output: Output, verbosity: u8) {
-    if verbosity == 0 {
+pub(crate) fn init(output: Output, verbose: bool, level: Option<Level>) {
+    if !verbose && level.is_none() {
         return;
     }
     let filter = tracing_subscriber::filter::filter_fn(move |metadata| {
-        let target = metadata.target();
-        (target == "darkbio_connect::setup")
-            || (verbosity >= 2
-                && target.starts_with("darkbio_connect")
-                && *metadata.level() <= tracing::Level::DEBUG)
-            || (verbosity >= 3 && target.starts_with("darkbio_wire"))
+        enabled(metadata.target(), *metadata.level(), verbose, level)
     });
     let _ = tracing_subscriber::registry()
         .with(Log(output).with_filter(filter))
         .try_init();
+}
+
+/// Rejects every target outside connect and wire, regardless of diagnostic level.
+fn enabled(target: &str, severity: tracing::Level, verbose: bool, level: Option<Level>) -> bool {
+    if target == "darkbio_connect::setup" {
+        return verbose;
+    }
+    match level {
+        Some(Level::Debug) => {
+            (target == "darkbio_connect" || target.starts_with("darkbio_connect::"))
+                && severity <= tracing::Level::DEBUG
+        }
+        Some(Level::Trace) => ["darkbio_connect", "darkbio_wire"].iter().any(|name| {
+            target == *name
+                || target
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with("::"))
+        }),
+        None => false,
+    }
 }
 
 /// Tracing layer that routes selected events through the CLI's stderr policy.
@@ -87,5 +102,66 @@ impl Visit for Fields {
     /// Retains a string field without adding debug quotes.
     fn record_str(&mut self, field: &Field, value: &str) {
         self.0.insert(field.name().into(), json!(value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_are_separate_from_steps_and_exclude_http_and_subprocesses() {
+        for level in [None, Some(Level::Debug), Some(Level::Trace)] {
+            for verbose in [false, true] {
+                assert_eq!(
+                    enabled(
+                        "darkbio_connect::setup",
+                        tracing::Level::INFO,
+                        verbose,
+                        level
+                    ),
+                    verbose
+                );
+                for target in [
+                    "ureq",
+                    "hyper::client",
+                    "rustls",
+                    "ark::access",
+                    "std::process",
+                    "darkbio_connect_http",
+                ] {
+                    assert!(
+                        !enabled(target, tracing::Level::ERROR, verbose, level),
+                        "{target}"
+                    );
+                }
+            }
+        }
+        assert!(enabled(
+            "darkbio_connect::hardware",
+            tracing::Level::DEBUG,
+            false,
+            Some(Level::Debug)
+        ));
+        assert!(!enabled(
+            "darkbio_connect::hardware",
+            tracing::Level::TRACE,
+            true,
+            Some(Level::Debug)
+        ));
+        assert!(!enabled(
+            "darkbio_wire::transport",
+            tracing::Level::DEBUG,
+            true,
+            Some(Level::Debug)
+        ));
+        for target in ["darkbio_connect::hardware", "darkbio_wire::transport"] {
+            assert!(enabled(
+                target,
+                tracing::Level::TRACE,
+                false,
+                Some(Level::Trace)
+            ));
+        }
     }
 }

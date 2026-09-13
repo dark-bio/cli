@@ -6,7 +6,6 @@
 
 //! Role colors and terminal capabilities, kept separate from content.
 
-use crate::args::Format;
 use clap::builder::styling::{Ansi256Color, RgbColor, Style, Styles};
 use std::io::{self, IsTerminal};
 
@@ -62,15 +61,14 @@ pub(crate) struct Theme {
 }
 
 impl Theme {
-    /// Combines explicit format, stream attendance, locale and color preferences.
-    /// Forced human mode keeps layouts in pipes, but never enables cursor control there.
-    pub fn new(format: Format, stderr: bool) -> Self {
+    /// Keeps reading layouts in pipes; only terminals get color and cursor control.
+    pub fn new(json: bool, stderr: bool) -> Self {
         let attended = if stderr {
             io::stderr().is_terminal()
         } else {
             io::stdout().is_terminal()
         };
-        let human = format == Format::Human || (format == Format::Auto && attended);
+        let human = !json;
         let term = std::env::var("TERM").unwrap_or_default();
         let interactive = human && attended && term != "dumb";
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]

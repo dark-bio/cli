@@ -139,7 +139,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         path: package::path(target),
         response: None,
     };
-    let mut transfer = Transfer::new(context.output.human());
+    let mut transfer = Transfer::new(context.output.terminal());
     let result = connection.client.update_firmware(
         &target.firmware(),
         &mut reader,

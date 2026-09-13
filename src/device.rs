@@ -104,11 +104,11 @@ fn status_value(connection: &Connection) -> Value {
 fn print_status(context: &Context, value: &Value) -> Result<(), Error> {
     context
         .output
-        .document_with(value, |theme, verbose| status_block(theme, value, verbose))
+        .document_with(value, |theme| status_block(theme, value))
 }
 
-/// Groups identity and state facts, expanding full keys only at verbose detail.
-fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
+/// Groups identity and state facts; the full public key belongs in JSON.
+fn status_block(theme: &Theme, value: &Value) -> String {
     let field = |key: &str| human::value(theme, key, &value[key]);
     let flag = |key: &str, yes: &str, no: &str| match value[key].as_bool() {
         Some(true) => theme.mark(Role::Success, yes),
@@ -117,14 +117,7 @@ fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
     };
     let hardware = &value["hardware"];
     let firmware = &value["firmware"];
-    let mut fingerprint = value["identity"].as_str().unwrap_or("-").to_string();
-    if verbose == 0 && fingerprint.len() > 12 {
-        fingerprint = format!(
-            "{}{}",
-            fingerprint.chars().take(8).collect::<String>(),
-            theme.glyph("\u{2026}", "...")
-        );
-    }
+    let fingerprint = value["identity"].as_str().unwrap_or("-");
     let sep = theme.separator();
     let mut rows = vec![
         (
@@ -132,10 +125,7 @@ fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
             format!(
                 "{}  {}",
                 theme.paint(Role::Heading, value["name"].as_str().unwrap_or("Ark")),
-                theme.paint(
-                    Role::Muted,
-                    crate::output::display("serial", &value["serial"], true)
-                )
+                theme.paint(Role::Muted, human::value(theme, "serial", &value["serial"]))
             ),
         ),
         (
@@ -172,9 +162,6 @@ fn status_block(theme: &Theme, value: &Value, verbose: u8) -> String {
         ),
         ("Identity".into(), theme.paint(Role::Accent, fingerprint)),
     ];
-    if verbose > 0 {
-        rows.push(("Public key".into(), field("pubkey")));
-    }
     if !value["mismatch"].is_null() {
         rows.push(("Mismatch".into(), field("mismatch")));
     }
@@ -357,13 +344,13 @@ mod tests {
             "identity":"0123456789abcdef","pubkey":"abcdef0123456789","mismatch":"Ark II - A",
         });
         assert_eq!(
-            status_block(&theme, &value, 0),
-            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware  Ark I, revision B, model 01\n\n  Firmware  0.11.5, published -\n  Trust     \x1b[1m! self-signed\x1b[0m \u{00b7} - \u{00b7} -\n\n  Cloud     -\n  Pairing   \x1b[1m\u{2713} paired\x1b[0m \u{00b7} \x1b[1m! locked\x1b[0m\n  Identity  \x1b[1m01234567\u{2026}\x1b[0m\n  Mismatch  \x1b[1mArk II - A\x1b[0m"
+            status_block(&theme, &value),
+            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware  Ark I, revision B, model 01\n\n  Firmware  0.11.5, published -\n  Trust     \x1b[1m! self-signed\x1b[0m \u{00b7} - \u{00b7} -\n\n  Cloud     -\n  Pairing   \x1b[1m\u{2713} paired\x1b[0m \u{00b7} \x1b[1m! locked\x1b[0m\n  Identity  \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch  \x1b[1mArk II - A\x1b[0m"
         );
-        let verbose = status_block(&theme, &value, 1);
-        assert!(verbose.contains("0123456789abcdef"));
-        assert!(verbose.contains("abcdef0123456789"));
+        let rendered = status_block(&theme, &value);
+        assert!(rendered.contains("0123456789abcdef"));
+        assert!(!rendered.contains("abcdef0123456789"));
         value["synced"] = json!(false);
-        assert!(status_block(&theme, &value, 0).contains("! not synced"));
+        assert!(status_block(&theme, &value).contains("! not synced"));
     }
 }

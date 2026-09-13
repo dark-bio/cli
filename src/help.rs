@@ -7,30 +7,32 @@
 //! Help is generated from the commands this build actually serves.
 
 use crate::{
-    args::{Cli, Format},
+    args::Cli,
     error::Error,
     style::{self, Color, Role, Theme},
 };
 use clap::CommandFactory;
+
+/// Help stays plain in pipes and gains terminal styling independently of --json.
+pub(crate) fn theme(stderr: bool) -> Theme {
+    let mut theme = Theme::new(false, stderr);
+    theme.human = theme.interactive;
+    theme
+}
 
 /// Builds the executable command tree with shared styling and command-specific contracts.
 pub(crate) fn command(theme: &Theme) -> clap::Command {
     let mut command = Cli::command();
     decorate(&mut command, "", theme);
     command.build();
-    compact(&mut command, true, theme);
+    compact(&mut command, theme);
     command
 }
 
 /// Clap normally expands long help onto two lines per option. Render its short
 /// layout once, then let the help action select the short or long footer.
-fn compact(command: &mut clap::Command, root: bool, theme: &Theme) {
+fn compact(command: &mut clap::Command, theme: &Theme) {
     let mut display = command.clone().after_help(None).after_long_help(None);
-    if !root {
-        for arg in command.get_arguments().filter(|arg| arg.is_global_set()) {
-            display = display.mut_arg(arg.get_id().clone(), |arg| arg.hide(true));
-        }
-    }
     let rendered = display.render_help();
     let scan = if theme.human {
         rendered
@@ -47,7 +49,7 @@ fn compact(command: &mut clap::Command, root: bool, theme: &Theme) {
         .clone()
         .help_template(format!("{}{{after-help}}", scan.trim_end()));
     for child in command.get_subcommands_mut() {
-        compact(child, false, theme);
+        compact(child, theme);
     }
 }
 
@@ -83,133 +85,133 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "nothing",
             "none",
             "seconds",
-            "devices: locator, kind, name, serial, image, environment, ready; the last two need a connection",
-            "ark devices\nark devices --format json",
+            "locator, name, serial, kind, environment, ready; JSON adds image",
+            "ark devices\nark devices --json",
         ),
         "status" => (
             "one Ark (works offline, including while unpaired or locked)",
             "none",
             "seconds",
-            "name, serial, hardware, firmware, trust, environment, realm, synced, paired, unlocked, identity, pubkey, mismatch",
-            "ark status\nark -d emulator status --format json",
+            "name, serial, hardware, firmware, trust, environment, realm, synced, paired, unlocked, identity, mismatch; JSON adds pubkey",
+            "ark status\nark -d emulator status --json",
         ),
         "genuine" => (
             "one Ark and a cloud environment",
             "none",
             "seconds",
             "serial, enrolled, active, disabled, expired, superseded",
-            "ark genuine\nark genuine --env develop --format json",
+            "ark genuine\nark genuine --env develop --json",
         ),
         "pair" => (
             "an unpaired Ark and cloud access",
             "scan in Ark Companion and confirm colours",
             "up to 10 minutes to scan; then approval and storage setup",
             "serial, paired; pairing URL on stderr",
-            "ark pair\nark pair --format json",
+            "ark pair\nark pair --json",
         ),
         "unlock" => (
             "a paired Ark and cloud access",
             "on your phone unless already unlocked",
             "up to a minute for approval; unlocking lasts until power is cut",
             "unlocked, changed",
-            "ark unlock\nark unlock --format json",
+            "ark unlock\nark unlock --json",
         ),
         "enroll" => (
             "one Ark; --cwt accepts an existing attestation",
             "online enrollment uses the Hub; none with --cwt",
             "seconds for --cwt and reconnection",
-            "enrolled, url for online enrollment; enrolled and status fields with --cwt",
+            "enrolled, url for online enrollment; status fields then enrolled with --cwt",
             "ark enroll\nark enroll --cwt attestation.cwt",
         ),
         "data list" => (
-            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "a paired, unlocked Ark (--unlock only if status reports locked)",
             "none; --unlock needs your phone",
             "seconds",
-            "slots: slot, id, name, description, state, origin, requires, size_bytes, build, version, damage, download",
-            "ark data list\nark data list --unlock --format json",
+            "slot, name, state, origin, build, size, dependencies; JSON slot fields: `ark help datasets`",
+            "ark data list\nark data list --json",
         ),
         "data show" => (
-            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "a paired, unlocked Ark (--unlock only if status reports locked)",
             "none; --unlock needs your phone",
             "seconds",
-            "slot, id, name, description, state, origin, requires, size_bytes, build, version, damage, download, required_by, cached",
-            "ark data show snp-indel-calls\nark data show 3 --format json",
+            "slot, id, name, state, origin, damage, dependencies, size, build, version, download, description, required_by, cached; JSON uses size_bytes",
+            "ark data show snp-indel-calls\nark data show 3 --json",
         ),
         "data paths" => (
-            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "a paired, unlocked Ark (--unlock only if status reports locked)",
             "none; --unlock needs your phone",
             "seconds",
             "the Ark's dataset README verbatim; JSON: readme",
-            "ark data paths\nark data paths --unlock --format json",
+            "ark data paths\nark data paths --json",
         ),
         "data upload" => (
-            "a local file and a paired, unlocked Ark (pass --unlock if it is locked)",
+            "a local file and a paired, unlocked Ark (--unlock only if status reports locked)",
             "on your phone for personal data; none for reference data or --dry-run",
             "minutes to an hour; each processing step has its own ETA",
-            "slot, id, confidence, uploaded_bytes, phases, duration_seconds; state, requires under --dry-run",
+            "slot, id, confidence, uploaded, phases, duration; then state, dependencies under --dry-run; JSON uses uploaded_bytes, duration_seconds",
             "ark data upload calls.vcf.gz\nark data upload calls.vcf.gz --dry-run",
         ),
         "data fetch" => (
-            "a paired, unlocked Ark and an advertised download",
+            "a paired, unlocked Ark and an advertised download (--unlock only if status reports locked)",
             "none for reference downloads; --unlock may require your phone",
             "a large catalog may take an hour; network stalls retry up to 3 attempts",
-            "fetched: slot, id, url, size_bytes, sha256, cached, outcome, error",
-            "ark data fetch --all --unlock\nark data fetch reference-genome --dry-run --format json",
+            "slot, size, cached, outcome; JSON fetched: slot, id, url, size_bytes, sha256, cached, outcome, error",
+            "ark data fetch --all\nark data fetch reference-genome --dry-run --json",
         ),
         "data delete" | "data repair" => (
-            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "a paired, unlocked Ark (--unlock only if status reports locked)",
             "on your phone; never under --dry-run",
             "up to a minute for approval",
             "slot, id, state, changed; required_by under --dry-run",
             "ark data delete snp-indel-calls --dry-run\nark data repair snp-indel-calls",
         ),
         "app run" => (
-            "a local WASM file and a paired, unlocked Ark (pass --unlock if it is locked)",
+            "a local WASM file and a paired, unlocked Ark (--unlock only if status reports locked)",
             "on your phone before running",
             "unbounded run; --timeout bounds replies, not the whole app",
             "exact report bytes; JSON: task, app, success, stdout or stdout_base64, stderr or stderr_base64, duration_seconds",
-            "ark app run app.wasm > report.md\nark app run app.wasm --unlock --format json",
+            "ark app run app.wasm > report.md\nark app run app.wasm --json",
         ),
         "app cancel" => (
             "one Ark and a task id from app run",
             "none",
             "seconds",
             "task, cancelled",
-            "ark app cancel 42\nark app cancel 18446744073709551615 --format json",
+            "ark app cancel 42\nark app cancel 18446744073709551615 --json",
         ),
         "firmware list" => (
             "one Ark and its package host",
             "none; develop and staging package hosts may need browser login",
             "seconds",
-            "installed, update, firmwares: version, published, size_bytes, sha256, summary, installed, candidate",
-            "ark firmware list\nark firmware list --format json",
+            "version, published, size, flags, summary; JSON: installed, update, firmwares (see `ark help states`)",
+            "ark firmware list\nark firmware list --json",
         ),
         "firmware update" => (
             "one Ark, cloud and package access",
             "none if unpaired; button if locked; phone if unlocked; --yes confirms reboot",
             "minutes plus up to 120 s for reboot verification; --no-wait skips that wait",
-            "from, to, size_bytes, approval, installed, returned, verified, running",
-            "ark firmware update --dry-run\nark firmware update --yes --format json",
+            "from, to, size, approval, installed, returned, verified, running; JSON uses size_bytes",
+            "ark firmware update --dry-run\nark firmware update --yes --json",
         ),
         "doctor" => (
             "nothing; unavailable checks are skipped",
             "none; develop and staging package hosts may need browser login",
             "seconds per check",
-            "checks: name, result, detail, hint; tool, connect, wire, minimum_firmware, minimum_develop_publish",
-            "ark doctor\nark doctor --format json",
+            "checks: result, name, detail, hint; JSON: tool, connect, wire, minimum_firmware, minimum_develop_publish, checks",
+            "ark doctor\nark doctor --json",
         ),
         "completions" => (
             "nothing",
             "none",
             "immediate",
-            "shell completion text in every format",
+            "shell completion text even with --json",
             "ark completions bash\nark completions zsh",
         ),
         _ => (
             "nothing",
             "none",
             "immediate",
-            "help text in every format",
+            "help text even with --json",
             "ark --help\nark help agents",
         ),
     };
@@ -232,7 +234,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         _ => "0 done; 1 local; 2 usage",
     };
     let help = format!(
-        "Requires: {requires}\nApproval: {approval}\nTime:     {time}\nPrints:   {prints}\nExit:     {exits}; 130/143 interrupted\n\nExamples:\n  {}\n\nGlobal options: ark --help",
+        "Requires: {requires}\nApproval: {approval}\nTime:     {time}\nPrints:   {prints}\nExit:     {exits}; 130/143 interrupted\n\nExamples:\n  {}",
         examples.replace('\n', "\n  ")
     );
     let help = if theme.human {
@@ -251,7 +253,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         help
     };
     let help = if parent.is_empty() {
-        "Output defaults to human on terminals, text in pipes (per stream).
+        "Output is formatted for reading; --json keeps complete, exact values.
 Scripts and AI agents: read `ark help agents` first.
 Topics: agents, states, output, devices, datasets, apps."
             .to_string()
@@ -290,8 +292,8 @@ Topics: agents, states, output, devices, datasets, apps."
 
 /// Prints a command page, an embedded topic or the full manual without discovery.
 /// Help remains readable text even when the invocation selects JSON.
-pub(crate) fn run(path: &[String], all: bool, format: Format) -> Result<(), Error> {
-    let theme = Theme::new(format, false);
+pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
+    let theme = theme(false);
     let mut root = command(&theme);
     if all {
         if theme.human {
@@ -368,11 +370,6 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
             4,
         )
     }));
-    lines.push(format!(
-        "\n{} {}",
-        theme.paint(Role::Muted, "Global options:"),
-        theme.paint(Role::Accent, "ark --help")
-    ));
     lines.join("\n")
 }
 
@@ -473,7 +470,7 @@ mod tests {
                 &[("Requires", "a paired Ark"), ("Approval", "only if locked")],
                 "ark unlock"
             ),
-            "Requires   a paired Ark\nApproval   only if locked\n\n\x1b[1mExamples\x1b[0m\n  $ \x1b[1mark unlock\x1b[0m\n\nGlobal options: \x1b[1mark --help\x1b[0m"
+            "Requires   a paired Ark\nApproval   only if locked\n\n\x1b[1mExamples\x1b[0m\n  $ \x1b[1mark unlock\x1b[0m"
         );
         assert_eq!(
             markdown(
@@ -499,7 +496,7 @@ mod tests {
                 .lines()
                 .all(|line| console::measure_text_width(line) <= theme.width)
         );
-        assert!(console::strip_ansi_codes(&rendered).contains("ark data fetch --all --unlock"));
+        assert!(console::strip_ansi_codes(&rendered).contains("ark data fetch --all"));
         assert!(rendered.contains("\x1b["));
     }
 
@@ -529,7 +526,8 @@ mod tests {
                 .unwrap()
                 .render_long_help()
                 .to_string();
-            assert!(long.contains("pass --unlock if it is locked"));
+            let long = long.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(long.contains("--unlock only if status reports locked"));
             assert!(long.contains("none; --unlock needs your phone"));
         }
     }

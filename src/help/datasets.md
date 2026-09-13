@@ -1,34 +1,49 @@
 # Datasets
 
-`ark data list` reports slots by protocol name and state. `ark data show SLOT`
-adds required_by and cached. Both include the Ark's descriptions, dependencies
-and public download when advertised. Neither command transfers dataset bytes.
-`ark data paths` prints the Ark's README verbatim, including absent paths and
-the slots that would supply them. JSON returns it as readme.
-Numeric slot IDs remain usable when a new kind has no name in this CLI build.
+`ark data list` is an inventory of slots, with short names and state.
+`ark data show SLOT` adds the long description, required_by and cached.
+Neither transfers dataset bytes. `ark data paths` prints the Ark's README
+verbatim, including absent paths and the slots that would supply them.
+With --json it returns readme. Numeric slot IDs remain usable when a new kind
+has no name in this CLI build.
 
-Slot fields describe the Ark's inventory:
+Check `ark status` before a data command. It needs a paired, unlocked Ark;
+use --unlock only if status reports locked, and the owner will approve on
+the phone. A dry run never unlocks and conflicts with --unlock.
+
+## Slot fields
+
+JSON list entries contain slot, id, name, state, origin, damage, requires,
+size_bytes, build, version and download. show adds description, required_by
+and cached. The reading view scales
+size_bytes under Size and includes dependency state alongside each name.
 
 - size_bytes is the bytes on the Ark's disk for this slot, zero when empty.
   It is not the original upload or download size; processing may change it.
-- build is the reference assembly, for example GRCh38.p14. version is the
+- build is the reference assembly, for example GRCh38.p14. The Ark matches
+  datasets by assembly family rather than exact patch, so GRCh38.p13 beside
+  GRCh38.p14 is normal, and it refuses data that does not fit. version is the
   dataset's own release, for example dbSNP 157 for variant-catalog; it is not
-  a firmware version. Absent values are - in text.
-- requires names slots that must be filled before this slot is actionable.
-  required_by is the reverse direction: slots that depend on this one.
-  These dataset dependencies differ from a help page's Requires preconditions.
-- download is an optional offer with url, size_bytes and sha256. Filled slots
-  normally advertise none, shown as - in text. Read state to learn whether a
-  slot holds data.
+  a firmware version.
+- requires names dependency slots, whether already filled or still missing.
+  The reading view marks each as filled or not filled. required_by names the
+  slots that depend on this one. These relationships differ from a help page's
+  Requires preconditions.
+- download is what the Ark offers to fill an empty slot, with url, size_bytes
+  and sha256; the CLI never builds a URL itself. Filled slots normally offer
+  none, shown as - in the reading view or null in JSON, so read state to learn
+  whether a slot holds data.
 - cached refers only to this computer's download cache, never to the Ark. yes
   means a file named by the advertised SHA-256 is already here, which fetch
   still verifies as it replays. Personal slots always print no, since personal
   uploads are never cached.
 
+## Transfers and changes
+
 `ark data upload FILE` asks the Ark to identify the first bytes, then uploads
 and waits for validation and indexing. Compressed files stay compressed.
---slot is an assertion about identification, not an override. --dry-run stops
-after identification and reads the slot state without changing it.
+--slot asserts the expected identification. --dry-run stops after identification
+and reads the slot state without changing it.
 
 `ark data fetch SLOT` installs the reference download advertised by the Ark.
 --all fills empty reference slots in dependency order; filled slots are skipped.

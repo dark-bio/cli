@@ -60,16 +60,23 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
     match command {
         args::Data::List => {
             let rows: Vec<_> = slots.iter().map(metadata).collect();
+            let document = json!({"slots":rows});
+            let rows: Vec<_> = rows
+                .into_iter()
+                .zip(&slots)
+                .map(|(value, slot)| dependency_view(value, slot, &slots))
+                .collect();
             context.output.table(
-                &json!({"slots":rows}),
+                &document,
                 &rows,
                 &[
                     ("SLOT", "slot"),
+                    ("NAME", "name"),
                     ("STATE", "state"),
                     ("ORIGIN", "origin"),
                     ("BUILD", "build"),
                     ("SIZE", "size_bytes"),
-                    ("REQUIRES", "requires"),
+                    ("DEPENDENCIES", "requires"),
                 ],
             )?;
             for slot in &slots {
@@ -105,11 +112,15 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         args::Data::Show { slot } => {
             let slot = select(&slots, slot)?;
             let mut value = metadata(slot);
+            value["description"] = json!(slot.desc);
             value["required_by"] = json!(required_by(&slots, slot.kind));
             value["cached"] = json!(
                 download(slot).is_some_and(|(_, _, hash)| cache::cached(&cache::directory(), hash))
             );
-            context.output.document(&value)
+            let view = dependency_view(value.clone(), slot, &slots);
+            context
+                .output
+                .document_with(&value, |theme| crate::output::human::document(theme, &view))
         }
         args::Data::Delete(args) | args::Data::Repair(args) => {
             let slot = select(&slots, args.slot)?;
@@ -232,7 +243,10 @@ fn upload(
                 .map(|id| slot_name(*id))
                 .collect::<Vec<_>>()
         );
-        return context.output.document(&value);
+        let view = dependency_view(value.clone(), target, &slots);
+        return context
+            .output
+            .document_with(&value, |theme| crate::output::human::document(theme, &view));
     }
     file.rewind()?;
     let started = Instant::now();
@@ -286,9 +300,9 @@ impl<'a> Progress<'a> {
         Self {
             context,
             slot,
-            transfer: Transfer::new(context.output.human()),
+            transfer: Transfer::new(context.output.terminal()),
             last_upload: None,
-            processing: Processing::new(context.output.human()),
+            processing: Processing::new(context.output.terminal()),
             uploaded: 0,
             phases: Vec::new(),
         }
@@ -328,7 +342,7 @@ impl<'a> Progress<'a> {
                 self.uploaded = uploaded;
                 if let Some(line) = self.transfer.update(uploaded, total) {
                     self.context.output.progress(&line);
-                    if self.context.output.human() {
+                    if self.context.output.terminal() {
                         self.last_upload = Some(line);
                     }
                 }
@@ -420,6 +434,24 @@ pub(crate) fn download(slot: &SlotStatus) -> Option<(&str, u64, &str)> {
         )
     })
 }
+/// Shows dependency state without changing the advertised JSON dependency names.
+fn dependency_view(mut value: Value, slot: &SlotStatus, slots: &[SlotStatus]) -> Value {
+    value["requires"] = json!(
+        slot.deps
+            .iter()
+            .map(|id| {
+                let state = if slots.iter().any(|other| other.kind == *id && filled(other)) {
+                    "filled"
+                } else {
+                    "not filled"
+                };
+                format!("{} ({state})", slot_name(*id))
+            })
+            .collect::<Vec<_>>()
+    );
+    value
+}
+
 /// Builds generic slot output, preserving future IDs and optional advertised details.
 pub(crate) fn metadata(slot: &SlotStatus) -> Value {
     let origin = schema::SlotOrigin::try_from(slot.origin)
@@ -432,7 +464,7 @@ pub(crate) fn metadata(slot: &SlotStatus) -> Value {
         .unwrap_or_else(|_| slot.origin.to_string());
     json!({
         "slot": slot_name(slot.kind), "id": slot.kind,
-        "name": slot.name, "description": slot.desc,
+        "name": slot.name,
         "state": state(slot), "origin": origin,
         "damage": (!slot.damage.is_empty()).then_some(&slot.damage),
         "requires": slot.deps.iter().map(|id| slot_name(*id)).collect::<Vec<_>>(),
@@ -475,15 +507,20 @@ mod tests {
         assert_eq!(value["requires"], json!(["reference-genome"]));
         assert!(value["damage"].is_null());
         assert!(value["download"].is_null());
-        let text = crate::output::text_document(&value);
-        for key in value.as_object().unwrap().keys() {
-            assert!(
-                text.lines()
-                    .any(|line| line.starts_with(&format!("{key}: ")))
-            );
-        }
-        assert!(text.contains("size_bytes: 123"));
-        assert!(text.contains("version: 158"));
+        assert!(value.get("description").is_none());
+        let dependency = SlotStatus {
+            kind: 1,
+            state: SlotState::StateFilled as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            dependency_view(value.clone(), &slot, &[dependency])["requires"],
+            json!(["reference-genome (filled)"])
+        );
+        assert_eq!(
+            dependency_view(value, &slot, &[])["requires"],
+            json!(["reference-genome (not filled)"])
+        );
         let error = select(&[], 5).unwrap_err();
         assert_eq!((error.class, error.code), (1, "invalid-slot"));
         assert!(!filled(&SlotStatus {
