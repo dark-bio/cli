@@ -5,6 +5,10 @@
 // license that can be found in the LICENSE file.
 
 //! Download planning, transport recovery and cache replay.
+//!
+//! Each attempt starts a new Ark upload and replays the retained bytes from disk.
+//! The HTTP range request opens only when replay reaches the missing suffix.
+//! Opening it earlier leaves the response unread while a large prefix uploads.
 
 use super::{Progress, cache, download, filled, select};
 use crate::{
@@ -12,6 +16,7 @@ use crate::{
     context::{Connection, Context},
     error::Error,
     http,
+    output::Output,
 };
 use darkbio_connect::{Dataset, schema::SlotStatus};
 use serde_json::{Value, json};
@@ -217,6 +222,7 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
 /// Replays a complete cache or streams a download through a fresh Ark upload.
 /// At most three network attempts resume retained bytes when possible. Protocol
 /// refusals are returned; only source failures or a corrupt prefix permit replay.
+/// A refused HTTP range discards the prefix before the next attempt.
 fn install(
     context: &Context,
     connection: &Connection,
@@ -258,7 +264,7 @@ fn install(
     }
     let agent = http::agent(Duration::from_secs(context.options.timeout), 5);
     for attempt in 0..3 {
-        let mut entry = match directory {
+        let entry = match directory {
             Some(path) => {
                 match cache::Entry::open(path, &source.hash, &source.url, source.dataset.size) {
                     Ok(entry) => Some(entry),
@@ -274,93 +280,8 @@ fn install(
             }
             None => None,
         };
-        let mut offset = entry
-            .as_ref()
-            .map(|entry| entry.len())
-            .transpose()?
-            .unwrap_or(0);
-        let request = |offset: u64, entry: &Option<cache::Entry>| {
-            let mut request = agent.get(&source.url).header("Accept-Encoding", "identity");
-            if offset > 0 {
-                request = request.header("Range", format!("bytes={offset}-"));
-                if let Some(validator) = entry
-                    .as_ref()
-                    .and_then(|entry| entry.meta.validator.as_ref())
-                {
-                    request = request.header("If-Range", validator);
-                }
-            }
-            request.call().map_err(http::error)
-        };
-        let mut response = match request(offset, &entry) {
-            Ok(response) => response,
-            Err(error) if attempt < 2 && (error.class == 4 || error.class == 7) => {
-                context.output.event(
-                    "warning",
-                    format!("download interrupted; retry {}/3", attempt + 2),
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        // A server may ignore Range or invalidate If-Range. Never append that
-        // response to the old prefix; restart both the request and cache at zero.
-        if offset > 0 && !valid_range(&response, offset, source.dataset.size) {
-            if let Some(entry) = &mut entry {
-                entry.reset()?;
-            }
-            offset = 0;
-            response = match request(0, &entry) {
-                Ok(response) => response,
-                Err(error) if attempt < 2 && (error.class == 4 || error.class == 7) => {
-                    context.output.event(
-                        "warning",
-                        format!("download interrupted; retry {}/3", attempt + 2),
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-        }
-        if (offset == 0 && response.status() != 200) || (offset > 0 && response.status() != 206) {
-            return Err(Error::new(
-                4,
-                "cloud-unreachable",
-                format!("reference download returned HTTP {}", response.status()),
-            ));
-        }
-        if let Some(entry) = &mut entry {
-            entry.meta.validator = response
-                .headers()
-                .get("ETag")
-                .or_else(|| response.headers().get("Last-Modified"))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            if let Err(error) = entry.save() {
-                context
-                    .output
-                    .event("warning", format!("cannot save resume metadata: {error}"));
-            }
-        }
-        let prefix = entry
-            .as_ref()
-            .filter(|_| offset > 0)
-            .map(|entry| entry.prefix())
-            .transpose()?;
-        let writer = entry
-            .map(|entry| entry.writer(context.output.clone()))
-            .transpose()?;
-        let last_upload = Rc::new(Cell::new(None));
-        let mut reader = Reader {
-            last_upload: last_upload.clone(),
-            prefix: prefix.map(|file| file.take(offset)),
-            network: response.body_mut().as_reader(),
-            writer,
-            hash: Sha256::new(),
-            read: 0,
-            failed: false,
-            expected: source.dataset.size,
-        };
+        let mut reader = Reader::new(&agent, source, &context.output, entry)?;
+        let last_upload = reader.last_upload.clone();
         let mut progress = Progress::new(context, source.dataset.slot.expect("reference slot"));
         let result = connection.client.upload_dataset(
             &source.dataset,
@@ -383,22 +304,29 @@ fn install(
         let valid = reader.read == source.dataset.size
             && reader.hash.clone().finalize().as_slice() == source.dataset.sha256.unwrap();
         let failed = reader.failed;
-        if let Some(writer) = reader.writer.take() {
-            let path = writer.path.clone();
-            if let Some(entry) = writer.finish(valid) {
-                if valid {
-                    if let Err(error) = cache::complete(entry, &source.hash) {
-                        context.output.event(
-                            "warning",
-                            format!("could not retain complete cache entry: {error}"),
-                        );
-                    }
-                } else if reader.read == source.dataset.size {
-                    drop(entry);
-                    let _ = fs::remove_file(&path);
-                }
-            } else {
+        let entry = if let Some(writer) = reader.writer.take() {
+            let entry = writer.finish(valid);
+            if entry.is_none() {
                 directory = None;
+            }
+            entry
+        } else {
+            // Replay may finish or fail before any HTTP request starts. The
+            // reader still owns the entry when no append worker was needed.
+            reader.entry.take()
+        };
+        if let Some(entry) = entry {
+            if valid {
+                if let Err(error) = cache::complete(entry, &source.hash) {
+                    context.output.event(
+                        "warning",
+                        format!("could not retain complete cache entry: {error}"),
+                    );
+                }
+            } else if reader.read == source.dataset.size {
+                let path = entry.path.clone();
+                drop(entry);
+                let _ = fs::remove_file(&path);
             }
         }
         match result {
@@ -411,7 +339,7 @@ fn install(
                 }
                 return Ok(());
             }
-            Err(darkbio_connect::Error::Integrity(_)) if offset > 0 && attempt < 2 => {
+            Err(darkbio_connect::Error::Integrity(_)) if reader.offset > 0 && attempt < 2 => {
                 context.output.event(
                     "warning",
                     "cached prefix failed verification; restarting download",
@@ -422,13 +350,13 @@ fn install(
                 format!("download interrupted; retry {}/3", attempt + 2),
             ),
             Err(error) if failed => {
-                return Err(match error {
+                return Err(reader.error.unwrap_or_else(|| match error {
                     darkbio_connect::Error::Timeout => error.into(),
                     darkbio_connect::Error::DatasetRead(error) => http::read_error(error),
                     error => error.into(),
-                });
+                }));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(reader.error.unwrap_or_else(|| error.into())),
         }
     }
     unreachable!("last attempt returns its result")
@@ -462,13 +390,24 @@ fn valid_range(response: &ureq::http::Response<ureq::Body>, offset: u64, size: u
 
 /// Replays a retained prefix, then tees network bytes into a best-effort cache.
 /// Hashes both sources together and marks network failures for download retry policy.
-struct Reader<R> {
-    /// Latest upload acknowledgement, shared with callbacks on the same thread.
+/// The cache lock stays held across replay, response validation and queued writes.
+struct Reader<'a> {
+    /// HTTP client whose first request waits until the prefix has been read.
+    agent: &'a ureq::Agent,
+    /// Advertised URL, length and digest for this attempt.
+    source: &'a Source,
+    /// Warning sink for best-effort cache persistence.
+    output: &'a Output,
+    /// Locked cache entry, moved to the writer once the response is validated.
+    entry: Option<cache::Entry>,
+    /// Retained byte count used for the range request after replay.
+    offset: u64,
+    /// Session start or latest upload acknowledgement, shared with progress callbacks.
     last_upload: Rc<Cell<Option<Instant>>>,
     /// Retained prefix with an independent cursor capped at the resume offset.
     prefix: Option<io::Take<File>>,
-    /// HTTP body beginning at the requested resume offset.
-    network: R,
+    /// HTTP body opened only when the reader reaches the network suffix.
+    network: Option<ureq::BodyReader<'static>>,
     /// Optional append worker receiving only newly downloaded bytes.
     writer: Option<cache::Writer>,
     /// Digest of all bytes replayed or downloaded in this attempt.
@@ -477,10 +416,109 @@ struct Reader<R> {
     read: u64,
     /// Whether a source failure permits another download attempt.
     failed: bool,
-    /// Full advertised length, used to detect premature network EOF.
-    expected: u64,
+    /// Request or cache setup error preserved through connect's reader boundary.
+    error: Option<Error>,
 }
-impl<R: Read> Read for Reader<R> {
+impl<'a> Reader<'a> {
+    /// Opens only the cached prefix. A live response must not wait through replay.
+    /// Retains the cache lock even if the reader never reaches the network.
+    fn new(
+        agent: &'a ureq::Agent,
+        source: &'a Source,
+        output: &'a Output,
+        entry: Option<cache::Entry>,
+    ) -> io::Result<Self> {
+        let offset = entry
+            .as_ref()
+            .map(|entry| entry.len())
+            .transpose()?
+            .unwrap_or(0);
+        let prefix = entry
+            .as_ref()
+            .filter(|_| offset > 0)
+            .map(|entry| entry.prefix().map(|file| file.take(offset)))
+            .transpose()?;
+        Ok(Self {
+            agent,
+            source,
+            output,
+            entry,
+            offset,
+            last_upload: Rc::new(Cell::new(None)),
+            prefix,
+            network: None,
+            writer: None,
+            hash: Sha256::new(),
+            read: 0,
+            failed: false,
+            error: None,
+        })
+    }
+
+    /// Validates the response before accepting any bytes or starting the cache writer.
+    /// A refused range resets the cache and fails this attempt. Request failures
+    /// permit retry; HTTP status failures on a full download are returned directly.
+    fn open(&mut self) -> Result<(), Error> {
+        let mut request = self
+            .agent
+            .get(&self.source.url)
+            .header("Accept-Encoding", "identity");
+        if self.offset > 0 {
+            request = request.header("Range", format!("bytes={}-", self.offset));
+            if let Some(validator) = self
+                .entry
+                .as_ref()
+                .and_then(|entry| entry.meta.validator.as_ref())
+            {
+                request = request.header("If-Range", validator);
+            }
+        }
+        let response = request.call().map_err(|error| {
+            self.failed = true;
+            http::error(error)
+        })?;
+        if self.offset > 0 && !valid_range(&response, self.offset, self.source.dataset.size) {
+            // The Ark already has the prefix. Reset the cache and let connect
+            // cancel this upload before the next attempt starts from zero.
+            if let Some(entry) = &mut self.entry {
+                entry.reset()?;
+            }
+            self.failed = true;
+            return Err(Error::new(
+                4,
+                "cloud-unreachable",
+                "server did not accept the download resume",
+            ));
+        }
+        if self.offset == 0 && response.status() != 200 {
+            return Err(Error::new(
+                4,
+                "cloud-unreachable",
+                format!("reference download returned HTTP {}", response.status()),
+            ));
+        }
+        if let Some(entry) = &mut self.entry {
+            entry.meta.validator = response
+                .headers()
+                .get("ETag")
+                .or_else(|| response.headers().get("Last-Modified"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            if let Err(error) = entry.save() {
+                self.output
+                    .event("warning", format!("cannot save resume metadata: {error}"));
+            }
+        }
+        self.writer = self
+            .entry
+            .take()
+            .map(|entry| entry.writer(self.output.clone()))
+            .transpose()?;
+        self.network = Some(response.into_body().into_reader());
+        Ok(())
+    }
+}
+impl Read for Reader<'_> {
     /// Serves prefix bytes first, then records and caches network bytes.
     /// After a network read, detects an upload window already lost to a source stall.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -496,14 +534,28 @@ impl<R: Read> Read for Reader<R> {
             }
             self.prefix = None;
         }
-        let count = match self.network.read(buffer) {
+        if self.network.is_none() {
+            // A complete partial file may have survived interruption just before
+            // publication. Verify it without requesting a range beyond EOF.
+            if self.read == self.source.dataset.size {
+                return Ok(0);
+            }
+            if let Err(error) = self.open() {
+                // Connect sees a source failure. Keep the original CLI error so
+                // HTTP and cache setup failures retain their exit classification.
+                let failure = io::Error::other(error.to_string());
+                self.error = Some(error);
+                return Err(failure);
+            }
+        }
+        let count = match self.network.as_mut().expect("opened response").read(buffer) {
             Ok(count) => count,
             Err(error) => {
                 self.failed = true;
                 return Err(http::normalize_read_error(error));
             }
         };
-        if count == 0 && self.read < self.expected {
+        if count == 0 && self.read < self.source.dataset.size {
             self.failed = true;
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -533,7 +585,107 @@ impl<R: Read> Read for Reader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use darkbio_connect::schema::{SlotDownload, SlotOrigin, SlotState};
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    /// Keeps parallel fixtures in separate temporary directories.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Removes a test's cache files on drop.
+    struct Directory(PathBuf);
+    impl Directory {
+        /// Creates an empty cache outside the user's real cache directory.
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ark-reference-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Keeps expected cache diagnostics out of test output.
+    fn output() -> Output {
+        Output::new(&crate::args::Cli::parse_from(["ark", "--quiet"]).options)
+    }
+
+    /// Allows loopback HTTP while retaining production status handling.
+    fn agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .into()
+    }
+
+    /// Builds a reference offer with the exact expected length and digest.
+    fn source(url: String, bytes: &[u8]) -> Source {
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        Source {
+            dataset: Dataset {
+                name: "reference.gz".into(),
+                size: bytes.len() as u64,
+                slot: Some(4),
+                sha256: Some(hash),
+            },
+            url,
+            hash: hex::encode(hash),
+        }
+    }
+
+    /// Leaves only committed chunks and their validator for a fresh reader.
+    fn interrupted(directory: &Path, source: &Source, bytes: &[u8]) {
+        let mut entry =
+            cache::Entry::open(directory, &source.hash, &source.url, source.dataset.size).unwrap();
+        entry.meta.validator = Some("\"reference-v1\"".into());
+        entry.save().unwrap();
+        let mut writer = entry.writer(output()).unwrap();
+        writer.append(bytes);
+        drop(writer.finish(false).unwrap());
+    }
+
+    /// Serves scripted responses and records headers for resume assertions.
+    fn serve(
+        listener: TcpListener,
+        replies: Vec<(u16, String, Vec<u8>)>,
+    ) -> thread::JoinHandle<Vec<String>> {
+        listener.set_nonblocking(false).unwrap();
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, headers, body) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nETag: \"reference-v1\"\r\nConnection: close\r\n{headers}\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+                requests.push(String::from_utf8(request).unwrap().to_ascii_lowercase());
+            }
+            requests
+        })
+    }
 
     fn reference(id: i32, deps: &[i32], filled: bool) -> SlotStatus {
         SlotStatus {
@@ -612,16 +764,11 @@ mod tests {
 
     #[test]
     fn truncated_sources_are_transport_failures() {
-        let mut reader = Reader {
-            last_upload: Rc::new(Cell::new(None)),
-            prefix: None,
-            network: [1u8, 2].as_slice(),
-            writer: None,
-            hash: Sha256::new(),
-            read: 0,
-            expected: 3,
-            failed: false,
-        };
+        let agent = http::agent(Duration::from_secs(1), 0);
+        let output = output();
+        let source = source("https://example.com/reference.gz".into(), &[1, 2, 3]);
+        let mut reader = Reader::new(&agent, &source, &output, None).unwrap();
+        reader.network = Some(ureq::Body::builder().data([1, 2]).into_reader());
         let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert!(reader.failed);
@@ -652,20 +799,165 @@ mod tests {
     }
     #[test]
     fn download_stall_tracks_the_upload_window() {
-        let mut reader = Reader {
-            last_upload: Rc::new(Cell::new(Some(Instant::now() - Duration::from_secs(31)))),
-            prefix: None,
-            network: [42].as_slice(),
-            writer: None,
-            hash: Sha256::new(),
-            read: 0,
-            expected: 1,
-            failed: false,
-        };
+        let agent = http::agent(Duration::from_secs(1), 0);
+        let output = output();
+        let source = source("https://example.com/reference.gz".into(), &[42]);
+        let mut reader = Reader::new(&agent, &source, &output, None).unwrap();
+        reader
+            .last_upload
+            .set(Some(Instant::now() - Duration::from_secs(31)));
+        reader.network = Some(ureq::Body::builder().data([42]).into_reader());
         assert_eq!(
             reader.read(&mut [0]).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
         assert!(reader.failed);
+    }
+
+    #[test]
+    fn restarted_download_opens_http_only_after_cache_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let bytes = [vec![42; cache::CHUNK], b"remaining bytes".to_vec()].concat();
+        let source = source(
+            format!("http://{}/reference.gz", listener.local_addr().unwrap()),
+            &bytes,
+        );
+        let directory = Directory::new();
+        // Keep one committed chunk and discard an interrupted tail. The next
+        // reader has only the files left by the previous invocation.
+        interrupted(&directory.0, &source, &bytes[..cache::CHUNK + 3]);
+        let entry =
+            cache::Entry::open(&directory.0, &source.hash, &source.url, source.dataset.size)
+                .unwrap();
+        let agent = agent();
+        let output = output();
+        let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+        let mut received = vec![0; cache::CHUNK];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(received, bytes[..cache::CHUNK]);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let server = serve(
+            listener,
+            vec![(
+                206,
+                format!(
+                    "Content-Range: bytes {}-{}/{}\r\n",
+                    cache::CHUNK,
+                    bytes.len() - 1,
+                    bytes.len()
+                ),
+                bytes[cache::CHUNK..].to_vec(),
+            )],
+        );
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, bytes);
+        assert_eq!(
+            reader.hash.clone().finalize().as_slice(),
+            source.dataset.sha256.unwrap()
+        );
+        assert!(!reader.failed);
+        cache::complete(
+            reader.writer.take().unwrap().finish(true).unwrap(),
+            &source.hash,
+        )
+        .unwrap();
+        assert_eq!(fs::read(directory.0.join(&source.hash)).unwrap(), bytes);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(&format!("\r\nrange: bytes={}-\r\n", cache::CHUNK)));
+        assert!(requests[0].contains("\r\nif-range: \"reference-v1\"\r\n"));
+    }
+
+    #[test]
+    fn refused_resume_discards_the_prefix_before_retry() {
+        for status in [200, 206, 416] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let bytes = [vec![42; cache::CHUNK], b"remaining bytes".to_vec()].concat();
+            let source = source(
+                format!("http://{}/reference.gz", listener.local_addr().unwrap()),
+                &bytes,
+            );
+            let directory = Directory::new();
+            interrupted(&directory.0, &source, &bytes[..cache::CHUNK]);
+            let server = serve(
+                listener,
+                vec![
+                    (
+                        status,
+                        "Content-Range: bytes 0-4/5\r\n".into(),
+                        b"wrong".to_vec(),
+                    ),
+                    (200, String::new(), bytes.clone()),
+                ],
+            );
+            let agent = agent();
+            let output = output();
+            {
+                let entry = cache::Entry::open(
+                    &directory.0,
+                    &source.hash,
+                    &source.url,
+                    source.dataset.size,
+                )
+                .unwrap();
+                let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+                let mut received = Vec::new();
+                assert!(reader.read_to_end(&mut received).is_err());
+                assert_eq!(received, bytes[..cache::CHUNK]);
+                assert!(reader.failed);
+                assert!(reader.writer.is_none());
+            }
+            let entry =
+                cache::Entry::open(&directory.0, &source.hash, &source.url, source.dataset.size)
+                    .unwrap();
+            assert_eq!(entry.len().unwrap(), 0);
+            let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).unwrap();
+            assert_eq!(received, bytes);
+            assert_eq!(
+                reader.hash.finalize().as_slice(),
+                source.dataset.sha256.unwrap()
+            );
+            cache::complete(
+                reader.writer.take().unwrap().finish(true).unwrap(),
+                &source.hash,
+            )
+            .unwrap();
+            assert_eq!(fs::read(directory.0.join(&source.hash)).unwrap(), bytes);
+            let requests = server.join().unwrap();
+            assert!(requests[0].contains("\r\nrange:"));
+            assert!(!requests[1].contains("\r\nrange:"));
+            assert!(!requests[1].contains("\r\nif-range:"));
+        }
+    }
+
+    #[test]
+    fn complete_partial_file_needs_no_http_request() {
+        let bytes = vec![42; cache::CHUNK];
+        let source = source("http://127.0.0.1:1/reference.gz".into(), &bytes);
+        let directory = Directory::new();
+        interrupted(&directory.0, &source, &bytes);
+        let entry =
+            cache::Entry::open(&directory.0, &source.hash, &source.url, source.dataset.size)
+                .unwrap();
+        let agent = agent();
+        let output = output();
+        let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, bytes);
+        assert_eq!(
+            reader.hash.finalize().as_slice(),
+            source.dataset.sha256.unwrap()
+        );
+        assert!(reader.network.is_none());
+        cache::complete(reader.entry.take().unwrap(), &source.hash).unwrap();
+        assert_eq!(fs::read(directory.0.join(&source.hash)).unwrap(), bytes);
     }
 }

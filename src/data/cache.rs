@@ -131,7 +131,6 @@ impl Entry {
         let failed = Arc::new(AtomicBool::new(false));
         let fault = failed.clone();
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(2);
-        let path = self.path.clone();
         let worker = std::thread::Builder::new()
             .name("ark-cache".into())
             .spawn(move || {
@@ -161,7 +160,6 @@ impl Entry {
             worker: Some(worker),
             buffer: Vec::with_capacity(CHUNK),
             failed,
-            path,
         })
     }
 }
@@ -186,8 +184,6 @@ pub(super) struct Writer {
     buffer: Vec<u8>,
     /// Worker failure signal allowing subsequent cache appends to be skipped.
     failed: Arc<AtomicBool>,
-    /// Partial path retained for cleanup after the worker has been joined.
-    pub path: PathBuf,
 }
 impl Writer {
     /// Accumulates network bytes and queues full chunks, waiting if the worker is behind.
