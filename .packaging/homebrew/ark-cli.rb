@@ -1,11 +1,12 @@
 # Release template filled with the version and downloaded artifact digests.
-class ArkCli < Formula
+class @CLASS@ < Formula
   desc "Command line interface to Ark enclaves"
   homepage "https://dark.bio"
   version "@VERSION@"
   license "BSD-3-Clause"
 
   depends_on :macos
+  conflicts_with "@CONFLICT@", because: "both install the ark command"
 
   on_arm do
     url "https://github.com/dark-bio/cli/releases/download/v@VERSION@/ark-@VERSION@-macos-arm64", using: :nounzip

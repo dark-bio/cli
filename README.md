@@ -19,22 +19,28 @@ What this tool does:
 Homebrew on macOS:
 
 ```sh
-brew install dark-bio/tap/ark-cli
+# Pick one or the other
+brew install dark-bio/tap/ark-cli      # Stable releases
+brew install dark-bio/tap/ark-cli-dev  # Develop releases
 ```
 
-The shell installer on macOS and Linux places the executable in `~/.local/bin`:
+Shell installer on Linux:
 
 ```sh
 curl -fsSL https://github.com/dark-bio/cli/releases/latest/download/ark-installer.sh | sh
 ```
 
-Plain executables for macOS, Linux and Windows, on `arm64` and `amd64`, are attached to every [GitHub release](https://github.com/dark-bio/cli/releases). With Rust 1.95 or later you can also build it yourself:
+With Rust, you can build it yourself:
 
 ```sh
 cargo install darkbio-ark --locked
 ```
 
-On Linux, grant your user access to the USB device once, then reconnect the Ark:
+Plain executables are attached to every [GitHub release](https://github.com/dark-bio/cli/releases).
+
+---
+
+*Note, on Linux you need to grant your user access to the USB device once:*
 
 ```sh
 echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="10f1", TAG+="uaccess"' \

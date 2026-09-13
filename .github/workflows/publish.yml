@@ -2,7 +2,12 @@ name: Publish
 
 on:
   push:
+    branches: [ 'main' ]
     tags: [ 'v*' ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,6 +16,48 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      formula: ${{ steps.version.outputs.formula }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select the release version
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "darkbio-ark") | .version')
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "error: tag $GITHUB_REF_NAME does not match Cargo version $version" >&2
+              exit 1
+            fi
+          else
+            if git show-ref --verify --quiet "refs/tags/v$version"; then
+              echo "error: v$version is already tagged; bump the version in Cargo.toml before building develop" >&2
+              exit 1
+            fi
+            version="$version-dev.$GITHUB_RUN_NUMBER"
+            if git show-ref --verify --quiet "refs/tags/v$version"; then
+              echo "error: develop tag v$version already exists" >&2
+              exit 1
+            fi
+          fi
+          prerelease=false
+          formula=ark-cli
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+            formula=ark-cli-dev
+          fi
+          printf 'version=%s\ntag=v%s\nprerelease=%s\nformula=%s\n' \
+            "$version" "$version" "$prerelease" "$formula" >> "$GITHUB_OUTPUT"
+
   tests:
     uses: ./.github/workflows/ci.yml
 
@@ -18,8 +65,11 @@ jobs:
     uses: ./.github/workflows/audit.yml
 
   build:
+    needs: [ version ]
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    env:
+      ARK_VERSION: ${{ needs.version.outputs.version }}
     strategy:
       matrix:
         include:
@@ -47,14 +97,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check the release version
-        id: version
+      - name: Set the build version
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          cargo metadata --no-deps --format-version 1 --locked | jq -e --arg version "$version" \
-            '[.packages[] | select(.name == "darkbio-ark") | .version] == [$version]'
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          for file in Cargo.toml Cargo.lock; do
+            awk -v version="$ARK_VERSION" '
+              /^name = "darkbio-ark"$/ { package = 1 }
+              package && /^version = / {
+                $0 = "version = \"" version "\""
+                package = 0
+                changed++
+              }
+              { print }
+              END { if (changed != 1) exit 1 }
+            ' "$file" > "$file.release"
+            mv "$file.release" "$file"
+          done
 
       - name: Build
         run: cargo build --release --locked --bin ark --target ${{ matrix.target }}
@@ -67,22 +125,27 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/ark${{ matrix.suffix }} release/ark-${{ steps.version.outputs.version }}-${{ matrix.platform }}${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/ark${{ matrix.suffix }} "release/ark-$ARK_VERSION-${{ matrix.platform }}${{ matrix.suffix }}"
 
       - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.platform }}
-          path: release/ark-${{ steps.version.outputs.version }}-${{ matrix.platform }}${{ matrix.suffix }}
+          path: release/ark-${{ env.ARK_VERSION }}-${{ matrix.platform }}${{ matrix.suffix }}
           if-no-files-found: error
+          overwrite: true
 
   prepare:
-    needs: [ build, audit ]
+    needs: [ version, build, audit ]
     runs-on: ubuntu-latest
+    env:
+      ARK_VERSION: ${{ needs.version.outputs.version }}
+      ARK_FORMULA: ${{ needs.version.outputs.formula }}
 
     steps:
       - uses: actions/checkout@v7
 
       - name: Check crate packaging
+        if: needs.version.outputs.prerelease == 'false'
         run: cargo publish --dry-run --locked
 
       - uses: actions/download-artifact@v8
@@ -98,26 +161,38 @@ jobs:
 
       - name: Generate release metadata
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$ARK_VERSION"
           arm64=$(sha256sum "release/ark-$version-macos-arm64" | cut -d ' ' -f 1)
           amd64=$(sha256sum "release/ark-$version-macos-amd64" | cut -d ' ' -f 1)
           licenses=$(sha256sum release/LICENSES.txt | cut -d ' ' -f 1)
           mkdir -p metadata
           sed "s/@VERSION@/$version/g" .packaging/shell/install.sh > metadata/ark-installer.sh
           sh -n metadata/ark-installer.sh
+          class=ArkCli
+          conflict=ark-cli-dev
+          if [[ "$ARK_FORMULA" == ark-cli-dev ]]; then
+            class=ArkCliDev
+            conflict=ark-cli
+          fi
           sed -e "s/@VERSION@/$version/g" -e "s/@ARM64_SHA256@/$arm64/g" -e "s/@AMD64_SHA256@/$amd64/g" \
-            -e "s/@LICENSES_SHA256@/$licenses/g" .packaging/homebrew/ark-cli.rb > metadata/ark-cli.rb
-          ruby -c metadata/ark-cli.rb
-          cargo run --locked --example winget -- "$version" "release/ark-$version-windows-amd64.exe" --output metadata/winget
+            -e "s/@LICENSES_SHA256@/$licenses/g" -e "s/@CLASS@/$class/g" -e "s/@CONFLICT@/$conflict/g" \
+            .packaging/homebrew/ark-cli.rb > "metadata/$ARK_FORMULA.rb"
+          ruby -c "metadata/$ARK_FORMULA.rb"
+
+      - name: Generate winget manifests
+        if: needs.version.outputs.prerelease == 'false'
+        run: cargo run --locked --example winget -- "$ARK_VERSION" "release/ark-$ARK_VERSION-windows-amd64.exe" --output metadata/winget
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-metadata
           path: metadata/
           if-no-files-found: error
+          overwrite: true
 
   publish:
-    needs: [ tests, prepare ]
+    needs: [ version, tests, prepare ]
+    if: github.ref_type == 'tag' && needs.version.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
 
     permissions:
@@ -135,8 +210,11 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   release:
-    needs: [ tests, prepare ]
+    needs: [ version, tests, prepare ]
     runs-on: ubuntu-latest
+    env:
+      ARK_TAG: ${{ needs.version.outputs.tag }}
+      ARK_PRERELEASE: ${{ needs.version.outputs.prerelease }}
 
     permissions:
       contents: write
@@ -165,17 +243,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           flags=()
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            flags+=(--prerelease)
+          if [[ "$ARK_PRERELEASE" == true ]]; then
+            flags+=(--prerelease --latest=false)
           fi
-          gh release create "$GITHUB_REF_NAME" release/* metadata/ark-installer.sh --verify-tag --generate-notes \
-            --title "Ark CLI $GITHUB_REF_NAME" "${flags[@]}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            flags+=(--verify-tag)
+          fi
+          gh release create "$ARK_TAG" release/* metadata/ark-installer.sh metadata/*.rb \
+            --target "$GITHUB_SHA" --generate-notes --title "Ark CLI $ARK_TAG" "${flags[@]}"
 
   homebrew:
-    needs: [ release ]
-    if: ${{ !contains(github.ref_name, '-') }}
+    needs: [ version, release ]
     runs-on: ubuntu-latest
     environment: github-action-releaser
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
+    env:
+      ARK_TAG: ${{ needs.version.outputs.tag }}
+      ARK_FORMULA: ${{ needs.version.outputs.formula }}
 
     steps:
       - uses: actions/checkout@v7
@@ -184,27 +270,39 @@ jobs:
           # Write deploy key on the tap repository.
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: release-metadata
-          path: ${{ runner.temp }}/metadata
+      - name: Download the published formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "$ARK_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ARK_FORMULA.rb" --dir "$RUNNER_TEMP/metadata"
 
       - name: Commit the formula
         run: |
           mkdir -p Formula
-          cp "$RUNNER_TEMP/metadata/ark-cli.rb" Formula/ark-cli.rb
+          # An older run may finish or be retried after a newer release.
+          if [[ -f "Formula/$ARK_FORMULA.rb" ]]; then
+            newer=$(ruby -r rubygems -e '
+              versions = ARGV.map { |file| Gem::Version.new(File.read(file).match(/^  version "([^"]+)"$/)[1]) }
+              puts versions[0] > versions[1]
+            ' "$RUNNER_TEMP/metadata/$ARK_FORMULA.rb" "Formula/$ARK_FORMULA.rb")
+            if [[ "$newer" != true ]]; then
+              echo "$ARK_FORMULA is already at this version or newer"
+              exit 0
+            fi
+          fi
+          cp "$RUNNER_TEMP/metadata/$ARK_FORMULA.rb" "Formula/$ARK_FORMULA.rb"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Formula/ark-cli.rb
+          git add "Formula/$ARK_FORMULA.rb"
           if ! git diff --cached --quiet; then
-            git commit -m "ark-cli ${GITHUB_REF_NAME#v}"
+            git commit -m "$ARK_FORMULA ${ARK_TAG#v}"
+            git pull --rebase
             git push
           fi
 
   winget:
-    needs: [ release ]
+    needs: [ version, release ]
     # Enable in the follow-up after configuring the submission bot's OAuth token.
-    if: ${{ false && !contains(github.ref_name, '-') }}
+    if: ${{ false && needs.version.outputs.prerelease == 'false' }}
     runs-on: windows-latest
 
     steps:

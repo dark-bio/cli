@@ -2,8 +2,6 @@ name: audit
 
 on:
   workflow_call:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
   schedule:
@@ -45,8 +43,9 @@ jobs:
         run: cargo about generate --locked --fail --config .packaging/licenses/about.toml .packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"
 
       - uses: actions/upload-artifact@v7
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push'
         with:
           name: licenses
           path: ${{ runner.temp }}/LICENSES.txt
           if-no-files-found: error
+          overwrite: true
