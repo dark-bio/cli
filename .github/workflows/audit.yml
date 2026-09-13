@@ -40,7 +40,7 @@ jobs:
         run: cargo install cargo-about --locked --features cli
 
       - name: Generate dependency notices
-        run: cargo about generate --locked --fail --config .packaging/licenses/about.toml .packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"
+        run: cargo about generate --locked --fail --config .github/packaging/licenses/about.toml .github/packaging/licenses/notices.hbs --output-file "$RUNNER_TEMP/LICENSES.txt"
 
       - uses: actions/upload-artifact@v7
         if: github.event_name == 'push'

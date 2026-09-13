@@ -166,7 +166,7 @@ jobs:
           amd64=$(sha256sum "release/ark-$version-macos-amd64" | cut -d ' ' -f 1)
           licenses=$(sha256sum release/LICENSES.txt | cut -d ' ' -f 1)
           mkdir -p metadata
-          sed "s/@VERSION@/$version/g" .packaging/shell/install.sh > metadata/ark-installer.sh
+          sed "s/@VERSION@/$version/g" .github/packaging/shell/install.sh > metadata/ark-installer.sh
           sh -n metadata/ark-installer.sh
           class=ArkCli
           conflict=ark-cli-dev
@@ -176,7 +176,7 @@ jobs:
           fi
           sed -e "s/@VERSION@/$version/g" -e "s/@ARM64_SHA256@/$arm64/g" -e "s/@AMD64_SHA256@/$amd64/g" \
             -e "s/@LICENSES_SHA256@/$licenses/g" -e "s/@CLASS@/$class/g" -e "s/@CONFLICT@/$conflict/g" \
-            .packaging/homebrew/ark-cli.rb > "metadata/$ARK_FORMULA.rb"
+            .github/packaging/homebrew/ark-cli.rb > "metadata/$ARK_FORMULA.rb"
           ruby -c "metadata/$ARK_FORMULA.rb"
 
       - name: Generate winget manifests
