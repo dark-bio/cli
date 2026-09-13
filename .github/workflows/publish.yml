@@ -249,7 +249,7 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
             flags+=(--verify-tag)
           fi
-          gh release create "$ARK_TAG" release/* metadata/ark-installer.sh metadata/*.rb \
+          gh release create "$ARK_TAG" release/* metadata/ark-installer.sh \
             --target "$GITHUB_SHA" --generate-notes --title "Ark CLI $ARK_TAG" "${flags[@]}"
 
   homebrew:
@@ -270,10 +270,10 @@ jobs:
           # Write deploy key on the tap repository.
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
 
-      - name: Download the published formula
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download "$ARK_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ARK_FORMULA.rb" --dir "$RUNNER_TEMP/metadata"
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/metadata
 
       - name: Commit the formula
         run: |
