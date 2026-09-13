@@ -13,7 +13,7 @@ use crate::{
     args::{self, slot_name},
     context::{Context, open_file},
     error::Error,
-    progress::{Processing, Transfer},
+    progress::{Processing, Transfer, Update},
 };
 use darkbio_connect::{
     Dataset, UploadProgress,
@@ -271,6 +271,8 @@ pub(crate) struct Progress<'a> {
     slot: i32,
     /// Rate history beginning at the first acknowledged upload observation.
     transfer: Transfer,
+    /// Last upload row, retained to align it when processing phases arrive.
+    last_upload: Option<Update>,
     /// Independent rate history for each device processing step.
     processing: Processing,
     /// Most recent byte count acknowledged by the Ark.
@@ -285,6 +287,7 @@ impl<'a> Progress<'a> {
             context,
             slot,
             transfer: Transfer::new(context.output.human()),
+            last_upload: None,
             processing: Processing::new(context.output.human()),
             uploaded: 0,
             phases: Vec::new(),
@@ -325,15 +328,25 @@ impl<'a> Progress<'a> {
                 self.uploaded = uploaded;
                 if let Some(line) = self.transfer.update(uploaded, total) {
                     self.context.output.progress(&line);
+                    if self.context.output.human() {
+                        self.last_upload = Some(line);
+                    }
                 }
             }
             UploadProgress::Processing(status) => {
+                let first = self.phases.is_empty();
                 self.phases = status
                     .phases
                     .iter()
                     .map(|phase| phase.name.clone())
                     .collect();
-                if let Some(line) = self.processing.update(&status) {
+                for mut line in self.processing.update(&status) {
+                    if let Some(upload) = &mut self.last_upload {
+                        line.align(upload);
+                        if first {
+                            self.context.output.progress(upload);
+                        }
+                    }
                     self.context.output.progress(&line);
                 }
             }

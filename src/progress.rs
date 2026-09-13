@@ -28,36 +28,76 @@ pub(crate) struct Update {
     pub text: String,
     /// Human stage label and live-line identity.
     pub stage: String,
+    /// Label column shared by the known phases, measured in terminal cells.
+    pub stage_width: usize,
     /// Completion percentage for this stage, not for the entire workflow.
     pub percent: u64,
     /// Human facts in discard order; the leftmost is dropped first on narrow terminals.
     pub details: Vec<String>,
+    /// Shared fact column widths, allowing narrower layouts without moving the bars.
+    pub detail_widths: Vec<usize>,
 }
 
 impl Update {
+    /// Shares label and fact columns with another stage of the same operation.
+    pub(super) fn align(&mut self, other: &mut Self) {
+        let stage_width = self.stage_width.max(other.stage_width);
+        let mut detail_widths = Vec::new();
+        for update in [&*self, &*other] {
+            if update.detail_widths.is_empty() {
+                for index in 0..update.details.len() {
+                    detail_widths.push(console::measure_text_width(
+                        &update.details[index..].join(" - "),
+                    ));
+                }
+            } else {
+                detail_widths.extend_from_slice(&update.detail_widths);
+            }
+        }
+        detail_widths.sort_unstable();
+        detail_widths.dedup();
+        self.stage_width = stage_width;
+        other.stage_width = stage_width;
+        self.detail_widths = detail_widths.clone();
+        other.detail_widths = detail_widths;
+    }
+
     /// Fits a stage, progress bar and optional facts into one terminal line.
     pub fn render(&self, theme: &Theme) -> String {
         let width = theme.width.saturating_sub(1);
-        let stage = theme.truncate(&self.stage, (width / 2).max(8));
+        let stage_width = self.stage_width.min((width / 2).max(8));
+        let stage = theme.truncate(&self.stage, stage_width);
+        let stage = format!(
+            "{stage}{}",
+            " ".repeat(stage_width.saturating_sub(console::measure_text_width(&stage)))
+        );
         let prefix = theme.paint(Role::Muted, "progress:");
         let percent = format!("{:3} %", self.percent);
+        let fixed = console::measure_text_width(&format!("progress: {stage} {percent}"));
+        let reserve = if theme.width >= 60 { 9 } else { 0 };
+        let available = width.saturating_sub(fixed + reserve);
+        let shared = (!self.detail_widths.is_empty()).then(|| {
+            self.detail_widths
+                .iter()
+                .map(|width| width + console::measure_text_width(&theme.separator()))
+                .filter(|width| *width <= available)
+                .max()
+                .unwrap_or(0)
+        });
         let mut details = self.details.clone();
-        let facts = loop {
+        let (facts, facts_width) = loop {
             let facts = if details.is_empty() {
                 String::new()
             } else {
                 format!("{}{}", theme.separator(), details.join(&theme.separator()))
             };
-            let reserve = if width >= 60 { 9 } else { 0 };
-            if console::measure_text_width(&format!("progress: {stage} {percent}{facts}")) + reserve
-                <= width
-                || details.is_empty()
-            {
-                break facts;
+            let facts_width = console::measure_text_width(&facts);
+            if facts_width <= shared.unwrap_or(available) || details.is_empty() {
+                break (facts, shared.unwrap_or(facts_width));
             }
             details.remove(0);
         };
-        let used = console::measure_text_width(&format!("progress: {stage} {percent}{facts}"));
+        let used = fixed + facts_width;
         let size = width.saturating_sub(used + 1).min(40);
         let bar = if size >= 8 {
             let filled = (size as u64 * self.percent.min(100) / 100) as usize;
@@ -130,6 +170,7 @@ impl Transfer {
         Some(Update {
             text,
             stage: "uploading".into(),
+            stage_width: "uploading".len(),
             percent,
             details: vec![
                 format!(
@@ -140,6 +181,7 @@ impl Transfer {
                 speed,
                 human_eta(total.saturating_sub(uploaded), rate),
             ],
+            detail_widths: Vec::new(),
         })
     }
 }
@@ -147,7 +189,8 @@ impl Transfer {
 /// Progress percentages belong to individual steps. Device timestamps identify
 /// a restarted step; elapsed time is measured by the host's monotonic clock.
 pub(super) struct Processing {
-    phase: Option<(u64, u64, u64)>, // Processing start, step number and step start
+    /// Last report, retained to finish a phase when the next report advances past it.
+    previous: Option<SlotUploadProcessResponse>,
     /// Basis-point progress samples for the current processing step only.
     rate: Rate,
     /// Reporting cadence reset whenever a step starts or restarts.
@@ -158,30 +201,58 @@ impl Processing {
     /// Starts without a step identity or estimate; the first report establishes both.
     pub(super) fn new(human: bool) -> Self {
         Self {
-            phase: None,
+            previous: None,
             rate: Rate::default(),
             report: Report::new(human),
         }
     }
 
-    /// Samples the current processing step, resetting estimates when its identity changes.
-    pub(super) fn update(&mut self, status: &SlotUploadProcessResponse) -> Option<Update> {
-        self.update_at(status, Instant::now())
+    /// Finishes an observed phase before starting a later one in the same run.
+    /// Restarts and failures never imply successful completion of the previous phase.
+    pub(super) fn update(
+        &mut self,
+        status: &SlotUploadProcessResponse,
+    ) -> impl Iterator<Item = Update> {
+        let completed = self
+            .previous
+            .as_ref()
+            .filter(|previous| {
+                previous.proc_start == status.proc_start
+                    && previous.phase_in < status.phase_in
+                    && previous.phase_progress < 10_000
+                    && status.failure.is_empty()
+            })
+            .map(|previous| {
+                let mut completed = previous.clone();
+                completed.phase_progress = 10_000;
+                Self::observation(&completed, None)
+            });
+        completed
+            .into_iter()
+            .chain(self.update_at(status, Instant::now()))
     }
 
     /// Builds a step-specific estimate from basis points and monotonic host time.
     fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<Update> {
         let phase = (status.proc_start, status.phase_in, status.phase_start);
-        if self.phase != Some(phase) {
-            self.phase = Some(phase);
+        if self.previous.as_ref().is_none_or(|previous| {
+            (previous.proc_start, previous.phase_in, previous.phase_start) != phase
+        }) {
             self.rate = Rate::default();
             self.report.last = None;
         }
+        self.previous = Some(status.clone());
         let rate = self.rate.sample(status.phase_progress, now);
         let percent = percent(status.phase_progress, 10_000);
         if !self.report.due(percent, now) {
             return None;
         }
+        Some(Self::observation(status, rate))
+    }
+
+    /// Reserves the widest phase label and the initial ETA before rendering any step.
+    fn observation(status: &SlotUploadProcessResponse, rate: Option<f64>) -> Update {
+        let percent = percent(status.phase_progress, 10_000);
         let name = status
             .phase_in
             .checked_sub(1)
@@ -195,19 +266,36 @@ impl Processing {
             status.phases.len(),
             eta(10_000_u64.saturating_sub(status.phase_progress), rate),
         );
-        Some(Update {
+        let stage = format!(
+            "processing [{}/{}] {name}",
+            status.phase_in,
+            status.phases.len()
+        );
+        let stage_width = status
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| {
+                console::measure_text_width(&format!(
+                    "processing [{}/{}] {}",
+                    index + 1,
+                    status.phases.len(),
+                    phase.name
+                ))
+            })
+            .max()
+            .unwrap_or_else(|| console::measure_text_width(&stage));
+        Update {
             text,
-            stage: format!(
-                "processing [{}/{}] {name}",
-                status.phase_in,
-                status.phases.len()
-            ),
+            stage,
+            stage_width,
             percent,
             details: vec![human_eta(
                 10_000_u64.saturating_sub(status.phase_progress),
                 rate,
             )],
-        })
+            detail_widths: vec!["eta estimating...".len(), "eta 0 s".len()],
+        }
     }
 }
 
@@ -335,12 +423,14 @@ mod tests {
         let update = Update {
             text: String::new(),
             stage: "uploading".into(),
+            stage_width: "uploading".len(),
             percent: 50,
             details: vec![
                 "50.0/100.0 MiB".into(),
                 "10.0 MiB/s".into(),
                 "eta 5 s".into(),
             ],
+            detail_widths: Vec::new(),
         };
         let theme = Theme::test(120, Color::Basic, false);
         assert_eq!(
@@ -400,6 +490,132 @@ mod tests {
             phase_in: phase,
             phase_progress: progress,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn processing_bars_align_across_labels_and_estimates() {
+        use crate::style::Color;
+        let mut report = status(1, 8200);
+        report.phases = ["Compressing", "Indexing", "\u{68c0}\u{9a8c}"]
+            .into_iter()
+            .cycle()
+            .take(12)
+            .map(|name| darkbio_connect::schema::SlotPhase {
+                name: name.into(),
+                desc: String::new(),
+            })
+            .collect();
+        for width in [60, 80, 100, 140] {
+            let theme = Theme::test(width, Color::True, true);
+            let mut expected = None;
+            for phase in 1..=12 {
+                report.phase_in = phase;
+                for (progress, rate) in [(8200, None), (9200, Some(500.0)), (10_000, None)] {
+                    report.phase_progress = progress;
+                    let rendered = Processing::observation(&report, rate).render(&theme);
+                    let line = console::strip_ansi_codes(&rendered);
+                    let position = bar_position(&line);
+                    assert_eq!(position, *expected.get_or_insert(position), "{line}");
+                    assert!(console::measure_text_width(&line) < width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upload_and_processing_share_columns_without_losing_transfer_facts() {
+        use crate::style::Color;
+        for width in [60, 80, 100, 140] {
+            let theme = Theme::test(width, Color::True, true);
+            let start = Instant::now();
+            let total = 290 * 1024 * 1024;
+            let mut transfer = Transfer::new(true);
+            transfer.update_at(0, total, start);
+            let mut upload = transfer
+                .update_at(total, total, start + Duration::from_secs(8))
+                .unwrap();
+            let mut report = status(1, 8200);
+            report.phases[0].name = "Compressing".into();
+            report.phases[1].name = "Indexing".into();
+            Processing::observation(&report, None).align(&mut upload);
+            let rendered = upload.render(&theme);
+            let expected = bar_position(&rendered);
+            assert!(console::measure_text_width(&rendered) < width);
+            if width >= 100 {
+                assert!(rendered.contains("MiB/s"));
+                assert!(rendered.contains("eta 0 s"));
+            }
+            if width >= 140 {
+                assert!(rendered.contains("290.0/290.0 MiB"));
+            }
+            let mut processing = Processing::new(true);
+            for (phase, progress) in [(1, 8200), (2, 9200), (2, 10_000)] {
+                report.phase_in = phase;
+                report.phase_progress = progress;
+                for mut update in processing.update(&report) {
+                    update.align(&mut upload);
+                    let rendered = update.render(&theme);
+                    assert_eq!(bar_position(&rendered), expected, "{rendered}");
+                    assert!(console::measure_text_width(&rendered) < width);
+                }
+            }
+        }
+    }
+
+    fn bar_position(line: &str) -> (usize, usize) {
+        let line = console::strip_ansi_codes(line);
+        let bar = line
+            .find(['\u{2501}', '\u{2500}'])
+            .unwrap_or_else(|| panic!("missing progress bar: {line}"));
+        (
+            console::measure_text_width(&line[..bar]),
+            line[bar..]
+                .chars()
+                .take_while(|ch| matches!(ch, '\u{2501}' | '\u{2500}'))
+                .count(),
+        )
+    }
+
+    #[test]
+    fn advancing_completes_the_previous_phase_before_rendering_the_next() {
+        let mut processing = Processing::new(true);
+        let first: Vec<_> = processing.update(&status(1, 8200)).collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].percent, 82);
+        let next: Vec<_> = processing.update(&status(2, 9200)).collect();
+        assert_eq!(next.len(), 2);
+        assert_eq!(next[0].stage, first[0].stage);
+        assert_eq!(next[0].percent, 100);
+        assert!(next[0].text.ends_with("100% | step ETA 0s"));
+        assert_eq!(next[0].details, ["eta 0 s"]);
+        assert_eq!(next[1].percent, 92);
+        let done: Vec<_> = processing.update(&status(2, 10_000)).collect();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].stage, next[1].stage);
+        assert_eq!(done[0].percent, 100);
+        assert_eq!(done[0].details, ["eta 0 s"]);
+    }
+
+    #[test]
+    fn restarts_and_failures_do_not_complete_the_previous_phase() {
+        for next in [
+            SlotUploadProcessResponse {
+                phase_start: 999,
+                ..status(1, 2000)
+            },
+            SlotUploadProcessResponse {
+                proc_start: 999,
+                ..status(2, 2000)
+            },
+            SlotUploadProcessResponse {
+                failure: "failed".into(),
+                ..status(2, 2000)
+            },
+        ] {
+            let mut processing = Processing::new(true);
+            assert_eq!(processing.update(&status(1, 8200)).count(), 1);
+            assert!(processing.update(&next).all(|update| update.percent != 100));
         }
     }
 
