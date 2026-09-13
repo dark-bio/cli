@@ -30,9 +30,8 @@ size_bytes under Size and includes dependency state alongside each name.
   slots that depend on this one. These relationships differ from a help page's
   Requires preconditions.
 - download is what the Ark offers to fill an empty slot, with url, size_bytes
-  and sha256; the CLI never builds a URL itself. Filled slots normally offer
-  none, shown as - in the reading view or null in JSON, so read state to learn
-  whether a slot holds data.
+  and sha256; the CLI never builds a URL itself. It says nothing about what a
+  slot already holds, which is what state reports.
 - cached refers only to this computer's download cache, never to the Ark. yes
   means a file named by the advertised SHA-256 is already here, which fetch
   still verifies as it replays. Personal slots always print no, since personal

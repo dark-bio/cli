@@ -71,12 +71,12 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
                 &rows,
                 &[
                     ("SLOT", "slot"),
-                    ("NAME", "name"),
                     ("STATE", "state"),
                     ("ORIGIN", "origin"),
                     ("BUILD", "build"),
+                    ("VERSION", "version"),
                     ("SIZE", "size_bytes"),
-                    ("DEPENDENCIES", "requires"),
+                    ("REQUIRES", "requires"),
                 ],
             )?;
             for slot in &slots {

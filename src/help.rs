@@ -127,7 +127,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "a paired, unlocked Ark (--unlock only if status reports locked)",
             "none; --unlock needs your phone",
             "seconds",
-            "slot, name, state, origin, build, size, dependencies; JSON slot fields: `ark help datasets`",
+            "slot, state, origin, build, version, size, requires; JSON adds id, name, damage, download",
             "ark data list\nark data list --json",
         ),
         "data show" => (

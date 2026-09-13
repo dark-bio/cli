@@ -30,18 +30,22 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         "locator":device.locator().to_string(), "kind":match device.kind() { DeviceKind::Hardware=>"hardware", DeviceKind::Emulator=>"emulator" },
         "name":device.name(),"serial":device.serial(),"image":device.image(),"environment":device.env(),"ready":device.ready(),
     })).collect();
-    context.output.table(
-        &json!({"devices":rows}),
-        &rows,
-        &[
-            ("LOCATOR", "locator"),
-            ("NAME", "name"),
-            ("SERIAL", "serial"),
-            ("KIND", "kind"),
-            ("ENV", "environment"),
-            ("STATE", "ready"),
-        ],
-    )?;
+    // environment and ready are launcher metadata; discovery leaves them unset for
+    // hardware, and a dash under READY reads as "not ready" rather than "not asked".
+    let mut columns = vec![
+        ("LOCATOR", "locator"),
+        ("NAME", "name"),
+        ("SERIAL", "serial"),
+        ("KIND", "kind"),
+    ];
+    for (label, key) in [("ENVIRONMENT", "environment"), ("READY", "ready")] {
+        if rows.iter().any(|row| !row[key].is_null()) {
+            columns.push((label, key));
+        }
+    }
+    context
+        .output
+        .table(&json!({"devices":rows}), &rows, &columns)?;
     if rows.len() > 1 {
         context
             .output
@@ -118,7 +122,6 @@ fn status_block(theme: &Theme, value: &Value) -> String {
     let hardware = &value["hardware"];
     let firmware = &value["firmware"];
     let fingerprint = value["identity"].as_str().unwrap_or("-");
-    let sep = theme.separator();
     let mut rows = vec![
         (
             String::new(),
@@ -146,20 +149,13 @@ fn status_block(theme: &Theme, value: &Value) -> String {
                 human::value(theme, "published", &firmware["published"])
             ),
         ),
-        (
-            "Trust".into(),
-            [field("trust"), field("environment"), field("realm")].join(&sep),
-        ),
+        ("Trust".into(), field("trust")),
+        ("Environment".into(), field("environment")),
+        ("Realm".into(), field("realm")),
         (String::new(), String::new()),
         ("Cloud".into(), flag("synced", "synced", "not synced")),
-        (
-            "Pairing".into(),
-            format!(
-                "{}{sep}{}",
-                flag("paired", "paired", "unpaired"),
-                flag("unlocked", "unlocked", "locked")
-            ),
-        ),
+        ("Pairing".into(), flag("paired", "paired", "unpaired")),
+        ("Lock".into(), flag("unlocked", "unlocked", "locked")),
         ("Identity".into(), theme.paint(Role::Accent, fingerprint)),
     ];
     if !value["mismatch"].is_null() {
@@ -345,7 +341,7 @@ mod tests {
         });
         assert_eq!(
             status_block(&theme, &value),
-            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware  Ark I, revision B, model 01\n\n  Firmware  0.11.5, published -\n  Trust     \x1b[1m! self-signed\x1b[0m \u{00b7} - \u{00b7} -\n\n  Cloud     -\n  Pairing   \x1b[1m\u{2713} paired\x1b[0m \u{00b7} \x1b[1m! locked\x1b[0m\n  Identity  \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch  \x1b[1mArk II - A\x1b[0m"
+            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware     Ark I, revision B, model 01\n\n  Firmware     0.11.5, published -\n  Trust        \x1b[1m! self-signed\x1b[0m\n  Environment  -\n  Realm        -\n\n  Cloud        -\n  Pairing      \x1b[1m\u{2713} paired\x1b[0m\n  Lock         \x1b[1m! locked\x1b[0m\n  Identity     \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch     \x1b[1mArk II - A\x1b[0m"
         );
         let rendered = status_block(&theme, &value);
         assert!(rendered.contains("0123456789abcdef"));

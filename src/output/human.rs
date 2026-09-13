@@ -182,36 +182,12 @@ pub(super) fn table(
     columns: &[(&str, &str)],
     groups: &[String],
 ) -> String {
-    let units: Vec<_> = columns
-        .iter()
-        .map(|(_, key)| {
-            let largest = rows.iter().filter_map(|row| row[*key].as_u64()).max()?;
-            key.ends_with("_bytes").then(|| {
-                [("MiB", 1_u64 << 20), ("KiB", 1 << 10)]
-                    .into_iter()
-                    .find(|(_, divisor)| largest >= *divisor)
-                    .unwrap_or(("B", 1))
-            })
-        })
-        .collect();
     let cells: Vec<Vec<_>> = rows
         .iter()
         .map(|row| {
             columns
                 .iter()
-                .enumerate()
-                .map(|(index, (_, key))| {
-                    if let Some((unit, divisor)) = units[index]
-                        && let Some(bytes) = row[*key].as_u64()
-                    {
-                        return if divisor == 1 {
-                            format!("{bytes} B")
-                        } else {
-                            format!("{:.1} {unit}", bytes as f64 / divisor as f64)
-                        };
-                    }
-                    value(theme, key, &row[*key])
-                })
+                .map(|(_, key)| value(theme, key, &row[*key]))
                 .collect()
         })
         .collect();
@@ -412,26 +388,21 @@ mod tests {
                 &[("SLOT", "slot"), ("STATE", "state"), ("SIZE", "size_bytes")],
                 &[]
             ),
-            "  SLOT              STATE           SIZE\n  \x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m  3072.0 MiB\n  \x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty            -\n  \x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m   256.0 MiB"
+            "  SLOT              STATE          SIZE\n  \x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m    3.0 GiB\n  \x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n  \x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m  256.0 MiB"
         );
     }
 
     #[test]
-    fn stacked_tables_keep_the_shared_byte_unit() {
-        let theme = Theme::test(25, Color::Off, false);
+    fn tables_and_blocks_agree_on_byte_units() {
+        let theme = Theme::test(80, Color::Off, false);
         let rows = [
             json!({"slot":"reference-genome","size_bytes":1_u64 << 28}),
             json!({"slot":"variant-catalog","size_bytes":3_u64 << 30}),
         ];
-        let rendered = table(
-            &theme,
-            &rows,
-            &[("DATASET SLOT", "slot"), ("SIZE", "size_bytes")],
-            &[],
-        );
-        assert!(rendered.contains("256.0 MiB"));
-        assert!(rendered.contains("3072.0"));
-        assert!(!rendered.contains("GiB"));
+        let rendered = table(&theme, &rows, &[("SLOT", "slot"), ("SIZE", "size_bytes")], &[]);
+        for row in &rows {
+            assert!(rendered.contains(&value(&theme, "size_bytes", &row["size_bytes"])));
+        }
     }
 
     #[test]

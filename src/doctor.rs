@@ -176,7 +176,10 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     }
     let cache = crate::data::cache::directory();
     match crate::data::cache::size(&cache) {
-        Ok(size) => checks.ok("cache", &format!("{} ({size} bytes)", cache.display())),
+        Ok(size) => checks.ok(
+            "cache",
+            &format!("{} ({})", cache.display(), crate::style::bytes(size)),
+        ),
         Err(error) => checks.fail("cache", error.into()),
     }
     let mut document = crate::versions();

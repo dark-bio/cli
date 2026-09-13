@@ -8,9 +8,9 @@ in Ark Companion. You cannot approve for them.
 
 - Use --json for complete, exact data: one indented JSON document on stdout,
   JSON Lines events on stderr. Default output is formatted for reading and
-  may scale values or omit fields. If your tool merges the streams, add -q
-  to drop optional events; hints, approvals and errors remain, so check the
-  exit code. `ark help output` defines the stream and error contracts.
+  may scale values or omit fields. If your tool merges the streams, drop the
+  lines starting with `{"event":`; each event is one line and what remains is
+  the document. `ark help output` defines the stream and error contracts.
 - Run ark commands one at a time, including reads. Concurrent commands to the
   same Ark collide with device-busy; wait for your earlier command to finish.
   One Ark is selected automatically. With several, select an exact locator or
