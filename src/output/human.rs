@@ -399,7 +399,12 @@ mod tests {
             json!({"slot":"reference-genome","size_bytes":1_u64 << 28}),
             json!({"slot":"variant-catalog","size_bytes":3_u64 << 30}),
         ];
-        let rendered = table(&theme, &rows, &[("SLOT", "slot"), ("SIZE", "size_bytes")], &[]);
+        let rendered = table(
+            &theme,
+            &rows,
+            &[("SLOT", "slot"), ("SIZE", "size_bytes")],
+            &[],
+        );
         for row in &rows {
             assert!(rendered.contains(&value(&theme, "size_bytes", &row["size_bytes"])));
         }
