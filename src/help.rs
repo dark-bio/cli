@@ -62,6 +62,16 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         } else {
             clap::ColorChoice::Always
         });
+    if !parent.is_empty() {
+        *command = command.clone().arg(
+            clap::Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(clap::ArgAction::Help)
+                .help("Print help (see more with '--help')")
+                .long_help("Print help (see a summary with '-h')"),
+        );
+    }
     let path = if parent.is_empty() {
         command.get_name().to_string()
     } else {
@@ -73,11 +83,11 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "nothing",
             "none",
             "seconds",
-            "devices: locator, kind, name, serial, image, environment, ready",
+            "devices: locator, kind, name, serial, image, environment, ready; the last two need a connection",
             "ark devices\nark devices --format json",
         ),
         "status" => (
-            "one Ark; no cloud access",
+            "one Ark (works offline, including while unpaired or locked)",
             "none",
             "seconds",
             "name, serial, hardware, firmware, trust, environment, realm, synced, paired, unlocked, identity, pubkey, mismatch",
@@ -108,35 +118,35 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "one Ark; --cwt accepts an existing attestation",
             "online enrollment uses the Hub; none with --cwt",
             "seconds for --cwt and reconnection",
-            "enrolled and status, or the online enrollment URL",
+            "enrolled, url for online enrollment; enrolled and status fields with --cwt",
             "ark enroll\nark enroll --cwt attestation.cwt",
         ),
         "data list" => (
-            "a paired, unlocked Ark (add --unlock)",
-            "none",
+            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "none; --unlock needs your phone",
             "seconds",
             "slots: slot, id, name, description, state, origin, requires, size_bytes, build, version, damage, download",
             "ark data list\nark data list --unlock --format json",
         ),
         "data show" => (
-            "a paired, unlocked Ark (add --unlock)",
-            "none",
+            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "none; --unlock needs your phone",
             "seconds",
-            "slot metadata, required_by, cached",
+            "slot, id, name, description, state, origin, requires, size_bytes, build, version, damage, download, required_by, cached",
             "ark data show snp-indel-calls\nark data show 3 --format json",
         ),
         "data paths" => (
-            "a paired, unlocked Ark (add --unlock)",
-            "none",
+            "a paired, unlocked Ark (pass --unlock if it is locked)",
+            "none; --unlock needs your phone",
             "seconds",
             "the Ark's dataset README verbatim; JSON: readme",
             "ark data paths\nark data paths --unlock --format json",
         ),
         "data upload" => (
-            "a local file and a paired, unlocked Ark (add --unlock)",
+            "a local file and a paired, unlocked Ark (pass --unlock if it is locked)",
             "on your phone for personal data; none for reference data or --dry-run",
             "minutes to an hour; each processing step has its own ETA",
-            "slot, id, confidence, uploaded_bytes, phases, duration_seconds",
+            "slot, id, confidence, uploaded_bytes, phases, duration_seconds; state, requires under --dry-run",
             "ark data upload calls.vcf.gz\nark data upload calls.vcf.gz --dry-run",
         ),
         "data fetch" => (
@@ -147,14 +157,14 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "ark data fetch --all --unlock\nark data fetch reference-genome --dry-run --format json",
         ),
         "data delete" | "data repair" => (
-            "a paired, unlocked Ark (add --unlock)",
+            "a paired, unlocked Ark (pass --unlock if it is locked)",
             "on your phone; never under --dry-run",
             "up to a minute for approval",
             "slot, id, state, changed; required_by under --dry-run",
             "ark data delete snp-indel-calls --dry-run\nark data repair snp-indel-calls",
         ),
         "app run" => (
-            "a local WASM file and a paired, unlocked Ark (add --unlock)",
+            "a local WASM file and a paired, unlocked Ark (pass --unlock if it is locked)",
             "on your phone before running",
             "unbounded run; --timeout bounds replies, not the whole app",
             "exact report bytes; JSON: task, app, success, stdout or stdout_base64, stderr or stderr_base64, duration_seconds",
@@ -171,7 +181,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "one Ark and its package host",
             "none; develop and staging package hosts may need browser login",
             "seconds",
-            "installed, update, firmwares",
+            "installed, update, firmwares: version, published, size_bytes, sha256, summary, installed, candidate",
             "ark firmware list\nark firmware list --format json",
         ),
         "firmware update" => (
@@ -185,28 +195,38 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "nothing; unavailable checks are skipped",
             "none; develop and staging package hosts may need browser login",
             "seconds per check",
-            "checks: name, result, detail, hint; tool, connect, wire",
+            "checks: name, result, detail, hint; tool, connect, wire, minimum_firmware, minimum_develop_publish",
             "ark doctor\nark doctor --format json",
+        ),
+        "completions" => (
+            "nothing",
+            "none",
+            "immediate",
+            "shell completion text in every format",
+            "ark completions bash\nark completions zsh",
         ),
         _ => (
             "nothing",
             "none",
             "immediate",
-            "help or shell completion text",
+            "help text in every format",
             "ark --help\nark help agents",
         ),
     };
     let exits = match key {
         "devices" => "0 done; 1 local; 2 usage; 3 device",
-        "status" | "enroll" => "0 done; 1 local; 2 usage; 3 device; 5 Ark; 7 timeout",
+        "status" => {
+            "0 done; 1 local; 2 usage; 3 device; 5 Ark (including outdated firmware, not pairing or lock state); 7 timeout"
+        }
+        "enroll" => "0 done; 1 local; 2 usage; 3 device; 5 Ark; 7 timeout",
         "genuine" | "app cancel" | "firmware list" | "doctor" => {
             "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 7 timeout"
         }
-        "pair" | "unlock" | "data" | "data list" | "data show" | "data paths" | "data upload"
-        | "data fetch" | "data delete" | "data repair" | "firmware" | "firmware update" => {
+        "pair" | "unlock" | "data list" | "data show" | "data paths" | "data upload"
+        | "data fetch" | "data delete" | "data repair" | "firmware update" => {
             "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout"
         }
-        "app" | "app run" => {
+        "app run" => {
             "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout; 8 app"
         }
         _ => "0 done; 1 local; 2 usage",
@@ -231,9 +251,14 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         help
     };
     let help = if parent.is_empty() {
-        "Scripts and AI agents: read `ark help agents` first.
+        "Output defaults to human on terminals, text in pipes (per stream).
+Scripts and AI agents: read `ark help agents` first.
 Topics: agents, states, output, devices, datasets, apps."
             .to_string()
+    } else if command.get_subcommands().next().is_some() {
+        format!(
+            "Each subcommand has its own requirements, approvals and output.\nRead `ark {key} COMMAND --help` for its contract."
+        )
     } else {
         let advanced = if matches!(key, "status" | "enroll") {
             "Advanced:
@@ -445,10 +470,10 @@ mod tests {
         assert_eq!(
             footer(
                 &theme,
-                &[("Requires", "a paired Ark"), ("Approval", "on your phone")],
+                &[("Requires", "a paired Ark"), ("Approval", "only if locked")],
                 "ark unlock"
             ),
-            "Requires   a paired Ark\nApproval   on your phone\n\n\x1b[1mExamples\x1b[0m\n  $ \x1b[1mark unlock\x1b[0m\n\nGlobal options: \x1b[1mark --help\x1b[0m"
+            "Requires   a paired Ark\nApproval   only if locked\n\n\x1b[1mExamples\x1b[0m\n  $ \x1b[1mark unlock\x1b[0m\n\nGlobal options: \x1b[1mark --help\x1b[0m"
         );
         assert_eq!(
             markdown(
@@ -476,6 +501,37 @@ mod tests {
         );
         assert!(console::strip_ansi_codes(&rendered).contains("ark data fetch --all --unlock"));
         assert!(rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn groups_point_to_child_contracts() {
+        let theme = Theme::test(80, Color::Off, false);
+        let mut root = command(&theme);
+        for name in ["data", "app", "firmware"] {
+            let group = root.find_subcommand_mut(name).unwrap();
+            let long = group.render_long_help().to_string();
+            assert!(long.contains("Each subcommand has its own requirements"));
+            assert!(!long.contains("Requires:"));
+            assert!(!long.contains("Approval:"));
+            assert!(!long.contains("Exit:"));
+        }
+        let status = root.find_subcommand_mut("status").unwrap();
+        assert!(
+            status
+                .render_long_help()
+                .to_string()
+                .contains("works offline")
+        );
+        let data = root.find_subcommand_mut("data").unwrap();
+        for name in ["list", "show", "paths"] {
+            let long = data
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(long.contains("pass --unlock if it is locked"));
+            assert!(long.contains("none; --unlock needs your phone"));
+        }
     }
 
     #[test]

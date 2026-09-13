@@ -127,6 +127,10 @@ impl Interrupt {
         if output.json() {
             let fallback = json!({"error":error.json()});
             let _ = output.document(state.partial.as_ref().unwrap_or(&fallback));
+        } else if output.structured()
+            && let Some(partial) = &state.partial
+        {
+            let _ = output.document(partial);
         }
         output.error(&error);
         output.finish();

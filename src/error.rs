@@ -113,7 +113,7 @@ impl From<ConnectError> for Error {
                 ))
             }
             Busy(_) => Self::new(3, "device-busy", "the Ark is in use")
-                .hint("close the Ark Hub browser tab or the other ark command"),
+                .hint("wait for the other ark command to finish; run commands one at a time, or close the Ark Hub browser tab"),
             Usb(cause) => {
                 let cause = std::io::Error::from(cause);
                 let mut error = Self::new(3, "device-unreachable", cause.to_string());

@@ -12,7 +12,7 @@ What this tool does:
 - **Datasets**: upload your own files, install public reference data, inspect slots.
 - **Apps**: run WebAssembly apps on the Ark and collect their reports.
 - **Firmware**: list published builds, install and verify an update.
-- **Diagnostics**: check your computer, the Ark and the cloud, with fixes.
+- **Diagnostics**: check your computer, the Ark and the cloud, and suggest fixes.
 
 ## Installation
 
@@ -56,7 +56,7 @@ ark status                        # trust, firmware, paired, unlocked
 ark pair                          # scan and confirm in Ark Companion
 ark unlock                        # approve on the phone
 ark data list                     # what is loaded
-ark app run my.wasm > report.md   # approve on the phone; the report lands on stdout
+ark app run my.wasm > report.md   # approve on the phone; report on stdout
 ```
 
 Pairing happens once. Unlocking lasts until the Ark loses power, and every data and app command needs an unlocked Ark; pass `--unlock` to let a command unlock first, which the phone still approves. Nothing bypasses the phone. Deleting the pairing in Ark Companion discards the unlock key, and the reset button on the Ark erases all data.
@@ -75,7 +75,7 @@ Uploads of your own data are approved on the phone; public reference downloads a
 
 ## Apps
 
-An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval, runs it on the Ark and prints the report on stdout, so redirect stdout to keep the exact bytes. Ctrl-C cancels a run; `ark app cancel <task>` cleans up one whose terminal went away. The [examples](https://github.com/dark-bio/examples) repository has working apps and the data tree; `ark help apps` has the manifest and the sandbox limits.
+An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval, runs it on the Ark and prints the report on stdout, so redirect stdout to keep the exact bytes. `--format json` wraps the report with the run's metadata instead. Ctrl-C cancels a run; `ark app cancel <task>` cleans up one whose terminal went away. The [examples](https://github.com/dark-bio/examples) repository has working apps and the data tree; `ark help apps` has the manifest and the sandbox limits.
 
 ## Firmware
 
@@ -91,11 +91,11 @@ One Ark is picked automatically. With several, select one with `-d` by locator, 
 
 ## Scripts and agents
 
-`ark help agents` is written for scripts and AI agents and should be read first. `--format json` prints one JSON document on stdout and JSON events on stderr, nothing prompts without a terminal, and the exit code says what happened: 0 done, 1 local, 2 usage, 3 device, 4 cloud, 5 Ark, 6 approval, 7 timeout, 8 app.
+`ark help agents` is written for scripts and AI agents and should be read first. Text carries every result field with exact values, so an agent can read it as it is. `--format json` is for programmatic parsing, with one JSON document on stdout and JSON events on stderr. Nothing prompts without a terminal, and the exit code says what happened: 0 done, 1 local, 2 usage, 3 device, 4 cloud, 5 Ark, 6 approval, 7 timeout, 8 app.
 
 ## Help
 
-`ark -h` is the scan. `ark --help` and `ark help <command>` add each command's contract: what it requires, who approves, how long it takes, what it prints and how it exits. Six topics cover the rest, and `ark help --all` prints the whole manual as one document:
+`ark -h` is the scan. For one command, `ark <command> --help` or `ark help <command>` adds its contract: what it requires, who approves, how long it takes, what it prints and how it exits. Six topics cover the rest, and `ark help --all` prints the whole manual as one document:
 
 | Topic | Contents |
 | --- | --- |
@@ -110,7 +110,7 @@ One Ark is picked automatically. With several, select one with `-d` by locator, 
 
 ## Disclaimer
 
-The Ark, its protocols and this tool are still evolving quickly. Command names and JSON fields are meant to stay stable, but every release may change behaviour, and firmware, cloud and tool versions are expected to move together.
+The Ark, its protocols and this tool are still evolving quickly. Command names and output fields are meant to stay stable, and `ark help output` has the exact promise. Every release may change behaviour, and firmware, cloud and tool versions are expected to move together.
 
 The connection library in `connect/` is internal to this CLI package. Its Rust API is unstable and is not a supported integration interface.
 

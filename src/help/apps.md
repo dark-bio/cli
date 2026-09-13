@@ -9,7 +9,9 @@ execution sandbox.
 `ark app run FILE` uploads, asks for owner approval and waits for the result.
 The task ID is printed as soon as allocated. Ctrl-C or SIGTERM attempts to
 cancel it; `ark app cancel TASK` can clean up a run whose CLI process died.
-Results arrive whole. Redirect stdout to preserve the exact report bytes.
+Results arrive whole. Use `ark app run FILE > report.md` to
+preserve the exact report bytes. Text and JSON include the report alongside
+task, app, success, stderr and duration_seconds; see `ark help output`.
 
 The manifest contains four fields, all under `[package]`:
 

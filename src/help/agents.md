@@ -7,8 +7,11 @@ in Ark Companion. You cannot approve for them.
 ## Running
 
 - Output is text without colour when a stream is not a terminal. Pass
-  --format text to force it, --format json for one JSON document on stdout
-  and JSON events on stderr.
+  --format text to force it. Text carries every JSON field with exact values,
+  so read it directly. Use --format json to parse programmatically, with one
+  JSON document on stdout and JSON events on stderr. If your tool merges the
+  two streams, add -q: it drops optional events, leaving hints, approvals and
+  errors, so trust the exit code rather than an empty stderr.
 - Nothing prompts when stdin is not a terminal, under --no-input, or in JSON
   mode. --yes confirms firmware installation; without it the command fails
   with `confirmation-required`. A develop or staging cloud or package host may
@@ -25,12 +28,15 @@ in Ark Companion. You cannot approve for them.
   Expect seconds for status, up to a minute for an approval, up to ten
   minutes for the owner to scan a pairing, minutes for an app run, minutes to
   an hour for an upload, and an hour or more for a reference catalog.
-  --timeout bounds each machine wait, never a person or a total. A repeated
-  processing percentage counts as a reply. Use your shell's timeout utility
+  --timeout bounds each machine reply or network chunk wait, not an approval
+  or the total command runtime. It must be positive and cannot be disabled.
+  A repeated processing percentage counts as a reply. Use your shell's timeout utility
   for a workflow ceiling. Ctrl-C and SIGTERM attempt cancellation; the task id
   printed by `app run` also works with `app cancel`.
 - Three flags say what may happen beyond the command itself: --unlock, --yes,
   --dry-run. Nothing happens that you did not name.
+- Run ark commands one at a time, including reads. Concurrent commands to the
+  same Ark collide with device-busy; wait for your earlier command to finish.
 - One Ark is selected automatically. With several, select an exact locator or
   unique label with --device. A browser tab or another ark process can hold
   the USB session; close it on `device-busy`.

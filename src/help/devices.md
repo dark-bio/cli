@@ -3,7 +3,11 @@
 `ark devices` discovers hardware over USB and running emulators through their
 local launcher registry. It does not connect or authenticate. A missing emulator
 registry is normal when no emulator is running. A failed discovery source does
-not hide devices found through another source.
+not hide devices found through another source. environment and ready are
+launcher metadata for emulators and normally null for hardware, because USB
+discovery does not handshake. Other unavailable labels are null too. Text shows
+null as -; this does not mean unreachable or uninitialized. Use status to read
+authenticated state, and do not gate hardware access on discovery's ready.
 
 Select an exact locator (hardware:BUS:ADDR or emulator:PORT), unique serial,
 name or emulator image basename. The words hardware and emulator select the

@@ -140,18 +140,12 @@ impl Output {
         } else if self.0.out.human {
             render(&self.0.out, self.0.verbose)
         } else {
-            let mut lines = Vec::new();
-            fields("", value, &mut lines, false);
-            lines
-                .into_iter()
-                .map(|(key, value)| format!("{key}: {value}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            text_document(value)
         };
         self.write_result(&text)
     }
 
-    /// Renders rows as a table, retaining the complete supplied document for JSON.
+    /// Renders human rows as a table; text and JSON retain the complete document.
     pub fn table(
         &self,
         document: &Value,
@@ -161,7 +155,7 @@ impl Output {
         self.grouped_table(document, rows, columns, &[])
     }
 
-    /// Adds human group labels parallel to rows; text and JSON keep their layouts.
+    /// Adds human group labels parallel to rows; text and JSON keep all fields.
     pub fn grouped_table(
         &self,
         document: &Value,
@@ -169,46 +163,14 @@ impl Output {
         columns: &[(&str, &str)],
         groups: &[String],
     ) -> Result<(), Error> {
-        self.list(document, rows, columns, |theme| {
+        self.document_with(document, |theme, _| {
             human::table(theme, rows, columns, groups)
         })
     }
 
     /// Renders diagnostic rows with local hints, or the equivalent machine result.
     pub fn checklist(&self, document: &Value, rows: &[Value]) -> Result<(), Error> {
-        self.list(
-            document,
-            rows,
-            &[
-                ("CHECK", "name"),
-                ("RESULT", "result"),
-                ("DETAIL", "detail"),
-                ("HINT", "hint"),
-            ],
-            |theme| human::checklist(theme, rows),
-        )
-    }
-
-    /// Claims one result and selects human rows, a text table or the JSON document.
-    fn list(
-        &self,
-        document: &Value,
-        rows: &[Value],
-        columns: &[(&str, &str)],
-        render: impl FnOnce(&Theme) -> String,
-    ) -> Result<(), Error> {
-        if self.json() {
-            return self.document(document);
-        }
-        let _result = self.0.result.lock().expect("output not poisoned");
-        if self.0.printed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        self.write_result(&if self.0.out.human {
-            render(&self.0.out)
-        } else {
-            text_table(rows, columns)
-        })
+        self.document_with(document, |theme, _| human::checklist(theme, rows))
     }
 
     /// Ends live stderr activity and writes a complete stdout result block.
@@ -227,7 +189,12 @@ impl Output {
         Ok(())
     }
 
-    /// App reports and dataset READMEs bypass every layout rule.
+    /// Whether stdout uses a complete document instead of a human byte stream.
+    pub fn structured(&self) -> bool {
+        !self.0.out.human
+    }
+
+    /// App reports and dataset READMEs are payloads that bypass every layout rule.
     pub fn app(&self, stdout: &[u8], stderr: &[u8]) -> Result<(), Error> {
         let _result = self.0.result.lock().expect("output not poisoned");
         if self.0.printed.swap(true, Ordering::SeqCst) {
@@ -624,57 +591,22 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
     let _ = output.flush();
 }
 
-/// Formats stable plain text columns without truncating values to terminal width.
-fn text_table(rows: &[Value], columns: &[(&str, &str)]) -> String {
-    let cells: Vec<Vec<_>> = rows
-        .iter()
-        .map(|row| {
-            columns
-                .iter()
-                .map(|(_, key)| display(key, &row[*key], false))
-                .collect()
-        })
-        .collect();
-    let widths: Vec<_> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, (name, _))| {
-            cells
-                .iter()
-                .map(|row| console::measure_text_width(&row[i]))
-                .max()
-                .unwrap_or(0)
-                .max(name.len())
-        })
-        .collect();
-    let line = |row: &[String]| {
-        row.iter()
-            .enumerate()
-            .map(|(i, cell)| {
-                if i + 1 == row.len() {
-                    cell.clone()
-                } else {
-                    format!(
-                        "{cell}{}",
-                        " ".repeat(widths[i].saturating_sub(console::measure_text_width(cell)) + 2)
-                    )
-                }
-            })
-            .collect::<String>()
-    };
-    let mut lines = vec![line(
-        &columns
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect::<Vec<_>>(),
-    )];
-    lines.extend(cells.iter().map(|row| line(row)));
-    lines.join("\n")
+/// Renders every document field without terminal layout or scaled units.
+pub(crate) fn text_document(value: &Value) -> String {
+    let mut lines = Vec::new();
+    fields("", value, &mut lines, false);
+    lines
+        .into_iter()
+        .map(|(key, value)| format!("{key}: {}", value.replace('\n', "\n  ")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// Flattens objects and object arrays into dotted paths; scalar arrays stay joined.
+/// Flattens nested fields into dotted paths; scalar arrays remain single fields.
 fn fields(prefix: &str, value: &Value, lines: &mut Vec<(String, String)>, human: bool) {
-    if let Value::Object(object) = value {
+    if let Value::Object(object) = value
+        && (human || !object.is_empty())
+    {
         for (key, value) in object {
             let key = if prefix.is_empty() {
                 key.clone()
@@ -684,7 +616,9 @@ fn fields(prefix: &str, value: &Value, lines: &mut Vec<(String, String)>, human:
             fields(&key, value, lines, human);
         }
     } else if let Value::Array(values) = value
-        && values.iter().any(Value::is_object)
+        && values
+            .iter()
+            .any(|value| value.is_object() || (!human && value.is_array()))
     {
         for (index, value) in values.iter().enumerate() {
             fields(&format!("{prefix}.{index}"), value, lines, human);
@@ -696,6 +630,13 @@ fn fields(prefix: &str, value: &Value, lines: &mut Vec<(String, String)>, human:
 
 /// Formats a plain field with units and explicit absence; human dates use local time.
 pub(crate) fn display(key: &str, value: &Value, human: bool) -> String {
+    if !human {
+        return if value.is_array() {
+            value.to_string()
+        } else {
+            scalar(value)
+        };
+    }
     if key == "serial" && value.is_null() {
         return "unverified".into();
     }
@@ -820,18 +761,16 @@ mod tests {
     }
 
     #[test]
-    fn text_table_keeps_machine_layout() {
-        let rows = [
-            json!({"slot":"reference-genome","state":"filled","size_bytes":3_u64 << 30}),
-            json!({"slot":"variant-catalog","state":"empty","size_bytes":null}),
-        ];
+    fn text_keeps_the_complete_document() {
+        let value = json!({"slots":[
+            {"slot":"reference-genome","description":"A paragraph.\nAnother line.","size_bytes":6263252307_u64,"requires":["snp-indel-calls"]},
+            {"slot":"variant-catalog","size_bytes":null,"requires":[]}
+        ],"empty":{},"duration_seconds":120});
         assert_eq!(
-            text_table(
-                &rows,
-                &[("SLOT", "slot"), ("STATE", "state"), ("SIZE", "size_bytes")]
-            ),
-            "SLOT              STATE   SIZE\nreference-genome  filled  3072.0 MiB\nvariant-catalog   empty   -"
+            text_document(&value),
+            "slots.0.slot: reference-genome\nslots.0.description: A paragraph.\n  Another line.\nslots.0.size_bytes: 6263252307\nslots.0.requires: [\"snp-indel-calls\"]\nslots.1.slot: variant-catalog\nslots.1.size_bytes: -\nslots.1.requires: []\nempty: {}\nduration_seconds: 120"
         );
+        assert_eq!(text_document(&json!({"devices":[]})), "devices: []");
     }
 
     #[test]
@@ -853,11 +792,19 @@ mod tests {
 
     #[test]
     fn units_and_absent_fields_are_explicit() {
-        assert_eq!(display("serial", &Value::Null, false), "unverified");
-        assert_eq!(display("size_bytes", &json!(13002342), false), "12.4 MiB");
-        assert_eq!(display("duration_seconds", &json!(72), false), "72 s");
+        assert_eq!(display("serial", &Value::Null, false), "-");
+        assert_eq!(display("size_bytes", &json!(13002342), false), "13002342");
+        assert_eq!(display("duration_seconds", &json!(72), false), "72");
         assert_eq!(display("duration_seconds", &json!(72), true), "1m 12s");
         assert_eq!(display("size_bytes", &Value::Null, false), "-");
+        for key in ["size_bytes", "duration_seconds"] {
+            assert_eq!(display(key, &json!(u64::MAX), false), u64::MAX.to_string());
+        }
+        assert_eq!(display("paired", &json!(true), false), "yes");
+        assert_eq!(
+            display("published", &json!("2026-09-12T17:49:41.024Z"), false),
+            "2026-09-12T17:49:41.024Z"
+        );
         let mut lines = Vec::new();
         fields(
             "",

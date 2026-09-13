@@ -475,6 +475,17 @@ mod tests {
         assert_eq!(value["requires"], json!(["reference-genome"]));
         assert!(value["damage"].is_null());
         assert!(value["download"].is_null());
+        let text = crate::output::text_document(&value);
+        for key in value.as_object().unwrap().keys() {
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with(&format!("{key}: ")))
+            );
+        }
+        assert!(text.contains("size_bytes: 123"));
+        assert!(text.contains("version: 158"));
+        let error = select(&[], 5).unwrap_err();
+        assert_eq!((error.class, error.code), (1, "invalid-slot"));
         assert!(!filled(&SlotStatus {
             state: SlotState::StateDamaged as i32,
             ..slot

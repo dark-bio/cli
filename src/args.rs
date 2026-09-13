@@ -19,6 +19,7 @@ use std::path::PathBuf;
     name = "ark",
     about = "Command line interface to Ark enclaves",
     disable_help_subcommand = true,
+    disable_help_flag = true,
     disable_version_flag = true,
     propagate_version = false
 )]
@@ -29,6 +30,12 @@ pub(crate) struct Cli {
     /// Tool, connect and wire versions
     #[arg(short = 'V', long)]
     pub version: bool,
+    /// Print help; `ark help --all` prints the manual
+    #[arg(short = 'h', long)]
+    pub help: bool,
+    // Accept the common --help --all spelling of the manual.
+    #[arg(long, hide = true, requires = "help", conflicts_with = "version")]
+    pub all: bool,
     // Absent for top-level help or the standalone version flag.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -74,7 +81,7 @@ pub(crate) struct Options {
     /// Output style; each stream chooses its own style under auto
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub format: Format,
-    /// Longest wait for a reply or network chunk; never a person or a total
+    /// Seconds to wait for each reply or network chunk, not an approval or the whole run
     #[arg(long, global = true, default_value_t = 60, value_parser = parse_timeout, value_name = "SECONDS")]
     pub timeout: u64,
     /// Unlock first when needed, approved on your phone
@@ -134,7 +141,7 @@ pub(crate) enum Command {
     /// Firmware: list, update
     #[command(subcommand)]
     Firmware(Firmware),
-    /// Check this computer, the Ark and the cloud, with fixes
+    /// Check this computer, the Ark and the cloud; suggest fixes
     Doctor,
     /// Generate shell completions
     Completions {
@@ -183,7 +190,7 @@ pub(crate) enum Data {
     Paths,
     /// List dataset slots and their state
     List,
-    /// Show one slot's metadata, download and dependencies
+    /// Show one slot's metadata, download URL and dependencies
     Show {
         /// Slot name or id from `ark data list`
         #[arg(value_parser = parse_slot)]
@@ -320,7 +327,10 @@ fn parse_timeout(value: &str) -> Result<u64, String> {
             .checked_add(std::time::Duration::from_secs(seconds))
             .is_none()
     {
-        return Err("timeout must fit a positive monotonic duration".into());
+        return Err(
+            "timeout must be a positive number of seconds"
+                .into(),
+        );
     }
     Ok(seconds)
 }

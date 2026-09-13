@@ -41,9 +41,9 @@ fn main() -> ExitCode {
         Ok(matches) => matches,
         Err(error) => {
             let code = error.exit_code() as u8;
-            if code != 0 && json_requested(&arguments) {
+            if code != 0 && !style::Theme::new(format, true).human {
                 let mut options = Cli::parse_from(["ark"]).options;
-                options.format = args::Format::Json;
+                options.format = format;
                 let output = output::Output::new(&options);
                 let message = error.to_string();
                 let message = message
@@ -53,7 +53,9 @@ fn main() -> ExitCode {
                     .trim_start_matches("error: ")
                     .trim();
                 let error = Error::new(2, "usage", message);
-                let _ = output.document(&json!({"error":error.json()}));
+                if output.json() {
+                    let _ = output.document(&json!({"error":error.json()}));
+                }
                 output.error(&error);
             } else if code != 0 {
                 // Usage errors follow stderr's capabilities, independently of help.
@@ -91,6 +93,8 @@ fn main() -> ExitCode {
     };
     let result = if let Err(error) = validation {
         Err(error)
+    } else if cli.help {
+        help::run(&[], cli.all, context.options.format)
     } else if cli.version {
         context.output.document(&versions())
     } else {
@@ -149,12 +153,6 @@ pub(crate) fn versions() -> Value {
         "minimum_firmware": firmware::MINIMUM_VERSION,
         "minimum_develop_publish": device::timestamp(firmware::MINIMUM_DEVELOP_PUBLISH),
     })
-}
-
-/// Parsing can fail before clap produces matches. Only the explicit format
-/// selection is needed to report that failure in the requested stream format.
-fn json_requested(arguments: &[std::ffi::OsString]) -> bool {
-    requested_format(arguments) == args::Format::Json
 }
 
 /// Finds the last explicit format before --, without requiring valid command syntax.
