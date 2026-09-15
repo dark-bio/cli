@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 /// Verification window covering old-session closure and discovery after installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
-/// First firmware version containing the wire 0.9 protocol batch.
+/// First firmware version speaking the wire protocol this CLI uses.
 pub(crate) const MINIMUM_VERSION: &str = "0.11.5";
 
 /// Bump when current-release changes require developers to rebuild their image.

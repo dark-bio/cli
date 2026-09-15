@@ -183,7 +183,7 @@ pub(crate) struct Enroll {
 // Dataset inspection and mutation commands; slot names map to wire IDs below.
 #[derive(Subcommand)]
 pub(crate) enum Data {
-    /// Print the Ark's README of paths available to apps
+    /// Map the data paths an app can read
     Paths,
     /// List dataset slots and their state
     List,

@@ -47,9 +47,9 @@ Ark's own verdict; read its message, never match its number or wording.
 Partial results survive errors. JSON also preserves the latest partial result
 on interruption.
 
-Without --json, app reports and the dataset README stream raw to stdout.
-The app's own stderr is announced, then written unprefixed. With --json both
-app streams are in the result document.
+Without --json, app reports stream raw to stdout. The app's own stderr is
+announced, then written unprefixed. With --json both app streams are in the
+result document.
 
 Exit codes: 0 done, 1 local input or confirmation, 2 usage, 3 device access,
 4 cloud, 5 Ark state or refusal, 6 approval denied or expired, 7 machine
@@ -69,10 +69,10 @@ unlock key, and the reset button on the Ark erases all data. Neither recovers
 a locked Ark; never propose them as a way around locked.
 
 `ark genuine` checks the registry; `ark doctor` checks this computer, the Ark
-and the cloud, and suggests fixes without applying them. `ark data list` shows the
-inventory; `ark data show SLOT` adds its description. Read `ark help datasets`
-for build, version, dependency and cache meanings, and `ark help states` for
-sync, identity and firmware fields.
+and the cloud, and suggests fixes without applying them. `ark data list` shows
+the inventory, and `ark data show SLOT` adds a slot's description and format.
+Read `ark help datasets` for build, version, dependency and cache meanings, and
+`ark help states` for sync, identity and firmware fields.
 
 Unpaired Arks can receive firmware updates without phone or button approval.
 The CLI still requires installation confirmation; use --yes noninteractively.
@@ -81,6 +81,7 @@ The CLI still requires installation confirmation; use --yes noninteractively.
 
 An app is one WebAssembly file using WASI preview 1. Run with no arguments it
 prints a TOML manifest naming itself and the data paths it wants; run with a
-data directory it reads those paths and prints a report. Read `ark help apps`
-and the example apps for the manifest contract. Apps are checked and executed
-on the Ark; the CLI has no separate WASM runtime.
+data directory it reads those paths and prints a report. `ark data paths --json`
+describes every path an app can read, with each file's exact contents and
+examples, and `ark help apps` covers the manifest, grants and sandbox. Apps are
+checked and executed on the Ark; the CLI has no separate WASM runtime.

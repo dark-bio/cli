@@ -7,7 +7,11 @@
 //! Dataset selection, planning and result presentation.
 
 pub(crate) mod cache;
+mod paths;
 mod reference;
+
+#[cfg(test)]
+mod scenarios;
 
 use crate::{
     args::{self, slot_name},
@@ -24,8 +28,8 @@ use std::io::Seek;
 use std::time::Instant;
 
 /// Dispatches dataset commands after applying CLI unlock and dry-run policy.
-/// Slot metadata and refusal messages come from the Ark; the CLI does not predict
-/// whether a requested delete, repair or upload will be accepted.
+/// Path entries, slot metadata and refusal messages come from the Ark; the CLI
+/// does not predict whether a requested delete, repair or upload will be accepted.
 pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
     if let args::Data::Upload {
         file,
@@ -46,11 +50,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         let paths = connection
             .client
             .call(schema::DatasetPathsRequest {}, context.timing())?;
-        return if context.output.json() {
-            context.output.document(&json!({"readme": paths.readme}))
-        } else {
-            context.output.app(paths.readme.as_bytes(), &[])
-        };
+        return paths::print(&context.output, &paths.paths);
     }
     let slots = connection
         .client
@@ -58,70 +58,8 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         .slots;
     let repair = matches!(&command, args::Data::Repair(_));
     match command {
-        args::Data::List => {
-            let rows: Vec<_> = slots.iter().map(metadata).collect();
-            let document = json!({"slots":rows});
-            let rows: Vec<_> = rows
-                .into_iter()
-                .zip(&slots)
-                .map(|(value, slot)| dependency_view(value, slot, &slots))
-                .collect();
-            context.output.table(
-                &document,
-                &rows,
-                &[
-                    ("SLOT", "slot"),
-                    ("STATE", "state"),
-                    ("ORIGIN", "origin"),
-                    ("BUILD", "build"),
-                    ("VERSION", "version"),
-                    ("SIZE", "size_bytes"),
-                    ("REQUIRES", "requires"),
-                ],
-            )?;
-            for slot in &slots {
-                if slot.state == SlotState::StateDamaged as i32 {
-                    context.output.event(
-                        "hint",
-                        format!("run `ark data repair {}`", slot_name(slot.kind)),
-                    );
-                } else if !filled(slot) && download(slot).is_some() {
-                    context.output.event(
-                        "hint",
-                        format!("run `ark data fetch {}`", slot_name(slot.kind)),
-                    );
-                }
-                for dependency in &slot.deps {
-                    if !slots
-                        .iter()
-                        .any(|other| other.kind == *dependency && filled(other))
-                    {
-                        context.output.event(
-                            "hint",
-                            format!(
-                                "{} requires {}; fill it first",
-                                slot_name(slot.kind),
-                                slot_name(*dependency)
-                            ),
-                        );
-                    }
-                }
-            }
-            Ok(())
-        }
-        args::Data::Show { slot } => {
-            let slot = select(&slots, slot)?;
-            let mut value = metadata(slot);
-            value["description"] = json!(slot.desc);
-            value["required_by"] = json!(required_by(&slots, slot.kind));
-            value["cached"] = json!(
-                download(slot).is_some_and(|(_, _, hash)| cache::cached(&cache::directory(), hash))
-            );
-            let view = dependency_view(value.clone(), slot, &slots);
-            context
-                .output
-                .document_with(&value, |theme| crate::output::human::document(theme, &view))
-        }
+        args::Data::List => listing(&context.output, &slots),
+        args::Data::Show { slot } => show(&context.output, &slots, slot),
         args::Data::Delete(args) | args::Data::Repair(args) => {
             let slot = select(&slots, args.slot)?;
             let mut value = json!({"slot":slot_name(slot.kind),"id":slot.kind,"state":state(slot),"changed":false});
@@ -169,6 +107,70 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         ),
         args::Data::Upload { .. } | args::Data::Paths => unreachable!(),
     }
+}
+
+/// Prints the compact slot inventory and hints for missing or damaged data.
+fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), Error> {
+    let rows: Vec<_> = slots.iter().map(metadata).collect();
+    let document = json!({"slots":rows});
+    let rows: Vec<_> = rows
+        .into_iter()
+        .zip(slots)
+        .map(|(value, slot)| dependency_view(value, slot, slots))
+        .collect();
+    output.table(
+        &document,
+        &rows,
+        &[
+            ("SLOT", "slot"),
+            ("STATE", "state"),
+            ("ORIGIN", "origin"),
+            ("BUILD", "build"),
+            ("VERSION", "version"),
+            ("SIZE", "size_bytes"),
+            ("REQUIRES", "requires"),
+        ],
+    )?;
+    for slot in slots {
+        if slot.state == SlotState::StateDamaged as i32 {
+            output.event(
+                "hint",
+                format!("run `ark data repair {}`", slot_name(slot.kind)),
+            );
+        } else if !filled(slot) && download(slot).is_some() {
+            output.event(
+                "hint",
+                format!("run `ark data fetch {}`", slot_name(slot.kind)),
+            );
+        }
+        for dependency in &slot.deps {
+            if !slots
+                .iter()
+                .any(|other| other.kind == *dependency && filled(other))
+            {
+                output.event(
+                    "hint",
+                    format!(
+                        "{} requires {}; fill it first",
+                        slot_name(slot.kind),
+                        slot_name(*dependency)
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prints a slot's description, upload format, metadata and local cache state.
+fn show(output: &crate::output::Output, slots: &[SlotStatus], id: i32) -> Result<(), Error> {
+    let slot = select(slots, id)?;
+    let mut value = metadata(slot);
+    value["required_by"] = json!(required_by(slots, slot.kind));
+    value["cached"] =
+        json!(download(slot).is_some_and(|(_, _, hash)| cache::cached(&cache::directory(), hash)));
+    let view = dependency_view(value.clone(), slot, slots);
+    output.document_with(&value, |theme| crate::output::human::document(theme, &view))
 }
 
 /// Identifies a local file, checks an optional target constraint and either plans
@@ -465,6 +467,7 @@ pub(crate) fn metadata(slot: &SlotStatus) -> Value {
     json!({
         "slot": slot_name(slot.kind), "id": slot.kind,
         "name": slot.name,
+        "description": slot.desc, "format": slot.format,
         "state": state(slot), "origin": origin,
         "damage": (!slot.damage.is_empty()).then_some(&slot.damage),
         "requires": slot.deps.iter().map(|id| slot_name(*id)).collect::<Vec<_>>(),
@@ -488,11 +491,14 @@ mod tests {
         assert!(upload_approval(SlotSnpIndelCalls as i32));
     }
 
+    /// A slot kind this CLI doesn't know keeps its texts and dependency state.
     #[test]
     fn future_slots_keep_generic_metadata() {
         let slot = SlotStatus {
             kind: 42,
             name: "Future dataset".into(),
+            desc: "A public dataset for apps.".into(),
+            format: "An unchanged file from the reference catalog.".into(),
             state: SlotState::StateFilled as i32,
             bytes: 123,
             build: "GRCh39".into(),
@@ -507,7 +513,8 @@ mod tests {
         assert_eq!(value["requires"], json!(["reference-genome"]));
         assert!(value["damage"].is_null());
         assert!(value["download"].is_null());
-        assert!(value.get("description").is_none());
+        assert_eq!(value["description"], slot.desc);
+        assert_eq!(value["format"], slot.format);
         let dependency = SlotStatus {
             kind: 1,
             state: SlotState::StateFilled as i32,
