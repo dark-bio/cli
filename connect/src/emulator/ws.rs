@@ -42,7 +42,7 @@ const INBOUND_LIMIT: usize = 2 * MAX_MESSAGE;
 pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     url: &str,
     verifier: &V,
-    cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
+    cloud: impl FnOnce(&crate::Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,
 ) -> Result<(Ark, V::Info), Error> {
     // Resolve the endpoint before starting the TCP and HTTP handshake budget.
     let request = url.into_client_request().map_err(Error::Upgrade)?;
@@ -749,7 +749,7 @@ mod tests {
         let (ark, _) = connect(
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
-            None,
+            |_| None,
         )
         .unwrap();
         assert_eq!(
@@ -777,7 +777,7 @@ mod tests {
         let (ark, _) = connect(
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
-            None,
+            |_| None,
         )
         .unwrap();
         let err = ark

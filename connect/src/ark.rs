@@ -42,13 +42,13 @@ impl Ark {
         self.services.set_cloud_auth(Arc::new(auth));
     }
 
-    /// Takes ownership of a stream and authenticates the peer under wire's
-    /// handshake timeout. Returns the verifier's identity information. Failure
-    /// closes the stream.
+    /// Authenticates the peer under wire's handshake timeout, then selects cloud
+    /// routing for the session. Returns the verifier's identity information.
+    /// Failure closes the stream.
     pub(crate) fn attach<R, W, V>(
         stream: transport::Stream<R, W>,
         verifier: &V,
-        cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
+        cloud: impl FnOnce(&Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,
     ) -> Result<(Self, V::Info), Error>
     where
         R: transport::Read + Send + 'static,
@@ -68,7 +68,7 @@ impl Ark {
             }
             Error::Handshake(err)
         })?;
-        let services = Arc::new(Services::new(&info, cloud));
+        let services = Arc::new(Services::new(&info, cloud(&info)));
         Ok((Self::start(session, services)?, info))
     }
 
@@ -436,6 +436,75 @@ mod tests {
     /// Budget for test I/O that is not exercising expiration.
     const TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Cloud selection sees the authenticated identity and keeps its session.
+    #[test]
+    fn test_cloud_selection_after_handshake() {
+        use crate::trust::{Environment, Realm};
+
+        struct Attested(Environment);
+
+        impl Verifier for Attested {
+            type Info = Identity;
+
+            fn verify(
+                &self,
+                attestation: &transport::Attestation,
+            ) -> Result<(crate::wire::crypto::xdsa::PublicKey, Identity), String> {
+                let (key, _) = crate::TrustMode::RootOrSelf.verify(attestation)?;
+                let identity = Identity::Attested {
+                    env: self.0,
+                    device: crate::trust::device::Device {
+                        realm: Realm::Hardware,
+                        identity: key.clone(),
+                        serial: "test-device".into(),
+                        oem: crate::wire::crypto::cwt::claims::eat::Oemid::new_pen(0),
+                        model: vec![],
+                        version: String::new(),
+                        issued: 0,
+                        expiry: None,
+                    },
+                };
+                Ok((key, identity))
+            }
+        }
+
+        for &env in crate::identity::ENVIRONMENTS {
+            let mut peer = Peer::spawn(Box::new(answering));
+            let mut selected = None;
+            let (ark, identity) = Ark::attach(peer.stream(), &Attested(env), |identity| {
+                let Identity::Attested { env, device } = identity else {
+                    panic!("expected attested identity");
+                };
+                assert_eq!(device.identity.to_bytes(), peer.identity.to_bytes());
+                assert!(selected.replace(*env).is_none());
+                Some((*env, device.realm))
+            })
+            .unwrap();
+            assert_eq!(selected, Some(env));
+            assert!(matches!(identity, Identity::Attested { env: actual, .. } if actual == env));
+            assert_eq!(
+                ark.client()
+                    .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                    .unwrap()
+                    .firmware_version,
+                "1.0.0"
+            );
+        }
+    }
+
+    /// Failed authentication never invokes the cloud selector.
+    #[test]
+    fn test_cloud_selection_rejects_failed_handshake() {
+        let mut peer = Peer::spawn(Box::new(answering));
+        let wrong = crate::wire::crypto::xdsa::SecretKey::generate().public_key();
+        let result = Ark::attach(
+            peer.stream(),
+            &crate::TrustMode::Recover(Box::new(wrong)),
+            |_| panic!("cloud selected before authentication"),
+        );
+        assert!(matches!(result, Err(Error::Handshake(_))));
+    }
+
     /// Exercises manual reverse requests without automatic cloud attachment.
     struct ManualUnlock;
 
@@ -579,7 +648,10 @@ mod tests {
             replies
         });
         let (mut ark, _) =
-            Ark::attach(host, &crate::TrustMode::Recover(Box::new(identity)), None).unwrap();
+            Ark::attach(host, &crate::TrustMode::Recover(Box::new(identity)), |_| {
+                None
+            })
+            .unwrap();
         let (request, responder) = ark.recv().unwrap();
         assert!(matches!(
             request,

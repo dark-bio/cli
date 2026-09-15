@@ -156,35 +156,33 @@ impl Device {
     /// The verifier's identity selects cloud routing for later operations;
     /// connecting itself does not contact the cloud.
     pub fn connect(&self, verifier: &TrustMode) -> Result<(Ark, Identity), Error> {
-        self.open(verifier, None)
+        self.open(verifier, |_| None)
     }
 
-    /// Connects with an explicit cloud environment, overriding the attestation's
-    /// environment without changing its trust result. Cloud access stays lazy.
+    /// Selects the cloud environment from the authenticated identity without
+    /// reopening the connection. The callback runs once after a successful
+    /// handshake, before cloud services start. Cloud access stays lazy.
     /// Self-signed and recovery peers use the discovered kind to select a registry;
-    /// attested peers retain their verified realm. The Ark verifies the cloud's
-    /// certificates, and the cloud verifies device proofs against its registry.
+    /// attested peers retain their verified realm. Routing never changes trust.
     pub fn connect_with_env(
         &self,
         verifier: &TrustMode,
-        env: Environment,
+        env: impl FnOnce(&Identity) -> Environment,
     ) -> Result<(Ark, Identity), Error> {
-        self.open(verifier, Some(env))
+        self.open(verifier, |identity| Some(env(identity)))
     }
 
     /// Opens the retained transport with any caller-supplied cloud route.
     fn open(
         &self,
         verifier: &TrustMode,
-        env: Option<Environment>,
+        env: impl FnOnce(&Identity) -> Option<Environment>,
     ) -> Result<(Ark, Identity), Error> {
-        let cloud = env.map(|env| {
-            let realm = match self.kind() {
-                DeviceKind::Hardware => Realm::Hardware,
-                DeviceKind::Emulator => Realm::Emulator,
-            };
-            (env, realm)
-        });
+        let realm = match self.kind() {
+            DeviceKind::Hardware => Realm::Hardware,
+            DeviceKind::Emulator => Realm::Emulator,
+        };
+        let cloud = |identity: &Identity| env(identity).map(|env| (env, realm));
         match &self.source {
             Source::Usb(info) => hardware::connect(info, verifier, cloud),
             Source::Registry(instance) => emulator::connect(&instance.url(), verifier, cloud),

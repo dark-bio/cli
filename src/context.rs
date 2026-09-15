@@ -115,32 +115,17 @@ impl Context {
             self.timing().with_deadline(deadline)
         });
         let trust = trust(pubkey)?;
-        let selected = environment(self.options.env, None, device.env());
-        let (mut ark, mut identity) = device.connect_with_env(&trust, selected)?;
-        let env = environment(self.options.env, Some(&identity), device.env());
-        if let Identity::Attested { env: attested, .. } = &identity {
-            let attested = *attested;
-            if self.options.env.is_some_and(|env| env != attested) {
-                self.output.event(
-                    "warning",
-                    format!("--env overrides the attested {attested} environment"),
-                );
-            } else if self.options.env.is_none() {
-                // Routing is fixed when connect opens a session. A verified
-                // attestation supersedes any provisional launcher default.
-                if selected != attested {
-                    let key = identity.key().clone();
-                    drop(ark);
-                    (ark, identity) = device.connect_with_env(&trust, attested)?;
-                    if identity.key().to_bytes() != key.to_bytes() {
-                        return Err(Error::new(
-                            3,
-                            "handshake-failed",
-                            "the Ark's identity changed while connecting",
-                        ));
-                    }
-                }
-            }
+        let (mut ark, identity) = device.connect_with_env(&trust, |identity| {
+            environment(self.options.env, identity, device.env())
+        })?;
+        let env = environment(self.options.env, &identity, device.env());
+        if let Identity::Attested { env: attested, .. } = &identity
+            && self.options.env.is_some_and(|env| env != *attested)
+        {
+            self.output.event(
+                "warning",
+                format!("--env overrides the attested {attested} environment"),
+            );
         }
         self.output.environment(env);
         if env != Environment::Release {
@@ -224,11 +209,11 @@ impl Context {
 /// Routing does not change the identity established by the handshake.
 fn environment(
     overridden: Option<Environment>,
-    identity: Option<&Identity>,
+    identity: &Identity,
     reported: Option<&str>,
 ) -> Environment {
     let attested = match identity {
-        Some(Identity::Attested { env, .. }) => Some(*env),
+        Identity::Attested { env, .. } => Some(*env),
         _ => None,
     };
     overridden
@@ -314,32 +299,30 @@ mod tests {
                     expiry: None,
                 },
             };
-            assert_eq!(environment(None, Some(&identity), Some("develop")), env);
-            assert_eq!(environment(None, Some(&identity), Some("release")), env);
+            assert_eq!(environment(None, &identity, None), env);
+            assert_eq!(environment(None, &identity, Some("develop")), env);
+            assert_eq!(environment(None, &identity, Some("release")), env);
             assert_eq!(
-                environment(Some(Environment::Staging), Some(&identity), Some("develop")),
+                environment(Some(Environment::Staging), &identity, Some("develop")),
                 Environment::Staging
             );
         }
         for identity in [Identity::SelfSigned(key.clone()), Identity::Recovered(key)] {
             assert_eq!(
-                environment(None, Some(&identity), Some("develop")),
+                environment(None, &identity, Some("develop")),
                 Environment::Develop
             );
             assert_eq!(
-                environment(None, Some(&identity), Some("staging")),
+                environment(None, &identity, Some("staging")),
                 Environment::Staging
             );
+            assert_eq!(environment(None, &identity, None), Environment::Release);
             assert_eq!(
-                environment(None, Some(&identity), None),
+                environment(None, &identity, Some("invalid")),
                 Environment::Release
             );
             assert_eq!(
-                environment(None, Some(&identity), Some("invalid")),
-                Environment::Release
-            );
-            assert_eq!(
-                environment(Some(Environment::Release), Some(&identity), Some("develop")),
+                environment(Some(Environment::Release), &identity, Some("develop")),
                 Environment::Release
             );
         }

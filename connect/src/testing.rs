@@ -143,7 +143,7 @@ impl Peer {
         Ark::attach(
             stream,
             &TrustMode::Recover(Box::new(self.identity.clone())),
-            None,
+            |_| None,
         )
     }
 }
