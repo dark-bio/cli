@@ -61,7 +61,7 @@ pub(crate) fn name(product: &str) -> Option<&str> {
 pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     info: &nusb::DeviceInfo,
     verifier: &V,
-    cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
+    cloud: impl FnOnce(&crate::Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,
 ) -> Result<(Ark, V::Info), Error> {
     let device = info.open().wait().map_err(Error::Usb)?;
     let config = device

@@ -781,7 +781,7 @@ pub(crate) mod tests {
             } else {
                 TrustMode::RootOrSelf
             };
-            let (ark, _) = Ark::attach(peer.stream(), &policy, None).unwrap();
+            let (ark, _) = Ark::attach(peer.stream(), &policy, |_| None).unwrap();
             let client = ark.client();
             assert!(matches!(
                 client.call(GenuinityProofRequest {}, Instant::now() + TIMEOUT),

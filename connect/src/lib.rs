@@ -40,9 +40,10 @@
 //! only when required and is reused while healthy. [`Client::sync`] explicitly
 //! refreshes the signed clock and cloud keys; [`Client::attach_relay`] exposes
 //! attachment for diagnostics.
-//! Status and enrollment work before either step. A self-signed or recovery
-//! connection needs an explicit environment through [`Device::connect_with_env`]
-//! for cloud operations. Routing never changes the handshake's trust result.
+//! Status and enrollment work before either step. [`Device::connect_with_env`]
+//! selects cloud routing after authentication on the same connection. Self-signed
+//! and recovery peers need a caller-selected environment for cloud operations.
+//! Routing never changes the handshake's trust result.
 //!
 //! Calls and workflows accept an [`Instant`](std::time::Instant) for one fixed
 //! deadline or [`Timing`] for an inactivity allowance, optionally combined with
