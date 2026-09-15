@@ -30,12 +30,11 @@ colour; neither can force it on in a pipe.
 
 ## Payloads and failures
 
-App reports and the dataset README pass through to stdout as exact bytes by
-default. App stderr is announced and written verbatim to stderr. With --json,
-app streams become stdout and stderr strings, or stdout_base64 and stderr_base64
-when their bytes are not UTF-8. The dataset README becomes readme. Failed apps
-return output only with `develop = true`; the CLI preserves whatever the Ark
-returns.
+App reports pass through to stdout as exact bytes by default. App stderr is
+announced and written verbatim to stderr. With --json, app streams become stdout
+and stderr strings, or stdout_base64 and stderr_base64 when their bytes are not
+UTF-8. Failed apps return output only with `develop = true`; the CLI preserves
+whatever the Ark returns.
 
 A command that did partial work keeps that result, reports failure on stderr
 and exits nonzero. It never replaces an emitted result with an error document.

@@ -1,11 +1,9 @@
 # Datasets
 
-`ark data list` is an inventory of slots, with short names and state.
-`ark data show SLOT` adds the long description, required_by and cached.
-Neither transfers dataset bytes. `ark data paths` prints the Ark's README
-verbatim, including absent paths and the slots that would supply them.
-With --json it returns readme. Numeric slot IDs remain usable when a new kind
-has no name in this CLI build.
+`ark data list` is a compact inventory of slots and their state, and
+`ark data show SLOT` adds the detail it leaves out. `ark data paths` maps the
+data an app can read. None of them transfers dataset bytes. Numeric slot IDs
+remain usable when a new kind has no name in this CLI build.
 
 Check `ark status` before a data command. It needs a paired, unlocked Ark;
 use --unlock only if status reports locked, and the owner will approve on
@@ -13,11 +11,14 @@ the phone. A dry run never unlocks and conflicts with --unlock.
 
 ## Slot fields
 
-JSON list entries contain slot, id, name, state, origin, damage, requires,
-size_bytes, build, version and download. show adds description, required_by
-and cached. The reading view scales
-size_bytes under Size and includes dependency state alongside each name.
+JSON list entries contain slot, id, name, description, format, state, origin,
+damage, requires, size_bytes, build, version and download. show adds required_by
+and cached. The reading list keeps to short columns, while show also prints the
+full description and format. Both show dependency state alongside each name.
 
+- description explains the slot's data to its owner. format tells whoever fills
+  the slot which file it accepts, the shape that file needs, what the Ark
+  refuses and whether the owner approves the upload.
 - size_bytes is the bytes on the Ark's disk for this slot, zero when empty.
   It is not the original upload or download size; processing may change it.
 - build is the reference assembly, for example GRCh38.p14. The Ark matches
@@ -36,6 +37,24 @@ size_bytes under Size and includes dependency state alongside each name.
   means a file named by the advertised SHA-256 is already here, which fetch
   still verifies as it replays. Personal slots always print no, since personal
   uploads are never cached.
+
+## Data paths
+
+`ark data paths` prints every path pattern an app can read as an indented
+tree, with each entry under its parent. A trailing / marks a directory, + one a
+manifest may grant, and ! data this Ark lacks, which covers everything beneath
+the marked entry. Placeholders such as <gene> stand for values an app fills in.
+
+--json returns the same entries in order, each with path, directory, grantable,
+available, description, format and examples. path is complete, v1/ included,
+and is what a manifest names. description says what the path holds, when it is
+absent and when reading it fails. format gives a file's exact contents or what a
+directory lists, and examples lists sample values, most typical first.
+
+available means the slots a pattern needs are filled, not that every gene,
+position or genotype has an answer. The map never carries a value from the
+owner's data. When anything is unavailable, a hint points at `ark data list`.
+`ark help apps` covers manifest grants and the Ark's checks before an app runs.
 
 ## Transfers and changes
 

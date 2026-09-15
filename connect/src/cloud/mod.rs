@@ -1127,10 +1127,21 @@ pub(crate) mod tests {
     }
 
     /// Reusing device state needs no HTTP, while explicit diagnostics always
-    /// refresh it. Dataset paths remain the exact text produced by the Ark.
+    /// refresh it. Dataset paths keep every field across the connection.
     #[test]
     fn test_reported_sync_and_explicit_refresh() {
         use crate::schema;
+        let expected = schema::DatasetPathsResponse {
+            paths: vec![schema::DatasetPath {
+                path: "v1/sample/<item>".into(),
+                directory: true,
+                grantable: true,
+                available: true,
+                desc: "A sample item.".into(),
+                format: "Plain text.".into(),
+                examples: vec!["first".into(), "second".into()],
+            }],
+        };
         for initially_synced in [false, true] {
             let mut responses = sync_responses();
             if !initially_synced {
@@ -1140,6 +1151,7 @@ pub(crate) mod tests {
             let infos = Arc::new(AtomicUsize::new(0));
             let mut peer = Peer::spawn(Box::new({
                 let infos = infos.clone();
+                let paths = expected.clone();
                 let mut synced = initially_synced;
                 move |session, request, responder| {
                     let deadline = Instant::now() + TIMEOUT;
@@ -1159,10 +1171,7 @@ pub(crate) mod tests {
                         }
                         Content::DatasetPaths(_) => {
                             assert!(synced, "request served before sync");
-                            schema::DatasetPathsResponse {
-                                readme: "# Paths\n\n/v1/README.md\n".into(),
-                            }
-                            .into()
+                            paths.clone().into()
                         }
                         Content::CloudSyncStart(_) => {
                             schema::CloudSyncStartResponse { challenge: vec![3] }.into()
@@ -1186,7 +1195,7 @@ pub(crate) mod tests {
                 let paths = client
                     .call(schema::DatasetPathsRequest {}, deadline)
                     .unwrap();
-                assert_eq!(paths.readme, "# Paths\n\n/v1/README.md\n");
+                assert_eq!(paths, expected);
             }
             assert_eq!(infos.load(Ordering::SeqCst), 1);
             assert_eq!(

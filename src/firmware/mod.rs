@@ -23,11 +23,11 @@ use std::time::{Duration, Instant};
 /// Verification window covering old-session closure and discovery after installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
-/// First firmware version containing the wire 0.9 protocol batch.
+/// First firmware version speaking the wire protocol this CLI uses.
 pub(crate) const MINIMUM_VERSION: &str = "0.11.5";
 
 /// Bump when current-release changes require developers to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_231_693; // 2026-09-12 16:48:13 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_461_469; // 2026-09-15 08:37:49 UTC
 
 /// Requires the protocol batch and, for mutable develop builds, its publish cutoff.
 /// This is CLI compatibility guidance based on reported firmware metadata.
