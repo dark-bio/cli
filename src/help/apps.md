@@ -54,10 +54,9 @@ root and v1/ itself cannot be granted.
 
 The Ark checks every grant before asking the owner. It refuses a misspelled or
 ungrantable path, and one whose data is missing, such as an empty slot, an
-unknown gene or rsID, or a position past the end of its chromosome. These
-checks read slot state and public reference data only, never the owner's
-genome. After approval the Ark mounts the grants read-only and passes the data
-directory as the app's first argument, with the manifest paths beneath it.
+unknown gene or rsID, or a position past the end of its chromosome. After
+approval the Ark mounts the grants read-only and passes the data directory as
+the app's first argument, with the manifest paths beneath it.
 
 ## Sandbox
 
