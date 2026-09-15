@@ -79,6 +79,19 @@ impl Theme {
         // Windows needs ANSI processing enabled for colors and live progress.
         #[cfg(windows)]
         let interactive = interactive && terminal.features().colors_supported();
+        let native_console = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::Console::GetConsoleMode;
+                let mut mode = 0;
+                unsafe { GetConsoleMode(terminal.as_raw_handle(), &mut mode) != 0 }
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok())
@@ -93,7 +106,7 @@ impl Theme {
             || std::env::var("CLICOLOR").is_ok_and(|value| value == "0")
         {
             Color::Off
-        } else if (cfg!(windows) && !terminal.features().is_msys_tty())
+        } else if native_console
             || std::env::var("COLORTERM")
                 .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"))
         {
@@ -387,6 +400,9 @@ mod tests {
                 let json = Theme::new(true, stderr);
                 assert!(!json.interactive);
                 assert_eq!(json.paint(Role::Muted, "label"), "label");
+                let repeated = Theme::new(false, stderr);
+                assert_eq!(repeated.color, theme.color);
+                assert_eq!(repeated.interactive, theme.interactive);
             }
         });
         unsafe {
