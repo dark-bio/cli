@@ -27,7 +27,7 @@ pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 pub(crate) const MINIMUM_VERSION: &str = "0.11.5";
 
 /// Bump when current-release changes require developers to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_461_469; // 2026-09-15 08:37:49 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_461_235; // 2026-09-15 08:33:55 UTC
 
 /// Requires the protocol batch and, for mutable develop builds, its publish cutoff.
 /// This is CLI compatibility guidance based on reported firmware metadata.
