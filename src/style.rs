@@ -63,6 +63,11 @@ pub(crate) struct Theme {
 impl Theme {
     /// Keeps reading layouts in pipes; only terminals get color and cursor control.
     pub fn new(json: bool, stderr: bool) -> Self {
+        let terminal = if stderr {
+            console::Term::stderr()
+        } else {
+            console::Term::stdout()
+        };
         let attended = if stderr {
             io::stderr().is_terminal()
         } else {
@@ -71,6 +76,9 @@ impl Theme {
         let human = !json;
         let term = std::env::var("TERM").unwrap_or_default();
         let interactive = human && attended && term != "dumb";
+        // Windows needs ANSI processing enabled for colors and live progress.
+        #[cfg(windows)]
+        let interactive = interactive && terminal.features().colors_supported();
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok())
@@ -85,19 +93,15 @@ impl Theme {
             || std::env::var("CLICOLOR").is_ok_and(|value| value == "0")
         {
             Color::Off
-        } else if std::env::var("COLORTERM")
-            .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"))
+        } else if (cfg!(windows) && !terminal.features().is_msys_tty())
+            || std::env::var("COLORTERM")
+                .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"))
         {
             Color::True
         } else if term.contains("256color") {
             Color::Ansi256
         } else {
             Color::Basic
-        };
-        let terminal = if stderr {
-            console::Term::stderr()
-        } else {
-            console::Term::stdout()
         };
         let width = terminal
             .size_checked()
@@ -300,6 +304,100 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_enables_color_without_environment() {
+        use std::{fs::OpenOptions, os::windows::io::AsRawHandle, process::Command};
+        use windows_sys::Win32::System::Console::{
+            AllocConsole, ENABLE_VIRTUAL_TERMINAL_PROCESSING, FreeConsole, GetConsoleMode,
+            GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+        };
+
+        // Isolate console handles and environment from the other tests.
+        const CHILD: &str = "ARK_TEST_WINDOWS_CONSOLE";
+        let Ok(case) = std::env::var(CHILD) else {
+            for (name, value) in [
+                ("", ""),
+                ("NO_COLOR", "1"),
+                ("CLICOLOR", "0"),
+                ("TERM", "dumb"),
+            ] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "style::tests::windows_console_enables_color_without_environment",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, if name.is_empty() { "color" } else { name })
+                    .env_remove("TERM")
+                    .env_remove("COLORTERM")
+                    .env_remove("NO_COLOR")
+                    .env_remove("CLICOLOR")
+                    .env_remove("CLICOLOR_FORCE")
+                    .env_remove("FORCE_COLOR");
+                if !name.is_empty() {
+                    command.env(name, value);
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{name}={value}: {output:?}");
+            }
+            return;
+        };
+
+        let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        unsafe { FreeConsole() };
+        assert_ne!(unsafe { AllocConsole() }, 0);
+        let result = std::panic::catch_unwind(|| {
+            let console = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("CONOUT$")
+                .unwrap();
+            let handle = console.as_raw_handle();
+            for (stream, stderr) in [(STD_OUTPUT_HANDLE, false), (STD_ERROR_HANDLE, true)] {
+                assert_ne!(unsafe { SetStdHandle(stream, handle) }, 0);
+                let mut mode = 0;
+                assert_ne!(unsafe { GetConsoleMode(handle, &mut mode) }, 0);
+                assert_ne!(
+                    unsafe { SetConsoleMode(handle, mode & !ENABLE_VIRTUAL_TERMINAL_PROCESSING) },
+                    0
+                );
+                let theme = Theme::new(false, stderr);
+                assert_eq!(theme.interactive, case != "TERM");
+                assert_eq!(
+                    theme.color,
+                    if case == "color" {
+                        Color::True
+                    } else {
+                        Color::Off
+                    }
+                );
+                assert_eq!(
+                    theme.paint(Role::Muted, "label").contains("\x1b[38;2;"),
+                    case == "color"
+                );
+                assert_ne!(unsafe { GetConsoleMode(handle, &mut mode) }, 0);
+                assert_eq!(
+                    mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0,
+                    case != "TERM"
+                );
+                let json = Theme::new(true, stderr);
+                assert!(!json.interactive);
+                assert_eq!(json.paint(Role::Muted, "label"), "label");
+            }
+        });
+        unsafe {
+            FreeConsole();
+            SetStdHandle(STD_OUTPUT_HANDLE, stdout);
+            SetStdHandle(STD_ERROR_HANDLE, stderr);
+        }
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
 
     #[test]
     fn palette_degrades_without_losing_words() {
