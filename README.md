@@ -75,7 +75,7 @@ Uploads of your own data are approved on the phone; public reference downloads a
 
 ## Apps
 
-An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval, runs it on the Ark and writes the report's exact bytes to stdout. Redirect stdout to save it, or use `--json` to include the run's metadata. Ctrl-C cancels a run; `ark app cancel <task>` cleans up one whose terminal went away. `ark data paths` describes the data tree; `ark help apps` has the manifest, grant rules and sandbox limits.
+An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval, runs it on the Ark and writes the report's exact bytes to stdout. Redirect stdout to save it, or use `--json` to include the run's metadata. Ctrl-C cancels a run; `ark app cancel <task>` cleans up one whose terminal went away. `ark data paths` describes the data tree; `ark help apps` has the manifest, grant rules and sandbox limits. The [examples](https://github.com/dark-bio/examples) repository has worked apps in Rust, Go, C and Python, with fixtures that run them on your computer.
 
 ## Firmware
 
@@ -85,7 +85,7 @@ This release needs Ark firmware 0.11.5 or later; `ark --version` prints the mini
 
 ## Devices and diagnostics
 
-One Ark is picked automatically. With several, select one with `-d` by locator, serial, name or emulator image, or with the bare words `hardware` and `emulator`. Run commands one at a time, including reads. `device-busy` means another `ark` command or an Ark Hub browser tab holds the USB session.
+One Ark is picked automatically. With several, select one with `-d` by locator, serial, name or emulator image, or with the bare words `hardware` and `emulator`. Run commands one at a time, including reads. `device-busy` means another `ark` command or an Ark Hub browser tab holds the USB session. Emulators come from the [Ark Emulator](https://github.com/dark-bio/emulator) desktop app, which boots the real firmware on your computer for development and demos.
 
 `ark status` shows the Ark's attested identity and works offline; `ark genuine` checks that identity against Dark Bio's device registry; `ark enroll` gives a fresh emulator its identity. When something is off, `ark doctor` checks your computer, the Ark and the cloud, and suggests fixes without applying them. `-v` adds step narration; `--log debug` or `--log trace` enables diagnostic logs.
 

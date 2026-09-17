@@ -85,3 +85,8 @@ data directory it reads those paths and prints a report. `ark data paths --json`
 describes every path an app can read, with each file's exact contents and
 examples, and `ark help apps` covers the manifest, grants and sandbox. Apps are
 checked and executed on the Ark; the CLI has no separate WASM runtime.
+
+Worked apps in Rust, Go, C and Python live at
+https://github.com/dark-bio/examples, with fixtures that run them on this
+computer. Without hardware, the desktop emulator at
+https://github.com/dark-bio/emulator boots the real firmware for development.

@@ -3,8 +3,11 @@
 An app is one WASI preview 1 WebAssembly file. With no arguments it prints a
 TOML manifest; when the Ark runs it with a data directory it reads its declared
 paths and prints a report. The Ark owns manifest validation, sandboxing and
-permission enforcement. Use a hardware Ark or emulator; the CLI has no local
-execution sandbox.
+permission enforcement. Use a hardware Ark or the desktop emulator from
+https://github.com/dark-bio/emulator; the CLI has no local execution sandbox.
+
+Worked apps in Rust, Go, C and Python, with fixtures that run them on this
+computer, are at https://github.com/dark-bio/examples.
 
 ## Running and collecting results
 
