@@ -5,6 +5,10 @@ local launcher registry. It does not connect or authenticate. A missing emulator
 registry is normal when no emulator is running. A failed discovery source does
 not hide devices found through another source.
 
+Emulators come from the desktop app at https://github.com/dark-bio/emulator,
+which boots the real firmware on this computer. It exists for development and
+demos and keeps its data in a plain file, so keep real data on hardware.
+
 The reading view shows locator, name, serial, kind, environment and ready.
 JSON devices entries contain locator, kind, name, serial, image, environment
 and ready. environment and ready are launcher metadata for
