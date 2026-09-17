@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-ark"
-version = "0.3.3"
+version = "0.3.4"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Command line interface to Ark enclaves"
 repository = "https://github.com/dark-bio/cli"
