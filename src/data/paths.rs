@@ -38,22 +38,13 @@ fn metadata(path: &DatasetPath) -> Value {
 }
 
 /// Renders the entries as a tree, nesting each under its closest listed parent.
-/// Only the topmost unavailable entry of a subtree carries the mark.
+/// Only the topmost unavailable entry of a subtree carries the mark. Examples
+/// line up in one column right of the widest row and wrap within it.
 fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
     if paths.is_empty() {
         return format!("  {}", theme.paint(Role::Muted, "No dataset paths"));
     }
-    let mut lines = vec![style::wrap(
-        &format!(
-            "  {}",
-            theme.paint(
-                Role::Muted,
-                "/ directory, + grantable, ! unavailable; details with --json"
-            )
-        ),
-        theme.width,
-        2,
-    )];
+    let mut rows = Vec::new();
     let mut parents: Vec<&DatasetPath> = Vec::new();
     for path in paths {
         // Names shorten only under a listed parent, so a root keeps its full path.
@@ -88,10 +79,40 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
         if !path.available && parents.last().is_none_or(|parent| parent.available) {
             line.push_str(&theme.paint(Role::Attention, " !"));
         }
-        lines.push(style::wrap(&line, theme.width, indent + 2));
+        rows.push((line, indent, &path.examples));
         if path.directory {
             parents.push(path);
         }
+    }
+    let column = rows
+        .iter()
+        .map(|(line, _, _)| console::measure_text_width(line))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let mut lines = vec![style::wrap(
+        &format!(
+            "  {}",
+            theme.paint(
+                Role::Muted,
+                "/ directory, + grantable, ! unavailable; details with --json"
+            )
+        ),
+        theme.width,
+        2,
+    )];
+    for (line, indent, examples) in rows {
+        if examples.is_empty() {
+            lines.push(style::wrap(&line, theme.width, indent + 2));
+            continue;
+        }
+        let padding = " ".repeat(column - console::measure_text_width(&line));
+        let examples = theme.paint(Role::Muted, examples.join(", "));
+        lines.push(style::wrap(
+            &format!("{line}{padding}{examples}"),
+            theme.width,
+            column,
+        ));
     }
     lines.join("\n")
 }
@@ -102,7 +123,8 @@ mod tests {
     use crate::style::Color;
 
     /// Unknown roots, missing parents and long names keep every path component in
-    /// tree order, and unavailable ancestors hide repeated marks.
+    /// tree order, unavailable ancestors hide repeated marks, and examples share
+    /// one column that wraps within itself.
     #[test]
     fn future_paths_keep_their_hierarchy() {
         let paths = [
@@ -116,10 +138,16 @@ mod tests {
             DatasetPath {
                 path: "v1/sample/groups/<item>".into(),
                 directory: true,
+                examples: ["alpha", "beta"].map(String::from).to_vec(),
                 ..Default::default()
             },
             DatasetPath {
                 path: "v1/sample/groups/<item>/value".into(),
+                examples: [
+                    "A/G", "T|T", "A", "./.", "A/.", ".", "AT/A", "T/*", "A/<DEL>",
+                ]
+                .map(String::from)
+                .to_vec(),
                 ..Default::default()
             },
             DatasetPath {
@@ -136,7 +164,12 @@ mod tests {
         let text = render(&Theme::test(80, Color::Off, false), &paths);
         assert_eq!(
             text,
-            "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    groups/<item>/ !\n      value\n    summary\n  v2/sample/a-long-example-directory-name/ !"
+            format!(
+                "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    groups/<item>/ !{}alpha, beta\n      value{}A/G, T|T, A, ./., A/., ., AT/A, \n{}T/*, A/<DEL>\n    summary\n  v2/sample/a-long-example-directory-name/ !",
+                " ".repeat(26),
+                " ".repeat(35),
+                " ".repeat(46)
+            )
         );
         for width in [20, 40, 80] {
             for color in [Color::Off, Color::Basic, Color::True] {
@@ -148,7 +181,9 @@ mod tests {
                 let plain = console::strip_ansi_codes(&text);
                 let joined = plain.split_whitespace().collect::<String>();
                 assert!(joined.contains("v2/sample/a-long-example-directory-name/!"));
-                assert!(joined.contains("groups/<item>/!valuesummary"));
+                assert!(joined.contains(
+                    "groups/<item>/!alpha,betavalueA/G,T|T,A,./.,A/.,.,AT/A,T/*,A/<DEL>summary"
+                ));
             }
         }
         assert_eq!(

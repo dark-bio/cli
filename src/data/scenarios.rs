@@ -206,9 +206,9 @@ fn inventory_output() {
                 assert_eq!(
                     stdout,
                     if unavailable {
-                        "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    label\n    group/ + !\n      <item>/\n        value\n  v1/other/ !\n"
+                        "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    label       first, second\n    group/ + !\n      <item>/   one\n        value   7, 9\n  v1/other/ !\n"
                     } else {
-                        "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    label\n    group/ +\n      <item>/\n        value\n  v1/other/\n"
+                        "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    label       first, second\n    group/ +\n      <item>/   one\n        value   7, 9\n  v1/other/\n"
                     }
                 );
                 if unavailable {

@@ -44,6 +44,8 @@ full description and format. Both show dependency state alongside each name.
 tree, with each entry under its parent. A trailing / marks a directory, + one a
 manifest may grant, and ! data this Ark lacks, which covers everything beneath
 the marked entry. Placeholders such as <gene> stand for values an app fills in.
+The column to the right lists examples, sample values for a placeholder and
+sample contents for a file.
 
 --json returns the same entries in order, each with path, directory, grantable,
 available, description, format and examples. path is complete, v1/ included,
