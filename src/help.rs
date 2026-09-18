@@ -141,7 +141,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "a paired, unlocked Ark (--unlock only if status reports locked)",
             "none; --unlock needs your phone",
             "seconds",
-            "path tree with directories, grants and availability; JSON paths: path, directory, grantable, available, description, format, examples",
+            "path tree with directories, grants, availability and examples; JSON paths: path, directory, grantable, available, description, format, examples",
             "ark data paths\nark data paths --json",
         ),
         "data upload" => (
