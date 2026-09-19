@@ -51,9 +51,15 @@ impl Instance {
     }
 }
 
+/// The listing version this build understands. A breaking change to the
+/// registry bumps it, so a newer registry is refused rather than misread.
+const VERSION: u64 = 1;
+
 /// Registry response with entries retained for individual decoding.
 #[derive(Deserialize)]
 struct Listing {
+    #[serde(default)]
+    version: Option<u64>, // Absent on a registry older than the contract
     #[serde(default)]
     instances: Vec<serde_json::Value>, // Entries decoded independently for compatibility
 }
@@ -73,6 +79,15 @@ fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
     };
     let listing: Listing = serde_json::from_slice(&body)
         .map_err(|err| Error::Registry(io::Error::new(io::ErrorKind::InvalidData, err)))?;
+    if listing.version != Some(VERSION) {
+        return Err(Error::Registry(io::Error::new(
+            io::ErrorKind::InvalidData,
+            match listing.version {
+                Some(version) => format!("emulator registry version {version} is not supported"),
+                None => "emulator registry listing carries no version".to_string(),
+            },
+        )));
+    }
 
     // Skip entries this build cannot decode without losing compatible entries
     // from the same registry response.
@@ -196,7 +211,7 @@ mod tests {
     #[test]
     fn test_chunked_listing() {
         let (listener, addr) = bind();
-        let parts = ["{\"instances\":[", "{\"port\":18181}]}"];
+        let parts = ["{\"version\":1,\"instances\":[", "{\"port\":18181}]}"];
         let mut response = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
         for part in parts {
             response.push_str(&format!("{:x}\r\n{part}\r\n", part.len()));
@@ -221,6 +236,23 @@ mod tests {
         assert!(
             matches!(list_at(addr), Err(Error::Registry(error)) if error.kind() == io::ErrorKind::InvalidData)
         );
+    }
+
+    // Tests that a listing of a version this build does not know, or of no
+    // version at all, is refused rather than read.
+    #[test]
+    fn test_unknown_version_is_refused() {
+        for body in [
+            "{\"version\":2,\"instances\":[{\"port\":18181}]}",
+            "{\"instances\":[{\"port\":18181}]}",
+        ] {
+            let (listener, addr) = bind();
+            serve(listener, format!("HTTP/1.1 200 OK\r\n\r\n{body}"));
+            assert!(
+                matches!(list_at(addr), Err(Error::Registry(error)) if error.kind() == io::ErrorKind::InvalidData),
+                "{body}"
+            );
+        }
     }
 
     // Tests that a service answering with anything but a listing fails the

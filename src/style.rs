@@ -48,8 +48,6 @@ pub(crate) enum Color {
 /// Presentation capabilities resolved once for one output stream.
 #[derive(Clone, Debug)]
 pub(crate) struct Theme {
-    /// Whether this stream uses human layouts.
-    pub human: bool,
     /// Whether this stream permits cursor control and live line updates.
     pub interactive: bool,
     /// Whether terminal and locale permit decorative Unicode glyphs.
@@ -120,7 +118,6 @@ impl Theme {
             .size_checked()
             .map_or(80, |(_, width)| usize::from(width).max(1));
         Self {
-            human,
             interactive,
             unicode,
             color,
@@ -234,6 +231,23 @@ impl Theme {
 /// Terminal control sequences belong to the writer, never to result content.
 pub(crate) const CLEAR_LINE: &str = "\r\x1b[2K";
 
+/// Escapes control characters in text that came from a device, a file or a
+/// remote, so it can neither drive the terminal nor start a line of its own.
+pub(crate) fn printable(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    text.chars()
+        .flat_map(|ch| {
+            if ch.is_control() {
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+
 /// Formats a byte count in binary units up to GiB with one decimal place.
 pub(crate) fn bytes(bytes: u64) -> String {
     for (unit, divisor) in [("GiB", 1_u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
@@ -253,6 +267,10 @@ pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> String {
     let mut append = |word: &str| {
         let size = console::measure_text_width(word.trim_end());
         if column > indent && column + size > width && size <= width - indent {
+            // The space that ended the previous word is not part of the line.
+            while result.ends_with(' ') {
+                result.pop();
+            }
             result.push('\n');
             result.push_str(&" ".repeat(indent));
             column = indent;
@@ -305,7 +323,6 @@ pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> String {
 impl Theme {
     pub fn test(width: usize, color: Color, unicode: bool) -> Self {
         Self {
-            human: true,
             interactive: true,
             unicode,
             color,
@@ -466,6 +483,15 @@ mod tests {
         assert_eq!(wrapped.split_whitespace().collect::<String>(), wide);
         assert_eq!(theme.truncate("abcdef", 2), "a\u{2026}");
         assert_eq!(theme.truncate("abcdef", 6), "abcdef");
+    }
+
+    #[test]
+    fn control_characters_cannot_reach_the_terminal() {
+        assert_eq!(printable("plain name"), "plain name");
+        assert_eq!(
+            printable("evil\x1b[2Jname\nsecond line\t"),
+            "evil\\u{1b}[2Jname\\nsecond line\\t"
+        );
     }
 
     #[test]

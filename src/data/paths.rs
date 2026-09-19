@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    groups/<item>/ !{}alpha, beta\n      value{}A/G, T|T, A, ./., A/., ., AT/A, \n{}T/*, A/<DEL>\n    summary\n  v2/sample/a-long-example-directory-name/ !",
+                "  / directory, + grantable, ! unavailable; details with --json\n  v1/sample/ +\n    groups/<item>/ !{}alpha, beta\n      value{}A/G, T|T, A, ./., A/., ., AT/A,\n{}T/*, A/<DEL>\n    summary\n  v2/sample/a-long-example-directory-name/ !",
                 " ".repeat(26),
                 " ".repeat(35),
                 " ".repeat(46)

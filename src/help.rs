@@ -4,7 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Help is generated from the commands this build actually serves.
+//! Help is generated from the commands this build actually serves. A page has
+//! one shape on a terminal and in a pipe; only color and glyphs differ.
 
 use crate::{
     args::Cli,
@@ -13,11 +14,19 @@ use crate::{
 };
 use clap::CommandFactory;
 
-/// Help stays plain in pipes and gains terminal styling independently of --json.
-pub(crate) fn theme(stderr: bool) -> Theme {
-    let mut theme = Theme::new(false, stderr);
-    theme.human = theme.interactive;
-    theme
+/// Options every command accepts, listed once on the root page and hidden on
+/// every other page, since an agent reads the manual from the root.
+const GLOBAL: [&str; 10] = [
+    "device", "json", "timeout", "unlock", "yes", "no_input", "env", "quiet", "verbose", "log",
+];
+
+/// Help topics in the order the manual prints them.
+const TOPICS: [&str; 6] = ["agents", "states", "output", "devices", "datasets", "apps"];
+
+/// Help is written for reading even when the invocation selects JSON, so the
+/// theme never follows that flag; a pipe still loses color and glyphs.
+pub(crate) fn theme() -> Theme {
+    Theme::new(false, false)
 }
 
 /// Builds the executable command tree with shared styling and command-specific contracts.
@@ -25,31 +34,35 @@ pub(crate) fn command(theme: &Theme) -> clap::Command {
     let mut command = Cli::command();
     decorate(&mut command, "", theme);
     command.build();
-    compact(&mut command, theme);
+    compact(&mut command, theme, true);
     command
 }
 
 /// Clap normally expands long help onto two lines per option. Render its short
-/// layout once, then let the help action select the short or long footer.
-fn compact(command: &mut clap::Command, theme: &Theme) {
+/// layout once, wrapped to the width, then let the help action select the
+/// short or long footer. The shared options drop off every page but the root.
+fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
+    if !root {
+        for name in GLOBAL {
+            *command = command
+                .clone()
+                .mut_arg(name, |argument| argument.hide(true));
+        }
+    }
     let mut display = command.clone().after_help(None).after_long_help(None);
-    let rendered = display.render_help();
-    let scan = if theme.human {
-        rendered
-            .ansi()
-            .to_string()
-            .lines()
-            .map(|line| style::wrap(&theme.inline(line), theme.width, 6))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        rendered.to_string()
-    };
+    let scan = display
+        .render_help()
+        .ansi()
+        .to_string()
+        .lines()
+        .map(|line| style::wrap(&theme.inline(line), theme.width, 6))
+        .collect::<Vec<_>>()
+        .join("\n");
     *command = command
         .clone()
         .help_template(format!("{}{{after-help}}", scan.trim_end()));
     for child in command.get_subcommands_mut() {
-        compact(child, theme);
+        compact(child, theme, false);
     }
 }
 
@@ -104,7 +117,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         ),
         "pair" => (
             "an unpaired Ark and cloud access",
-            "scan in Ark Companion and confirm colours",
+            "scan in Ark Companion and confirm colors",
             "up to 10 minutes to scan; then approval and storage setup",
             "serial, paired; pairing URL on stderr",
             "ark pair\nark pair --json",
@@ -118,7 +131,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         ),
         "enroll" => (
             "one Ark; --cwt accepts an existing attestation",
-            "online enrollment uses the Hub; none with --cwt",
+            "online enrollment uses Ark Hub; none with --cwt",
             "seconds for --cwt and reconnection",
             "enrolled, url for online enrollment; status fields then enrolled with --cwt",
             "ark enroll\nark enroll --cwt attestation.cwt",
@@ -158,12 +171,19 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "slot, size, cached, outcome; JSON fetched: slot, id, url, size_bytes, sha256, cached, outcome, error",
             "ark data fetch --all\nark data fetch reference-genome --dry-run --json",
         ),
-        "data delete" | "data repair" => (
+        "data delete" => (
             "a paired, unlocked Ark (--unlock only if status reports locked)",
             "on your phone; never under --dry-run",
             "up to a minute for approval",
             "slot, id, state, changed; required_by under --dry-run",
-            "ark data delete snp-indel-calls --dry-run\nark data repair snp-indel-calls",
+            "ark data delete snp-indel-calls\nark data delete snp-indel-calls --dry-run",
+        ),
+        "data repair" => (
+            "a paired, unlocked Ark (--unlock only if status reports locked)",
+            "on your phone; never under --dry-run",
+            "up to a minute for approval",
+            "slot, id, state, changed; required_by under --dry-run",
+            "ark data repair snp-indel-calls\nark data repair snp-indel-calls --dry-run",
         ),
         "app run" => (
             "a local WASM file and a paired, unlocked Ark (--unlock only if status reports locked)",
@@ -233,25 +253,6 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         }
         _ => "0 done; 1 local; 2 usage",
     };
-    let help = format!(
-        "Requires: {requires}\nApproval: {approval}\nTime:     {time}\nPrints:   {prints}\nExit:     {exits}; 130/143 interrupted\n\nExamples:\n  {}",
-        examples.replace('\n', "\n  ")
-    );
-    let help = if theme.human {
-        footer(
-            theme,
-            &[
-                ("Requires", requires),
-                ("Approval", approval),
-                ("Time", time),
-                ("Prints", prints),
-                ("Exit", &format!("{exits}; 130/143 interrupted")),
-            ],
-            examples,
-        )
-    } else {
-        help
-    };
     let help = if parent.is_empty() {
         "Output is formatted for reading; --json keeps complete, exact values.
 Scripts and AI agents: read `ark help agents` first.
@@ -262,6 +263,8 @@ Topics: agents, states, output, devices, datasets, apps."
             "Each subcommand has its own requirements, approvals and output.\nRead `ark {key} COMMAND --help` for its contract."
         )
     } else {
+        // Clap keeps an option hidden from the short page out of the rendered
+        // scan too, so the long page lists it by hand ahead of the contract.
         let advanced = if matches!(key, "status" | "enroll") {
             "Advanced:
       --pubkey <HEX>  Pin an xDSA public key instead of verifying the attestation
@@ -270,16 +273,26 @@ Topics: agents, states, output, devices, datasets, apps."
         } else {
             ""
         };
-        format!("{advanced}{help}")
+        format!(
+            "{advanced}{}",
+            footer(
+                theme,
+                &[
+                    ("Requires", requires),
+                    ("Approval", approval),
+                    ("Time", time),
+                    ("Prints", prints),
+                    ("Exit", &format!("{exits}; 130/143 interrupted")),
+                ],
+                examples,
+            )
+        )
     };
-    let help = if theme.human {
-        help.lines()
-            .map(|line| style::wrap(&theme.inline(line), theme.width, 0))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        help
-    };
+    let help = help
+        .lines()
+        .map(|line| style::wrap(&theme.inline(line), theme.width, 0))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut decorated = command.clone().after_long_help(format!("{help}\n"));
     if parent.is_empty() {
         decorated = decorated.after_help(format!("{help}\n"));
@@ -293,42 +306,25 @@ Topics: agents, states, output, devices, datasets, apps."
 /// Prints a command page, an embedded topic or the full manual without discovery.
 /// Help remains readable text even when the invocation selects JSON.
 pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
-    let theme = theme(false);
+    let theme = theme();
     let mut root = command(&theme);
     if all {
-        if theme.human {
-            let mut pages = Vec::new();
-            collect_help(&mut root, &mut pages);
-            pages.extend(
-                ["agents", "states", "output", "devices", "datasets", "apps"]
-                    .map(|name| markdown(&theme, topic(name).unwrap())),
-            );
-            println!(
-                "{}",
-                pages.join(&format!(
-                    "\n\n{}\n\n",
-                    theme.paint(Role::Muted, "-".repeat(theme.width.min(80)))
-                ))
-            );
-            return Ok(());
-        }
-        print_command(&mut root)?;
-        for name in ["agents", "states", "output", "devices", "datasets", "apps"] {
-            println!("\n{}", topic(name).unwrap().trim_end());
-        }
+        let mut pages = Vec::new();
+        collect_help(&mut root, &mut pages);
+        pages.extend(TOPICS.map(|name| markdown(&theme, topic(name).unwrap())));
+        println!(
+            "{}",
+            pages.join(&format!(
+                "\n\n{}\n\n",
+                theme.paint(Role::Muted, "-".repeat(theme.width.min(80)))
+            ))
+        );
         return Ok(());
     }
     if path.len() == 1
         && let Some(topic) = topic(&path[0])
     {
-        println!(
-            "{}",
-            if theme.human {
-                markdown(&theme, topic)
-            } else {
-                topic.trim_end().to_string()
-            }
-        );
+        println!("{}", markdown(&theme, topic));
         return Ok(());
     }
     let mut command = &mut root;
@@ -345,29 +341,36 @@ pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// Aligns short contract labels and shell examples within the human terminal width.
+/// Lays out the contract: labels with a colon padded to one column, values
+/// wrapped under themselves, then the examples as bare commands, since a pasted
+/// prompt breaks in a shell.
 fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
+    let column = fields
+        .iter()
+        .map(|(label, _)| label.len() + 2)
+        .max()
+        .unwrap_or(0);
     let mut lines = fields
         .iter()
         .map(|(label, text)| {
             style::wrap(
                 &format!(
                     "{}{}{}",
-                    theme.paint(Role::Muted, label),
-                    " ".repeat(11 - label.len()),
+                    theme.paint(Role::Muted, format!("{label}:")),
+                    " ".repeat(column - label.len() - 1),
                     theme.inline(text)
                 ),
                 theme.width,
-                11,
+                column,
             )
         })
         .collect::<Vec<_>>();
-    lines.push(format!("\n{}", theme.paint(Role::Heading, "Examples")));
+    lines.push(format!("\n{}", theme.paint(Role::Heading, "Examples:")));
     lines.extend(examples.lines().map(|line| {
         style::wrap(
-            &format!("  $ {}", theme.paint(Role::Accent, line)),
+            &format!("  {}", theme.paint(Role::Accent, line)),
             theme.width,
-            4,
+            2,
         )
     }));
     lines.join("\n")
@@ -421,7 +424,7 @@ fn markdown(theme: &Theme, text: &str) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
-/// Collects human command pages in command-tree order for the complete manual.
+/// Collects command pages in command-tree order for the complete manual.
 fn collect_help(command: &mut clap::Command, pages: &mut Vec<String>) {
     pages.push(
         command
@@ -435,15 +438,7 @@ fn collect_help(command: &mut clap::Command, pages: &mut Vec<String>) {
         collect_help(child, pages);
     }
 }
-/// Prints this command and its descendants as plain long-help pages.
-fn print_command(command: &mut clap::Command) -> Result<(), Error> {
-    command.print_long_help()?;
-    println!("\n");
-    for child in command.get_subcommands_mut() {
-        print_command(child)?;
-    }
-    Ok(())
-}
+
 /// Returns a compiled-in help topic by its public name.
 fn topic(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -470,7 +465,7 @@ mod tests {
                 &[("Requires", "a paired Ark"), ("Approval", "only if locked")],
                 "ark unlock"
             ),
-            "Requires   a paired Ark\nApproval   only if locked\n\n\x1b[1mExamples\x1b[0m\n  $ \x1b[1mark unlock\x1b[0m"
+            "Requires: a paired Ark\nApproval: only if locked\n\n\x1b[1mExamples:\x1b[0m\n  \x1b[1mark unlock\x1b[0m"
         );
         assert_eq!(
             markdown(
@@ -479,6 +474,34 @@ mod tests {
             ),
             "\x1b[1mStates\x1b[0m\n\nUse \x1b[1mark status\x1b[0m.\n\n  - Keep the phone nearby.\n\n  \x1b[1mark unlock\x1b[0m"
         );
+    }
+
+    /// A terminal and a pipe print the same page; only color differs.
+    #[test]
+    fn pages_have_one_shape_with_and_without_color() {
+        let colored = Theme::test(80, Color::True, true);
+        let plain = Theme {
+            interactive: false,
+            unicode: false,
+            color: Color::Off,
+            ..colored.clone()
+        };
+        let mut styled = command(&colored);
+        let mut bare = command(&plain);
+        for path in [vec!["data", "upload"], vec!["status"], vec![]] {
+            let (mut styled, mut bare) = (&mut styled, &mut bare);
+            for name in &path {
+                styled = styled.find_subcommand_mut(name).unwrap();
+                bare = bare.find_subcommand_mut(name).unwrap();
+            }
+            let rendered = styled.render_long_help().ansi().to_string();
+            assert!(rendered.contains("\x1b["), "{path:?}");
+            assert_eq!(
+                console::strip_ansi_codes(&rendered),
+                bare.render_long_help().to_string(),
+                "{path:?}"
+            );
+        }
     }
 
     #[test]
@@ -498,6 +521,36 @@ mod tests {
         );
         assert!(console::strip_ansi_codes(&rendered).contains("ark data fetch --all"));
         assert!(rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn shared_options_are_listed_on_the_root_page_only() {
+        let theme = Theme::test(80, Color::Off, false);
+        let mut root = command(&theme);
+        // Examples mention the flags too, so the listing is told by the text
+        // clap prints beside each option.
+        let listed = [
+            "--timeout <SECONDS>",
+            "Print the complete result as JSON",
+            "Never prompt; fail with",
+            "Diagnostic logs: debug for connect",
+            "Which Ark: locator",
+        ];
+        let page = root.render_help().to_string();
+        for option in listed {
+            assert!(page.contains(option), "{option}");
+        }
+        for path in [vec!["data"], vec!["data", "upload"], vec!["doctor"]] {
+            let mut command = &mut root;
+            for name in &path {
+                command = command.find_subcommand_mut(name).unwrap();
+            }
+            let page = command.render_long_help().to_string();
+            for option in listed {
+                assert!(!page.contains(option), "{path:?}: {option}");
+            }
+            assert!(page.contains("-h, --help"), "{path:?}");
+        }
     }
 
     #[test]

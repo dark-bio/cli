@@ -216,14 +216,17 @@ impl Output {
             return;
         }
         let message = message.as_ref();
+        // JSON escapes on its own; the reading streams get a printable copy,
+        // since a device name or verdict must not drive the terminal.
+        let shown = style::printable(message);
         if kind == "progress" && self.terminal() {
             let theme = &self.0.err;
             let line = format!(
                 "{} {}",
                 theme.paint(Role::Muted, "progress:"),
-                theme.inline(message)
+                theme.inline(&shown)
             );
-            self.progress_line(message.split(':').next().unwrap_or(message), &line);
+            self.progress_line(shown.split(':').next().unwrap_or(&shown), &line);
             return;
         }
         {
@@ -237,9 +240,9 @@ impl Output {
                 let _ = writeln!(stderr, "{}", json!({"event":kind,"message":message}));
             } else if self.terminal() {
                 separate_result(&mut terminal, &mut stderr);
-                let _ = writeln!(stderr, "{}", event_line(&self.0.err, kind, message));
+                let _ = writeln!(stderr, "{}", event_line(&self.0.err, kind, &shown));
             } else {
-                let _ = writeln!(stderr, "{kind}: {message}");
+                let _ = writeln!(stderr, "{kind}: {shown}");
             }
             terminal.err_printed = true;
             let _ = stderr.flush();
@@ -474,6 +477,7 @@ impl Output {
                 .as_ref()
                 .map(|remote| format!(" (code 0x{:x})", remote.code))
                 .unwrap_or_default();
+            let message = style::printable(&error.message);
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
             let mut stderr = io::stderr().lock();
             if self.terminal() {
@@ -482,12 +486,12 @@ impl Output {
                 let line = format!(
                     "{} {}{}",
                     theme.paint(Role::Failure, format!("error[{}]:", error.code)),
-                    theme.inline(&error.message),
+                    theme.inline(&message),
                     theme.paint(Role::Muted, &remote)
                 );
                 let _ = writeln!(stderr, "{}", style::wrap(&line, theme.width, 2));
             } else {
-                let _ = writeln!(stderr, "error[{}]: {}{remote}", error.code, error.message);
+                let _ = writeln!(stderr, "error[{}]: {message}{remote}", error.code);
             }
             terminal.err_printed = true;
         }
@@ -583,12 +587,13 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
 }
 
 /// Formats scalar values and lists without terminal styling or field-specific units.
+/// Text is made printable here, since every reading layout passes through it.
 pub(crate) fn scalar(value: &Value) -> String {
     match value {
         Value::Null => "-".into(),
         Value::Bool(true) => "yes".into(),
         Value::Bool(false) => "no".into(),
-        Value::String(value) => value.clone(),
+        Value::String(value) => style::printable(value),
         Value::Array(values) => values.iter().map(scalar).collect::<Vec<_>>().join(", "),
         value => value.to_string(),
     }

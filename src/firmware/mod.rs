@@ -70,7 +70,6 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     let args::Firmware::Update {
         version,
         dry_run,
-        wait: _,
         no_wait,
     } = command
     else {

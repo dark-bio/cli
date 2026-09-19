@@ -91,7 +91,7 @@ One Ark is picked automatically. With several, select one with `-d` by locator, 
 
 ## Output and automation
 
-Default output is formatted for reading. Use `--json` for complete, exact values, with an indented result document on stdout and one JSON event per line on stderr. App reports pass through raw by default. Colour requires a terminal; `NO_COLOR` or `CLICOLOR=0` disables it.
+Default output is formatted for reading. Use `--json` for complete, exact values, with an indented result document on stdout and one JSON event per line on stderr. App reports pass through raw by default. Color requires a terminal; `NO_COLOR` or `CLICOLOR=0` disables it.
 
 Scripts and AI agents should read `ark help agents` first. Nothing prompts without a terminal or with `--json`, and the exit code says what happened. `ark help output` defines the streams, JSON fields and error codes.
 

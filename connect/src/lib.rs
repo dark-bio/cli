@@ -62,7 +62,7 @@
 //! Firmware preparation may require approval, so a rejected proof refreshes cloud
 //! keys and returns an error for the caller to retry explicitly.
 //!
-//! Downloads, package catalogues, version selection, caches, prompts, signal
+//! Downloads, package catalogs, version selection, caches, prompts, signal
 //! handling and reboot waits belong to callers. Connect accepts readers, checks
 //! declared sizes and optional dataset hashes, and does not retry a failed
 //! transfer. Progress supplies upload session and execution task IDs for explicit
