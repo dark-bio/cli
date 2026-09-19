@@ -6,7 +6,7 @@ instructions, hints and errors. Keep the streams separate when parsing output.
 ## Reading and parsing
 
 Default output is formatted for reading, including when redirected. It may use
-tables, scale units, localise timestamps and add status marks. Labels describe
+tables, scale units, localize timestamps and add status marks. Labels describe
 what is shown, so Size carries its unit in the value. Byte columns share one unit
 so sizes can be compared down the column. A mark before a state value is decoration,
 not part of the value. Absent values appear as -, empty lists as none and
@@ -20,13 +20,14 @@ differ.
 
 --json prints one complete, exact result document on stdout, indented by two
 spaces. Keys are snake_case, absent values null, enums strings, times ISO 8601
-UTC, byte counts suffixed _bytes and durations _seconds. Task IDs are decimal
-strings so every u64 is exact. JSON field additions are allowed; renames require
-a major version. Scripts should pin the tool version. Reading layouts and
-labels may change. Help and completions always print text.
+UTC, byte counts suffixed _bytes and durations _seconds. Task IDs and the Ark's
+error numbers are decimal strings so every 64-bit value is exact. JSON field
+additions are allowed; renames require a major version. Scripts should pin the
+tool version. Reading layouts and labels may change. Help and completions always
+print text.
 
-Colour and live progress require a terminal. NO_COLOR or CLICOLOR=0 disables
-colour; neither can force it on in a pipe.
+Color and live progress require a terminal. NO_COLOR or CLICOLOR=0 disables
+color; neither can force it on in a pipe.
 
 ## Payloads and failures
 
@@ -70,7 +71,7 @@ structured progress API.
 The code in error[code]: is stable and its exit code is the class below. This
 prefix also applies to argument errors. hint: lines name a next step where the
 tool knows one. JSON errors carry code, message and, for the Ark's own verdicts,
-remote code and message.
+remote code and message, the code as a decimal string.
 
 Exit 1, local input or confirmation:
 - `file-not-found`, `file-unreadable`, `file-empty`: the named path

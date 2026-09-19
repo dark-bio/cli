@@ -84,9 +84,13 @@ fn conformance(args: &[&str]) {
 fn command_tree_output_conforms() {
     for (path, page) in commands() {
         let args: Vec<_> = path.iter().map(String::as_str).collect();
-        assert!(page.contains("--json"), "{path:?}");
+        // The shared options are listed once, on the root page. Examples
+        // mention the flags too, so the listing is told by its description.
+        for option in ["--timeout <SECONDS>", "Print the complete result as JSON"] {
+            assert_eq!(page.contains(option), path.is_empty(), "{path:?}: {option}");
+        }
         assert!(!page.contains("--format"), "{path:?}");
-        assert!(page.contains("--log"), "{path:?}");
+        assert!(page.contains("-h, --help"), "{path:?}");
         let mut rejected = args.clone();
         rejected.extend(["--json", "--format", "json"]);
         let output = ark(&rejected);
@@ -149,8 +153,10 @@ fn help_differs_exactly_where_it_promises_more() {
 
 #[test]
 fn documented_usage_errors_keep_the_text_prefix() {
+    // Topics render in a pipe as on a terminal, so code spans lose their
+    // backtick markers there and keep only their text.
     let help = String::from_utf8(ark(&["help", "output"]).stdout).unwrap();
-    assert!(help.contains("Exit 2, `usage`"));
+    assert!(help.contains("Exit 2, usage"));
     for args in [
         vec!["bogus"],
         vec!["--timeout", "0", "status"],
@@ -169,7 +175,7 @@ fn documented_usage_errors_keep_the_text_prefix() {
     }
     let output = ark(&["status", "--device", "hardware:palette-no-device"]);
     assert_eq!(output.status.code(), Some(3));
-    assert!(help.contains("`no-device`"));
+    assert!(help.contains("no-device: no Ark found"));
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
@@ -301,7 +307,13 @@ fn help_matches_the_supported_palette() {
         ] {
             assert!(long.contains(field), "{path}: {long}");
         }
-        assert!(long.contains("--timeout <SECONDS>"));
+        // The contract block keeps one shape in a pipe: colon labels, wrapped
+        // values, and examples as bare commands with no prompt.
+        for line in long.lines() {
+            assert!(line.chars().count() <= 80, "{path}: {line}");
+            assert!(!line.trim_start().starts_with("$ "), "{path}: {line}");
+        }
+        assert!(!long.contains("--timeout <SECONDS>"), "{path}");
         let mut command = vec!["help"];
         command.extend(path.split(' '));
         assert_eq!(ark(&command).stdout, long.as_bytes());
@@ -326,6 +338,85 @@ fn help_matches_the_supported_palette() {
             .unwrap()
             .contains("--pubkey")
     );
+}
+
+/// The manual names the example apps and the emulator, the two other corners
+/// of the loop a reader arrives in, and the root page lists the shared options.
+#[test]
+fn manual_carries_the_cross_references() {
+    let manual = String::from_utf8(ark(&["help", "--all"]).stdout).unwrap();
+    for link in [
+        "https://github.com/dark-bio/examples",
+        "https://github.com/dark-bio/emulator",
+    ] {
+        assert!(manual.contains(link), "{link}");
+    }
+    let root = String::from_utf8(ark(&["--help"]).stdout).unwrap();
+    assert!(root.contains("--timeout <SECONDS>"));
+    assert!(root.contains("--json"));
+}
+
+/// Every error code the source can emit, read from the source itself, so the
+/// output topic is checked against what the tool does and not a second list.
+fn emitted_codes() -> std::collections::BTreeSet<String> {
+    fn visit(dir: &std::path::Path, codes: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, codes);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for prefix in ["Error::new(", "Self::new("] {
+                for (index, _) in text.match_indices(prefix) {
+                    let rest = text[index + prefix.len()..]
+                        .trim_start()
+                        .trim_start_matches(|c: char| c.is_ascii_digit())
+                        .trim_start()
+                        .trim_start_matches(',')
+                        .trim_start();
+                    if let Some(rest) = rest.strip_prefix('"')
+                        && let Some(end) = rest.find('"')
+                    {
+                        codes.insert(rest[..end].to_string());
+                    }
+                }
+            }
+            // The Ark's reserved verdicts map to codes in match arms.
+            if path.file_name().is_some_and(|name| name == "error.rs") {
+                for (index, _) in text.match_indices("=> \"") {
+                    let rest = &text[index + 4..];
+                    if let Some(end) = rest.find('"') {
+                        codes.insert(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut codes = std::collections::BTreeSet::new();
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut codes,
+    );
+    assert!(codes.len() > 20, "{codes:?}");
+    codes
+}
+
+#[test]
+fn every_error_code_is_documented() {
+    let topic = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/help/output.md"),
+    )
+    .unwrap();
+    for code in emitted_codes() {
+        assert!(
+            topic.contains(&format!("`{code}`")),
+            "{code} is not in `ark help output`"
+        );
+    }
 }
 
 #[test]

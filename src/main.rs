@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         .skip(1)
         .take_while(|arg| *arg != "--")
         .any(|arg| arg == "--json");
-    let mut command = help::command(&help::theme(false));
+    let mut command = help::command(&help::theme());
     let matches = match command.try_get_matches_from_mut(&arguments) {
         Ok(matches) => matches,
         Err(error) => {
@@ -117,7 +117,7 @@ fn main() -> ExitCode {
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
         None => {
-            help::command(&help::theme(false)).print_help()?;
+            help::command(&help::theme()).print_help()?;
             Ok(())
         }
         Some(Command::Devices) => device::devices(context),
@@ -134,7 +134,7 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         Some(Command::Completions { shell }) => {
             clap_complete::generate(
                 shell,
-                &mut help::command(&help::theme(false)),
+                &mut help::command(&help::theme()),
                 "ark",
                 &mut std::io::stdout(),
             );

@@ -93,7 +93,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                 }
                 context
                     .output
-                    .event("approve", "confirm the colours on the Ark and your phone");
+                    .event("approve", "confirm the colors on the Ark and your phone");
                 if context.output.terminal() {
                     previous = Some("approval");
                 }

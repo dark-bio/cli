@@ -2,8 +2,9 @@
 
 `ark devices` discovers hardware over USB and running emulators through their
 local launcher registry. It does not connect or authenticate. A missing emulator
-registry is normal when no emulator is running. A failed discovery source does
-not hide devices found through another source.
+registry is normal when no emulator is running. A registry whose listing
+version this tool does not know is a failed source, reported as a warning. A
+failed discovery source does not hide devices found through another source.
 
 Emulators come from the desktop app at https://github.com/dark-bio/emulator,
 which boots the real firmware on this computer. It exists for development and

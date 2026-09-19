@@ -129,13 +129,13 @@ pub(crate) enum Command {
     Unlock,
     /// Give the Ark its attested identity
     Enroll(Enroll),
-    /// Datasets: read with list/show/paths; change with upload/fetch/delete/repair
+    /// Read and change the datasets on the Ark
     #[command(subcommand)]
     Data(Data),
-    /// Apps: run, cancel
+    /// Run an app on the Ark, or cancel one
     #[command(subcommand)]
     App(App),
-    /// Firmware: list, update
+    /// List and install Ark firmware
     #[command(subcommand)]
     Firmware(Firmware),
     /// Check this computer, the Ark and the cloud; suggest fixes
@@ -150,7 +150,7 @@ pub(crate) enum Command {
         /// Command path or topic name
         #[arg(num_args = 0.., value_name = "COMMAND_OR_TOPIC")]
         path: Vec<String>,
-        // Print all command help and embedded topics as one manual.
+        /// Print the whole manual: every command page and every topic
         #[arg(long, conflicts_with = "path")]
         all: bool,
     },
@@ -267,10 +267,7 @@ pub(crate) enum Firmware {
         /// Plan the update without approval or installation
         #[arg(long, conflicts_with = "unlock")]
         dry_run: bool,
-        /// Verify the Ark returns running the target build (default)
-        #[arg(long, conflicts_with = "no_wait")]
-        wait: bool,
-        /// Return when installation is acknowledged
+        /// Return when installation is acknowledged, before the reboot is verified
         #[arg(long)]
         no_wait: bool,
     },
@@ -402,7 +399,7 @@ mod tests {
                 "x",
                 "--no-cache",
             ],
-            vec!["ark", "firmware", "update", "--wait", "--no-wait"],
+            vec!["ark", "firmware", "update", "--dry-run", "--unlock"],
             vec!["ark", "--quiet", "status", "-v"],
         ] {
             assert!(

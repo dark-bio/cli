@@ -41,11 +41,12 @@ impl Error {
         self.hints.push(hint.into());
         self
     }
-    /// Encodes the result error; hints travel as stderr events instead.
+    /// Encodes the result error; hints travel as stderr events instead. The
+    /// Ark's number is a decimal string, as every 64-bit value is in JSON.
     pub fn json(&self) -> Value {
         let mut value = json!({"code": self.code, "message": self.message});
         if let Some(remote) = &self.remote {
-            value["remote"] = json!({"code": remote.code, "message": remote.msg});
+            value["remote"] = json!({"code": remote.code.to_string(), "message": remote.msg});
         }
         value
     }
@@ -214,7 +215,7 @@ mod tests {
             assert_eq!(error.class, 5);
             assert_eq!(error.code, "ark");
             assert!(error.hints.is_empty());
-            assert_eq!(error.json()["remote"]["code"], code);
+            assert_eq!(error.json()["remote"]["code"], code.to_string());
             assert_eq!(error.json()["remote"]["message"], "owner's verdict");
         }
     }
