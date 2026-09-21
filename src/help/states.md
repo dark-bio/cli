@@ -1,8 +1,9 @@
 # Ark states
 
 Discovery reports labels; the handshake establishes identity. Trust is attested,
-self-signed, or pinned by --pubkey on status and enroll. A cloud environment
-controls routing and never changes the handshake's trust result.
+self-signed, or pinned by --pubkey on status and enroll. A fresh emulator is
+self-signed until it is enrolled, as `ark help devices` describes. A cloud
+environment controls routing and never changes the handshake's trust result.
 
 Status works offline, including while unpaired or locked. It reads pairing,
 lock and cloud sync state without synchronizing. Commands that need cloud

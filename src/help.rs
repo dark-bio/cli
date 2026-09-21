@@ -240,7 +240,9 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         "status" => {
             "0 done; 1 local; 2 usage; 3 device; 5 Ark (including outdated firmware, not pairing or lock state); 7 timeout"
         }
-        "enroll" => "0 done; 1 local; 2 usage; 3 device; 5 Ark; 7 timeout",
+        "enroll" => {
+            "0 installed with --cwt; 1 local or enrollment-required; 2 usage; 3 device; 5 Ark; 7 timeout"
+        }
         "genuine" | "app cancel" | "firmware list" | "doctor" => {
             "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 7 timeout"
         }
