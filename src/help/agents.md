@@ -1,8 +1,8 @@
 # Driving ark from a script or an AI agent
 
 An Ark holds one person's health data. It is plugged into this computer over
-USB, or emulated on it. The owner approves access to their data on their phone,
-in Ark Companion. You cannot approve for them.
+USB, or emulated on it by Ark Emulator. The owner approves access to their data
+on their phone, in Ark Companion. You cannot approve for them.
 
 ## Running
 
@@ -58,7 +58,9 @@ timeout, 8 app failure, 130 Ctrl-C, 143 SIGTERM.
 ## Checking state
 
 Start with `ark devices` and `ark status`. Status works offline and shows
-paired and unlocked state. If unpaired, `ark pair` needs the owner's phone.
+trust, paired and unlocked state. A fresh emulator reports self-signed trust
+and is enrolled before pairing; `ark enroll` prints the Ark Hub address where
+that happens, in a browser. If unpaired, `ark pair` needs the owner's phone.
 If locked, `ark unlock` needs phone approval and lasts until power is cut.
 Data commands and app run need an unlocked Ark. Pass --unlock only when status
 reports locked and unlocking is authorized. A dry run never unlocks; unlock
@@ -77,6 +79,16 @@ Read `ark help datasets` for build, version, dependency and cache meanings, and
 Unpaired Arks can receive firmware updates without phone or button approval.
 The CLI still requires installation confirmation; use --yes noninteractively.
 
+## Emulated Arks
+
+Without hardware, Ark Emulator from https://github.com/dark-bio/emulator boots
+the real firmware on this computer, for development and demos. Read
+`ark-emulator help agents` before starting, stopping or wiping one.
+`ark-emulator start` returns once the emulator accepts clients and prints its
+locator, which --device takes. From there ark drives it like hardware, and the
+owner approves on their phone. `ark help devices` covers how long an
+emulator's identity lasts and where its firmware comes from.
+
 ## Writing an app
 
 An app is one WebAssembly file using WASI preview 1. Run with no arguments it
@@ -84,9 +96,9 @@ prints a TOML manifest naming itself and the data paths it wants; run with a
 data directory it reads those paths and prints a report. `ark data paths --json`
 describes every path an app can read, with each file's exact contents and
 examples, and `ark help apps` covers the manifest, grants and sandbox. Apps are
-checked and executed on the Ark; the CLI has no separate WASM runtime.
+checked and executed on the Ark, hardware or emulated; the CLI has no separate
+WASM runtime.
 
 Worked apps in Rust, Go, C and Python live at
 https://github.com/dark-bio/examples, with fixtures that run them on this
-computer. Without hardware, the desktop emulator at
-https://github.com/dark-bio/emulator boots the real firmware for development.
+computer.

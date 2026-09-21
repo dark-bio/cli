@@ -224,10 +224,11 @@ pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
     if !registration.active() {
         return Err(
             Error::new(4, "registry-inactive", "the Ark registration is inactive").hint(
-                if registration.disabled {
+                if registration.disabled || connection.device.kind() != DeviceKind::Emulator {
                     "contact Dark Bio"
                 } else {
-                    "enroll the emulator again to obtain a fresh identity"
+                    "run `ark-emulator stop`, `ark-emulator wipe` and `ark-emulator start` \
+                     for a fresh device, then `ark enroll`"
                 },
             ),
         );
@@ -235,7 +236,7 @@ pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
-/// Installs a supplied attestation or directs online enrollment to the Ark Hub.
+/// Installs a supplied attestation or directs online enrollment to Ark Hub.
 /// After installation, reconnects without recovery pinning to verify the new identity;
 /// a reconnect failure still reports that enrollment was acknowledged.
 pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error> {
@@ -256,12 +257,19 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
     };
     let Some(certificate) = certificate else {
         if matches!(connection.identity, Identity::Attested { .. }) {
-            return Err(Error::new(
+            let mut error = Error::new(
                 5,
                 "already-enrolled",
                 "the Ark already has an attested identity",
-            )
-            .hint("a fresh emulator identity requires a fresh emulator disk"));
+            );
+            if connection.device.kind() == DeviceKind::Emulator {
+                error.hints.push(
+                    "a new identity needs a fresh device, from `ark-emulator stop`, \
+                     `ark-emulator wipe` and `ark-emulator start`"
+                        .into(),
+                );
+            }
+            return Err(error);
         }
         let env = connection.env.ok_or_else(|| {
             Error::new(4, "environment-unknown", "cloud environment unknown")
@@ -277,7 +285,7 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
         return Err(Error::new(
             1,
             "enrollment-required",
-            "online enrollment is performed at the Ark Hub",
+            "online enrollment happens at Ark Hub",
         ));
     };
     connection.client.call(

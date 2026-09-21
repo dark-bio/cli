@@ -127,7 +127,7 @@ pub(crate) enum Command {
     Pair,
     /// Unlock the Ark, approved on your phone
     Unlock,
-    /// Give the Ark its attested identity
+    /// Enroll the Ark at Ark Hub, or install an attestation
     Enroll(Enroll),
     /// Read and change the datasets on the Ark
     #[command(subcommand)]

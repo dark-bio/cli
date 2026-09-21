@@ -344,10 +344,13 @@ fn help_matches_the_supported_palette() {
 /// of the loop a reader arrives in, and the root page lists the shared options.
 #[test]
 fn manual_carries_the_cross_references() {
+    // Wrapped, so a phrase is looked for across line breaks.
     let manual = String::from_utf8(ark(&["help", "--all"]).stdout).unwrap();
+    let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
     for link in [
         "https://github.com/dark-bio/examples",
         "https://github.com/dark-bio/emulator",
+        "ark-emulator help agents",
     ] {
         assert!(manual.contains(link), "{link}");
     }

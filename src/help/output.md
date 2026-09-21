@@ -82,7 +82,8 @@ Exit 1, local input or confirmation:
   published for the environment
 - `confirmation-required`: firmware installation needs confirmation; use
   --yes when running noninteractively
-- `enrollment-required`: online enrollment happens at the Ark Hub
+- `enrollment-required`: enrollment happens in a browser at Ark Hub, at the
+  address the hint gives
 - `io`: a local read or write failed
 
 Exit 2, `usage`: invalid arguments or an unknown help topic. A zero, negative or
@@ -105,7 +106,8 @@ Exit 4, cloud:
   has the cloudflared command
 - `proof-rejected`: the cloud refused the device proof; run `ark doctor`
 - `pairing-failed`: the rendezvous or the companion side failed
-- `registry-inactive`: the registration is disabled, expired or superseded
+- `registry-inactive`: the registration is disabled, expired or superseded;
+  contact Dark Bio, or wipe an expired or superseded emulator and enroll again
 
 Exit 5, Ark state or refusal:
 - `not-paired`: run `ark pair`
