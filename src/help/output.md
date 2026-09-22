@@ -23,7 +23,8 @@ spaces. Keys are snake_case, absent values null, enums strings, times ISO 8601
 UTC, byte counts suffixed _bytes and durations _seconds. Task IDs and the Ark's
 error numbers are decimal strings so every 64-bit value is exact. JSON field
 additions are allowed; renames require a major version. Scripts should pin the
-tool version. Reading layouts and labels may change. Help and completions always
+tool version, which `ark --json --version` prints beside the oldest firmware it
+supports. Reading layouts and labels may change. Help and completions always
 print text.
 
 Color and live progress require a terminal. NO_COLOR or CLICOLOR=0 disables

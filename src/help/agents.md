@@ -66,6 +66,9 @@ Data commands and app run need an unlocked Ark. Pass --unlock only when status
 reports locked and unlocking is authorized. A dry run never unlocks; unlock
 separately if needed. Do not add --unlock to a read-only task.
 
+Nothing in ark waits for an Ark to appear, so a script that has to wait polls
+`ark status --json`. no-device means none is attached yet.
+
 Nothing bypasses the phone. Deleting the pairing in Ark Companion discards the
 unlock key, and the reset button on the Ark erases all data. Neither recovers
 a locked Ark; never propose them as a way around locked.
