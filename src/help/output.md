@@ -7,10 +7,10 @@ instructions, hints and errors. Keep the streams separate when parsing output.
 
 Default output is formatted for reading, including when redirected. It may use
 tables, scale units, localize timestamps and add status marks. Labels describe
-what is shown, so Size carries its unit in the value. Byte columns share one unit
-so sizes can be compared down the column. A mark before a state value is decoration,
-not part of the value. Absent values appear as -, empty lists as none and
-booleans as yes/no.
+what is shown, so Size carries its unit in the value. Byte columns share one
+unit so sizes can be compared down the column. A mark before a state value is
+decoration, not part of the value. Absent values appear as -, empty lists as
+none and booleans as yes/no.
 
 The view may shorten or omit a long field; --json always has the complete value.
 Lists are inventories, and data show adds the detail they leave out. See
