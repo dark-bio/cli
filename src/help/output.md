@@ -39,8 +39,11 @@ whatever the Ark returns.
 
 A command that did partial work keeps that result, reports failure on stderr
 and exits nonzero. It never replaces an emitted result with an error document.
-With no result at all, --json prints an error object on stdout beside the error
-event on stderr; default output leaves stdout empty.
+With no result at all, --json prints an error document on stdout beside the
+error event on stderr; default output leaves stdout empty. The document holds
+one key, error, with the fields listed under Error codes:
+
+    {"error": {"code": "no-device", "message": "no Ark enclave found"}}
 
 ## Diagnostics
 

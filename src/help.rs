@@ -257,7 +257,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
     };
     let help = if parent.is_empty() {
         "Output is formatted for reading; --json keeps complete, exact values.
-Scripts and AI agents: read `ark help agents` first.
+AI agents: read `ark help agents` first.
 Topics: agents, states, output, devices, datasets, apps."
             .to_string()
     } else if command.get_subcommands().next().is_some() {

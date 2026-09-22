@@ -106,20 +106,20 @@ One Ark is picked automatically. With several, select one with `-d` by locator, 
 
 Default output is formatted for reading. Use `--json` for complete, exact values, with an indented result document on stdout and one JSON event per line on stderr. App reports pass through raw by default. Color requires a terminal; `NO_COLOR` or `CLICOLOR=0` disables it.
 
-Scripts and AI agents should read `ark help agents` first. Nothing prompts without a terminal or with `--json`, and the exit code says what happened. `ark help output` defines the streams, JSON fields and error codes.
+AI agents should read [`ark help agents`](src/help/agents.md) first. Nothing prompts without a terminal or with `--json`, and the exit code says what happened. `ark help output` defines the streams, JSON fields and error codes.
 
 ## Help
 
-`ark -h` is the scan. For one command, `ark <command> --help` or `ark help <command>` adds its contract: what it requires, who approves, how long it takes, what it prints and how it exits. Global flags are available on every command. Six topics cover the rest, and `ark help --all` prints the whole manual:
+`ark -h` is the scan. For one command, `ark <command> --help` or `ark help <command>` adds its contract: what it requires, who approves, how long it takes, what it prints and how it exits. Global flags are available on every command. Six topics cover the rest, and `ark help --all` prints the whole manual. Each topic's source in [`src/help`](src/help) reads the same on GitHub:
 
 | Topic | Contents |
 | --- | --- |
-| `agents` | Driving the tool from a script or an AI agent |
-| `states` | Pairing, locking, trust and firmware compatibility |
-| `output` | Reading output, JSON, streams and error codes |
-| `devices` | Locators, selection, emulators and cloud environments |
-| `datasets` | Slots, uploads, reference downloads and the cache |
-| `apps` | The manifest, the sandbox and its limits |
+| [`agents`](src/help/agents.md) | Driving the tool from a script or an AI agent |
+| [`states`](src/help/states.md) | Pairing, locking, trust and firmware compatibility |
+| [`output`](src/help/output.md) | Reading output, JSON, streams and error codes |
+| [`devices`](src/help/devices.md) | Locators, selection, emulators and cloud environments |
+| [`datasets`](src/help/datasets.md) | Slots, uploads, reference downloads and the cache |
+| [`apps`](src/help/apps.md) | The manifest, the sandbox and its limits |
 
 `ark completions <shell>` generates completions for your shell.
 
