@@ -20,6 +20,10 @@ genuine for that. mismatch names the attested hardware when it disagrees with
 what the Ark reports, and says nothing about dataset builds. Either field is
 null when the firmware cannot report it.
 
+In JSON, hardware holds version, revision and model, and firmware holds
+version and published. synced, paired and unlocked are null on firmware older
+than this tool supports; status still prints them, then exits 5.
+
 identity is the short fingerprint and the reading view shows it in full.
 pubkey is the whole public key, several kilobytes of hex, and only --json
 carries it. -v adds step narration; it never expands the result.

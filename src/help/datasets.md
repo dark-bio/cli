@@ -69,8 +69,9 @@ and reads the slot state without changing it.
 --all fills empty reference slots in dependency order; filled slots are skipped.
 Each item reports done, skipped, failed, or not-attempted. A dry run reports
 planned or skipped. Download URLs are never guessed. On a fresh Ark the
-reference slots can require snp-indel-calls first: the owner must upload personal
-calls before --all can fill those references. --all does not supply personal data.
+reference slots can require snp-indel-calls first: the owner must upload
+personal calls before --all can fill those references. --all does not supply
+personal data.
 
 The CLI streams and caches public reference bytes at the same time. Files are
 addressed by SHA-256; incomplete entries retain resumable prefixes. Transport

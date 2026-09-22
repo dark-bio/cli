@@ -7,10 +7,10 @@ instructions, hints and errors. Keep the streams separate when parsing output.
 
 Default output is formatted for reading, including when redirected. It may use
 tables, scale units, localize timestamps and add status marks. Labels describe
-what is shown, so Size carries its unit in the value. Byte columns share one unit
-so sizes can be compared down the column. A mark before a state value is decoration,
-not part of the value. Absent values appear as -, empty lists as none and
-booleans as yes/no.
+what is shown, so Size carries its unit in the value. Byte columns share one
+unit so sizes can be compared down the column. A mark before a state value is
+decoration, not part of the value. Absent values appear as -, empty lists as
+none and booleans as yes/no.
 
 The view may shorten or omit a long field; --json always has the complete value.
 Lists are inventories, and data show adds the detail they leave out. See
@@ -23,7 +23,8 @@ spaces. Keys are snake_case, absent values null, enums strings, times ISO 8601
 UTC, byte counts suffixed _bytes and durations _seconds. Task IDs and the Ark's
 error numbers are decimal strings so every 64-bit value is exact. JSON field
 additions are allowed; renames require a major version. Scripts should pin the
-tool version. Reading layouts and labels may change. Help and completions always
+tool version, which `ark --json --version` prints beside the oldest firmware it
+supports. Reading layouts and labels may change. Help and completions always
 print text.
 
 Color and live progress require a terminal. NO_COLOR or CLICOLOR=0 disables
@@ -39,8 +40,11 @@ whatever the Ark returns.
 
 A command that did partial work keeps that result, reports failure on stderr
 and exits nonzero. It never replaces an emitted result with an error document.
-With no result at all, --json prints an error object on stdout beside the error
-event on stderr; default output leaves stdout empty.
+With no result at all, --json prints an error document on stdout beside the
+error event on stderr; default output leaves stdout empty. The document holds
+one key, error, with the fields listed under Error codes:
+
+    {"error": {"code": "no-device", "message": "no Ark enclave found"}}
 
 ## Diagnostics
 
