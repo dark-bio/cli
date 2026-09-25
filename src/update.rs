@@ -91,8 +91,10 @@ impl Answer {
     /// Replaces the kept answer through a renamed temporary file, so a reader
     /// never sees half of it.
     pub fn write(&self, directory: &Path) -> io::Result<()> {
-        // Serialize the answer and make sure the cache directory exists
-        let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
+        // Serialize the answer as one line ending in a newline, and make sure
+        // the cache directory exists
+        let mut bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
+        bytes.push(b'\n');
         fs::create_dir_all(directory)?;
 
         // Rename only a completely written file over the kept answer
