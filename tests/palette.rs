@@ -17,8 +17,149 @@ fn ark(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ark"))
         .args(args)
         .env("NO_COLOR", "1")
+        .env("CI", "1")
         .output()
         .unwrap()
+}
+
+/// The private update entry point does nothing and prints nothing under CI.
+#[test]
+fn test_update_entry_point_is_silent_under_ci() {
+    let output = ark(&["__update"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+/// A fresh isolated answer produces one stderr note while help and invalid invocations stay quiet.
+#[cfg(unix)]
+#[test]
+fn test_update_note_preserves_command_output_and_excludes_noncommands() {
+    /// Removes the subprocess home and cache even after an assertion failure.
+    struct Directory(
+        /// Isolated root used for both HOME and XDG_CACHE_HOME.
+        std::path::PathBuf,
+    );
+    impl Drop for Directory {
+        /// Cleans up files owned by this process test.
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // macOS uses Library/Caches while other Unix targets use XDG_CACHE_HOME
+    let _process = PROCESS.lock().unwrap();
+    let directory =
+        Directory(std::env::temp_dir().join(format!("ark-update-palette-{}", std::process::id())));
+    let home = directory.0.join("home");
+    let xdg_cache = directory.0.join("cache");
+    let cache = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/ark")
+    } else {
+        xdg_cache.join("ark")
+    };
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    let version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let newest = format!("{}.0.0", version.major + 1);
+    let answer = serde_json::to_vec(&serde_json::json!({
+        "channel": if version.pre.is_empty() { "release" } else { "develop" },
+        "asked": chrono::Utc::now().to_rfc3339(),
+        "newest": newest,
+    }))
+    .unwrap();
+    std::fs::write(cache.join("update.json"), &answer).unwrap();
+    let invoke = |args: &[&str], ci: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ark"));
+        command
+            .args(args)
+            .env_remove("CI")
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &xdg_cache)
+            .env("NO_COLOR", "1");
+        if let Some(ci) = ci {
+            command.env("CI", ci);
+        }
+        command.output().unwrap()
+    };
+
+    // The note precedes the error and repeats in both reading and JSON output
+    let message = format!(
+        "ark {newest} is available, this is {version}; download it from https://github.com/dark-bio/cli"
+    );
+    for json in [false, true] {
+        let mut args = vec!["status", "--device", "hardware:palette-no-device"];
+        if json {
+            args.push("--json");
+        }
+        let baseline = invoke(&args, Some("1"));
+        for ci in [None, Some("")] {
+            let output = invoke(&args, ci);
+            assert_eq!(output.status.code(), Some(3), "json={json}, CI={ci:?}");
+            assert_eq!(output.stdout, baseline.stdout, "json={json}, CI={ci:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            if json {
+                let events: Vec<Value> = stderr
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events[0],
+                    serde_json::json!({"event":"note","message":message})
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["event"] == "note")
+                        .count(),
+                    1
+                );
+                assert_eq!(events[1]["event"], "error");
+            } else {
+                assert_eq!(stderr.lines().next().unwrap(), format!("note: {message}"));
+                assert_eq!(
+                    stderr
+                        .lines()
+                        .filter(|line| line.starts_with("note:"))
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        // Quiet suppresses the notice without changing the result or status
+        args.push("-q");
+        let quiet = invoke(&args, None);
+        assert_eq!(quiet.stdout, baseline.stdout);
+        assert_eq!(quiet.status.code(), baseline.status.code());
+        assert!(!String::from_utf8_lossy(&quiet.stderr).contains("is available"));
+        assert!(!String::from_utf8_lossy(&baseline.stderr).contains("is available"));
+    }
+
+    // None of these paths may announce or refresh a release, even with a known newer build
+    for args in [
+        vec!["help"],
+        vec!["help", "--all"],
+        vec!["-h"],
+        vec!["--help"],
+        vec!["--help", "--all"],
+        vec!["status", "--help"],
+        vec!["completions", "zsh"],
+        vec!["--version"],
+        vec![],
+        vec!["--all"],
+        vec!["--timeout", "0", "status"],
+        vec!["bogus"],
+        vec!["--json", "data", "upload", "x", "--dry-run", "--unlock"],
+        vec!["--version", "status"],
+    ] {
+        let output = invoke(&args, None);
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("is available"),
+            "{args:?}"
+        );
+    }
+    assert_eq!(std::fs::read(cache.join("update.json")).unwrap(), answer);
 }
 
 /// Walks the executable command tree through its generated help pages.

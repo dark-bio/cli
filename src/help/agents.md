@@ -41,11 +41,15 @@ on their phone, in Ark Companion. You cannot approve for them.
 
 ## Reading results
 
-An approve event means the owner needs to act. CLI error codes are stable;
-`ark help output` lists them with next steps. error[ark]: passes through the
-Ark's own verdict; read its message, never match its number or wording.
-Partial results survive errors. JSON also preserves the latest partial result
-on interruption.
+An approve event means the owner needs to act. A note that a newer ark is
+available names the upgrade and repeats on every command until it happens, so
+pass it on to the person; upgrading is their call. doctor reports the same as
+its update check, and a nonempty CI turns the note off.
+
+CLI error codes are stable; `ark help output` lists them with next steps.
+error[ark]: passes through the Ark's own verdict; read its message, never
+match its number or wording. Partial results survive errors. JSON also
+preserves the latest partial result on interruption.
 
 Without --json, app reports stream raw to stdout. The app's own stderr is
 announced, then written unprefixed. With --json both app streams are in the
