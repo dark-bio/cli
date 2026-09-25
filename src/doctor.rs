@@ -6,7 +6,7 @@
 
 //! Independent diagnostics composed from connection primitives.
 
-use crate::{context::Context, error::Error, firmware::Packages};
+use crate::{context::Context, error::Error, firmware::Packages, update};
 use darkbio_connect::schema;
 use serde_json::{Value, json};
 
@@ -28,6 +28,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             darkbio_connect::wire::VERSION,
         ),
     );
+    checks.update();
     let mut discovered = 0;
     for (name, result) in [
         ("usb", darkbio_connect::hardware::list()),
@@ -197,9 +198,48 @@ struct Checks<'a> {
     failure: Option<Error>,
 }
 impl Checks<'_> {
+    /// Looks up the newest ark afresh. A newer one is a warn and a failed
+    /// lookup a skip, so neither sets the exit code.
+    fn update(&mut self) {
+        // Under CI nothing is looked up
+        if update::disabled() {
+            self.skip("update", "CI is set");
+            return;
+        }
+
+        // Look up within --timeout, keeping the answer for later commands
+        let running = update::running();
+        let channel = update::Channel::for_version(&running);
+        let asked = chrono::Utc::now();
+        let result = update::refresh(
+            &crate::data::cache::directory(),
+            channel,
+            asked,
+            std::time::Duration::from_secs(self.context.options.timeout),
+        );
+
+        // Only a newer version needs action; an unpublished local build is current too
+        match result {
+            Ok(newest) if newest.cmp_precedence(&running).is_gt() => self.warn(
+                "update",
+                &format!("ark {newest} is available, this is {running}"),
+                &update::hint(channel),
+            ),
+            Ok(_) => self.ok(
+                "update",
+                &format!("ark {running} is the newest {}", channel.description()),
+            ),
+            Err(error) => self.skip("update", error),
+        }
+    }
+
     /// Records a successful diagnostic with its observed detail.
     fn ok(&mut self, name: &str, detail: &str) {
         self.add(name, "ok", detail, None);
+    }
+    /// Records something to act on with its hint, never failing the command.
+    fn warn(&mut self, name: &str, detail: &str, hint: &str) {
+        self.add(name, "warn", detail, Some(hint));
     }
     /// Records an unmet prerequisite without making the command fail by itself.
     fn skip(&mut self, name: &str, detail: &str) {

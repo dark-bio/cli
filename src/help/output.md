@@ -50,9 +50,10 @@ one key, error, with the fields listed under Error codes:
 
 -q drops progress, notes, warnings and steps. Errors, hints, owner approval
 instructions, diagnostic logs and app output remain. -v enables step narration.
---log debug enables connect diagnostics; --log trace enables connect and wire
-traces. They are independent of -v. HTTP and subprocess log targets are excluded
-so authorization headers and package login credentials cannot enter the stream.
+--log debug enables update and connect diagnostics; --log trace adds wire
+traces. They are independent of -v. HTTP and subprocess log targets are
+excluded so authorization headers and package login credentials cannot enter
+the stream.
 
 Terminal progress refreshes once a second, showing new steps and completion at
 once. Redirected progress and JSON report at ten-percent boundaries or every
@@ -69,6 +70,22 @@ events carry message; diagnostic log events carry level, target and fields;
 error events carry an error object. Progress messages describe transfers,
 processing phases or elapsed time. Their wording is for reading, not a
 structured progress API.
+
+## New releases
+
+At most once an hour, ark asks GitHub for its newest release. A release build
+reads the redirect at https://github.com/dark-bio/cli/releases/latest, and a
+development build reads the release list from api.github.com. The request
+carries nothing about this computer, its Arks or the running version. It runs
+in a detached copy of ark that exits within 30 s, so no command waits for it.
+The answer is kept in update.json in ark's cache directory, and a nonempty CI
+turns the lookup off.
+
+While the kept answer names a newer version, every command except help,
+completions, --version and doctor starts with a note naming both versions and
+how to upgrade. Under --json it is an ordinary note event. The note never
+changes the result or the exit code, and -q hides it. doctor looks up afresh
+and reports the answer as its update check.
 
 ## Error codes
 

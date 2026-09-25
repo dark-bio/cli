@@ -459,17 +459,19 @@ mod tests {
         );
     }
 
+    /// Every result carries its own mark, and each hint stays under its check.
     #[test]
-    fn checklist_keeps_skips_explicit_and_hints_local() {
+    fn test_checklist_keeps_skips_explicit_and_hints_local() {
         let theme = Theme::test(80, Color::Basic, true);
         let rows = [
             json!({"name":"usb","result":"ok","detail":"1 device found","hint":null}),
             json!({"name":"relay","result":"fail","detail":"no answer","hint":"open `Ark Companion`"}),
             json!({"name":"slots","result":"skip","detail":"Ark locked","hint":null}),
+            json!({"name":"tool","result":"warn","detail":"new release","hint":"run `brew upgrade ark-cli`"}),
         ];
         assert_eq!(
             checklist(&theme, &rows),
-            "  \x1b[1m\u{2713} usb\x1b[0m    1 device found\n  \x1b[1m\u{2717} relay\x1b[0m  no answer\n    \x1b[1mhint:\x1b[0m open \x1b[1mArk Companion\x1b[0m\n  \u{00b7} slots  skipped: Ark locked"
+            "  \x1b[1m\u{2713} usb\x1b[0m    1 device found\n  \x1b[1m\u{2717} relay\x1b[0m  no answer\n    \x1b[1mhint:\x1b[0m open \x1b[1mArk Companion\x1b[0m\n  \u{00b7} slots  skipped: Ark locked\n  \x1b[1m! tool\x1b[0m   new release\n    \x1b[1mhint:\x1b[0m run \x1b[1mbrew upgrade ark-cli\x1b[0m"
         );
     }
 }

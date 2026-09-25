@@ -217,7 +217,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "nothing; unavailable checks are skipped",
             "none; develop and staging package hosts may need browser login",
             "seconds per check",
-            "checks: result, name, detail, hint; JSON: tool, connect, wire, minimum_firmware, minimum_develop_publish, checks",
+            "checks: result (ok, warn, fail or skip), name, detail, hint; JSON: tool, connect, wire, minimum_firmware, minimum_develop_publish, checks",
             "ark doctor\nark doctor --json",
         ),
         "completions" => (

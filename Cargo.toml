@@ -27,7 +27,7 @@ path = ".github/packaging/winget/main.rs"
 test = true
 
 [dependencies]
-chrono = "0.4.41"
+chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.60", features = ["derive"] }
 darkbio-crypto = { version = "0.18.2", features = ["cbor", "xdsa"] }
 darkbio-trust = { version = "0.5.1", features = ["release", "staging", "develop"] }
@@ -43,17 +43,15 @@ qrcode = { version = "0.14", default-features = false }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+semver = { version = "1.0.28", features = ["serde"] }
 sha2 = "0.10"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = "0.3.23"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
-[dev-dependencies]
-semver = "1"
-
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

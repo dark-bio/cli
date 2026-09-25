@@ -23,6 +23,7 @@ mod output;
 mod pairing;
 mod progress;
 mod style;
+mod update;
 
 use args::{Cli, Command};
 use clap::{FromArgMatches, Parser};
@@ -35,6 +36,10 @@ use std::process::ExitCode;
 /// Help and usage failures honor stream formatting even before typed parsing succeeds.
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args_os().collect();
+    if arguments.len() == 2 && arguments[1] == update::ENTRY_POINT {
+        update::run();
+        return ExitCode::SUCCESS;
+    }
     let json = arguments
         .iter()
         .skip(1)
@@ -89,6 +94,17 @@ fn main() -> ExitCode {
         output,
         interrupt,
     };
+    // Valid commands print the release note, except help, completions, --version, a bare run and doctor
+    if validation.is_ok()
+        && !cli.help
+        && !cli.version
+        && !matches!(
+            &cli.command,
+            None | Some(Command::Help { .. } | Command::Completions { .. } | Command::Doctor)
+        )
+    {
+        update::start(&context.output, chrono::Utc::now());
+    }
     let result = if let Err(error) = validation {
         Err(error)
     } else if cli.help {
