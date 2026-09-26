@@ -6,7 +6,7 @@
 
 //! HTTP routes and payloads of the Ark cloud API.
 
-use super::{Failure, auth};
+use super::{Failure, auth, dns};
 use crate::schema::{CloudSyncFinishRequest, CloudSyncStartRequest};
 use crate::trust::{Environment, Realm};
 use crate::{Identity, Timing};
@@ -14,8 +14,10 @@ use base64::{
     Engine,
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
 };
+use darkbio_clock::Clock;
 use darkbio_wire::protocol;
 use serde::{Deserialize, de::DeserializeOwned};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Maximum JSON response, enough for cloud certificates, signed time or registry state.
@@ -24,11 +26,14 @@ const MAX_RESPONSE: u64 = 64 * 1024;
 /// Cloud operations selected by the attestation or an explicit environment.
 #[derive(Debug)]
 pub(super) struct Api {
+    pub(super) clock: Clock, // clock that the deadlines are measured on
+
     pub(super) auth: auth::Authorization, // Caller credentials, independent of the Ark proof
     pub(super) origin: String,            // HTTPS origin shared by API and socket credentials
     pub(super) agent: ureq::Agent,        // HTTP connections reused across the cloud exchange
     pub(super) url: String,               // API of the selected environment
     pub(super) realm: Realm,              // Realm selecting the device registry
+    pub(super) resolver: Arc<dns::Resolver>, // lookups shared by this connection's cloud sockets
     serial: Option<String>, // Attested serial, when available, checked against the registry
 }
 
@@ -57,7 +62,11 @@ impl Api {
 
     /// Prepares cloud access without I/O. An explicit environment overrides the
     /// attested one. Its discovery realm is used only without an attested realm.
-    pub(super) fn new(identity: &Identity, cloud: Option<(Environment, Realm)>) -> Option<Self> {
+    pub(super) fn new(
+        identity: &Identity,
+        cloud: Option<(Environment, Realm)>,
+        clock: &Clock,
+    ) -> Option<Self> {
         let (env, realm, serial) = match identity {
             Identity::Attested { env, device } => (
                 cloud.as_ref().map_or(env, |(env, _)| env),
@@ -70,11 +79,13 @@ impl Api {
             }
         };
         Some(Self {
+            clock: clock.clone(),
             auth: auth::Authorization::default(),
             origin: api_url(*env).trim_end_matches("/v1").into(),
             agent: agent(),
             url: api_url(*env).into(),
             realm,
+            resolver: dns::Resolver::new(clock),
             serial,
         })
     }
@@ -120,7 +131,7 @@ impl Api {
         if !matches!(result, Err(Failure::AuthRequired)) {
             return result;
         }
-        self.auth.login(&self.origin, timing)?;
+        self.auth.login(&self.origin, &self.clock, timing)?;
         match attempt() {
             Err(Failure::AuthRequired) => Err(Failure::CloudAuth {
                 origin: self.origin.clone(),
@@ -294,7 +305,7 @@ fn send(
         request = request.header(name, value);
     }
     let remaining = deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(api.clock.now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or(protocol::Error::Timeout)?;
     let response = request
@@ -330,19 +341,23 @@ pub(super) fn json<T: DeserializeOwned>(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::cloud::tests::{TIMEOUT, http, response, serve};
+    use crate::cloud::tests::{TIMEOUT, http, response, serve, serve_inner};
+    use crate::testing::test_clock;
     use serde_json::json;
-    use std::thread;
+    use std::sync::mpsc;
     use std::time::Duration;
 
-    /// Redirects an attested connection to the loopback cloud.
-    pub(in crate::cloud) fn api(url: String, realm: Realm) -> Api {
+    /// Redirects an attested connection to the loopback cloud, measuring its
+    /// deadlines on the clock.
+    pub(in crate::cloud) fn api(url: String, realm: Realm, clock: &Clock) -> Api {
         Api {
+            clock: clock.clone(),
             auth: auth::Authorization::default(),
             origin: url.trim_end_matches("/v1").into(),
             agent: http(),
             url,
             realm,
+            resolver: dns::Resolver::new(clock),
             serial: Some("test-serial".into()),
         }
     }
@@ -351,6 +366,7 @@ pub(super) mod tests {
     /// Without attestation, the supplied discovery realm selects the registry.
     #[test]
     fn test_cloud_routing() {
+        let clock = test_clock().clock();
         let key = darkbio_crypto::xdsa::SecretKey::generate().public_key();
         for &env in crate::identity::ENVIRONMENTS {
             let identity = Identity::Attested {
@@ -366,11 +382,11 @@ pub(super) mod tests {
                     expiry: Some(1),
                 },
             };
-            let cloud = Api::new(&identity, None).unwrap();
+            let cloud = Api::new(&identity, None, &clock).unwrap();
             assert_eq!(cloud.url, api_url(env));
             assert_eq!(cloud.realm, Realm::Emulator);
             for &selected in crate::identity::ENVIRONMENTS {
-                let cloud = Api::new(&identity, Some((selected, Realm::Hardware))).unwrap();
+                let cloud = Api::new(&identity, Some((selected, Realm::Hardware)), &clock).unwrap();
                 assert_eq!(cloud.url, api_url(selected));
                 assert_eq!(cloud.realm, Realm::Emulator);
                 assert!(cloud.relay_url().ends_with("/sandbox/relaying"));
@@ -380,9 +396,9 @@ pub(super) mod tests {
                 Identity::SelfSigned(key.clone()),
                 Identity::Recovered(key.clone()),
             ] {
-                assert!(Api::new(&identity, None).is_none());
+                assert!(Api::new(&identity, None, &clock).is_none());
                 for realm in [Realm::Hardware, Realm::Emulator] {
-                    let cloud = Api::new(&identity, Some((env, realm))).unwrap();
+                    let cloud = Api::new(&identity, Some((env, realm)), &clock).unwrap();
                     assert_eq!(cloud.url, api_url(env));
                     assert_eq!(cloud.realm, realm);
                     assert_eq!(cloud.serial, None);
@@ -405,31 +421,26 @@ pub(super) mod tests {
         let signature = [0, 1, 0xfe, 0xff];
         let unixmilli = (1u64 << 53) + 1;
         let (url, requests) = serve(vec![
-            (
-                Duration::ZERO,
-                response(
-                    200,
-                    &json!({
-                        "signer": BASE64_STANDARD.encode(signer),
-                        "crypto": BASE64_STANDARD.encode(crypto),
-                    })
-                    .to_string(),
-                ),
+            response(
+                200,
+                &json!({
+                    "signer": BASE64_STANDARD.encode(signer),
+                    "crypto": BASE64_STANDARD.encode(crypto),
+                })
+                .to_string(),
             ),
-            (
-                Duration::ZERO,
-                response(
-                    200,
-                    &json!({
-                        "unixmilli": unixmilli,
-                        "signature": BASE64_STANDARD.encode(signature),
-                    })
-                    .to_string(),
-                ),
+            response(
+                200,
+                &json!({
+                    "unixmilli": unixmilli,
+                    "signature": BASE64_STANDARD.encode(signature),
+                })
+                .to_string(),
             ),
         ]);
-        let cloud = api(url, Realm::Hardware);
-        let deadline = Instant::now() + TIMEOUT;
+        let clock = test_clock().clock();
+        let cloud = api(url, Realm::Hardware, &clock);
+        let deadline = clock.now() + TIMEOUT;
         let start = fetch_identity(&cloud, deadline).unwrap();
         assert_eq!(start.signer, signer);
         assert_eq!(start.crypto, crypto);
@@ -438,13 +449,13 @@ pub(super) mod tests {
         assert_eq!(finish.signature, signature);
         assert!(
             requests
-                .recv_timeout(TIMEOUT)
+                .recv()
                 .unwrap()
                 .starts_with("GET /v1/cloudsync/identity HTTP/1.1\r\n")
         );
         assert!(
             requests
-                .recv_timeout(TIMEOUT)
+                .recv()
                 .unwrap()
                 .starts_with("GET /v1/cloudsync/time?challenge=00fbff HTTP/1.1\r\n")
         );
@@ -454,32 +465,33 @@ pub(super) mod tests {
     /// unpadded URL-safe authentication header. Inactive flags are retained.
     #[test]
     fn test_registry_routes() {
+        let clock = test_clock().clock();
         for (realm, path) in [
             (Realm::Hardware, "/v1/genuine"),
             (Realm::Emulator, "/v1/sandbox/genuine"),
         ] {
-            let (url, requests) = serve(vec![(
-                Duration::ZERO,
-                response(
-                    200,
-                    &json!({
-                        "serial": "test-serial",
-                        "enrolled": 123,
-                        "disabled": true,
-                        "expired": true,
-                        "superseded": true,
-                    })
-                    .to_string(),
-                ),
+            let (url, requests) = serve(vec![response(
+                200,
+                &json!({
+                    "serial": "test-serial",
+                    "enrolled": 123,
+                    "disabled": true,
+                    "expired": true,
+                    "superseded": true,
+                })
+                .to_string(),
             )]);
-            let registration =
-                fetch_registration(&api(url, realm), &[0xfb, 0xff], Instant::now() + TIMEOUT)
-                    .unwrap();
+            let registration = fetch_registration(
+                &api(url, realm, &clock),
+                &[0xfb, 0xff],
+                clock.now() + TIMEOUT,
+            )
+            .unwrap();
             assert_eq!(registration.serial, "test-serial");
             assert_eq!(registration.enrolled, 123);
             assert!(registration.disabled && registration.expired && registration.superseded);
             assert!(!registration.active());
-            let request = requests.recv_timeout(TIMEOUT).unwrap();
+            let request = requests.recv().unwrap();
             assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
             assert!(
                 request
@@ -492,15 +504,13 @@ pub(super) mod tests {
     /// A registry reply for another serial cannot verify this connection.
     #[test]
     fn test_registry_identity() {
-        let (url, _requests) = serve(vec![(
-            Duration::ZERO,
-            response(
-                200,
-                r#"{"serial":"another-ark","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#,
-            ),
+        let clock = test_clock().clock();
+        let (url, _requests) = serve(vec![response(
+            200,
+            r#"{"serial":"another-ark","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#,
         )]);
         assert!(matches!(
-            api(url, Realm::Hardware).genuine(&[1], Instant::now() + TIMEOUT),
+            api(url, Realm::Hardware, &clock).genuine(&[1], clock.now() + TIMEOUT),
             Err(Failure::Cloud(error)) if error.contains("serial does not match")
         ));
     }
@@ -509,6 +519,7 @@ pub(super) mod tests {
     /// responses fail before a cloud payload can be forwarded to the Ark.
     #[test]
     fn test_bad_responses() {
+        let clock = test_clock().clock();
         for (status, body) in [
             (503, "unavailable".into()),
             (302, "redirect".into()),
@@ -525,34 +536,38 @@ pub(super) mod tests {
                 .to_string(),
             ),
         ] {
-            let (url, _requests) = serve(vec![(Duration::ZERO, response(status, &body))]);
-            assert!(fetch_identity(&api(url, Realm::Hardware), Instant::now() + TIMEOUT).is_err());
+            let (url, _requests) = serve(vec![response(status, &body)]);
+            let cloud = api(url, Realm::Hardware, &clock);
+            assert!(fetch_identity(&cloud, clock.now() + TIMEOUT).is_err());
         }
-        let (url, _requests) = serve(vec![(
-            Duration::ZERO,
-            response(200, r#"{"unixmilli":123,"signature":"!"}"#),
-        )]);
-        assert!(fetch_time(&api(url, Realm::Hardware), &[1], Instant::now() + TIMEOUT).is_err());
+        let (url, _requests) = serve(vec![response(200, r#"{"unixmilli":123,"signature":"!"}"#)]);
+        let cloud = api(url, Realm::Hardware, &clock);
+        assert!(fetch_time(&cloud, &[1], clock.now() + TIMEOUT).is_err());
     }
 
     /// A later HTTP request retains the original deadline. A stalled response
     /// also expires instead of leaving setup waiting indefinitely.
     #[test]
     fn test_deadlines() {
+        // A request after the clock reached the shared deadline fails without HTTP
+        let mut tester = test_clock();
+        let clock = tester.clock();
         let body = r#"{"signer":"AA==","crypto":"AA=="}"#;
-        let (url, _requests) = serve(vec![(Duration::ZERO, response(200, body))]);
-        let cloud = api(url, Realm::Hardware);
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let (url, _requests) = serve(vec![response(200, body)]);
+        let cloud = api(url, Realm::Hardware, &clock);
+        let deadline = clock.now() + Duration::from_secs(1);
         fetch_identity(&cloud, deadline).unwrap();
-        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        tester.advance_to(deadline);
         let error = fetch_time(&cloud, &[1], deadline).unwrap_err();
         assert!(matches!(error, Failure::Wire(protocol::Error::Timeout)));
 
-        let (url, _requests) = serve(vec![(Duration::from_secs(1), response(200, body))]);
+        // A response the server never sends ends at the HTTP client's own timeout
+        let (_release, pause) = mpsc::channel();
+        let (url, _requests) = serve_inner(vec![response(200, body)], Some(pause));
         assert!(matches!(
             fetch_identity(
-                &api(url, Realm::Hardware),
-                Instant::now() + Duration::from_millis(50)
+                &api(url, Realm::Hardware, &clock),
+                clock.now() + Duration::from_millis(50)
             ),
             Err(Failure::Wire(protocol::Error::Timeout))
         ));

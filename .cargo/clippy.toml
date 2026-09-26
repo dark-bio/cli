@@ -1,0 +1,39 @@
+# Settings for clippy, found through CLIPPY_CONF_DIR in config.toml.
+
+# Time comes from the clock of the Ark connection, so the calls it replaces are
+# banned. The first group is darkbio-clock's recommended list, crossbeam's
+# entries included. The second covers crypto's functions that read the system
+# time themselves, and the third chrono's reads of the wall time.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use Clock::now" },
+    { path = "std::time::Instant::elapsed", reason = "use Clock::elapsed" },
+    { path = "std::time::SystemTime::now", reason = "use Clock::system_time" },
+    { path = "std::time::SystemTime::elapsed", reason = "use Clock::system_time" },
+    { path = "std::thread::sleep", reason = "use Clock::sleep" },
+    { path = "std::thread::park_timeout", reason = "use a clock condvar" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "use darkbio_clock::sync::Condvar" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "use darkbio_clock::sync::Condvar" },
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "use a crossbeam receiver with Clock::recv_timeout" },
+    { path = "crossbeam_channel::after", reason = "use Clock::after" },
+    { path = "crossbeam_channel::at", reason = "use Clock::at" },
+    { path = "crossbeam_channel::tick", reason = "arm Clock::at per period" },
+    { path = "crossbeam_channel::Receiver::recv_timeout", reason = "use Clock::recv_timeout" },
+    { path = "crossbeam_channel::Receiver::recv_deadline", reason = "use Clock::recv_deadline" },
+    { path = "crossbeam_channel::Sender::send_timeout", reason = "select against a clock timer" },
+    { path = "crossbeam_channel::Sender::send_deadline", reason = "select against a clock timer" },
+    { path = "crossbeam_channel::Select::select_timeout", reason = "select against a clock timer" },
+    { path = "crossbeam_channel::Select::select_deadline", reason = "select against a clock timer" },
+    { path = "crossbeam_channel::Select::ready_timeout", reason = "select against a clock timer" },
+    { path = "crossbeam_channel::Select::ready_deadline", reason = "select against a clock timer" },
+
+    { path = "darkbio_crypto::cose::sign", reason = "use cose::sign_at with the clock's wall time" },
+    { path = "darkbio_crypto::cose::sign_detached", reason = "use cose::sign_detached_at with the clock's wall time" },
+    { path = "darkbio_crypto::cose::verify", reason = "use cose::verify_at with the clock's wall time" },
+    { path = "darkbio_crypto::cose::verify_detached", reason = "use cose::verify_detached_at with the clock's wall time" },
+    { path = "darkbio_crypto::cose::seal", reason = "use cose::seal_at with the clock's wall time" },
+    { path = "darkbio_crypto::cose::open", reason = "use cose::open_at with the clock's wall time" },
+    { path = "darkbio_crypto::cwt::issue", reason = "use cwt::issue_at with the clock's wall time" },
+
+    { path = "chrono::Utc::now", reason = "convert Clock::system_time" },
+    { path = "chrono::Local::now", reason = "convert Clock::system_time" },
+]

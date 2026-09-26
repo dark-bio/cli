@@ -8,6 +8,7 @@
 
 use crate::output::Output;
 use chrono::{DateTime, Utc};
+use darkbio_clock::Clock;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -25,7 +26,7 @@ const CACHE_LIMIT: u64 = 4 * 1024;
 /// Largest development release response accepted from GitHub, in bytes.
 const RESPONSE_LIMIT: u64 = 1024 * 1024;
 
-/// Release channel of a build, told apart by its version's prerelease field.
+/// Release channel of a build, distinguished by its version's prerelease field.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Channel {
@@ -187,23 +188,18 @@ pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
 }
 
 /// Runs the lookup in the detached copy, which ends within 30 s whatever happens.
+/// The copy opens no connection, so its clock is the real one.
 pub(crate) fn run() {
     // Under CI the copy does nothing
     if disabled() {
         return;
     }
-    let started = Instant::now();
-    let asked = Utc::now();
+    let clock = Clock::real();
+    let started = clock.now();
+    let asked = DateTime::<Utc>::from(clock.system_time());
 
     // End the process at 30 s, and skip the lookup when nothing can enforce that
-    if thread::Builder::new()
-        .name("ark-update-watchdog".into())
-        .spawn(move || {
-            thread::sleep(Duration::from_secs(30).saturating_sub(started.elapsed()));
-            std::process::exit(0);
-        })
-        .is_err()
-    {
+    if watchdog(started, Duration::from_secs(30)).is_err() {
         return;
     }
 
@@ -215,6 +211,22 @@ pub(crate) fn run() {
         asked,
         Duration::from_secs(20),
     );
+}
+
+/// Ends the process once `limit` has passed since `started` on the real clock,
+/// whatever the lookup is doing.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the watchdog bounds the real lifetime of the detached lookup process"
+)]
+fn watchdog(started: Instant, limit: Duration) -> io::Result<()> {
+    thread::Builder::new()
+        .name("ark-update-watchdog".into())
+        .spawn(move || {
+            thread::sleep(limit.saturating_sub(started.elapsed()));
+            std::process::exit(0);
+        })
+        .map(drop)
 }
 
 /// Stamps a new attempt, keeping the version last found on the same channel.
@@ -353,7 +365,7 @@ fn develop(bytes: &[u8]) -> Result<Version, &'static str> {
 
 /// Words the upgrade advice for the way this executable was installed.
 pub(crate) fn hint(channel: Channel) -> String {
-    // Gather the paths that tell the install methods apart
+    // Gather the paths that distinguish the install methods
     let executable = std::env::current_exe().ok();
     let home = directories::BaseDirs::new();
     let cargo_home = std::env::var_os("CARGO_HOME");

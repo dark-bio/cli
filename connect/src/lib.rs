@@ -21,14 +21,15 @@
 //!
 //! ```no_run
 //! use darkbio_connect::{Error, TrustMode, schema};
-//! use std::time::{Duration, Instant};
+//! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), Error> {
 //! let found = darkbio_connect::list();
 //! let device = found.select(None)?;
 //! let (ark, identity) = device.connect(&TrustMode::RootOrSelf)?;
-//! let info = ark.client().call(
-//!     schema::DeviceInfoRequest {}, Instant::now() + Duration::from_secs(10),
+//! let client = ark.client();
+//! let info = client.call(
+//!     schema::DeviceInfoRequest {}, client.clock().now() + Duration::from_secs(10),
 //! )?;
 //! # Ok(())
 //! # }
@@ -47,10 +48,11 @@
 //!
 //! Calls and workflows accept an [`Instant`](std::time::Instant) for one fixed
 //! deadline or [`Timing`] for an inactivity allowance, optionally combined with
-//! that deadline. No timeout state lives on the shared client. Approval requests
-//! use their protocol window when an inactivity allowance is supplied. Arbitrary
-//! readers and progress callbacks run on the caller's thread and must bound their
-//! own blocking work.
+//! that deadline. No timeout state lives on the shared client. Deadlines are
+//! measured on the connection's [`clock::Clock`], which [`Client::clock`] returns.
+//! Approval requests use their protocol window when an inactivity allowance is
+//! supplied. Arbitrary readers and progress callbacks run on the caller's thread
+//! and must bound their own blocking work.
 //!
 //! [`Client::identify_dataset`] identifies a file without opening an upload session.
 //! [`Client::upload_dataset`] streams a [`Dataset`] and waits for processing.
@@ -102,6 +104,8 @@ mod testing;
 
 pub use ark::{Ark, Client, Closer, Pending};
 pub use cloud::{CloudAuth, Firmware, PairingProgress, Registration, UpdateProgress, cloud_synced};
+/// Clocks that connections measure their deadlines on, as [`Client::clock`] returns.
+pub use darkbio_clock as clock;
 pub use darkbio_wire as wire;
 pub use darkbio_wire::protocol::schema;
 pub use darkbio_wire::protocol::{CodedError, Promise, Responder};

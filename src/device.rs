@@ -70,6 +70,7 @@ pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), 
 fn status_value(connection: &Connection) -> Value {
     let current = connection.require_current().is_ok();
     let info = &connection.info;
+    let clock = connection.client.clock();
     let reported = format!("{} - {}", info.version_str, info.revision_str);
     let (trust, serial, realm, model, mismatch, env) = match &connection.identity {
         Identity::Attested { env, device } => (
@@ -99,7 +100,7 @@ fn status_value(connection: &Connection) -> Value {
     json!({"name":connection.device.name(),"serial":serial,
         "hardware":{"version":info.version_str,"revision":info.revision_str,"model":model},
         "firmware":{"version":info.firmware_version,"published":timestamp(info.firmware_publish)},
-        "trust":trust,"environment":env,"realm":realm,"synced":current.then(|| darkbio_connect::cloud_synced(info)),"paired":current.then_some(info.paired),"unlocked":current.then_some(info.unlocked),
+        "trust":trust,"environment":env,"realm":realm,"synced":current.then(|| darkbio_connect::cloud_synced(info, &clock)),"paired":current.then_some(info.paired),"unlocked":current.then_some(info.unlocked),
         "identity":hex::encode(connection.identity.key().fingerprint().to_bytes()),
         "pubkey":hex::encode(connection.identity.key().to_bytes()),"mismatch":mismatch})
 }

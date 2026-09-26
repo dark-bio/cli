@@ -102,7 +102,7 @@ fn slots() -> Vec<SlotStatus> {
 }
 
 /// Runs one scenario in a child test process, capturing its real stdout and
-/// stderr so results and hints can be told apart.
+/// stderr so results and hints stay distinguishable.
 fn capture(scenario: &str, json: bool) -> (String, String) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([

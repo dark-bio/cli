@@ -29,9 +29,10 @@ test = true
 [dependencies]
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.60", features = ["derive"] }
-darkbio-crypto = { version = "0.18.2", features = ["cbor", "xdsa"] }
-darkbio-trust = { version = "0.5.1", features = ["release", "staging", "develop"] }
-darkbio-wire = "0.10.0"
+darkbio-clock = { version = "0.3", features = ["crossbeam"] }
+darkbio-crypto = { version = "0.19.1", features = ["cbor", "xdsa"] }
+darkbio-trust = { version = "0.6.0", features = ["release", "staging", "develop"] }
+darkbio-wire = "0.12.0"
 hex = "0.4.3"
 console = "0.15.11"
 base64 = "0.23.1"
@@ -55,6 +56,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Sys
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
+
+[dev-dependencies]
+darkbio-clock = { version = "0.3", features = ["crossbeam", "test-clock"] }
 
 # Firmware uploads push megabytes through the crypto, which crawls unoptimized,
 # so dependencies build optimized under the dev profile too. The CLI and its

@@ -31,6 +31,17 @@ fn test_update_entry_point_is_silent_under_ci() {
     assert!(output.stderr.is_empty());
 }
 
+/// Stamps a kept update answer as asked now. The spawned ark judges the
+/// answer's age against the real wall time, so the stamp reads it too.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the spawned binary compares the answer's stamp with the real wall time"
+)]
+fn asked_now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
 /// A fresh isolated answer produces one stderr note while help and invalid invocations stay quiet.
 #[cfg(unix)]
 #[test]
@@ -64,7 +75,7 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
     let newest = format!("{}.0.0", version.major + 1);
     let answer = serde_json::to_vec(&serde_json::json!({
         "channel": if version.pre.is_empty() { "release" } else { "develop" },
-        "asked": chrono::Utc::now().to_rfc3339(),
+        "asked": asked_now(),
         "newest": newest,
     }))
     .unwrap();
@@ -226,7 +237,8 @@ fn command_tree_output_conforms() {
     for (path, page) in commands() {
         let args: Vec<_> = path.iter().map(String::as_str).collect();
         // The shared options are listed once, on the root page. Examples
-        // mention the flags too, so the listing is told by its description.
+        // mention the flags too, so the test identifies the listing by its
+        // description.
         for option in ["--timeout <SECONDS>", "Print the complete result as JSON"] {
             assert_eq!(page.contains(option), path.is_empty(), "{path:?}: {option}");
         }

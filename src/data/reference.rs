@@ -18,6 +18,7 @@ use crate::{
     http,
     output::Output,
 };
+use darkbio_clock::Clock;
 use darkbio_connect::{Dataset, schema::SlotStatus};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -230,10 +231,15 @@ fn install(
     directory: Option<&Path>,
 ) -> Result<(), Error> {
     let mut directory = directory;
+    let clock = connection.client.clock();
     if let Some(directory) = directory {
         let path = directory.join(&source.hash);
         if let Ok(mut file) = File::open(&path) {
-            let mut progress = Progress::new(context, source.dataset.slot.expect("reference slot"));
+            let mut progress = Progress::new(
+                context,
+                clock.clone(),
+                source.dataset.slot.expect("reference slot"),
+            );
             let result = connection.client.upload_dataset(
                 &source.dataset,
                 &mut file,
@@ -280,9 +286,13 @@ fn install(
             }
             None => None,
         };
-        let mut reader = Reader::new(&agent, source, &context.output, entry)?;
+        let mut reader = Reader::new(&agent, source, &context.output, clock.clone(), entry)?;
         let last_upload = reader.last_upload.clone();
-        let mut progress = Progress::new(context, source.dataset.slot.expect("reference slot"));
+        let mut progress = Progress::new(
+            context,
+            clock.clone(),
+            source.dataset.slot.expect("reference slot"),
+        );
         let result = connection.client.upload_dataset(
             &source.dataset,
             &mut reader,
@@ -293,7 +303,7 @@ fn install(
                     darkbio_connect::UploadProgress::Started { .. }
                         | darkbio_connect::UploadProgress::Uploading { .. }
                 ) {
-                    last_upload.set(Some(Instant::now()));
+                    last_upload.set(Some(clock.now()));
                 }
                 progress.update(stage);
             },
@@ -392,6 +402,8 @@ fn valid_range(response: &ureq::http::Response<ureq::Body>, offset: u64, size: u
 /// Hashes both sources together and marks network failures for download retry policy.
 /// The cache lock stays held across replay, response validation and queued writes.
 struct Reader<'a> {
+    /// Connection clock that measures the upload window.
+    clock: Clock,
     /// HTTP client whose first request waits until the prefix has been read.
     agent: &'a ureq::Agent,
     /// Advertised URL, length and digest for this attempt.
@@ -426,6 +438,7 @@ impl<'a> Reader<'a> {
         agent: &'a ureq::Agent,
         source: &'a Source,
         output: &'a Output,
+        clock: Clock,
         entry: Option<cache::Entry>,
     ) -> io::Result<Self> {
         let offset = entry
@@ -439,6 +452,7 @@ impl<'a> Reader<'a> {
             .map(|entry| entry.prefix().map(|file| file.take(offset)))
             .transpose()?;
         Ok(Self {
+            clock,
             agent,
             source,
             output,
@@ -570,7 +584,7 @@ impl Read for Reader<'_> {
         if self
             .last_upload
             .get()
-            .is_some_and(|last| last.elapsed() >= Duration::from_secs(30))
+            .is_some_and(|last| self.clock.elapsed(last) >= Duration::from_secs(30))
         {
             self.failed = true;
             return Err(io::Error::new(
@@ -586,6 +600,7 @@ impl Read for Reader<'_> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use darkbio_clock::TestClock;
     use darkbio_connect::schema::{SlotDownload, SlotOrigin, SlotState};
     use std::io::Write;
     use std::net::TcpListener;
@@ -767,7 +782,8 @@ mod tests {
         let agent = http::agent(Duration::from_secs(1), 0);
         let output = output();
         let source = source("https://example.com/reference.gz".into(), &[1, 2, 3]);
-        let mut reader = Reader::new(&agent, &source, &output, None).unwrap();
+        let clock = TestClock::new().clock();
+        let mut reader = Reader::new(&agent, &source, &output, clock, None).unwrap();
         reader.network = Some(ureq::Body::builder().data([1, 2]).into_reader());
         let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
@@ -801,12 +817,19 @@ mod tests {
     fn download_stall_tracks_the_upload_window() {
         let agent = http::agent(Duration::from_secs(1), 0);
         let output = output();
-        let source = source("https://example.com/reference.gz".into(), &[42]);
-        let mut reader = Reader::new(&agent, &source, &output, None).unwrap();
-        reader
-            .last_upload
-            .set(Some(Instant::now() - Duration::from_secs(31)));
-        reader.network = Some(ureq::Body::builder().data([42]).into_reader());
+        let source = source("https://example.com/reference.gz".into(), &[42, 43]);
+        let mut tester = TestClock::new();
+        let mut reader = Reader::new(&agent, &source, &output, tester.clock(), None).unwrap();
+        reader.network = Some(ureq::Body::builder().data([42, 43]).into_reader());
+
+        // A read just inside the upload window passes
+        reader.last_upload.set(Some(tester.clock().now()));
+        tester.advance(Duration::from_secs(29));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
+        assert!(!reader.failed);
+
+        // A read at the end of the window fails the download
+        tester.advance(Duration::from_secs(1));
         assert_eq!(
             reader.read(&mut [0]).unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -832,7 +855,8 @@ mod tests {
                 .unwrap();
         let agent = agent();
         let output = output();
-        let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+        let clock = TestClock::new().clock();
+        let mut reader = Reader::new(&agent, &source, &output, clock, Some(entry)).unwrap();
         let mut received = vec![0; cache::CHUNK];
         reader.read_exact(&mut received).unwrap();
         assert_eq!(received, bytes[..cache::CHUNK]);
@@ -897,6 +921,7 @@ mod tests {
             );
             let agent = agent();
             let output = output();
+            let clock = TestClock::new().clock();
             {
                 let entry = cache::Entry::open(
                     &directory.0,
@@ -905,7 +930,8 @@ mod tests {
                     source.dataset.size,
                 )
                 .unwrap();
-                let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+                let mut reader =
+                    Reader::new(&agent, &source, &output, clock.clone(), Some(entry)).unwrap();
                 let mut received = Vec::new();
                 assert!(reader.read_to_end(&mut received).is_err());
                 assert_eq!(received, bytes[..cache::CHUNK]);
@@ -916,7 +942,7 @@ mod tests {
                 cache::Entry::open(&directory.0, &source.hash, &source.url, source.dataset.size)
                     .unwrap();
             assert_eq!(entry.len().unwrap(), 0);
-            let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+            let mut reader = Reader::new(&agent, &source, &output, clock, Some(entry)).unwrap();
             let mut received = Vec::new();
             reader.read_to_end(&mut received).unwrap();
             assert_eq!(received, bytes);
@@ -948,7 +974,8 @@ mod tests {
                 .unwrap();
         let agent = agent();
         let output = output();
-        let mut reader = Reader::new(&agent, &source, &output, Some(entry)).unwrap();
+        let clock = TestClock::new().clock();
+        let mut reader = Reader::new(&agent, &source, &output, clock, Some(entry)).unwrap();
         let mut received = Vec::new();
         reader.read_to_end(&mut received).unwrap();
         assert_eq!(received, bytes);

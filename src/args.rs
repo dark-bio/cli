@@ -312,6 +312,10 @@ pub(crate) fn slot_name(id: i32) -> String {
 }
 
 /// Reject durations that cannot be represented as monotonic deadlines.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "flags are parsed before any connection clock exists, and the timeout must fit a deadline on the real monotonic clock that connections run on"
+)]
 fn parse_timeout(value: &str) -> Result<u64, String> {
     let seconds = value
         .parse::<u64>()

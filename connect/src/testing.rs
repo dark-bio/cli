@@ -4,9 +4,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Scripted wire peers and attestations for connection and trust tests.
+//! Scripted wire peers, attestations and test clocks for connection and trust tests.
 
 use crate::{Ark, Error, Identity, TrustMode};
+use darkbio_clock::{Clock, TestClock};
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
 use darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION;
@@ -17,15 +18,37 @@ use darkbio_wire::protocol::schema::{self, DeviceInfoResponse, UnlockResponse};
 use darkbio_wire::protocol::{Responder, Server, Session};
 use darkbio_wire::transport::Attestation;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Bytes buffered per direction of a peer's stream, enough for the handshake
 /// and a few messages to flow without the other side reading.
 const CAPACITY: usize = 256 * 1024;
 
-/// Hardware attestation of an identity, signed by the given key. Signed by the
-/// identity itself, it is the placeholder of an Ark that was never onboarded.
-pub fn self_attestation(signer: &xdsa::SecretKey, identity: xdsa::PublicKey) -> Attestation {
+/// Creates a stopped clock a day ahead of real time, so a stray read of the
+/// real clock stands out from the test's time.
+pub fn test_clock() -> TestClock {
+    let mut tester = TestClock::new();
+    tester.advance(Duration::from_secs(86400));
+    tester
+}
+
+/// Blocks until the earliest wait or timer on the clock is due at `deadline`.
+/// The advance that reaches the deadline then wakes it, whenever the test makes
+/// that advance.
+pub fn wait_deadline(tester: &TestClock, deadline: Instant) {
+    while tester.next_deadline() != Some(deadline) {
+        thread::yield_now();
+    }
+}
+
+/// Hardware attestation of an identity, signed by the given key at the clock's
+/// wall time. Signed by the identity itself, it is the placeholder of an Ark
+/// that was never onboarded.
+pub fn self_attestation(
+    signer: &xdsa::SecretKey,
+    identity: xdsa::PublicKey,
+    clock: &Clock,
+) -> Attestation {
     let claims = HardwareClaims {
         sub: claims::Subject {
             sub: "test-device".into(),
@@ -37,7 +60,18 @@ pub fn self_attestation(signer: &xdsa::SecretKey, identity: xdsa::PublicKey) -> 
         hwm: eat::HwModel { hw_model: vec![] },
         hwv: eat::HwVersion::new("test-version".into()),
     };
-    let cwt = cwt::issue(&claims, signer, CRYPTO_DOMAIN_DEVICE_ATTESTATION).unwrap();
+    let timestamp = clock
+        .system_time()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cwt = cwt::issue_at(
+        &claims,
+        signer,
+        CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+        timestamp as i64,
+    )
+    .unwrap();
     Attestation::new(cwt).unwrap()
 }
 
@@ -49,7 +83,7 @@ pub type Script = Box<dyn FnMut(&Session, Request, Responder) -> bool + Send>;
 /// requests with a request of the peer's own ahead of the reply, and anything
 /// else with the protocol's UNSUPPORTED error.
 pub fn answering(session: &Session, request: Request, responder: Responder) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = session.clock().now() + Duration::from_secs(10);
     let queued = match request {
         Request::DeviceInfo(_) => responder.reply(
             DeviceInfoResponse {
@@ -104,13 +138,14 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// Starts a peer serving the client per the script.
-    pub fn spawn(mut script: Script) -> Self {
+    /// Starts a peer serving the client per the script. Both ends of its stream
+    /// measure their deadlines on the clock.
+    pub fn spawn(clock: &Clock, mut script: Script) -> Self {
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
-        let attestation = self_attestation(&signer, identity.clone());
+        let attestation = self_attestation(&signer, identity.clone(), clock);
 
-        let (host, ark) = memory::duplex(CAPACITY);
+        let (host, ark) = memory::duplex(CAPACITY, clock);
         let thread = thread::spawn(move || {
             let mut server = Server::new(ark, signer, attestation);
             let Ok(mut session) = server.accept() else {

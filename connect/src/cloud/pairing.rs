@@ -11,9 +11,10 @@ use super::{
     socket::{self, Connection, Socket, socket_mut},
 };
 use crate::{Error, Timing, schema};
+use darkbio_clock::Clock;
 use darkbio_crypto::{cbor::Cbor, cose};
 use darkbio_wire::protocol::Requester;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tungstenite::Message;
 
 /// Pairing stages. The caller renders the rendezvous or turns it into a QR code;
@@ -26,8 +27,9 @@ pub enum PairingProgress {
         colo: String,
         /// Rendezvous secret shared with the companion through the pairing code.
         secret: [u8; 32],
-        /// End of the scan window in Unix seconds.
-        deadline: u64,
+        /// End of the scan window on the connection's clock, when pairing
+        /// stops waiting for the companion.
+        deadline: Instant,
         /// Pairing encryption key fingerprint conveyed to the companion out of band.
         fingerprint: Vec<u8>,
     },
@@ -61,84 +63,118 @@ impl Services {
         &self,
         requester: &Requester,
         timing: Timing,
-        mut progress: impl FnMut(PairingProgress),
+        progress: impl FnMut(PairingProgress),
     ) -> Result<(), Error> {
         self.sync(requester, timing)?;
+        let clock = &self.clock;
         let cloud = self.cloud.as_ref().ok_or(Error::MissingEnvironment)?;
         let (mut socket, fingerprint) = self.authenticate(requester, timing, || {
             let auth = requester
-                .request(schema::PairingAuthRequest {}, timing.io())?
+                .request(schema::PairingAuthRequest {}, timing.io(clock))?
                 .wait::<schema::PairingAuthResponse>()?;
             let socket = socket::connect(
                 cloud,
                 &cloud.pairing_url(),
                 &auth.auth,
                 "Pairing",
-                timing.io(),
+                timing.io(clock),
             )?;
             Ok((socket, auth.fprint))
         })?;
-        // These claims locate the rendezvous and bound scanning. The Ark verifies
-        // the companion identity and storage messages forwarded below.
-        let rendezvous: Rendezvous = cose::peek(&receive(&mut socket, timing.io())?)
-            .map_err(|err| Error::Pairing(err.to_string()))?;
-        let expires = scan_deadline(rendezvous.deadline)?;
-        progress(PairingProgress::Rendezvous {
-            colo: rendezvous.colo,
-            secret: rendezvous.secret,
-            deadline: rendezvous.deadline,
-            fingerprint,
-        });
-        let wait = timing.limit(expires);
-        let identity = receive(&mut socket, wait).map_err(|err| {
-            if matches!(err, Error::Timeout) && wait == expires {
-                Error::PairingExpired
-            } else {
-                err
-            }
-        })?;
-        progress(PairingProgress::Identity);
-        requester
-            .request(
-                schema::PairingSetAppIdentityRequest { identity },
-                timing.io(),
-            )?
-            .wait::<schema::PairingSetAppIdentityResponse>()?;
-        let app_key = receive(&mut socket, timing.approval())?;
-        progress(PairingProgress::Storage);
-        let storage = requester
-            .request(schema::PairingSetAppStorageRequest { app_key }, timing.io())?
-            .wait::<schema::PairingSetAppStorageResponse>()?;
-        send(&mut socket, storage.ark_keys, timing.io())?;
-        let app_ack = receive(&mut socket, timing.approval())?;
-        requester
-            .request(schema::PairingAckArkStorageRequest { app_ack }, timing.io())?
-            .wait::<schema::PairingAckArkStorageResponse>()?;
-        progress(PairingProgress::Approval);
-        let accepted = requester
-            .request(
-                schema::PairingAcceptanceRequest {},
-                timing.window(crate::timing::PAIRING_WINDOW),
-            )?
-            .wait::<schema::PairingAcceptanceResponse>()?;
-        send(&mut socket, accepted.confirm, timing.io())?;
-        progress(PairingProgress::Formatting);
-        let completed = requester
-            .request(
-                schema::PairingCompletionRequest {},
-                timing.window(crate::timing::PAIRING_WINDOW),
-            )?
-            .wait::<schema::PairingCompletionResponse>()?;
-        send(&mut socket, completed.confirm, timing.io())?;
+        exchange(requester, timing, &mut socket, fingerprint, progress)?;
         let _ = socket.close(None);
         Ok(())
     }
 }
 
-/// Converts the cloud's Unix deadline once, then waits on the monotonic clock.
-fn scan_deadline(deadline: u64) -> Result<Instant, Error> {
-    let start = Instant::now();
-    let now = SystemTime::now()
+/// Presents the rendezvous, then forwards each opaque exchange between the
+/// companion and the Ark. The owner's scan waits under the cloud's deadline,
+/// which only a caller's earlier absolute deadline cuts short.
+fn exchange(
+    requester: &Requester,
+    timing: Timing,
+    channel: &mut impl Channel,
+    fingerprint: Vec<u8>,
+    mut progress: impl FnMut(PairingProgress),
+) -> Result<(), Error> {
+    let clock = &requester.clock();
+
+    // These claims locate the rendezvous and bound scanning. The Ark verifies
+    // the companion identity and storage messages forwarded below.
+    let rendezvous: Rendezvous = cose::peek(&channel.receive(timing.io(clock))?)
+        .map_err(|err| Error::Pairing(err.to_string()))?;
+    let expires = scan_deadline(clock, rendezvous.deadline)?;
+    let wait = timing.limit(expires);
+    progress(PairingProgress::Rendezvous {
+        colo: rendezvous.colo,
+        secret: rendezvous.secret,
+        deadline: wait,
+        fingerprint,
+    });
+    let identity = channel.receive(wait).map_err(|err| {
+        if matches!(err, Error::Timeout) && wait == expires {
+            Error::PairingExpired
+        } else {
+            err
+        }
+    })?;
+    progress(PairingProgress::Identity);
+    requester
+        .request(
+            schema::PairingSetAppIdentityRequest { identity },
+            timing.io(clock),
+        )?
+        .wait::<schema::PairingSetAppIdentityResponse>()?;
+    let app_key = channel.receive(timing.approval(clock))?;
+    progress(PairingProgress::Storage);
+    let storage = requester
+        .request(
+            schema::PairingSetAppStorageRequest { app_key },
+            timing.io(clock),
+        )?
+        .wait::<schema::PairingSetAppStorageResponse>()?;
+    channel.send(storage.ark_keys, timing.io(clock))?;
+    let app_ack = channel.receive(timing.approval(clock))?;
+    requester
+        .request(
+            schema::PairingAckArkStorageRequest { app_ack },
+            timing.io(clock),
+        )?
+        .wait::<schema::PairingAckArkStorageResponse>()?;
+    progress(PairingProgress::Approval);
+    let accepted = requester
+        .request(
+            schema::PairingAcceptanceRequest {},
+            timing.window(clock, crate::timing::PAIRING_WINDOW),
+        )?
+        .wait::<schema::PairingAcceptanceResponse>()?;
+    channel.send(accepted.confirm, timing.io(clock))?;
+    progress(PairingProgress::Formatting);
+    let completed = requester
+        .request(
+            schema::PairingCompletionRequest {},
+            timing.window(clock, crate::timing::PAIRING_WINDOW),
+        )?
+        .wait::<schema::PairingCompletionResponse>()?;
+    channel.send(completed.confirm, timing.io(clock))
+}
+
+/// Rendezvous with the companion, carrying opaque payloads both ways, each
+/// exchange under its own deadline.
+trait Channel {
+    /// Waits for one binary payload until the deadline.
+    fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>, Error>;
+
+    /// Sends one payload within the deadline.
+    fn send(&mut self, bytes: Vec<u8>, deadline: Instant) -> Result<(), Error>;
+}
+
+/// Converts the cloud's Unix deadline once, against the clock's wall time, then
+/// waits on the clock's monotonic time.
+fn scan_deadline(clock: &Clock, deadline: u64) -> Result<Instant, Error> {
+    let start = clock.now();
+    let now = clock
+        .system_time()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| Error::Pairing(err.to_string()))?;
     let remaining = Duration::from_secs(deadline)
@@ -192,35 +228,56 @@ fn send(socket: &mut Connection, bytes: Vec<u8>, deadline: Instant) -> Result<()
     Ok(())
 }
 
+impl Channel for Connection {
+    /// Waits on the cloud's pairing socket, answering its control frames.
+    fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
+        receive(self, deadline)
+    }
+
+    /// Sends through the cloud's pairing socket.
+    fn send(&mut self, bytes: Vec<u8>, deadline: Instant) -> Result<(), Error> {
+        send(self, bytes, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         Ark, TrustMode,
         cloud::{State, http},
-        testing::Peer,
+        testing::{Peer, test_clock, wait_deadline},
         trust::Realm,
     };
+    use darkbio_clock::crossbeam_channel;
     use darkbio_crypto::xdsa;
     use darkbio_wire::protocol::{self, schema::host_to_ark::Content};
     use std::{
         net::TcpListener,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc},
         thread,
     };
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn scan_uses_cloud_deadline_and_retains_caller_bound() {
-        assert!(matches!(scan_deadline(0), Err(Error::PairingExpired)));
-        let now = Instant::now();
-        let epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let expiry = scan_deadline(epoch + 60).unwrap();
-        assert!(expiry > now + Duration::from_secs(58));
-        assert!(expiry <= now + Duration::from_secs(60));
+        // Pin wall time to a whole second, so the cloud's deadline maps exactly
+        let mut tester = test_clock();
+        tester.set_system_time(UNIX_EPOCH + Duration::from_secs(1_789_000_000));
+        let clock = tester.clock();
+        assert!(matches!(
+            scan_deadline(&clock, 0),
+            Err(Error::PairingExpired)
+        ));
+        assert!(matches!(
+            scan_deadline(&clock, 1_789_000_000),
+            Err(Error::PairingExpired)
+        ));
+        let now = clock.now();
+        let expiry = scan_deadline(&clock, 1_789_000_060).unwrap();
+        assert_eq!(expiry, now + Duration::from_secs(60));
+
+        // The scan keeps its own deadline, cut only by the caller's absolute one
         let timing = Timing::inactivity(Duration::from_millis(1));
         assert_eq!(timing.limit(expiry), expiry);
         let caller = now + Duration::from_secs(1);
@@ -231,6 +288,7 @@ mod tests {
     #[test]
     #[allow(clippy::result_large_err)] // Tungstenite's HTTP callback owns its rejection.
     fn close_retains_timeout_and_other_reasons() {
+        let clock = test_clock().clock();
         for reason in ["pairing timed out", "companion disconnected"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("ws://{}/pairing", listener.local_addr().unwrap());
@@ -255,9 +313,9 @@ mod tests {
                     }))
                     .unwrap();
             });
-            let deadline = Instant::now() + TIMEOUT;
+            let deadline = clock.now() + TIMEOUT;
             let mut socket = socket::connect(
-                &http::tests::api(url.clone(), Realm::Hardware),
+                &http::tests::api(url.clone(), Realm::Hardware, &clock),
                 &url,
                 &[],
                 "Pairing",
@@ -274,75 +332,31 @@ mod tests {
         }
     }
 
-    /// The host only relays sealed payloads. Both completion messages and a
-    /// refusal retain their protocol ordering; a scan can outlive an I/O wait.
-    #[test]
-    #[allow(clippy::result_large_err)] // Tungstenite requires a full HTTP rejection response.
-    fn pairing_exchange_and_refusal() {
-        for refuse in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}/v1", listener.local_addr().unwrap());
-            let expiry = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 60;
-            let cloud = thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-                stream.set_write_timeout(Some(TIMEOUT)).unwrap();
-                let mut socket = tungstenite::accept_hdr(
-                    stream,
-                    |request: &tungstenite::handshake::server::Request,
-                     mut response: tungstenite::handshake::server::Response| {
-                        assert_eq!(request.uri().path(), "/v1/pairing");
-                        assert_eq!(
-                            request.headers()["Sec-WebSocket-Protocol"],
-                            "Pairing, Dark-Auth|-_8"
-                        );
-                        response
-                            .headers_mut()
-                            .insert("Sec-WebSocket-Protocol", "Pairing".parse().unwrap());
-                        Ok(response)
-                    },
-                )
-                .unwrap();
-                let rendezvous = Rendezvous {
-                    colo: "OTP".into(),
-                    secret: [9; 32],
-                    deadline: expiry,
-                };
-                let signed =
-                    cose::sign(rendezvous, (), &xdsa::SecretKey::generate(), b"pairing-v1")
-                        .unwrap();
-                socket.send(Message::Binary(signed.into())).unwrap();
-                thread::sleep(Duration::from_millis(1200));
-                socket.send(Message::Ping(vec![9].into())).unwrap();
-                socket
-                    .send(Message::Binary(vec![1, 0, 255].into()))
-                    .unwrap();
-                socket
-                    .send(Message::Binary(vec![2, 0, 254].into()))
-                    .unwrap();
-                let mut read = || loop {
-                    match socket.read().unwrap() {
-                        Message::Binary(bytes) => break bytes.to_vec(),
-                        Message::Pong(_) => {}
-                        message => panic!("unexpected cloud message {message:?}"),
-                    }
-                };
-                assert_eq!(read(), [3, 0, 253]);
-                socket
-                    .send(Message::Binary(vec![4, 0, 252].into()))
-                    .unwrap();
-                if !refuse {
-                    assert_eq!(socket.read().unwrap().into_data().as_ref(), [5, 0, 251]);
-                    assert_eq!(socket.read().unwrap().into_data().as_ref(), [6, 0, 250]);
-                    assert!(matches!(socket.read().unwrap(), Message::Close(_)));
-                }
-            });
-            let mut peer = Peer::spawn(Box::new(move |_, request, responder| {
-                let deadline = Instant::now() + TIMEOUT;
+    /// Signs a rendezvous at `signed` that expires at `deadline`, both in Unix
+    /// seconds.
+    fn rendezvous(signed: u64, deadline: u64) -> Vec<u8> {
+        let rendezvous = Rendezvous {
+            colo: "OTP".into(),
+            secret: [9; 32],
+            deadline,
+        };
+        cose::sign_at(
+            rendezvous,
+            (),
+            &xdsa::SecretKey::generate(),
+            b"pairing-v1",
+            signed as i64,
+        )
+        .unwrap()
+    }
+
+    /// Ark answering each pairing request with fixed opaque payloads, checking
+    /// the ones it receives. It refuses the owner's acceptance when asked to.
+    fn pairing_peer(clock: &Clock, refuse: bool) -> Peer {
+        Peer::spawn(
+            clock,
+            Box::new(move |_, request, responder| {
+                let deadline = responder.clock().now() + TIMEOUT;
                 match request {
                     Content::PairingAuth(_) => responder.reply(
                         schema::PairingAuthResponse {
@@ -387,13 +401,169 @@ mod tests {
                 }
                 .unwrap();
                 true
-            }));
+            }),
+        )
+    }
+
+    /// The owner's scan outlives the machine allowance under the cloud's
+    /// deadline, while a caller's earlier absolute deadline still ends it. The
+    /// presented rendezvous counts down to the deadline the scan waits on.
+    #[test]
+    fn test_scan_waits_under_the_cloud_deadline() {
+        /// Companion side of the rendezvous, which the test hands each payload
+        /// to. Every receive reports its deadline before it waits.
+        struct Companion {
+            clock: Clock,                                   // clock the receives wait on
+            payloads: crossbeam_channel::Receiver<Vec<u8>>, // payloads the test hands over
+            waits: mpsc::Sender<Instant>,                   // deadline of every receive
+        }
+        impl Channel for Companion {
+            fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
+                self.waits.send(deadline).unwrap();
+                self.clock
+                    .recv_deadline(&self.payloads, deadline)
+                    .map_err(|_| Error::Timeout)
+            }
+            fn send(&mut self, _: Vec<u8>, _: Instant) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        for caller in [None, Some(Duration::from_secs(10))] {
+            // Pin wall time to a whole second, so the cloud's deadline maps exactly
+            let mut tester = test_clock();
+            tester.set_system_time(UNIX_EPOCH + Duration::from_secs(1_789_000_000));
+            let clock = tester.clock();
+            let start = clock.now();
+
+            // Start pairing with the rendezvous at hand but the companion silent
+            let mut peer = pairing_peer(&clock, false);
+            let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
+            let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
+            let (hand, payloads) = crossbeam_channel::unbounded();
+            let (waits, receives) = mpsc::channel();
+            let (progress, stages) = mpsc::channel();
+            hand.send(rendezvous(1_789_000_000, 1_789_000_060)).unwrap();
+            let allowance = Timing::inactivity(Duration::from_secs(1));
+            let timing = caller.map_or(allowance, |caller| allowance.with_deadline(start + caller));
+            let pairing = thread::spawn({
+                let requester = session.requester();
+                let mut companion = Companion {
+                    clock: clock.clone(),
+                    payloads,
+                    waits,
+                };
+                move || {
+                    exchange(&requester, timing, &mut companion, vec![8; 32], |stage| {
+                        progress.send(stage).unwrap()
+                    })
+                }
+            });
+
+            // The rendezvous comes within the allowance, then the scan waits on
+            // the cloud's deadline or the caller's earlier one, which is also
+            // the deadline the rendezvous is presented with
+            assert_eq!(receives.recv().unwrap(), start + Duration::from_secs(1));
+            let scan = start + caller.unwrap_or(Duration::from_secs(60));
+            assert_eq!(receives.recv().unwrap(), scan);
+            assert!(matches!(
+                stages.recv().unwrap(),
+                PairingProgress::Rendezvous { deadline, .. } if deadline == scan
+            ));
+            wait_deadline(&tester, scan);
+
+            // Passing the machine allowance leaves the scan waiting
+            tester.advance(Duration::from_secs(2));
+            assert_eq!(tester.next_deadline(), Some(scan));
+
+            // A late companion completes the exchange, a caller's deadline ends it
+            if caller.is_none() {
+                for payload in [vec![1, 0, 255], vec![2, 0, 254], vec![4, 0, 252]] {
+                    hand.send(payload).unwrap();
+                }
+                pairing.join().unwrap().unwrap();
+            } else {
+                tester.advance_to(scan);
+                assert!(matches!(pairing.join().unwrap(), Err(Error::Timeout)));
+            }
+        }
+    }
+
+    /// The host only relays sealed payloads. Both completion messages and a
+    /// refusal retain their protocol ordering.
+    #[test]
+    #[allow(clippy::result_large_err)] // Tungstenite requires a full HTTP rejection response.
+    fn pairing_exchange_and_refusal() {
+        // Pin wall time to a whole second, so the cloud's deadline maps exactly
+        let mut tester = test_clock();
+        tester.set_system_time(UNIX_EPOCH + Duration::from_secs(1_789_000_000));
+        let clock = tester.clock();
+        let start = clock.now();
+
+        for refuse in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let signed = clock
+                .system_time()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let expiry = signed + 60;
+            let cloud = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+                let mut socket = tungstenite::accept_hdr(
+                    stream,
+                    |request: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        assert_eq!(request.uri().path(), "/v1/pairing");
+                        assert_eq!(
+                            request.headers()["Sec-WebSocket-Protocol"],
+                            "Pairing, Dark-Auth|-_8"
+                        );
+                        response
+                            .headers_mut()
+                            .insert("Sec-WebSocket-Protocol", "Pairing".parse().unwrap());
+                        Ok(response)
+                    },
+                )
+                .unwrap();
+                socket
+                    .send(Message::Binary(rendezvous(signed, expiry).into()))
+                    .unwrap();
+                socket.send(Message::Ping(vec![9].into())).unwrap();
+                socket
+                    .send(Message::Binary(vec![1, 0, 255].into()))
+                    .unwrap();
+                socket
+                    .send(Message::Binary(vec![2, 0, 254].into()))
+                    .unwrap();
+                let mut read = || loop {
+                    match socket.read().unwrap() {
+                        Message::Binary(bytes) => break bytes.to_vec(),
+                        Message::Pong(_) => {}
+                        message => panic!("unexpected cloud message {message:?}"),
+                    }
+                };
+                assert_eq!(read(), [3, 0, 253]);
+                socket
+                    .send(Message::Binary(vec![4, 0, 252].into()))
+                    .unwrap();
+                if !refuse {
+                    assert_eq!(socket.read().unwrap().into_data().as_ref(), [5, 0, 251]);
+                    assert_eq!(socket.read().unwrap().into_data().as_ref(), [6, 0, 250]);
+                    assert!(matches!(socket.read().unwrap(), Message::Close(_)));
+                }
+            });
+            let mut peer = pairing_peer(&clock, refuse);
             let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
             let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
             let services = Arc::new(Services {
-                cloud: Some(http::tests::api(url, Realm::Hardware)),
+                clock: clock.clone(),
+                cloud: Some(http::tests::api(url, Realm::Hardware, &clock)),
                 state: Mutex::new(State {
-                    synced: Some((Instant::now(), true)),
+                    synced: Some((clock.now(), true)),
                     ..Default::default()
                 }),
                 updating: Mutex::new(()),
@@ -420,7 +590,7 @@ mod tests {
             }
             assert!(
                 matches!(&stages[0], PairingProgress::Rendezvous { colo, secret, deadline, fingerprint }
-                if *deadline == expiry && colo == "OTP" && secret == &[9;32] && fingerprint == &vec![8;32])
+                if *deadline == start + Duration::from_secs(60) && colo == "OTP" && secret == &[9;32] && fingerprint == &vec![8;32])
             );
             cloud.join().unwrap();
         }

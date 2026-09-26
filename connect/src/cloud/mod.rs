@@ -28,17 +28,19 @@ use crate::schema::{
     GenuinityProofRequest, RelayArkToAppRequest, RelayJoinRequest, RelayJoinResponse,
 };
 use crate::{Error, Identity, Timing};
+use darkbio_clock::{Clock, sync};
 use darkbio_wire::protocol::{self, Requester, Responder};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Whether the reported cloud identity and clock can be reused for a request.
-/// Sync is needed before the first use or at 15 seconds of clock drift, leaving
-/// headroom for proof verification. Key rotation is detected by a refused proof;
-/// the marker only records setup since boot.
-pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse) -> bool {
-    let now = SystemTime::now()
+/// Sync is needed before the first use or at 15 seconds of drift from the
+/// clock's wall time, leaving headroom for proof verification. Key rotation is
+/// detected by a refused proof; the marker only records setup since boot.
+pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse, clock: &Clock) -> bool {
+    let now = clock
+        .system_time()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
@@ -54,6 +56,7 @@ fn synced_at(info: &crate::schema::DeviceInfoResponse, now: u64) -> bool {
 /// run outside its lock so independent requests and closure remain available.
 #[derive(Debug)]
 pub(crate) struct Services {
+    clock: Clock,             // clock of the wire session, which every operation reads
     cloud: Option<http::Api>, // Absent without an attested or caller-supplied environment
     state: Mutex<State>,      // Current initialization attempt and connection lifecycle
     updating: Mutex<()>,      // One firmware transfer at a time across client clones
@@ -70,11 +73,11 @@ struct State {
 }
 
 /// One attempt's outcome, retained by its waiters even after a retry starts.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Attempt {
-    result: Mutex<Option<Result<(), Failure>>>, // Shared success or the original failure
-    refreshed: AtomicBool,                      // This attempt exchanged keys and signed time
-    ready: Condvar,                             // Wakes waiters on completion or closure
+    result: sync::Mutex<Option<Result<(), Failure>>>, // Shared success or the original failure
+    refreshed: AtomicBool,                            // This attempt exchanged keys and signed time
+    ready: sync::Condvar,                             // Wakes waiters on completion or closure
 }
 
 /// Failures shareable between callers joining the same initialization attempt.
@@ -143,16 +146,24 @@ impl Services {
         error.into()
     }
 
-    /// Records cloud routing without starting network I/O.
+    /// Records cloud routing without starting network I/O. Every operation of the
+    /// connection reads its time from the clock of the wire session.
     pub(crate) fn new(
         identity: &Identity,
         cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
+        clock: &Clock,
     ) -> Self {
         Self {
-            cloud: http::Api::new(identity, cloud),
+            clock: clock.clone(),
+            cloud: http::Api::new(identity, cloud, clock),
             state: Mutex::new(State::default()),
             updating: Mutex::new(()),
         }
+    }
+
+    /// Returns the clock of the wire session, which every operation reads.
+    pub(crate) fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Reuses fresh device state, caching that decision for one minute. Each
@@ -189,7 +200,7 @@ impl Services {
     /// Serializes one prerequisite while allowing unrelated device traffic.
     /// Waiters retain the attempt they joined, even if a later caller retries it.
     fn ensure(&self, requester: &Requester, step: Step, timing: Timing) -> Result<(), Failure> {
-        let deadline = timing.io();
+        let deadline = timing.io(&self.clock);
         let (attempt, leader) = {
             let mut state = self.state.lock().expect("cloud setup not poisoned");
             if let Some(error) = &state.error {
@@ -199,7 +210,7 @@ impl Services {
                 _ if self.cloud.is_none() => return Err(Failure::MissingEnvironment),
                 Step::Sync
                     if state.synced.is_some_and(|(at, synced)| {
-                        synced && at.elapsed() < Duration::from_secs(60)
+                        synced && self.clock.elapsed(at) < Duration::from_secs(60)
                     }) =>
                 {
                     return Ok(());
@@ -209,7 +220,7 @@ impl Services {
                 }
                 _ => {}
             }
-            if Instant::now() >= deadline {
+            if self.clock.now() >= deadline {
                 return Err(protocol::Error::Timeout.into());
             }
             if matches!(step, Step::Refresh) {
@@ -222,7 +233,7 @@ impl Services {
             match pending {
                 Some(attempt) => (attempt.clone(), false),
                 None => {
-                    let attempt = Arc::new(Attempt::default());
+                    let attempt = Arc::new(Attempt::new(&self.clock));
                     *pending = Some(attempt.clone());
                     (attempt, true)
                 }
@@ -256,7 +267,7 @@ impl Services {
             result.and_then(|relay| {
                 match step {
                     Step::Sync | Step::Refresh => {
-                        state.synced = Some((Instant::now(), true));
+                        state.synced = Some((self.clock.now(), true));
                     }
                     Step::Relay => {
                         let mut relay = relay.expect("relay setup returned an attachment");
@@ -281,14 +292,14 @@ impl Services {
         let cloud = self.cloud.as_ref().expect("cloud route available");
         self.authenticate(requester, timing, || {
             let joined = requester
-                .request(RelayJoinRequest {}, timing.io())?
+                .request(RelayJoinRequest {}, timing.io(&self.clock))?
                 .wait::<RelayJoinResponse>()?;
             relay::Relay::connect(
                 cloud,
                 &cloud.relay_url(),
                 &joined.auth,
                 requester.clone(),
-                timing.io(),
+                timing.io(&self.clock),
             )
         })
     }
@@ -323,7 +334,7 @@ impl Services {
         if self.cloud.is_none() {
             return Some((request, responder));
         }
-        let deadline = Instant::now() + relay::EXCHANGE_TIMEOUT;
+        let deadline = self.clock.now() + relay::EXCHANGE_TIMEOUT;
         if let Err(error) = self.relay(requester, deadline) {
             relay::fail(responder, &error.to_string());
             return None;
@@ -348,9 +359,9 @@ impl Services {
         self.sync(requester, timing)?;
         self.authenticate(requester, timing, || {
             let proof = requester
-                .request(GenuinityProofRequest {}, timing.io())?
+                .request(GenuinityProofRequest {}, timing.io(&self.clock))?
                 .wait::<crate::schema::GenuinityProofResponse>()?;
-            cloud.genuine(&proof.proof, timing.io())
+            cloud.genuine(&proof.proof, timing.io(&self.clock))
         })
         .map_err(Into::into)
     }
@@ -369,7 +380,7 @@ impl Services {
                 .lock()
                 .expect("cloud setup not poisoned")
                 .synced
-                .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
+                .filter(|&(at, _)| self.clock.elapsed(at) < Duration::from_secs(60))
                 .map(|(_, synced)| synced);
             let synced = match reported {
                 Some(synced) => synced,
@@ -381,13 +392,15 @@ impl Services {
             }
         }
         let cloud = self.cloud.as_ref().expect("cloud route available");
-        let identity = cloud.with_auth(timing, || cloud.identity(timing.io()))?;
+        let identity = cloud.with_auth(timing, || cloud.identity(timing.io(&self.clock)))?;
         let started = requester
-            .request(identity, timing.io())?
+            .request(identity, timing.io(&self.clock))?
             .wait::<crate::schema::CloudSyncStartResponse>()?;
-        let time = cloud.with_auth(timing, || cloud.time(&started.challenge, timing.io()))?;
+        let time = cloud.with_auth(timing, || {
+            cloud.time(&started.challenge, timing.io(&self.clock))
+        })?;
         requester
-            .request(time, timing.io())?
+            .request(time, timing.io(&self.clock))?
             .wait::<crate::schema::CloudSyncFinishResponse>()?;
         tracing::info!(target: "darkbio_connect::setup", "cloud synchronized");
         Ok(true)
@@ -400,9 +413,9 @@ impl Services {
         timing: Timing,
     ) -> Result<bool, protocol::Error> {
         let info = requester
-            .request(crate::schema::DeviceInfoRequest {}, timing.io())?
+            .request(crate::schema::DeviceInfoRequest {}, timing.io(&self.clock))?
             .wait::<crate::schema::DeviceInfoResponse>()?;
-        Ok(cloud_synced(&info))
+        Ok(cloud_synced(&info, &self.clock))
     }
 
     /// Reuses device info already requested by the caller. A delayed response
@@ -413,7 +426,7 @@ impl Services {
             && state.syncing.is_none()
             && state.synced.is_none_or(|(at, _)| at < requested)
         {
-            state.synced = Some((requested, cloud_synced(info)));
+            state.synced = Some((requested, cloud_synced(info, &self.clock)));
         }
     }
 
@@ -453,6 +466,15 @@ enum Step {
 }
 
 impl Attempt {
+    /// Starts an attempt whose waiters measure their deadlines on the clock.
+    fn new(clock: &Clock) -> Self {
+        Self {
+            result: sync::Mutex::new(None),
+            refreshed: AtomicBool::new(false),
+            ready: sync::Condvar::new(clock),
+        }
+    }
+
     /// Publishes the first outcome, preserving closure if it won the race.
     fn finish(&self, result: Result<(), Failure>) {
         let mut outcome = self.result.lock().expect("cloud attempt not poisoned");
@@ -469,14 +491,14 @@ impl Attempt {
             if let Some(result) = &*outcome {
                 return result.clone();
             }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(protocol::Error::Timeout)?;
-            outcome = self
+            let (next, wait) = self
                 .ready
-                .wait_timeout(outcome, remaining)
-                .expect("cloud attempt not poisoned")
-                .0;
+                .wait_deadline(outcome, deadline)
+                .expect("cloud attempt not poisoned");
+            outcome = next;
+            if wait.timed_out() && outcome.is_none() {
+                return Err(protocol::Error::Timeout.into());
+            }
         }
     }
 }
@@ -489,7 +511,7 @@ pub(crate) mod tests {
     use crate::schema::{
         CloudSyncFinishResponse, CloudSyncStartResponse, DeviceInfoRequest, GenuinityProofResponse,
     };
-    use crate::testing::{Peer, answering};
+    use crate::testing::{Peer, answering, test_clock, wait_deadline};
     use crate::trust::Realm;
     use crate::{Ark, TrustMode};
     use std::io::{Read, Write};
@@ -503,36 +525,25 @@ pub(crate) mod tests {
     pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Serves scripted responses and captures requests, closing each connection
-    /// after its response. Accepts are bounded so a failed test leaves no waiter.
-    pub(crate) fn serve(responses: Vec<(Duration, String)>) -> (String, mpsc::Receiver<String>) {
+    /// after its response. A server left waiting by a failed test blocks only
+    /// its own thread.
+    pub(crate) fn serve(responses: Vec<String>) -> (String, mpsc::Receiver<String>) {
         serve_inner(responses, None)
     }
 
     /// Holds the first response until released, making setup races deterministic.
-    fn serve_inner(
-        responses: Vec<(Duration, String)>,
+    pub(super) fn serve_inner(
+        responses: Vec<String>,
         mut pause: Option<mpsc::Receiver<()>>,
     ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            for (delay, response) in responses {
-                let deadline = Instant::now() + TIMEOUT;
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            if Instant::now() >= deadline {
-                                return;
-                            }
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(_) => return,
-                    }
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
                 };
-                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                 stream.set_write_timeout(Some(TIMEOUT)).unwrap();
                 let mut request = Vec::new();
@@ -545,11 +556,10 @@ pub(crate) mod tests {
                 }
                 sender.send(String::from_utf8(request).unwrap()).unwrap();
                 if let Some(pause) = pause.take()
-                    && pause.recv_timeout(TIMEOUT).is_err()
+                    && pause.recv().is_err()
                 {
                     return;
                 }
-                thread::sleep(delay);
                 let _ = stream.write_all(response.as_bytes());
             }
         });
@@ -575,11 +585,14 @@ pub(crate) mod tests {
     }
 
     /// Attaches a real wire session with cloud routes redirected to the test server.
+    /// The connection runs on the clock of the peer's stream.
     pub(crate) fn attach(peer: &mut Peer, url: String) -> Ark {
         let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
+        let clock = session.clock();
         let services = Arc::new(Services {
-            cloud: Some(super::http::tests::api(url, Realm::Hardware)),
+            clock: clock.clone(),
+            cloud: Some(super::http::tests::api(url, Realm::Hardware, &clock)),
             state: Mutex::new(State::default()),
             updating: Mutex::new(()),
         });
@@ -588,87 +601,84 @@ pub(crate) mod tests {
 
     /// Peer that only issues a proof after sync, retaining counts for duplicate
     /// initialization checks. Optionally refuses its first start request.
-    fn peer(refuse_first: bool) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn peer(clock: &Clock, refuse_first: bool) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let starts = Arc::new(AtomicUsize::new(0));
         let proofs = Arc::new(AtomicUsize::new(0));
-        let peer = Peer::spawn(Box::new({
-            let starts = starts.clone();
-            let proofs = proofs.clone();
-            let mut synced = false;
-            move |session, request, responder| {
-                let deadline = Instant::now() + TIMEOUT;
-                match request {
-                    Content::CloudSyncStart(request) => {
-                        assert_eq!(request.signer, [1]);
-                        assert_eq!(request.crypto, [2]);
-                        if starts.fetch_add(1, Ordering::SeqCst) == 0 && refuse_first {
+        let peer = Peer::spawn(
+            clock,
+            Box::new({
+                let starts = starts.clone();
+                let proofs = proofs.clone();
+                let mut synced = false;
+                move |session, request, responder| {
+                    let deadline = session.clock().now() + TIMEOUT;
+                    match request {
+                        Content::CloudSyncStart(request) => {
+                            assert_eq!(request.signer, [1]);
+                            assert_eq!(request.crypto, [2]);
+                            if starts.fetch_add(1, Ordering::SeqCst) == 0 && refuse_first {
+                                responder
+                                    .fail(
+                                        crate::schema::Error::new(0x111, "identity rejected"),
+                                        deadline,
+                                    )
+                                    .unwrap()
+                                    .wait()
+                                    .unwrap();
+                            } else {
+                                responder
+                                    .reply(CloudSyncStartResponse { challenge: vec![3] }, deadline)
+                                    .unwrap()
+                                    .wait()
+                                    .unwrap();
+                            }
+                        }
+                        Content::CloudSyncFinish(request) => {
+                            assert_eq!(request.unixmilli, 123);
+                            assert_eq!(request.signature, [4]);
+                            synced = true;
                             responder
-                                .fail(
-                                    crate::schema::Error::new(0x111, "identity rejected"),
+                                .reply(CloudSyncFinishResponse { accepted: 123 }, deadline)
+                                .unwrap()
+                                .wait()
+                                .unwrap();
+                        }
+                        Content::GenuinityProof(_) => {
+                            assert!(synced, "proof requested before cloud sync");
+                            proofs.fetch_add(1, Ordering::SeqCst);
+                            responder
+                                .reply(
+                                    GenuinityProofResponse {
+                                        proof: vec![0xfb, 0xff],
+                                    },
                                     deadline,
                                 )
                                 .unwrap()
                                 .wait()
                                 .unwrap();
-                        } else {
+                        }
+                        Content::SlotList(_) => {
+                            assert!(synced, "slots requested before cloud sync");
                             responder
-                                .reply(CloudSyncStartResponse { challenge: vec![3] }, deadline)
+                                .reply(crate::schema::SlotListResponse::default(), deadline)
                                 .unwrap()
                                 .wait()
                                 .unwrap();
                         }
+                        request => return answering(session, request, responder),
                     }
-                    Content::CloudSyncFinish(request) => {
-                        assert_eq!(request.unixmilli, 123);
-                        assert_eq!(request.signature, [4]);
-                        synced = true;
-                        responder
-                            .reply(CloudSyncFinishResponse { accepted: 123 }, deadline)
-                            .unwrap()
-                            .wait()
-                            .unwrap();
-                    }
-                    Content::GenuinityProof(_) => {
-                        assert!(synced, "proof requested before cloud sync");
-                        proofs.fetch_add(1, Ordering::SeqCst);
-                        responder
-                            .reply(
-                                GenuinityProofResponse {
-                                    proof: vec![0xfb, 0xff],
-                                },
-                                deadline,
-                            )
-                            .unwrap()
-                            .wait()
-                            .unwrap();
-                    }
-                    Content::SlotList(_) => {
-                        assert!(synced, "slots requested before cloud sync");
-                        responder
-                            .reply(crate::schema::SlotListResponse::default(), deadline)
-                            .unwrap()
-                            .wait()
-                            .unwrap();
-                    }
-                    request => return answering(session, request, responder),
+                    true
                 }
-                true
-            }
-        }));
+            }),
+        );
         (peer, starts, proofs)
     }
 
     /// JSON replies used by the real wire peer's cloud synchronization exchange.
-    pub(super) fn sync_responses() -> Vec<(Duration, String)> {
+    pub(super) fn sync_responses() -> Vec<String> {
         vec![
-            (
-                Duration::ZERO,
-                response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
-            ),
-            (
-                Duration::ZERO,
-                response(200, r#"{"unixmilli":123,"signature":"BA=="}"#),
-            ),
+            response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
+            response(200, r#"{"unixmilli":123,"signature":"BA=="}"#),
         ]
     }
 
@@ -676,19 +686,24 @@ pub(crate) mod tests {
     /// independently and subsequent operations reuse the successful exchange.
     #[test]
     fn test_shared_setup() {
+        // Hold the leader's sync at its first HTTP request
+        let mut tester = test_clock();
+        let clock = tester.clock();
         let mut responses = sync_responses();
-        responses.push((Duration::ZERO, response(200, r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)));
+        responses.push(response(200, r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#));
         let (release, pause) = mpsc::channel();
         let (url, requests) = serve_inner(responses, Some(pause));
-        let (mut peer, starts, proofs) = peer(false);
+        let (mut peer, starts, proofs) = peer(&clock, false);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         let leader = thread::spawn({
             let client = client.clone();
             move || client.call(GenuinityProofRequest {}, deadline)
         });
-        requests.recv_timeout(TIMEOUT).unwrap();
+        requests.recv().unwrap();
+
+        // Status bypasses the pending setup
         assert_eq!(
             client
                 .call(DeviceInfoRequest {}, deadline)
@@ -697,12 +712,18 @@ pub(crate) mod tests {
             "1.0.0"
         );
         assert_eq!(starts.load(Ordering::SeqCst), 0);
-        assert!(matches!(
-            client
-                .clone()
-                .call_timeout(GenuinityProofRequest {}, Duration::from_millis(20)),
-            Err(Error::Timeout)
-        ));
+
+        // A short waiter on the pending setup expires alone, at the earliest deadline on the clock
+        let short = clock.now() + Duration::from_millis(20);
+        let waiter = thread::spawn({
+            let client = client.clone();
+            move || client.call_timeout(GenuinityProofRequest {}, Duration::from_millis(20))
+        });
+        wait_deadline(&tester, short);
+        tester.advance_to(short);
+        assert!(matches!(waiter.join().unwrap(), Err(Error::Timeout)));
+
+        // A later waiter and the leader both finish on the one exchange
         let follower = thread::spawn({
             let client = client.clone();
             move || client.call(GenuinityProofRequest {}, deadline)
@@ -715,28 +736,24 @@ pub(crate) mod tests {
         assert_eq!(proofs.load(Ordering::SeqCst), 3);
         assert!(
             requests
-                .recv_timeout(TIMEOUT)
+                .recv()
                 .unwrap()
                 .starts_with("GET /v1/cloudsync/time?challenge=03 ")
         );
-        assert!(
-            requests
-                .recv_timeout(TIMEOUT)
-                .unwrap()
-                .starts_with("GET /v1/genuine ")
-        );
+        assert!(requests.recv().unwrap().starts_with("GET /v1/genuine "));
     }
 
     /// A refused attempt preserves its device error and does not poison a retry.
     #[test]
     fn test_setup_retry() {
+        let clock = test_clock().clock();
         let mut responses = sync_responses();
         responses.insert(0, responses[0].clone());
         let (url, _requests) = serve(responses);
-        let (mut peer, starts, proofs) = peer(true);
+        let (mut peer, starts, proofs) = peer(&clock, true);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         assert!(matches!(client.call(GenuinityProofRequest {}, deadline),
             Err(Error::Remote(error)) if error.code == 0x111));
         client.call(GenuinityProofRequest {}, deadline).unwrap();
@@ -748,17 +765,18 @@ pub(crate) mod tests {
     /// and prevents that response from starting any request on the closed Ark.
     #[test]
     fn test_close_during_setup() {
+        let clock = test_clock().clock();
         let (release, pause) = mpsc::channel();
         let (url, requests) = serve_inner(vec![sync_responses().remove(0)], Some(pause));
-        let (mut peer, starts, _) = peer(false);
+        let (mut peer, starts, _) = peer(&clock, false);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         let leader = thread::spawn({
             let client = client.clone();
             move || client.call(GenuinityProofRequest {}, deadline)
         });
-        requests.recv_timeout(TIMEOUT).unwrap();
+        requests.recv().unwrap();
         let waiter = thread::spawn({
             let client = client.clone();
             move || client.call(GenuinityProofRequest {}, deadline)
@@ -774,8 +792,9 @@ pub(crate) mod tests {
     /// requests fail clearly when the caller did not supply an environment.
     #[test]
     fn test_unattested_setup() {
+        let clock = test_clock().clock();
         for recover in [false, true] {
-            let mut peer = Peer::spawn(Box::new(answering));
+            let mut peer = Peer::spawn(&clock, Box::new(answering));
             let policy = if recover {
                 TrustMode::Recover(Box::new(peer.identity.clone()))
             } else {
@@ -784,19 +803,19 @@ pub(crate) mod tests {
             let (ark, _) = Ark::attach(peer.stream(), &policy, |_| None).unwrap();
             let client = ark.client();
             assert!(matches!(
-                client.call(GenuinityProofRequest {}, Instant::now() + TIMEOUT),
+                client.call(GenuinityProofRequest {}, clock.now() + TIMEOUT),
                 Err(Error::MissingEnvironment)
             ));
             assert!(matches!(
-                client.genuine(Instant::now() + TIMEOUT),
+                client.genuine(clock.now() + TIMEOUT),
                 Err(Error::MissingEnvironment)
             ));
             assert!(matches!(
-                client.call(crate::schema::UnlockRequest {}, Instant::now() + TIMEOUT),
+                client.call(crate::schema::UnlockRequest {}, clock.now() + TIMEOUT),
                 Err(Error::MissingEnvironment)
             ));
             client
-                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                .call(DeviceInfoRequest {}, clock.now() + TIMEOUT)
                 .unwrap();
         }
     }
@@ -805,15 +824,16 @@ pub(crate) mod tests {
     /// Registry authentication uses their opaque proofs without an attested serial.
     #[test]
     fn test_unattested_cloud() {
+        let clock = test_clock().clock();
         for recover in [false, true] {
             for realm in [Realm::Hardware, Realm::Emulator] {
                 let mut responses = sync_responses();
-                responses.push((Duration::ZERO, response(200, r#"{"serial":"registry-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)));
-                responses.push((Duration::ZERO, response(403, "registry refused proof")));
+                responses.push(response(200, r#"{"serial":"registry-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#));
+                responses.push(response(403, "registry refused proof"));
                 responses.extend(sync_responses());
-                responses.push((Duration::ZERO, response(403, "registry refused proof")));
+                responses.push(response(403, "registry refused proof"));
                 let (url, requests) = serve(responses);
-                let (mut peer, starts, proofs) = peer(false);
+                let (mut peer, starts, proofs) = peer(&clock, false);
                 let policy = if recover {
                     TrustMode::Recover(Box::new(peer.identity.clone()))
                 } else {
@@ -824,13 +844,13 @@ pub(crate) mod tests {
                 assert_eq!(matches!(identity, Identity::Recovered(_)), recover);
 
                 let env = crate::identity::ENVIRONMENTS[0];
-                let mut services = Services::new(&identity, Some((env, realm)));
+                let mut services = Services::new(&identity, Some((env, realm)), &session.clock());
                 let cloud = services.cloud.as_mut().unwrap();
                 cloud.url = url;
                 cloud.agent = http();
                 let ark = Ark::start(session, Arc::new(services)).unwrap();
                 let client = ark.client();
-                let deadline = Instant::now() + TIMEOUT;
+                let deadline = clock.now() + TIMEOUT;
 
                 client.call(DeviceInfoRequest {}, deadline).unwrap();
                 assert_eq!(starts.load(Ordering::SeqCst), 0);
@@ -862,7 +882,7 @@ pub(crate) mod tests {
                     "/v1/cloudsync/time?challenge=03",
                     registry,
                 ] {
-                    let request = requests.recv_timeout(TIMEOUT).unwrap();
+                    let request = requests.recv().unwrap();
                     assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
                 }
             }
@@ -902,68 +922,74 @@ pub(crate) mod tests {
     #[test]
     fn test_authentication_refresh() {
         use crate::schema;
+        let clock = test_clock().clock();
         for operation in ["genuine", "relaying", "pairing"] {
             for (status, retried) in [(400, 400), (403, 403), (403, 200), (503, 503)] {
                 if retried == 200 && operation != "genuine" {
                     continue;
                 }
-                let mut responses = vec![(Duration::ZERO, response(status, "refused"))];
+                let mut responses = vec![response(status, "refused")];
                 if status == 403 {
                     responses.extend(sync_responses());
-                    responses.push((Duration::ZERO, response(retried, if retried == 200 {
+                    responses.push(response(retried, if retried == 200 {
                         r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#
-                    } else { "still refused" })));
+                    } else { "still refused" }));
                 }
                 let (url, requests) = serve(responses);
                 let proofs = Arc::new(AtomicUsize::new(0));
-                let mut peer = Peer::spawn(Box::new({
-                    let proofs = proofs.clone();
-                    let mut refreshed = false;
-                    move |_, request, responder| {
-                        let deadline = Instant::now() + TIMEOUT;
-                        let proof = vec![u8::from(refreshed)];
-                        let response: protocol::Message = match request {
-                            Content::DeviceInfo(_) => schema::DeviceInfoResponse {
-                                cloud_synced: true,
-                                cloud_clock: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                                ..Default::default()
-                            }
-                            .into(),
-                            Content::CloudSyncStart(_) => {
-                                schema::CloudSyncStartResponse { challenge: vec![3] }.into()
-                            }
-                            Content::CloudSyncFinish(_) => {
-                                refreshed = true;
-                                schema::CloudSyncFinishResponse { accepted: 123 }.into()
-                            }
-                            Content::GenuinityProof(_) => {
-                                proofs.fetch_add(1, Ordering::SeqCst);
-                                schema::GenuinityProofResponse { proof }.into()
-                            }
-                            Content::RelayJoin(_) => {
-                                proofs.fetch_add(1, Ordering::SeqCst);
-                                schema::RelayJoinResponse { auth: proof }.into()
-                            }
-                            Content::PairingAuth(_) => {
-                                proofs.fetch_add(1, Ordering::SeqCst);
-                                schema::PairingAuthResponse {
-                                    auth: proof,
-                                    fprint: vec![8; 32],
+                let mut peer = Peer::spawn(
+                    &clock,
+                    Box::new({
+                        let proofs = proofs.clone();
+                        let mut refreshed = false;
+                        move |session, request, responder| {
+                            let deadline = session.clock().now() + TIMEOUT;
+                            let proof = vec![u8::from(refreshed)];
+                            let response: protocol::Message = match request {
+                                Content::DeviceInfo(_) => schema::DeviceInfoResponse {
+                                    cloud_synced: true,
+                                    cloud_clock: session
+                                        .clock()
+                                        .system_time()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    ..Default::default()
                                 }
-                                .into()
-                            }
-                            other => panic!("unexpected request: {other:?}"),
-                        };
-                        responder.reply(response, deadline).unwrap();
-                        true
-                    }
-                }));
+                                .into(),
+                                Content::CloudSyncStart(_) => {
+                                    schema::CloudSyncStartResponse { challenge: vec![3] }.into()
+                                }
+                                Content::CloudSyncFinish(_) => {
+                                    refreshed = true;
+                                    schema::CloudSyncFinishResponse { accepted: 123 }.into()
+                                }
+                                Content::GenuinityProof(_) => {
+                                    proofs.fetch_add(1, Ordering::SeqCst);
+                                    schema::GenuinityProofResponse { proof }.into()
+                                }
+                                Content::RelayJoin(_) => {
+                                    proofs.fetch_add(1, Ordering::SeqCst);
+                                    schema::RelayJoinResponse { auth: proof }.into()
+                                }
+                                Content::PairingAuth(_) => {
+                                    proofs.fetch_add(1, Ordering::SeqCst);
+                                    schema::PairingAuthResponse {
+                                        auth: proof,
+                                        fprint: vec![8; 32],
+                                    }
+                                    .into()
+                                }
+                                other => panic!("unexpected request: {other:?}"),
+                            };
+                            responder.reply(response, deadline).unwrap();
+                            true
+                        }
+                    }),
+                );
                 let ark = attach(&mut peer, url);
                 let client = ark.client();
-                let deadline = Instant::now() + TIMEOUT;
+                let deadline = clock.now() + TIMEOUT;
                 let result = match operation {
                     "genuine" => client.genuine(deadline).map(drop),
                     "relaying" => client.attach_relay(deadline),
@@ -1015,48 +1041,58 @@ pub(crate) mod tests {
     #[test]
     fn caller_authentication_retries_fresh_proofs_without_cloud_sync() {
         use auth::tests::{Login, refused};
+        let clock = test_clock().clock();
         for operation in ["genuine", "relaying", "pairing"] {
             for fail_login in [false, true] {
-                let mut responses = vec![(Duration::ZERO, refused(403))];
+                let mut responses = vec![refused(403)];
                 if !fail_login {
-                    responses.push((Duration::ZERO, if operation == "genuine" {
+                    responses.push(if operation == "genuine" {
                         response(200, r#"{"serial":"test-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#)
-                    } else { refused(403) }));
+                    } else { refused(403) });
                 }
                 let (url, requests) = serve(responses);
                 let proofs = Arc::new(AtomicUsize::new(0));
-                let mut peer = Peer::spawn(Box::new({
-                    let proofs = proofs.clone();
-                    move |_, request, responder| {
-                        let response: protocol::Message = match request {
-                            Content::DeviceInfo(_) => crate::schema::DeviceInfoResponse {
-                                cloud_synced: true,
-                                cloud_clock: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                                ..Default::default()
-                            }
-                            .into(),
-                            Content::GenuinityProof(_) => crate::schema::GenuinityProofResponse {
-                                proof: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
-                            }
-                            .into(),
-                            Content::RelayJoin(_) => crate::schema::RelayJoinResponse {
-                                auth: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
-                            }
-                            .into(),
-                            Content::PairingAuth(_) => crate::schema::PairingAuthResponse {
-                                auth: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
-                                fprint: vec![8; 32],
-                            }
-                            .into(),
-                            other => panic!("unexpected request: {other:?}"),
-                        };
-                        responder.reply(response, Instant::now() + TIMEOUT).unwrap();
-                        true
-                    }
-                }));
+                let mut peer = Peer::spawn(
+                    &clock,
+                    Box::new({
+                        let proofs = proofs.clone();
+                        move |session, request, responder| {
+                            let response: protocol::Message = match request {
+                                Content::DeviceInfo(_) => crate::schema::DeviceInfoResponse {
+                                    cloud_synced: true,
+                                    cloud_clock: session
+                                        .clock()
+                                        .system_time()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    ..Default::default()
+                                }
+                                .into(),
+                                Content::GenuinityProof(_) => {
+                                    crate::schema::GenuinityProofResponse {
+                                        proof: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
+                                    }
+                                    .into()
+                                }
+                                Content::RelayJoin(_) => crate::schema::RelayJoinResponse {
+                                    auth: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
+                                }
+                                .into(),
+                                Content::PairingAuth(_) => crate::schema::PairingAuthResponse {
+                                    auth: vec![proofs.fetch_add(1, Ordering::SeqCst) as u8],
+                                    fprint: vec![8; 32],
+                                }
+                                .into(),
+                                other => panic!("unexpected request: {other:?}"),
+                            };
+                            responder
+                                .reply(response, session.clock().now() + TIMEOUT)
+                                .unwrap();
+                            true
+                        }
+                    }),
+                );
                 let mut ark = attach(&mut peer, url);
                 let login = Login {
                     fail: fail_login,
@@ -1109,10 +1145,10 @@ pub(crate) mod tests {
     #[test]
     fn cloud_sync_logs_in_before_sending_certificates_to_the_ark() {
         use auth::tests::{Login, refused};
-        let mut responses = vec![(Duration::ZERO, refused(302))];
+        let mut responses = vec![refused(302)];
         responses.extend(sync_responses());
         let (url, requests) = serve(responses);
-        let (mut peer, starts, _) = peer(false);
+        let (mut peer, starts, _) = peer(&test_clock().clock(), false);
         let mut ark = attach(&mut peer, url);
         let login = Login::default();
         ark.set_cloud_auth(login.clone());
@@ -1142,6 +1178,7 @@ pub(crate) mod tests {
                 examples: vec!["first".into(), "second".into()],
             }],
         };
+        let clock = test_clock().clock();
         for initially_synced in [false, true] {
             let mut responses = sync_responses();
             if !initially_synced {
@@ -1149,46 +1186,51 @@ pub(crate) mod tests {
             }
             let (url, requests) = serve(responses);
             let infos = Arc::new(AtomicUsize::new(0));
-            let mut peer = Peer::spawn(Box::new({
-                let infos = infos.clone();
-                let paths = expected.clone();
-                let mut synced = initially_synced;
-                move |session, request, responder| {
-                    let deadline = Instant::now() + TIMEOUT;
-                    let response: protocol::Message = match request {
-                        Content::DeviceInfo(_) => {
-                            infos.fetch_add(1, Ordering::SeqCst);
-                            let clock = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            schema::DeviceInfoResponse {
-                                cloud_clock: clock,
-                                cloud_synced: synced,
-                                ..Default::default()
+            let mut peer = Peer::spawn(
+                &clock,
+                Box::new({
+                    let infos = infos.clone();
+                    let paths = expected.clone();
+                    let mut synced = initially_synced;
+                    move |session, request, responder| {
+                        let deadline = session.clock().now() + TIMEOUT;
+                        let response: protocol::Message = match request {
+                            Content::DeviceInfo(_) => {
+                                infos.fetch_add(1, Ordering::SeqCst);
+                                let clock = session
+                                    .clock()
+                                    .system_time()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                schema::DeviceInfoResponse {
+                                    cloud_clock: clock,
+                                    cloud_synced: synced,
+                                    ..Default::default()
+                                }
+                                .into()
                             }
-                            .into()
-                        }
-                        Content::DatasetPaths(_) => {
-                            assert!(synced, "request served before sync");
-                            paths.clone().into()
-                        }
-                        Content::CloudSyncStart(_) => {
-                            schema::CloudSyncStartResponse { challenge: vec![3] }.into()
-                        }
-                        Content::CloudSyncFinish(_) => {
-                            synced = true;
-                            schema::CloudSyncFinishResponse { accepted: 123 }.into()
-                        }
-                        other => return answering(session, other, responder),
-                    };
-                    responder.reply(response, deadline).unwrap();
-                    true
-                }
-            }));
+                            Content::DatasetPaths(_) => {
+                                assert!(synced, "request served before sync");
+                                paths.clone().into()
+                            }
+                            Content::CloudSyncStart(_) => {
+                                schema::CloudSyncStartResponse { challenge: vec![3] }.into()
+                            }
+                            Content::CloudSyncFinish(_) => {
+                                synced = true;
+                                schema::CloudSyncFinishResponse { accepted: 123 }.into()
+                            }
+                            other => return answering(session, other, responder),
+                        };
+                        responder.reply(response, deadline).unwrap();
+                        true
+                    }
+                }),
+            );
             let ark = attach(&mut peer, url);
             let client = ark.client();
-            let deadline = Instant::now() + TIMEOUT;
+            let deadline = clock.now() + TIMEOUT;
             let info = client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
             assert_eq!(info.cloud_synced, initially_synced);
             for _ in 0..2 {
@@ -1203,18 +1245,8 @@ pub(crate) mod tests {
                 if initially_synced { 0 } else { 2 }
             );
             client.sync(deadline).unwrap();
-            assert!(
-                requests
-                    .recv_timeout(TIMEOUT)
-                    .unwrap()
-                    .contains("/cloudsync/identity")
-            );
-            assert!(
-                requests
-                    .recv_timeout(TIMEOUT)
-                    .unwrap()
-                    .contains("/cloudsync/time")
-            );
+            assert!(requests.recv().unwrap().contains("/cloudsync/identity"));
+            assert!(requests.recv().unwrap().contains("/cloudsync/time"));
             assert_eq!(infos.load(Ordering::SeqCst), 1);
         }
     }
@@ -1222,11 +1254,12 @@ pub(crate) mod tests {
     /// Waiting on an older status response must not undo a completed refresh.
     #[test]
     fn test_delayed_device_info_retains_newer_sync() {
+        let clock = test_clock().clock();
         let (url, requests) = serve(sync_responses());
-        let (mut peer, starts, _) = peer(false);
+        let (mut peer, starts, _) = peer(&clock, false);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         let pending = client.send(DeviceInfoRequest {}, deadline).unwrap();
         client.sync(deadline).unwrap();
         assert!(!pending.wait().unwrap().cloud_synced);
@@ -1242,6 +1275,7 @@ pub(crate) mod tests {
     #[test]
     fn test_unavailable_retry_requires_lost_sync() {
         use crate::schema::{self, ReservedErrors};
+        let clock = test_clock().clock();
         for (code, reset, repeat, retries) in [
             (ReservedErrors::Unavailable as u64, true, false, 1),
             (ReservedErrors::Unavailable as u64, true, true, 1),
@@ -1255,54 +1289,62 @@ pub(crate) mod tests {
                 vec![]
             });
             let count = Arc::new(AtomicUsize::new(0));
-            let mut peer = Peer::spawn(Box::new({
-                let count = count.clone();
-                let mut synced = true;
-                move |session, request, responder| {
-                    let deadline = Instant::now() + TIMEOUT;
-                    let response: protocol::Message = match request {
-                        Content::DeviceInfo(_) => {
-                            let clock = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            schema::DeviceInfoResponse {
-                                cloud_clock: clock,
-                                cloud_synced: synced,
-                                ..Default::default()
-                            }
-                            .into()
-                        }
-                        Content::SlotList(_) => {
-                            let attempt = count.fetch_add(1, Ordering::SeqCst);
-                            if attempt == 0 || repeat {
-                                if reset {
-                                    synced = false;
+            let mut peer = Peer::spawn(
+                &clock,
+                Box::new({
+                    let count = count.clone();
+                    let mut synced = true;
+                    move |session, request, responder| {
+                        let deadline = session.clock().now() + TIMEOUT;
+                        let response: protocol::Message = match request {
+                            Content::DeviceInfo(_) => {
+                                let clock = session
+                                    .clock()
+                                    .system_time()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                schema::DeviceInfoResponse {
+                                    cloud_clock: clock,
+                                    cloud_synced: synced,
+                                    ..Default::default()
                                 }
-                                responder
-                                    .fail(schema::Error::new(code, "original refusal"), deadline)
-                                    .unwrap();
-                                return true;
+                                .into()
                             }
-                            schema::SlotListResponse::default().into()
-                        }
-                        Content::CloudSyncStart(_) => {
-                            schema::CloudSyncStartResponse { challenge: vec![3] }.into()
-                        }
-                        Content::CloudSyncFinish(_) => {
-                            synced = true;
-                            schema::CloudSyncFinishResponse { accepted: 123 }.into()
-                        }
-                        other => return answering(session, other, responder),
-                    };
-                    responder.reply(response, deadline).unwrap();
-                    true
-                }
-            }));
+                            Content::SlotList(_) => {
+                                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                                if attempt == 0 || repeat {
+                                    if reset {
+                                        synced = false;
+                                    }
+                                    responder
+                                        .fail(
+                                            schema::Error::new(code, "original refusal"),
+                                            deadline,
+                                        )
+                                        .unwrap();
+                                    return true;
+                                }
+                                schema::SlotListResponse::default().into()
+                            }
+                            Content::CloudSyncStart(_) => {
+                                schema::CloudSyncStartResponse { challenge: vec![3] }.into()
+                            }
+                            Content::CloudSyncFinish(_) => {
+                                synced = true;
+                                schema::CloudSyncFinishResponse { accepted: 123 }.into()
+                            }
+                            other => return answering(session, other, responder),
+                        };
+                        responder.reply(response, deadline).unwrap();
+                        true
+                    }
+                }),
+            );
             let ark = attach(&mut peer, url);
             let result = ark
                 .client()
-                .call(schema::SlotListRequest {}, Instant::now() + TIMEOUT);
+                .call(schema::SlotListRequest {}, clock.now() + TIMEOUT);
             assert_eq!(count.load(Ordering::SeqCst), 1 + retries);
             if retries == 1 && !repeat {
                 assert!(result.is_ok());

@@ -15,10 +15,11 @@ use crate::{
     http,
     progress::Transfer,
 };
+use darkbio_clock::Clock;
 use darkbio_connect::{UpdateProgress, schema, trust::Environment};
 use package::Package;
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Verification window covering old-session closure and discovery after installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
@@ -62,7 +63,8 @@ pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(
 /// authorized update sequence. Partial results distinguish installation from return.
 pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Error> {
     let connection = context.connect_recovery(None)?;
-    let mut packages = Packages::new(context, connection.env)?;
+    let clock = connection.client.clock();
+    let mut packages = Packages::new(context, clock.clone(), connection.env)?;
     let firmwares = packages.list(context)?;
     if let args::Firmware::List = command {
         return listing(context, &connection, &firmwares);
@@ -138,7 +140,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         path: package::path(target),
         response: None,
     };
-    let mut transfer = Transfer::new(context.output.terminal());
+    let mut transfer = Transfer::new(context.output.terminal(), clock.clone());
     let result = connection.client.update_firmware(
         &target.firmware(),
         &mut reader,
@@ -191,7 +193,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             .output
             .event("progress", "waiting for the Ark to reboot");
         context.output.wait("waiting for the Ark to return", None);
-        let started = Instant::now();
+        let started = clock.now();
         let result = verify_reboot(context, &connection, &target.version, &mut value);
         context.output.finish();
         if result.is_ok() {
@@ -199,7 +201,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
                 "progress",
                 format!(
                     "returned after {} s; verified {}",
-                    started.elapsed().as_secs(),
+                    clock.elapsed(started).as_secs(),
                     target.version
                 ),
             );
@@ -211,31 +213,33 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
 }
 
 /// Installation acknowledges before scheduling reboot. Observe the old session
-/// ending first, including when reinstalling the same build.
+/// ending first, including when reinstalling the same build. The reboot window
+/// and the pauses between attempts run on the old connection's clock.
 fn verify_reboot(
     context: &Context,
     connection: &Connection,
     target: &str,
     value: &mut Value,
 ) -> Result<(), Error> {
-    let deadline = Instant::now() + REBOOT_WAIT;
+    let clock = connection.client.clock();
+    let deadline = clock.now() + REBOOT_WAIT;
     loop {
         match connection.client.call(
             schema::DeviceInfoRequest {},
             context.timing().with_deadline(deadline),
         ) {
-            Ok(_) => std::thread::sleep(Duration::from_millis(250)),
+            Ok(_) => clock.sleep(Duration::from_millis(250)),
             Err(darkbio_connect::Error::Closed | darkbio_connect::Error::Disconnected(_)) => break,
             Err(error) => return Err(error.into()),
         }
-        if Instant::now() >= deadline {
+        if clock.now() >= deadline {
             return Err(reboot_timeout());
         }
     }
     connection.ark.close();
     let device = &connection.device;
     let key = connection.identity.key();
-    while deadline.saturating_duration_since(Instant::now())
+    while deadline.saturating_duration_since(clock.now())
         > darkbio_connect::wire::transport::DEFAULT_HANDSHAKE_TIMEOUT
     {
         let found = darkbio_connect::list();
@@ -270,9 +274,9 @@ fn verify_reboot(
                 };
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        clock.sleep(Duration::from_millis(500));
     }
-    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    clock.sleep_until(deadline);
     Err(reboot_timeout())
 }
 /// Reports that installation was not verified within the reboot window.
@@ -399,6 +403,8 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
 
 /// Environment-specific package client and optional Access credentials.
 pub(crate) struct Packages {
+    /// Connection's clock, which bounds the Access login helpers.
+    clock: Clock,
     /// HTTPS downloader retaining connections and refusing automatic redirects.
     agent: ureq::Agent,
     /// Selected package origin; credentials are sent only to this host.
@@ -408,7 +414,7 @@ pub(crate) struct Packages {
 }
 impl Packages {
     /// Selects the package host and tries cached credentials without prompting for login.
-    pub fn new(context: &Context, env: Option<Environment>) -> Result<Self, Error> {
+    pub fn new(context: &Context, clock: Clock, env: Option<Environment>) -> Result<Self, Error> {
         let origin = match env.ok_or_else(|| {
             Error::new(4, "environment-unknown", "cloud environment unknown")
                 .hint("select one with --env")
@@ -418,11 +424,12 @@ impl Packages {
             Environment::Develop => "https://pkg.darkbio.dev",
         };
         let token = if origin != "https://pkg.dark.bio" {
-            access::cached(context, origin)
+            access::cached(context, &clock, origin)
         } else {
             None
         };
         let result = Self {
+            clock,
             agent: http::agent(Duration::from_secs(context.options.timeout), 0),
             origin,
             token,
@@ -467,7 +474,7 @@ impl Packages {
         };
         let response = fetch(self.token.as_deref())?;
         let response = if access::required(self.origin, response.status(), response.headers()) {
-            self.token = Some(access::authenticate(context, self.origin)?);
+            self.token = Some(access::authenticate(context, &self.clock, self.origin)?);
             fetch(self.token.as_deref())?
         } else {
             response

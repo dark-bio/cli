@@ -19,13 +19,13 @@ use crate::{
     error::Error,
     progress::{Processing, Transfer, Update},
 };
+use darkbio_clock::Clock;
 use darkbio_connect::{
     Dataset, UploadProgress,
     schema::{self, SlotState, SlotStatus},
 };
 use serde_json::{Value, json};
 use std::io::Seek;
-use std::time::Instant;
 
 /// Dispatches dataset commands after applying CLI unlock and dry-run policy.
 /// Path entries, slot metadata and refusal messages come from the Ark; the CLI
@@ -251,8 +251,9 @@ fn upload(
             .document_with(&value, |theme| crate::output::human::document(theme, &view));
     }
     file.rewind()?;
-    let started = Instant::now();
-    let mut progress = Progress::new(context, identified.kind);
+    let clock = connection.client.clock();
+    let started = clock.now();
+    let mut progress = Progress::new(context, clock.clone(), identified.kind);
     context.interrupt.partial(value.clone());
     let result = connection.client.upload_dataset(
         &Dataset {
@@ -267,14 +268,14 @@ fn upload(
             progress.update(stage);
             value["uploaded_bytes"] = json!(progress.uploaded);
             value["phases"] = json!(progress.phases);
-            value["duration_seconds"] = json!(started.elapsed().as_secs());
+            value["duration_seconds"] = json!(clock.elapsed(started).as_secs());
             context.interrupt.partial(value.clone());
         },
     );
     context.interrupt.clear();
     value["uploaded_bytes"] = json!(progress.uploaded);
     value["phases"] = json!(progress.phases);
-    value["duration_seconds"] = json!(started.elapsed().as_secs());
+    value["duration_seconds"] = json!(clock.elapsed(started).as_secs());
     context.output.document(&value)?;
     result.map_err(Into::into)
 }
@@ -298,13 +299,13 @@ pub(crate) struct Progress<'a> {
 }
 impl<'a> Progress<'a> {
     /// Starts a new dataset's progress without inheriting a previous transfer's estimates.
-    pub fn new(context: &'a Context, slot: i32) -> Self {
+    pub fn new(context: &'a Context, clock: Clock, slot: i32) -> Self {
         Self {
             context,
             slot,
-            transfer: Transfer::new(context.output.terminal()),
+            transfer: Transfer::new(context.output.terminal(), clock.clone()),
             last_upload: None,
-            processing: Processing::new(context.output.terminal()),
+            processing: Processing::new(context.output.terminal(), clock),
             uploaded: 0,
             phases: Vec::new(),
         }

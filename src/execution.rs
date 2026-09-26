@@ -16,7 +16,6 @@ use crate::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use darkbio_connect::{ExecutionProgress, schema};
 use serde_json::{Value, json};
-use std::time::Instant;
 
 /// Cancels an explicit task or uploads and runs a local app after unlock.
 /// The connector owns protocol sequencing; the CLI owns progress, partial results
@@ -39,8 +38,9 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, false)?;
     let mut value = json!({"task":null,"app":{"name":null,"version":null},"success":null,"stdout":null,"stderr":null,"duration_seconds":null});
+    let clock = connection.client.clock();
     let mut started = None;
-    let mut transfer = Transfer::new(context.output.terminal());
+    let mut transfer = Transfer::new(context.output.terminal(), clock.clone());
     let report_interval = if context.output.terminal() { 1 } else { 5 };
     let mut reported = None;
     let result =
@@ -66,7 +66,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                     format!("run {} (Ark Companion on your phone)", path.display()),
                 ),
                 ExecutionProgress::Running { elapsed } => {
-                    started.get_or_insert_with(|| Instant::now() - elapsed);
+                    started.get_or_insert_with(|| clock.now() - elapsed);
                     let seconds = elapsed.as_secs();
                     if reported.is_none_or(|last| seconds >= last + report_interval) {
                         context
@@ -88,9 +88,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     };
     value["app"] = json!({"name":result.app_name,"version":result.app_version});
     value["success"] = json!(result.success);
-    let duration = started
-        .expect("successful execution reported running")
-        .elapsed();
+    let duration = clock.elapsed(started.expect("successful execution reported running"));
     value["duration_seconds"] = json!(duration.as_secs());
     bytes(&mut value, "stdout", &result.stdout);
     bytes(&mut value, "stderr", &result.stderr);

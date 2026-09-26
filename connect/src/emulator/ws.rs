@@ -9,14 +9,19 @@
 //! One worker owns the WebSocket and handles binary data, Ping/Pong and Close.
 //! Socket readiness and explicit wakeups drive its nonblocking I/O. The adapters
 //! bound input buffering and wait for output under wire's write deadline.
+//!
+//! Wire's deadlines are measured on the connection's clock. The worker waits on
+//! the socket through mio, so the bound on its own control replies runs on real time.
 
+use crate::timing::ClockExt;
 use crate::{Ark, Error, wire};
+use darkbio_clock::{Clock, crossbeam_channel, sync};
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
@@ -39,10 +44,12 @@ const INBOUND_LIMIT: usize = 2 * MAX_MESSAGE;
 /// Opens a plain WebSocket endpoint and authenticates its wire session.
 /// After address resolution, TCP establishment and HTTP upgrade share the
 /// handshake timeout. The encrypted wire handshake starts its own timeout.
+/// The connection measures its deadlines on the clock.
 pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     url: &str,
     verifier: &V,
     cloud: impl FnOnce(&crate::Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,
+    clock: &Clock,
 ) -> Result<(Ark, V::Info), Error> {
     // Resolve the endpoint before starting the TCP and HTTP handshake budget.
     let request = url.into_client_request().map_err(Error::Upgrade)?;
@@ -61,15 +68,15 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
         .to_socket_addrs()
         .map_err(Error::Unreachable)?;
     // Failed address attempts consume the same budget as the eventual upgrade.
-    let deadline = Instant::now() + transport::DEFAULT_HANDSHAKE_TIMEOUT;
+    let deadline = clock.now() + transport::DEFAULT_HANDSHAKE_TIMEOUT;
     let mut last_error = io::Error::new(
         io::ErrorKind::AddrNotAvailable,
         "host resolves to no address",
     );
     let mut connected = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, remaining(deadline).map_err(Error::Unreachable)?)
-        {
+        let left = clock.remaining(deadline).map_err(Error::Unreachable)?;
+        match TcpStream::connect_timeout(&address, left) {
             Ok(stream) => {
                 connected = Some(stream);
                 break;
@@ -88,6 +95,7 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     let (socket, _) = tungstenite::client::client_with_config(
         request,
         Socket::Handshake {
+            clock: clock.clone(),
             stream: tcp,
             deadline,
         },
@@ -103,7 +111,7 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
         HandshakeError::Failure(err) => Error::Upgrade(err),
     })?;
     // Transfer the upgraded socket to its worker and give wire blocking adapters.
-    let (reader, writer, shutdown) = adapters(socket).map_err(Error::Unreachable)?;
+    let (reader, writer, shutdown) = adapters(socket, clock).map_err(Error::Unreachable)?;
     Ark::attach(
         transport::Stream::new(reader, writer, shutdown),
         verifier,
@@ -116,6 +124,8 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
 enum Socket {
     /// TCP stream whose individual I/O calls share the upgrade deadline.
     Handshake {
+        /// Clock of the connection, which the deadline is measured on.
+        clock: Clock,
         /// TCP connection being upgraded, before readiness registration.
         stream: TcpStream,
         /// Shared absolute bound for every HTTP upgrade read and write.
@@ -129,8 +139,12 @@ impl Read for Socket {
     /// Applies the upgrade deadline or delegates to the registered socket.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Handshake { stream, deadline } => {
-                stream.set_read_timeout(Some(remaining(*deadline)?))?;
+            Self::Handshake {
+                clock,
+                stream,
+                deadline,
+            } => {
+                stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.read(buf)
             }
             Self::Connected(stream) => stream.read(buf),
@@ -142,8 +156,12 @@ impl Write for Socket {
     /// Applies the upgrade deadline or writes through readiness-aware I/O.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Handshake { stream, deadline } => {
-                stream.set_write_timeout(Some(remaining(*deadline)?))?;
+            Self::Handshake {
+                clock,
+                stream,
+                deadline,
+            } => {
+                stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.write(buf)
             }
             Self::Connected(stream) => stream.write(buf),
@@ -157,14 +175,6 @@ impl Write for Socket {
             Self::Connected(stream) => stream.flush(),
         }
     }
-}
-
-/// Returns the time left before a deadline, refusing an already expired budget.
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
 }
 
 /// Reports output refused after the connection or its worker has closed.
@@ -196,10 +206,14 @@ struct Incoming {
 
 /// Input and closure state shared by the worker and its blocking adapters.
 struct Shared {
-    closed: AtomicBool,        // Local shutdown signal checked by every participant
-    incoming: Mutex<Incoming>, // Buffered input and the worker's ending result
-    available: Condvar,        // Wakes the reader for input, failure or closure
-    wake: Waker,               // Wakes the worker when an adapter changes its work
+    clock: Clock,                    // clock that wire's deadlines are measured on
+    closed: AtomicBool,              // Local shutdown signal checked by every participant
+    incoming: sync::Mutex<Incoming>, // Buffered input and the worker's ending result
+    available: sync::Condvar,        // Wakes the reader for input, failure or closure
+    wake: Waker,                     // Wakes the worker when an adapter changes its work
+    /// Notifies a test each time the flush of a writer's frame waits for the socket.
+    #[cfg(test)]
+    blocked: std::sync::Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl Shared {
@@ -237,6 +251,14 @@ impl Shared {
         incoming.chunks.push_back(bytes);
         self.available.notify_one();
     }
+
+    /// Notifies a waiting test that the flush of a writer's frame waits for the socket.
+    #[cfg(test)]
+    fn flush_blocked(&self) {
+        if let Some(sender) = self.blocked.lock().unwrap().as_ref() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 /// One flush submitted by the writer, acknowledged when the worker finishes it.
@@ -244,12 +266,16 @@ struct Outgoing {
     bytes: Vec<u8>,    // Complete frame accumulated since the previous flush
     deadline: Instant, // Original write deadline, including the queue wait
     /// Receives the local write result without blocking the socket worker.
-    done: mpsc::SyncSender<io::Result<()>>,
+    done: crossbeam_channel::Sender<io::Result<()>>,
 }
 
 /// Starts the socket worker and returns adapters with their shutdown operation.
 /// The returned shutdown wakes blocking I/O and closes the underlying socket.
-fn adapters(mut socket: WebSocket<Socket>) -> io::Result<(Reader, Writer, impl FnOnce() + Send)> {
+/// The adapters measure wire's deadlines on the clock.
+fn adapters(
+    mut socket: WebSocket<Socket>,
+    clock: &Clock,
+) -> io::Result<(Reader, Writer, impl FnOnce() + Send + use<>)> {
     let Socket::Handshake { stream, .. } = socket.get_ref() else {
         unreachable!("socket upgraded once")
     };
@@ -267,10 +293,13 @@ fn adapters(mut socket: WebSocket<Socket>) -> io::Result<(Reader, Writer, impl F
     // Reads and writes must use mio's socket, which rearms readiness on Windows.
     *socket.get_mut() = Socket::Connected(connected);
     let shared = Arc::new(Shared {
+        clock: clock.clone(),
         closed: AtomicBool::new(false),
-        incoming: Mutex::new(Incoming::default()),
-        available: Condvar::new(),
+        incoming: sync::Mutex::new(Incoming::default()),
+        available: sync::Condvar::new(clock),
         wake: Waker::new(poll.registry(), WAKE)?,
+        #[cfg(test)]
+        blocked: std::sync::Mutex::new(None),
     });
     let (outgoing, outbox) = mpsc::channel();
     thread::Builder::new().name("ark-websocket".into()).spawn({
@@ -295,17 +324,58 @@ fn adapters(mut socket: WebSocket<Socket>) -> io::Result<(Reader, Writer, impl F
     ))
 }
 
+/// Bounds output the socket has not taken yet, the worker's own control
+/// replies included. A deferred flush starts the bound, later ones keep its
+/// deadline, and only a completed flush ends it.
+#[derive(Debug, Default)]
+struct Backlog {
+    /// Time the pending output must be flushed by, while there is some.
+    deadline: Option<Instant>,
+}
+
+impl Backlog {
+    /// Starts the bound at `now` for output left to flush, keeping the
+    /// deadline of a bound already running.
+    fn start(&mut self, now: Instant) {
+        self.deadline
+            .get_or_insert(now + transport::DEFAULT_WRITE_TIMEOUT);
+    }
+
+    /// Ends the bound once a flush took all output.
+    fn flushed(&mut self) {
+        self.deadline = None;
+    }
+
+    /// Whether the output left to flush missed its deadline by `now`.
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Time left after `now` before the deadline, bounding the next poll.
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+}
+
 /// Drives the WebSocket while preserving input progress during blocked output.
 /// One adapter writer submits flushes serially and waits for each acknowledgement.
+/// Frame deadlines are wire's and measured on the connection's clock; control
+/// replies are bounded on real time.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the worker waits on the socket through mio, so the bound on its own control replies runs on real time"
+)]
 fn pump(
     mut socket: WebSocket<Socket>,
     mut poll: Poll,
     shared: Arc<Shared>,
     outbox: mpsc::Receiver<Outgoing>,
 ) {
+    let clock = &shared.clock;
     let mut events = Events::with_capacity(8);
     let mut active: Option<Outgoing> = None;
-    let mut control_deadline = None;
+    let mut backlog = Backlog::default();
     let mut peer_closed = false;
     let result = (|| -> io::Result<()> {
         loop {
@@ -313,17 +383,17 @@ fn pump(
                 return Ok(());
             }
             if let Some(frame) = &active {
-                remaining(frame.deadline)?;
+                clock.remaining(frame.deadline)?;
             }
-            if let Some(deadline) = control_deadline {
-                remaining(deadline)?;
+            if backlog.expired(Instant::now()) {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
             // Admit at most one flush. Its bytes stay in the WebSocket until
             // output completes, while the original deadline continues to run.
             if active.is_none() && !peer_closed {
                 match outbox.try_recv() {
                     Ok(mut frame) => {
-                        if remaining(frame.deadline).is_err() {
+                        if clock.remaining(frame.deadline).is_err() {
                             let _ = frame
                                 .done
                                 .send(Err(io::Error::from(io::ErrorKind::TimedOut)));
@@ -365,7 +435,7 @@ fn pump(
             // An acknowledgement covers everything queued before this flush.
             match socket.flush() {
                 Ok(()) => {
-                    control_deadline = None;
+                    backlog.flushed();
                     if let Some(frame) = active.take() {
                         let _ = frame.done.send(Ok(()));
                     }
@@ -374,8 +444,11 @@ fn pump(
                     }
                 }
                 Err(err) if would_block(&err) => {
-                    control_deadline
-                        .get_or_insert_with(|| Instant::now() + transport::DEFAULT_WRITE_TIMEOUT);
+                    #[cfg(test)]
+                    if active.is_some() {
+                        shared.flush_blocked();
+                    }
+                    backlog.start(Instant::now());
                 }
                 Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
                 Err(err) => return Err(socket_error(err)),
@@ -385,14 +458,12 @@ fn pump(
             }
             // Either socket readiness or an adapter wake may enable more work.
             // Deadlines must also wake an otherwise idle or blocked connection.
-            let deadline = active
+            let timeout = active
                 .as_ref()
-                .map(|frame| frame.deadline)
+                .map(|frame| frame.deadline.saturating_duration_since(clock.now()))
                 .into_iter()
-                .chain(control_deadline)
+                .chain(backlog.remaining(Instant::now()))
                 .min();
-            let timeout =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             match poll.poll(&mut events, timeout) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -457,9 +528,10 @@ impl Read for Reader {
                     .wait(incoming)
                     .expect("WebSocket input not poisoned"),
                 Some(deadline) => {
+                    self.shared.clock.remaining(deadline)?;
                     self.shared
                         .available
-                        .wait_timeout(incoming, remaining(deadline)?)
+                        .wait_deadline(incoming, deadline)
                         .expect("WebSocket input not poisoned")
                         .0
                 }
@@ -469,6 +541,11 @@ impl Read for Reader {
 }
 
 impl transport::Read for Reader {
+    /// Returns the connection's clock, which the read deadlines are measured on.
+    fn clock(&self) -> Clock {
+        self.shared.clock.clone()
+    }
+
     /// Bounds future input waits, leaving already buffered bytes available.
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
@@ -491,7 +568,7 @@ impl Write for Writer {
             return Err(closed());
         }
         if let Some(deadline) = self.deadline {
-            remaining(deadline)?;
+            self.shared.clock.remaining(deadline)?;
         }
         self.pending.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -503,14 +580,15 @@ impl Write for Writer {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(closed());
         }
+        let clock = &self.shared.clock;
         let deadline = self
             .deadline
-            .unwrap_or_else(|| Instant::now() + transport::DEFAULT_WRITE_TIMEOUT);
-        remaining(deadline)?;
+            .unwrap_or_else(|| clock.now() + transport::DEFAULT_WRITE_TIMEOUT);
+        clock.remaining(deadline)?;
         if self.pending.is_empty() {
             return Ok(());
         }
-        let (done, result) = mpsc::sync_channel(1);
+        let (done, result) = crossbeam_channel::bounded(1);
         self.outgoing
             .send(Outgoing {
                 bytes: std::mem::take(&mut self.pending),
@@ -519,15 +597,23 @@ impl Write for Writer {
             })
             .map_err(|_| closed())?;
         self.shared.wake.wake()?;
-        match result.recv_timeout(remaining(deadline)?) {
+        clock.remaining(deadline)?;
+        match clock.recv_deadline(&result, deadline) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::from(io::ErrorKind::TimedOut)),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(closed()),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(closed()),
         }
     }
 }
 
 impl transport::Write for Writer {
+    /// Returns the connection's clock, which the write deadline is measured on.
+    fn clock(&self) -> Clock {
+        self.shared.clock.clone()
+    }
+
     /// Installs the shared bound for accumulating and flushing the next frame.
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
@@ -539,13 +625,16 @@ impl transport::Write for Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Peer, answering, hangup};
+    use crate::testing::{Peer, answering, hangup, test_clock, wait_deadline};
     use darkbio_wire::memory::Duplex;
     use std::net::TcpListener;
     use std::thread;
+    use tungstenite::protocol::Role;
 
     /// Exercises the actual adapters without a wire session consuming their bytes.
-    fn socket_pair() -> (WebSocket<Socket>, WebSocket<TcpStream>) {
+    /// The upgrade's socket timeouts are measured from the clock, which the
+    /// tests never advance through them.
+    fn socket_pair(clock: &Clock) -> (WebSocket<Socket>, WebSocket<TcpStream>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -558,8 +647,9 @@ mod tests {
         let (client, _) = tungstenite::client(
             format!("ws://{addr}/v1/usb"),
             Socket::Handshake {
+                clock: clock.clone(),
                 stream: tcp,
-                deadline: Instant::now() + Duration::from_secs(2),
+                deadline: clock.now() + Duration::from_secs(2),
             },
         )
         .unwrap();
@@ -569,13 +659,9 @@ mod tests {
     /// Ping and Close receive protocol replies while the application is idle.
     #[test]
     fn test_control_frames() {
-        let (socket, mut server) = socket_pair();
-        let (mut reader, _writer, shutdown) = adapters(socket).unwrap();
-        transport::Read::set_read_deadline(
-            &mut reader,
-            Some(Instant::now() + Duration::from_secs(2)),
-        )
-        .unwrap();
+        let clock = test_clock().clock();
+        let (socket, mut server) = socket_pair(&clock);
+        let (mut reader, _writer, shutdown) = adapters(socket, &clock).unwrap();
         server
             .send(Message::Ping(Bytes::from_static(b"probe")))
             .unwrap();
@@ -592,28 +678,45 @@ mod tests {
     /// A read respects its deadline, and shutdown also wakes a read without one.
     #[test]
     fn test_read_deadline_and_close() {
-        let (socket, _server) = socket_pair();
-        let (mut reader, _writer, shutdown) = adapters(socket).unwrap();
-        transport::Read::set_read_deadline(
-            &mut reader,
-            Some(Instant::now() + Duration::from_millis(20)),
-        )
-        .unwrap();
-        assert_eq!(
-            reader.read(&mut [0]).unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (socket, _server) = socket_pair(&clock);
+        let (mut reader, _writer, shutdown) = adapters(socket, &clock).unwrap();
+
+        // The read waits on its deadline and ends once the clock reaches it
+        let deadline = clock.now() + Duration::from_millis(20);
+        transport::Read::set_read_deadline(&mut reader, Some(deadline)).unwrap();
+        let reading = thread::spawn(move || {
+            let result = reader.read(&mut [0]);
+            (reader, result)
+        });
+        wait_deadline(&tester, deadline);
+        tester.advance_to(deadline);
+        let (mut reader, result) = reading.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+        // Shutdown wakes a read that waits without a deadline. The reader is the
+        // only thread that waits on this clock, so the park after its start is
+        // the read's own. No deadline is listed for that park.
         transport::Read::set_read_deadline(&mut reader, None).unwrap();
-        let reading = thread::spawn(move || reader.read(&mut [0]));
+        let (started, reading) = mpsc::channel();
+        let read = thread::spawn(move || {
+            started.send(()).unwrap();
+            reader.read(&mut [0])
+        });
+        reading.recv().unwrap();
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), None);
         shutdown();
-        assert_eq!(reading.join().unwrap().unwrap(), 0);
+        assert_eq!(read.join().unwrap().unwrap(), 0);
     }
 
     /// Consuming buffered input releases capacity for the remaining messages.
     #[test]
     fn test_input_buffering() {
-        let (socket, mut server) = socket_pair();
-        let (mut reader, _writer, shutdown) = adapters(socket).unwrap();
+        let clock = test_clock().clock();
+        let (socket, mut server) = socket_pair(&clock);
+        let (mut reader, _writer, shutdown) = adapters(socket, &clock).unwrap();
         let sending = thread::spawn(move || {
             let message = Bytes::from(vec![7; MAX_MESSAGE]);
             for _ in 0..4 {
@@ -621,11 +724,6 @@ mod tests {
             }
             server
         });
-        transport::Read::set_read_deadline(
-            &mut reader,
-            Some(Instant::now() + Duration::from_secs(3)),
-        )
-        .unwrap();
         let mut message = vec![0; MAX_MESSAGE];
         for _ in 0..4 {
             reader.read_exact(&mut message).unwrap();
@@ -639,35 +737,41 @@ mod tests {
     /// Blocked output retains its deadline while incoming traffic still reaches the reader.
     #[test]
     fn test_output_backpressure() {
-        let (socket, mut server) = socket_pair();
-        let (_reader, mut writer, shutdown) = adapters(socket).unwrap();
+        // Flood the peer with output it never drains, under one write deadline,
+        // until the worker's flush of a frame waits for the socket
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (socket, mut server) = socket_pair(&clock);
+        let (_reader, mut writer, shutdown) = adapters(socket, &clock).unwrap();
         let shared = writer.shared.clone();
-        let (started, writing) = mpsc::channel();
+        let (blocked, flushes) = mpsc::channel();
+        *shared.blocked.lock().unwrap() = Some(blocked);
+        let deadline = clock.now() + Duration::from_millis(300);
+        transport::Write::set_write_deadline(&mut writer, deadline).unwrap();
         let sending = thread::spawn(move || -> io::Result<()> {
-            let deadline = Instant::now() + Duration::from_millis(300);
-            transport::Write::set_write_deadline(&mut writer, deadline).unwrap();
-            started.send(()).unwrap();
             let message = vec![9; MAX_MESSAGE];
             loop {
                 writer.write_all(&message)?;
                 writer.flush()?;
             }
         });
-        writing.recv().unwrap();
-        // The peer sends input but deliberately never drains the client's output.
+        flushes.recv().unwrap();
+
+        // The peer sends input, which reaches the reader past the stuck output
         server
             .send(Message::Binary(Bytes::from_static(b"incoming")))
             .unwrap();
-        let mut incoming = shared.incoming.lock().unwrap();
-        while incoming.bytes == 0 && !incoming.ended {
-            incoming = shared
-                .available
-                .wait_timeout(incoming, Duration::from_secs(1))
-                .unwrap()
-                .0;
-        }
+        let incoming = shared.incoming.lock().unwrap();
+        let incoming = shared
+            .available
+            .wait_while(incoming, |incoming| incoming.bytes == 0 && !incoming.ended)
+            .unwrap();
         assert_eq!(incoming.chunks.front().unwrap().as_ref(), b"incoming");
         drop(incoming);
+
+        // The writer waits for the stuck flush and gives up at its deadline
+        wait_deadline(&tester, deadline);
+        tester.advance_to(deadline);
         assert_eq!(
             sending.join().unwrap().unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -675,22 +779,70 @@ mod tests {
         shutdown();
     }
 
-    /// How often the bridge turns from one direction to the other.
-    const ROUND: Duration = Duration::from_millis(10);
+    /// A blocked flush starts the output bound once. Later blocked flushes keep
+    /// the original deadline, where the bound expires, and a completed flush
+    /// clears it for the next blockage.
+    #[test]
+    fn test_backlog() {
+        // The first blocked flush starts the bound
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let limit = transport::DEFAULT_WRITE_TIMEOUT;
+        let mut backlog = Backlog::default();
+        assert_eq!(backlog.remaining(clock.now()), None);
+        let start = clock.now();
+        backlog.start(start);
+        assert_eq!(backlog.remaining(start), Some(limit));
+
+        // Blocking again keeps the original deadline, which ends the bound on time
+        tester.advance(Duration::from_secs(3));
+        backlog.start(clock.now());
+        assert_eq!(
+            backlog.remaining(clock.now()),
+            Some(limit - Duration::from_secs(3))
+        );
+        tester.advance_to(start + limit - Duration::from_millis(1));
+        assert!(!backlog.expired(clock.now()));
+        tester.advance_to(start + limit);
+        assert!(backlog.expired(clock.now()));
+
+        // A completed flush clears the bound, and the next blockage starts afresh
+        backlog.flushed();
+        assert!(!backlog.expired(clock.now()));
+        assert_eq!(backlog.remaining(clock.now()), None);
+        backlog.start(clock.now());
+        assert_eq!(backlog.remaining(clock.now()), Some(limit));
+    }
 
     // Serves one WebSocket client on the listener the way an emulator does,
     // carrying its binary messages into the peer's stream and the stream's
-    // bytes back out as messages, until either side ends.
+    // bytes back out as messages, until either side ends. Each direction has
+    // its own thread and socket handle and blocks on its own input.
     fn bridge(listener: TcpListener, stream: Duplex) {
         let (mut reader, mut writer) = stream.into_halves();
         let (tcp, _) = listener.accept().unwrap();
         let mut socket = tungstenite::accept(tcp).unwrap();
-        socket
+
+        // Probe the client with a ping, then carry the peer's output to it,
+        // ending the connection once the peer is gone
+        let mut outgoing =
+            WebSocket::from_raw_socket(socket.get_ref().try_clone().unwrap(), Role::Server, None);
+        outgoing
             .send(Message::Ping(Bytes::from_static(b"keepalive")))
             .unwrap();
+        let sending = thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(count @ 1..) = reader.read(&mut buf) {
+                let message = Message::Binary(Bytes::copy_from_slice(&buf[..count]));
+                if outgoing.send(message).is_err() {
+                    break;
+                }
+            }
+            let _ = outgoing.get_ref().shutdown(Shutdown::Both);
+        });
+
+        // Carry the client's messages into the peer, until the client goes away
         let mut pong_received = false;
-        socket.get_ref().set_read_timeout(Some(ROUND)).unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
         loop {
             match socket.read() {
                 Ok(Message::Binary(data)) => {
@@ -706,30 +858,12 @@ mod tests {
                     assert_eq!(bytes.as_ref(), b"keepalive");
                     pong_received = true;
                 }
-                Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
+                Ok(Message::Close(_)) | Err(_) => break,
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err))
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
-                Err(_) => break,
-            }
-            transport::Read::set_read_deadline(&mut reader, Some(Instant::now() + ROUND)).unwrap();
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if socket
-                        .send(Message::Binary(Bytes::copy_from_slice(&buf[..n])))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                Err(_) => break,
             }
         }
+        drop(writer);
+        sending.join().unwrap();
         assert!(
             pong_received,
             "client must answer Ping while carrying wire traffic"
@@ -740,7 +874,8 @@ mod tests {
     // it, the requests answered and the close ending the socket.
     #[test]
     fn test_socket_session() {
-        let mut peer = Peer::spawn(Box::new(answering));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, Box::new(answering));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/usb", listener.local_addr().unwrap());
         let stream = peer.stream();
@@ -750,6 +885,7 @@ mod tests {
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
             |_| None,
+            &clock,
         )
         .unwrap();
         assert_eq!(
@@ -768,7 +904,8 @@ mod tests {
     // behind it is gone.
     #[test]
     fn test_socket_lost() {
-        let mut peer = Peer::spawn(hangup());
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, hangup());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/usb", listener.local_addr().unwrap());
         let stream = peer.stream();
@@ -778,6 +915,7 @@ mod tests {
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
             |_| None,
+            &clock,
         )
         .unwrap();
         let err = ark

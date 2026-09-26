@@ -12,6 +12,7 @@ use crate::{
     Dataset, Error, ExecutionProgress, Firmware, Identity, Registration, Request, Setup, Timing,
     UpdateProgress, UploadProgress, dataset, execution,
 };
+use darkbio_clock::Clock;
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
 use darkbio_wire::transport::{self, Verifier};
 use std::io;
@@ -44,6 +45,7 @@ impl Ark {
 
     /// Authenticates the peer under wire's handshake timeout, then selects cloud
     /// routing for the session. Returns the verifier's identity information.
+    /// Every operation of the connection reads time from the stream's clock.
     /// Failure closes the stream.
     pub(crate) fn attach<R, W, V>(
         stream: transport::Stream<R, W>,
@@ -55,6 +57,7 @@ impl Ark {
         W: transport::Write + Send + 'static,
         V: Verifier<Info = Identity>,
     {
+        let clock = stream.clock();
         let (session, info) = protocol::connect(stream, verifier).map_err(|err| {
             if let protocol::Error::Transport(cause) = &err
                 && let transport::Error::RecvFailed(io) | transport::Error::SendFailed(io) =
@@ -68,7 +71,7 @@ impl Ark {
             }
             Error::Handshake(err)
         })?;
-        let services = Arc::new(Services::new(&info, cloud(&info)));
+        let services = Arc::new(Services::new(&info, cloud(&info), &clock));
         Ok((Self::start(session, services)?, info))
     }
 
@@ -157,6 +160,12 @@ pub struct Client {
 }
 
 impl Client {
+    /// Returns the clock of this client's connection. Every deadline passed to
+    /// the client is measured on it, so callers build their deadlines from it.
+    pub fn clock(&self) -> Clock {
+        self.services.clock().clone()
+    }
+
     /// Sends a request and waits for its typed response under the chosen timing.
     /// An absolute deadline covers setup, queueing, sending and accepting the
     /// response; decoding is outside it. Reuse it to bound several calls.
@@ -193,7 +202,12 @@ impl Client {
         request: R,
         timeout: Duration,
     ) -> Result<R::Response, Error> {
-        let deadline = Instant::now().checked_add(timeout).ok_or(Error::Timeout)?;
+        let deadline = self
+            .services
+            .clock()
+            .now()
+            .checked_add(timeout)
+            .ok_or(Error::Timeout)?;
         self.call(request, deadline)
     }
 
@@ -225,9 +239,11 @@ impl Client {
             Setup::Cloud => self.services.sync(&self.requester, timing)?,
             Setup::Relay => self.services.relay(&self.requester, timing)?,
         }
-        let deadline = R::WINDOW.map_or_else(|| timing.io(), |window| timing.window(window));
+        let clock = self.services.clock();
+        let deadline =
+            R::WINDOW.map_or_else(|| timing.io(clock), |window| timing.window(clock, window));
         let setup = matches!(request, Message::DeviceInfoRequest(_))
-            .then(|| (self.services.clone(), Instant::now()));
+            .then(|| (self.services.clone(), clock.now()));
         let promise = self
             .requester
             .request(request, deadline)
@@ -246,7 +262,12 @@ impl Client {
         request: R,
         timeout: Duration,
     ) -> Result<Pending<R::Response>, Error> {
-        let deadline = Instant::now().checked_add(timeout).ok_or(Error::Timeout)?;
+        let deadline = self
+            .services
+            .clock()
+            .now()
+            .checked_add(timeout)
+            .ok_or(Error::Timeout)?;
         self.send(request, deadline)
     }
 
@@ -314,7 +335,8 @@ impl Client {
         timing: impl Into<Timing>,
     ) -> Result<schema::SlotIdentifyResponse, Error> {
         let timing = timing.into();
-        timing.check()?;
+        let clock = self.services.clock();
+        timing.check(clock)?;
         let mut chunk = vec![0; size.min(1024 * 1024) as usize];
         reader.read_exact(&mut chunk).map_err(|error| {
             if error.kind() == io::ErrorKind::TimedOut {
@@ -323,7 +345,7 @@ impl Client {
                 Error::DatasetRead(error)
             }
         })?;
-        timing.check()?;
+        timing.check(clock)?;
         self.call(
             schema::SlotIdentifyRequest {
                 name: name.into(),
@@ -404,7 +426,9 @@ impl<T> Pending<T> {
     ///
     /// Panics if a notification was already registered on this promise.
     pub fn notify<E: Copy + Send + 'static>(&mut self, sender: mpsc::Sender<E>, event: E) {
-        self.promise.notify(sender, event);
+        self.promise.notify(move || {
+            let _ = sender.send(event);
+        });
     }
 }
 
@@ -430,7 +454,7 @@ mod tests {
         DeviceInfoRequest, OnboardingRequest, RelayAppToArkResponse, RelayArkToAppRequest,
         UnlockRequest, UnlockResponse,
     };
-    use crate::testing::{Peer, answering, hangup, silent};
+    use crate::testing::{Peer, answering, hangup, silent, test_clock, wait_deadline};
     use std::thread;
 
     /// Budget for test I/O that is not exercising expiration.
@@ -449,8 +473,9 @@ mod tests {
             fn verify(
                 &self,
                 attestation: &transport::Attestation,
+                now: std::time::SystemTime,
             ) -> Result<(crate::wire::crypto::xdsa::PublicKey, Identity), String> {
-                let (key, _) = crate::TrustMode::RootOrSelf.verify(attestation)?;
+                let (key, _) = crate::TrustMode::RootOrSelf.verify(attestation, now)?;
                 let identity = Identity::Attested {
                     env: self.0,
                     device: crate::trust::device::Device {
@@ -468,8 +493,9 @@ mod tests {
             }
         }
 
+        let clock = test_clock().clock();
         for &env in crate::identity::ENVIRONMENTS {
-            let mut peer = Peer::spawn(Box::new(answering));
+            let mut peer = Peer::spawn(&clock, Box::new(answering));
             let mut selected = None;
             let (ark, identity) = Ark::attach(peer.stream(), &Attested(env), |identity| {
                 let Identity::Attested { env, device } = identity else {
@@ -484,7 +510,7 @@ mod tests {
             assert!(matches!(identity, Identity::Attested { env: actual, .. } if actual == env));
             assert_eq!(
                 ark.client()
-                    .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                    .call(DeviceInfoRequest {}, clock.now() + TIMEOUT)
                     .unwrap()
                     .firmware_version,
                 "1.0.0"
@@ -495,7 +521,7 @@ mod tests {
     /// Failed authentication never invokes the cloud selector.
     #[test]
     fn test_cloud_selection_rejects_failed_handshake() {
-        let mut peer = Peer::spawn(Box::new(answering));
+        let mut peer = Peer::spawn(&test_clock().clock(), Box::new(answering));
         let wrong = crate::wire::crypto::xdsa::SecretKey::generate().public_key();
         let result = Ark::attach(
             peer.stream(),
@@ -536,41 +562,45 @@ mod tests {
             }
         }
 
-        let mut peer = Peer::spawn(Box::new(|session, request, responder| {
-            if !matches!(request, schema::host_to_ark::Content::Unlock(_)) {
-                return answering(session, request, responder);
-            }
-            let deadline = Instant::now() + TIMEOUT;
-            let error = session
-                .requester()
-                .request(RelayArkToAppRequest::default(), deadline)
-                .unwrap()
-                .wait::<RelayAppToArkResponse>()
-                .unwrap_err();
-            assert!(matches!(
-                error, protocol::Error::Remote(error)
-                    if error.code == 0x100 && error.msg == "companion rejected authorization"
-            ));
-            responder
-                .fail(
-                    schema::Error::reserved(
-                        schema::ReservedErrors::Unavailable,
-                        "authorization required",
-                    ),
-                    deadline,
-                )
-                .unwrap()
-                .wait()
-                .unwrap();
-            true
-        }));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(
+            &clock,
+            Box::new(|session, request, responder| {
+                if !matches!(request, schema::host_to_ark::Content::Unlock(_)) {
+                    return answering(session, request, responder);
+                }
+                let deadline = session.clock().now() + TIMEOUT;
+                let error = session
+                    .requester()
+                    .request(RelayArkToAppRequest::default(), deadline)
+                    .unwrap()
+                    .wait::<RelayAppToArkResponse>()
+                    .unwrap_err();
+                assert!(matches!(
+                    error, protocol::Error::Remote(error)
+                        if error.code == 0x100 && error.msg == "companion rejected authorization"
+                ));
+                responder
+                    .fail(
+                        schema::Error::reserved(
+                            schema::ReservedErrors::Unavailable,
+                            "authorization required",
+                        ),
+                        deadline,
+                    )
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                true
+            }),
+        );
         let (mut ark, _) = peer.attach().unwrap();
         let client = ark.client();
-        let pending = client.send(ManualUnlock, Instant::now() + TIMEOUT).unwrap();
+        let pending = client.send(ManualUnlock, clock.now() + TIMEOUT).unwrap();
         let (request, responder) = ark.recv().unwrap();
         assert!(matches!(request, schema::ark_to_host::Content::RelayReq(_)));
         responder
-            .fail(Denied, Instant::now() + TIMEOUT)
+            .fail(Denied, clock.now() + TIMEOUT)
             .unwrap()
             .wait()
             .unwrap();
@@ -580,7 +610,7 @@ mod tests {
         ));
         assert_eq!(
             client
-                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                .call(DeviceInfoRequest {}, clock.now() + TIMEOUT)
                 .unwrap()
                 .firmware_version,
             "1.0.0"
@@ -608,10 +638,11 @@ mod tests {
             content: Vec<u8>,
         }
 
+        let clock = test_clock().clock();
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
-        let attestation = self_attestation(&signer, identity.clone());
-        let (host, remote) = memory::duplex(256 * 1024);
+        let attestation = self_attestation(&signer, identity.clone(), &clock);
+        let (host, remote) = memory::duplex(256 * 1024, &clock);
         let peer = thread::spawn(move || {
             let mut server = transport::Server::new(remote, signer, attestation);
             let transport::Event::Connected(sender) = server.recv().unwrap() else {
@@ -663,7 +694,7 @@ mod tests {
                     schema::ReservedErrors::Unsupported,
                     "host does not serve device info",
                 ),
-                Instant::now() + TIMEOUT,
+                clock.now() + TIMEOUT,
             )
             .unwrap()
             .wait()
@@ -686,23 +717,25 @@ mod tests {
     /// A reserved peer refusal is returned through the same request interface.
     #[test]
     fn test_requests() {
-        let mut peer = Peer::spawn(Box::new(answering));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, Box::new(answering));
         let (ark, _) = peer.attach().unwrap();
         let client = ark.client();
         let (completed, events) = mpsc::channel();
         let mut pending = client
-            .send(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+            .send(DeviceInfoRequest {}, clock.now() + TIMEOUT)
             .unwrap();
         pending.notify(completed, 7);
-        assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 7);
+        assert_eq!(events.recv().unwrap(), 7);
         assert_eq!(pending.wait().unwrap().firmware_version, "1.0.0");
 
+        let deadline = clock.now() + TIMEOUT;
         let callers: Vec<_> = (0..8)
             .map(|_| {
                 let client = client.clone();
                 thread::spawn(move || {
                     client
-                        .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+                        .call(DeviceInfoRequest {}, deadline)
                         .unwrap()
                         .firmware_version
                 })
@@ -712,23 +745,24 @@ mod tests {
             assert_eq!(caller.join().unwrap(), "1.0.0");
         }
         assert!(
-            matches!(client.call(OnboardingRequest::default(), Instant::now() + TIMEOUT), Err(Error::Remote(error)) if error.code == schema::ReservedErrors::Unsupported as u64)
+            matches!(client.call(OnboardingRequest::default(), clock.now() + TIMEOUT), Err(Error::Remote(error)) if error.code == schema::ReservedErrors::Unsupported as u64)
         );
     }
 
     /// Dropping the owner closes pending requests and refuses surviving clients.
     #[test]
     fn test_owner_drop() {
-        let mut peer = Peer::spawn(silent());
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, silent());
         let (ark, _) = peer.attach().unwrap();
         let client = ark.client();
         let pending = client
-            .send(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+            .send(DeviceInfoRequest {}, clock.now() + TIMEOUT)
             .unwrap();
         drop(ark);
         assert!(matches!(pending.wait(), Err(Error::Closed)));
         assert!(matches!(
-            client.call(DeviceInfoRequest {}, Instant::now() + TIMEOUT),
+            client.call(DeviceInfoRequest {}, clock.now() + TIMEOUT),
             Err(Error::Closed)
         ));
     }
@@ -736,11 +770,12 @@ mod tests {
     /// A closer wakes both the receive loop and outstanding requests.
     #[test]
     fn test_close() {
-        let mut peer = Peer::spawn(silent());
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, silent());
         let (mut ark, _) = peer.attach().unwrap();
         let pending = ark
             .client()
-            .send(DeviceInfoRequest {}, Instant::now() + TIMEOUT)
+            .send(DeviceInfoRequest {}, clock.now() + TIMEOUT)
             .unwrap();
         let closer = ark.closer();
         let receive = thread::spawn(move || ark.recv());
@@ -752,17 +787,18 @@ mod tests {
     /// A remote disconnect retains its reason for receives and later requests.
     #[test]
     fn test_disconnect() {
-        let mut peer = Peer::spawn(hangup());
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, hangup());
         let (mut ark, _) = peer.attach().unwrap();
         assert!(matches!(
             ark.client()
-                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT),
+                .call(DeviceInfoRequest {}, clock.now() + TIMEOUT),
             Err(Error::Disconnected(_))
         ));
         assert!(matches!(ark.recv(), Err(Error::Disconnected(_))));
         assert!(matches!(
             ark.client()
-                .call(DeviceInfoRequest {}, Instant::now() + TIMEOUT),
+                .call(DeviceInfoRequest {}, clock.now() + TIMEOUT),
             Err(Error::Disconnected(_))
         ));
     }
@@ -770,16 +806,24 @@ mod tests {
     /// A short request timeout leaves a concurrent request's budget intact.
     #[test]
     fn test_timeouts() {
-        let mut peer = Peer::spawn(silent());
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let mut peer = Peer::spawn(&clock, silent());
         let (ark, _) = peer.attach().unwrap();
         let client = ark.client();
         let pending = client.send_timeout(DeviceInfoRequest {}, TIMEOUT).unwrap();
-        assert!(matches!(
-            client
-                .clone()
-                .call_timeout(DeviceInfoRequest {}, Duration::from_millis(20)),
-            Err(Error::Timeout)
-        ));
+
+        // The short call's deadline is the earliest one, and reaching it expires the call
+        let deadline = clock.now() + Duration::from_millis(20);
+        let short = thread::spawn({
+            let client = client.clone();
+            move || client.call_timeout(DeviceInfoRequest {}, Duration::from_millis(20))
+        });
+        wait_deadline(&tester, deadline);
+        tester.advance_to(deadline);
+        assert!(matches!(short.join().unwrap(), Err(Error::Timeout)));
+
+        // The longer request is still pending until the owner closes
         ark.close();
         assert!(matches!(pending.wait(), Err(Error::Closed)));
     }
@@ -787,10 +831,12 @@ mod tests {
     /// Reusing a deadline across calls and cloned handles does not renew its budget.
     #[test]
     fn test_deadlines() {
-        let mut peer = Peer::spawn(Box::new(answering));
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let mut peer = Peer::spawn(&clock, Box::new(answering));
         let (ark, _) = peer.attach().unwrap();
         let client = ark.client();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = clock.now() + Duration::from_secs(1);
         assert_eq!(
             client
                 .call(DeviceInfoRequest {}, deadline)
@@ -799,7 +845,7 @@ mod tests {
             "1.0.0"
         );
         // Spend the remaining operation budget before issuing the next request.
-        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        tester.advance_to(deadline);
         assert!(matches!(
             client.clone().call(DeviceInfoRequest {}, deadline),
             Err(Error::Timeout)
@@ -816,34 +862,39 @@ mod tests {
     /// An unlock can wait for the host to return an opaque companion response.
     #[test]
     fn test_reverse_requests() {
-        let mut peer = Peer::spawn(Box::new(|session, _, responder| {
-            let deadline = Instant::now() + TIMEOUT;
-            // Unlock cannot complete until the application returns the opaque
-            // companion response through this reverse request.
-            let approval = session
-                .requester()
-                .request(
-                    RelayArkToAppRequest {
-                        id: 42,
-                        req: vec![1, 2, 3],
-                    },
-                    deadline,
-                )
-                .unwrap()
-                .wait::<RelayAppToArkResponse>()
-                .unwrap();
-            assert_eq!(approval.id, 42);
-            assert_eq!(approval.res, [4, 5, 6]);
-            responder
-                .reply(UnlockResponse::default(), deadline)
-                .unwrap()
-                .wait()
-                .unwrap();
-            true
-        }));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(
+            &clock,
+            Box::new(|session, _, responder| {
+                let deadline = session.clock().now() + TIMEOUT;
+                // Unlock cannot complete until the application returns the opaque
+                // companion response through this reverse request.
+                let approval = session
+                    .requester()
+                    .request(
+                        RelayArkToAppRequest {
+                            id: 42,
+                            req: vec![1, 2, 3],
+                        },
+                        deadline,
+                    )
+                    .unwrap()
+                    .wait::<RelayAppToArkResponse>()
+                    .unwrap();
+                assert_eq!(approval.id, 42);
+                assert_eq!(approval.res, [4, 5, 6]);
+                responder
+                    .reply(UnlockResponse::default(), deadline)
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                true
+            }),
+        );
         let (mut ark, _) = peer.attach().unwrap();
         let client = ark.client();
-        let operation = thread::spawn(move || client.call(ManualUnlock, Instant::now() + TIMEOUT));
+        let deadline = clock.now() + TIMEOUT;
+        let operation = thread::spawn(move || client.call(ManualUnlock, deadline));
         let (request, responder) = ark.recv().unwrap();
         let schema::ark_to_host::Content::RelayReq(request) = request else {
             panic!("expected relay request")
@@ -855,7 +906,7 @@ mod tests {
                     id: request.id,
                     res: vec![4, 5, 6],
                 },
-                Instant::now() + TIMEOUT,
+                clock.now() + TIMEOUT,
             )
             .unwrap()
             .wait()

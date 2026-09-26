@@ -74,8 +74,12 @@ impl Verifier for TrustMode {
     /// Trust outcome returned alongside the authenticated handshake key.
     type Info = Identity;
 
-    /// Verifies the attestation or returns the pinned key selected for recovery.
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Identity), String> {
+    /// Verifies the attestation at `now` or returns the pinned key selected for recovery.
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        now: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Identity), String> {
         // Recovery authenticates key possession without consulting the attestation.
         if let TrustMode::Recover(key) = self {
             return Ok((*key.clone(), Identity::Recovered(*key.clone())));
@@ -84,7 +88,7 @@ impl Verifier for TrustMode {
         // from a known root that fails to verify is a hard error, only unknown
         // signers fall through to the self-signed check. Retain their diagnostic
         // so an unknown signer is not obscured by the self-signed fallback.
-        let now = SystemTime::now()
+        let now = now
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_secs();
@@ -118,7 +122,7 @@ impl Verifier for TrustMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::self_attestation;
+    use crate::testing::{self_attestation, test_clock};
     use darkbio_crypto::{cbor, cose};
 
     // Tests that the root trust mode accepts a self-signed attestation with the
@@ -126,19 +130,25 @@ mod tests {
     // recovery mode pins the given identity regardless of the attestation.
     #[test]
     fn test_trust_modes() {
+        let clock = test_clock().clock();
         let identity = xdsa::SecretKey::generate();
         let foreign = xdsa::SecretKey::generate();
 
         // Self-signed attestation proves possession of its key only.
-        let attestation = self_attestation(&identity, identity.public_key());
-        let (key, info) = TrustMode::RootOrSelf.verify(&attestation).unwrap();
+        let attestation = self_attestation(&identity, identity.public_key(), &clock);
+        let (key, info) = TrustMode::RootOrSelf
+            .verify(&attestation, clock.system_time())
+            .unwrap();
         assert_eq!(key.fingerprint(), identity.public_key().fingerprint());
         assert!(matches!(info, Identity::SelfSigned(_)));
         assert_eq!(info.realm(), None);
 
         // Attestation by an unknown key, refused
-        let attestation = self_attestation(&foreign, identity.public_key());
-        let error = TrustMode::RootOrSelf.verify(&attestation).err().unwrap();
+        let attestation = self_attestation(&foreign, identity.public_key(), &clock);
+        let error = TrustMode::RootOrSelf
+            .verify(&attestation, clock.system_time())
+            .err()
+            .unwrap();
         assert!(error.contains(&hex::encode(foreign.fingerprint().to_bytes())));
         assert!(error.contains("unknown key"));
         assert!(!error.contains("--features"));
@@ -146,7 +156,7 @@ mod tests {
         // Recovery mode, the pinned key is used regardless of the attestation
         let pinned = xdsa::SecretKey::generate().public_key();
         let (key, info) = TrustMode::Recover(Box::new(pinned.clone()))
-            .verify(&attestation)
+            .verify(&attestation, clock.system_time())
             .unwrap();
         assert_eq!(key.fingerprint(), pinned.fingerprint());
         assert!(matches!(info, Identity::Recovered(_)));
@@ -156,8 +166,9 @@ mod tests {
     /// Known device roots verify signatures instead of accepting claimed fingerprints.
     #[test]
     fn test_known_signer() {
+        let clock = test_clock().clock();
         let key = xdsa::SecretKey::generate();
-        let attestation = self_attestation(&key, key.public_key());
+        let attestation = self_attestation(&key, key.public_key(), &clock);
         for fingerprint in [
             "8b842c20bb8083a1635140e58675f3b95a100ac0e39ab82fa6cb2ef23eb532fb", // Release hardware
             "7d725c5cb3f80ef4e17bb98ea1f14683714a7eaffaa78cded17ff0e2c0c96ffa", // Staging hardware
@@ -173,7 +184,10 @@ mod tests {
             header.kid = claimed;
             envelope.protected = cbor::encode(&header).unwrap();
             let forged = Attestation::new(cbor::encode(&envelope).unwrap()).unwrap();
-            let error = TrustMode::RootOrSelf.verify(&forged).err().unwrap();
+            let error = TrustMode::RootOrSelf
+                .verify(&forged, clock.system_time())
+                .err()
+                .unwrap();
             if root.role == trust::roots::Role::CloudAttester {
                 assert!(error.contains(fingerprint), "{error}");
                 assert!(error.contains(&root.to_string()), "{error}");
@@ -187,12 +201,16 @@ mod tests {
     /// Invalid self-signatures retain their cryptographic error.
     #[test]
     fn test_invalid_attestation() {
+        let clock = test_clock().clock();
         let key = xdsa::SecretKey::generate();
-        let attestation = self_attestation(&key, key.public_key());
+        let attestation = self_attestation(&key, key.public_key(), &clock);
         let mut bytes = attestation.as_bytes().to_vec();
         *bytes.last_mut().unwrap() ^= 1;
         let attestation = Attestation::new(bytes).unwrap();
-        let error = TrustMode::RootOrSelf.verify(&attestation).err().unwrap();
+        let error = TrustMode::RootOrSelf
+            .verify(&attestation, clock.system_time())
+            .err()
+            .unwrap();
         assert!(error.starts_with("cwt:"), "{error}");
         assert!(!error.contains("--features"));
         assert!(!error.contains("not among the trusted roots"));
