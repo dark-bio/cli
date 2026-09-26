@@ -6,6 +6,8 @@
 
 //! Bounds carried by one operation, never stored on a shared client.
 
+use darkbio_clock::Clock;
+use std::io;
 use std::time::{Duration, Instant};
 
 /// Device approval window with time for relay forwarding and the final reply.
@@ -53,21 +55,21 @@ impl Timing {
         self
     }
 
-    /// Deadline for the next machine response.
-    pub(crate) fn io(self) -> Instant {
-        self.bound(self.inactivity)
+    /// Deadline for the next machine response, measured on the clock.
+    pub(crate) fn io(self, clock: &Clock) -> Instant {
+        self.bound(clock, self.inactivity)
     }
 
     /// Approval windows include a small allowance for forwarding and replies.
     /// Callers using only an absolute deadline retain that exact bound.
-    pub(crate) fn approval(self) -> Instant {
-        self.window(APPROVAL_WINDOW)
+    pub(crate) fn approval(self, clock: &Clock) -> Instant {
+        self.window(clock, APPROVAL_WINDOW)
     }
 
     /// Replaces an inactivity allowance with a protocol-specific wait window.
     /// An absolute-only timing retains its original deadline.
-    pub(crate) fn window(self, window: Duration) -> Instant {
-        self.bound(self.inactivity.map(|_| window))
+    pub(crate) fn window(self, clock: &Clock, window: Duration) -> Instant {
+        self.bound(clock, self.inactivity.map(|_| window))
     }
 
     /// Clips a protocol deadline without applying the machine wait allowance.
@@ -77,10 +79,10 @@ impl Timing {
 
     /// Caller-supplied readers own their per-read timeout. Only a workflow's
     /// absolute deadline can expire while an otherwise active reader runs.
-    pub(crate) fn check(self) -> Result<(), crate::Error> {
+    pub(crate) fn check(self, clock: &Clock) -> Result<(), crate::Error> {
         if self
             .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| clock.now() >= deadline)
         {
             Err(crate::Error::Timeout)
         } else {
@@ -88,25 +90,26 @@ impl Timing {
         }
     }
 
-    /// Poll cadence is independent of the response allowance.
-    pub(crate) fn pause(self, interval: Duration) -> Result<(), crate::Error> {
+    /// Poll cadence is independent of the response allowance. The pause sleeps
+    /// on the clock, never past the absolute deadline.
+    pub(crate) fn pause(self, clock: &Clock, interval: Duration) -> Result<(), crate::Error> {
         let wait = match self.deadline {
             Some(deadline) => interval.min(
                 deadline
-                    .checked_duration_since(Instant::now())
+                    .checked_duration_since(clock.now())
                     .filter(|wait| !wait.is_zero())
                     .ok_or(crate::Error::Timeout)?,
             ),
             None => interval,
         };
-        std::thread::sleep(wait);
+        clock.sleep(wait);
         Ok(())
     }
 
     /// Chooses the earlier bound, treating duration overflow as immediate expiry.
-    fn bound(self, timeout: Option<Duration>) -> Instant {
+    fn bound(self, clock: &Clock, timeout: Option<Duration>) -> Instant {
         let wait = timeout.map(|timeout| {
-            let now = Instant::now();
+            let now = clock.now();
             now.checked_add(timeout).unwrap_or(now)
         });
         match (self.deadline, wait) {
@@ -125,27 +128,47 @@ impl From<Instant> for Timing {
     }
 }
 
+/// Time left on a clock before a deadline, as blocking OS calls take it.
+pub(crate) trait ClockExt {
+    /// Returns the time left before the deadline as a positive OS timeout. A
+    /// passed deadline fails with `TimedOut`, since a zero timeout means an
+    /// unbounded wait on some APIs.
+    fn remaining(&self, deadline: Instant) -> io::Result<Duration>;
+}
+
+impl ClockExt for Clock {
+    fn remaining(&self, deadline: Instant) -> io::Result<Duration> {
+        deadline
+            .checked_duration_since(self.now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    }
+}
+
 /// Deadline clipping and protocol window regressions.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::test_clock;
 
     /// A renewed machine allowance and a longer approval window cannot extend
     /// a caller's absolute workflow deadline.
     #[test]
     fn test_absolute_bound() {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let clock = test_clock().clock();
+        let deadline = clock.now() + Duration::from_secs(1);
         let timing = Timing::inactivity(Duration::from_secs(60)).with_deadline(deadline);
-        assert_eq!(timing.io(), deadline);
-        assert_eq!(timing.approval(), deadline);
-        assert_eq!(Timing::until(deadline).io(), deadline);
+        assert_eq!(timing.io(&clock), deadline);
+        assert_eq!(timing.approval(&clock), deadline);
+        assert_eq!(Timing::until(deadline).io(&clock), deadline);
     }
 
     /// Short inactivity limits do not shorten the device's approval window.
     #[test]
     fn test_approval_window() {
+        let clock = test_clock().clock();
         let timing = Timing::inactivity(Duration::from_millis(10));
-        assert!(timing.io() < Instant::now() + Duration::from_secs(1));
-        assert!(timing.approval() > Instant::now() + Duration::from_secs(39));
+        assert_eq!(timing.io(&clock), clock.now() + Duration::from_millis(10));
+        assert!(timing.approval(&clock) > clock.now() + Duration::from_secs(39));
     }
 }

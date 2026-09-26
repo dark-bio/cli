@@ -10,6 +10,7 @@
 use crate::emulator::Instance;
 use crate::trust::{Environment, Realm};
 use crate::{Ark, Error, Identity, TrustMode, emulator, hardware};
+use darkbio_clock::Clock;
 use std::fmt;
 
 /// Kind of Ark reported by discovery. Authentication establishes its identity
@@ -172,7 +173,8 @@ impl Device {
         self.open(verifier, |identity| Some(env(identity)))
     }
 
-    /// Opens the retained transport with any caller-supplied cloud route.
+    /// Opens the retained transport with any caller-supplied cloud route. The
+    /// connection runs on the real clock, which its clients hand to callers.
     fn open(
         &self,
         verifier: &TrustMode,
@@ -183,9 +185,12 @@ impl Device {
             DeviceKind::Emulator => Realm::Emulator,
         };
         let cloud = |identity: &Identity| env(identity).map(|env| (env, realm));
+        let clock = Clock::real();
         match &self.source {
-            Source::Usb(info) => hardware::connect(info, verifier, cloud),
-            Source::Registry(instance) => emulator::connect(&instance.url(), verifier, cloud),
+            Source::Usb(info) => hardware::connect(info, verifier, cloud, &clock),
+            Source::Registry(instance) => {
+                emulator::connect(&instance.url(), verifier, cloud, &clock)
+            }
         }
     }
 }

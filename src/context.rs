@@ -11,6 +11,7 @@ use crate::{
     error::Error,
     output::Output,
 };
+use darkbio_clock::Clock;
 use darkbio_connect::{
     Ark, Client, Device, Identity, Timing, TrustMode, schema, trust::Environment,
 };
@@ -62,9 +63,10 @@ impl Context {
     pub fn timing(&self) -> Timing {
         Timing::inactivity(Duration::from_secs(self.options.timeout))
     }
-    /// Starts one fixed wait budget, for operations that need a single bound.
-    pub fn deadline(&self) -> Instant {
-        Instant::now() + Duration::from_secs(self.options.timeout)
+    /// Starts one fixed wait budget on a connection's clock, for operations
+    /// that need a single bound.
+    pub fn deadline(&self, clock: &Clock) -> Instant {
+        clock.now() + Duration::from_secs(self.options.timeout)
     }
     /// Permits stdin prompts only for a terminal outside JSON and no-input modes.
     pub fn interactive(&self) -> bool {
@@ -104,7 +106,8 @@ impl Context {
 
     /// Opens an endpoint with CLI routing precedence and records it for interruption.
     /// An optional reboot deadline bounds device-info I/O; transport establishment
-    /// and the wire handshake retain their own connection timeouts.
+    /// and the wire handshake retain their own connection timeouts. The output
+    /// and the login helper time their waits on the new connection's clock.
     pub fn open_until(
         &self,
         device: Device,
@@ -118,6 +121,8 @@ impl Context {
         let (mut ark, identity) = device.connect_with_env(&trust, |identity| {
             environment(self.options.env, identity, device.env())
         })?;
+        let client = ark.client();
+        self.output.connection(client.clock());
         let env = environment(self.options.env, &identity, device.env());
         if let Identity::Attested { env: attested, .. } = &identity
             && self.options.env.is_some_and(|env| env != *attested)
@@ -129,9 +134,8 @@ impl Context {
         }
         self.output.environment(env);
         if env != Environment::Release {
-            ark.set_cloud_auth(crate::access::Login::new(self));
+            ark.set_cloud_auth(crate::access::Login::new(self, client.clock()));
         }
-        let client = ark.client();
         self.interrupt.connection(client.clone(), ark.closer());
         let info = client.call(schema::DeviceInfoRequest {}, timing)?;
         self.output.event("step", "connected and authenticated");

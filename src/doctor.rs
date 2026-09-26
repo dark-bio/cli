@@ -7,6 +7,7 @@
 //! Independent diagnostics composed from connection primitives.
 
 use crate::{context::Context, error::Error, firmware::Packages, update};
+use darkbio_clock::Clock;
 use darkbio_connect::schema;
 use serde_json::{Value, json};
 
@@ -91,7 +92,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             if connection.env.is_none() {
                 checks.skip("firmware", "cloud environment unknown");
             } else {
-                match Packages::new(context, connection.env)
+                match Packages::new(context, connection.client.clock(), connection.env)
                     .and_then(|mut packages| packages.list(context))
                 {
                     Ok(firmwares) => checks.ok(
@@ -210,7 +211,7 @@ impl Checks<'_> {
         // Look up within --timeout, keeping the answer for later commands
         let running = update::running();
         let channel = update::Channel::for_version(&running);
-        let asked = chrono::Utc::now();
+        let asked = chrono::DateTime::from(Clock::real().system_time());
         let result = update::refresh(
             &crate::data::cache::directory(),
             channel,

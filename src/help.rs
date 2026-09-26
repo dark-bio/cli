@@ -529,8 +529,8 @@ mod tests {
     fn shared_options_are_listed_on_the_root_page_only() {
         let theme = Theme::test(80, Color::Off, false);
         let mut root = command(&theme);
-        // Examples mention the flags too, so the listing is told by the text
-        // clap prints beside each option.
+        // Examples mention the flags too, so the test identifies the listing by
+        // the text clap prints beside each option.
         let listed = [
             "--timeout <SECONDS>",
             "Print the complete result as JSON",

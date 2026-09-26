@@ -8,13 +8,15 @@
 
 use super::Failure;
 use crate::Timing;
+use darkbio_clock::Clock;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use ureq::http::{HeaderMap, StatusCode};
 
 /// Caller-owned authentication for a cloud host. Connect supplies the HTTPS
 /// origin; credential storage, response recognition and login stay with the caller.
-/// The same headers are used for HTTP requests and WebSocket upgrades.
+/// The same headers are used for HTTP requests and WebSocket upgrades. Deadlines
+/// are measured on the clock of the connection, which its clients return.
 pub trait CloudAuth: Send + Sync {
     /// Returns cached authentication headers without prompting, or an empty map.
     /// The deadline bounds lookup. Headers must not replace protocol headers.
@@ -85,11 +87,12 @@ impl Authorization {
             .is_some_and(|provider| provider.rejected(origin, status, headers))
     }
 
-    /// Refreshes credentials without extending an absolute operation deadline.
-    pub(super) fn login(&self, origin: &str, timing: Timing) -> Result<(), Failure> {
+    /// Refreshes credentials without extending an absolute operation deadline,
+    /// which is measured on the clock.
+    pub(super) fn login(&self, origin: &str, clock: &Clock, timing: Timing) -> Result<(), Failure> {
         let check = || {
             timing
-                .check()
+                .check(clock)
                 .map_err(|_| Failure::Wire(darkbio_wire::protocol::Error::Timeout))
         };
         check()?;
@@ -119,6 +122,9 @@ fn sensitive(mut headers: HeaderMap) -> HeaderMap {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::testing::test_clock;
+    use darkbio_clock::TestClock;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -127,8 +133,10 @@ pub(super) mod tests {
     pub(in crate::cloud) struct Login {
         pub lookups: Arc<AtomicUsize>,
         pub logins: Arc<AtomicUsize>,
-        pub delay: Duration,
         pub fail: bool,
+        /// Test clock and the time each login spends on it, standing in for the
+        /// owner signing in through the browser.
+        pub browser: Option<(Arc<Mutex<TestClock>>, Duration)>,
     }
 
     impl CloudAuth for Login {
@@ -143,10 +151,15 @@ pub(super) mod tests {
 
         fn login(&self, _: &str, deadline: Option<Instant>) -> Result<HeaderMap, String> {
             self.logins.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(deadline.map_or(self.delay, |deadline| {
-                self.delay
-                    .min(deadline.saturating_duration_since(Instant::now()))
-            }));
+
+            // Spend the browser's time on the test clock, returning by the deadline as a provider must
+            if let Some((tester, delay)) = &self.browser {
+                let mut tester = tester.lock().unwrap();
+                let now = tester.clock().now();
+                tester.advance(deadline.map_or(*delay, |deadline| {
+                    (*delay).min(deadline.saturating_duration_since(now))
+                }));
+            }
             if self.fail {
                 return Err("test login refused".into());
             }
@@ -165,18 +178,20 @@ pub(super) mod tests {
 
     #[test]
     fn credentials_are_cached_redacted_and_refreshed() {
+        let clock = test_clock().clock();
         let auth = Authorization::default();
         let login = Login::default();
         auth.set(Arc::new(login.clone()));
         assert_eq!(login.lookups.load(Ordering::SeqCst), 0);
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = clock.now() + Duration::from_secs(1);
         for _ in 0..2 {
             let headers = auth.headers("https://test.invalid", deadline);
             assert_eq!(headers["authorization"], "cached");
             assert!(headers["authorization"].is_sensitive());
             assert!(!format!("{headers:?}").contains("cached"));
         }
-        auth.login("https://test.invalid", deadline.into()).unwrap();
+        auth.login("https://test.invalid", &clock, deadline.into())
+            .unwrap();
         let headers = auth.headers("https://test.invalid", deadline);
         assert_eq!(headers["authorization"], "refreshed");
         assert!(headers["authorization"].is_sensitive());
@@ -187,23 +202,31 @@ pub(super) mod tests {
 
     #[test]
     fn login_retains_absolute_deadlines() {
+        // Let every browser login take 100 ms of the test clock
+        let tester = Arc::new(Mutex::new(test_clock()));
+        let clock = tester.lock().unwrap().clock();
         let auth = Authorization::default();
         let login = Login {
-            delay: Duration::from_millis(100),
+            browser: Some((tester, Duration::from_millis(100))),
             ..Default::default()
         };
         auth.set(Arc::new(login.clone()));
+
+        // An expired deadline refuses before the browser opens
         assert!(matches!(
-            auth.login("https://test.invalid", Timing::until(Instant::now())),
+            auth.login("https://test.invalid", &clock, Timing::until(clock.now())),
             Err(Failure::Wire(darkbio_wire::protocol::Error::Timeout))
         ));
         assert_eq!(login.logins.load(Ordering::SeqCst), 0);
+
+        // An inactivity allowance does not bound the login, an absolute deadline does
         let timing = Timing::inactivity(Duration::from_millis(1));
-        auth.login("https://test.invalid", timing).unwrap();
+        auth.login("https://test.invalid", &clock, timing).unwrap();
         assert!(matches!(
             auth.login(
                 "https://test.invalid",
-                timing.with_deadline(Instant::now() + Duration::from_millis(5))
+                &clock,
+                timing.with_deadline(clock.now() + Duration::from_millis(5))
             ),
             Err(Failure::Wire(darkbio_wire::protocol::Error::Timeout))
         ));

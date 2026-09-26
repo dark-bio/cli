@@ -25,9 +25,13 @@ mod progress;
 mod style;
 mod update;
 
+#[cfg(test)]
+mod testing;
+
 use args::{Cli, Command};
 use clap::{FromArgMatches, Parser};
 use context::Context;
+use darkbio_clock::Clock;
 use error::Error;
 use serde_json::{Value, json};
 use std::process::ExitCode;
@@ -94,7 +98,8 @@ fn main() -> ExitCode {
         output,
         interrupt,
     };
-    // Valid commands print the release note, except help, completions, --version, a bare run and doctor
+    // Valid commands print the release note, except help, completions, --version, a bare run and doctor.
+    // The note comes before any connection, so it reads the real clock.
     if validation.is_ok()
         && !cli.help
         && !cli.version
@@ -103,7 +108,10 @@ fn main() -> ExitCode {
             None | Some(Command::Help { .. } | Command::Completions { .. } | Command::Doctor)
         )
     {
-        update::start(&context.output, chrono::Utc::now());
+        update::start(
+            &context.output,
+            chrono::DateTime::from(Clock::real().system_time()),
+        );
     }
     let result = if let Err(error) = validation {
         Err(error)

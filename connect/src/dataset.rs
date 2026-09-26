@@ -7,10 +7,11 @@
 //! Dataset identification, streaming and processing on the Ark.
 
 use crate::{Error, Timing, schema};
+use darkbio_clock::Clock;
 use darkbio_wire::protocol::{Message, Promise, Requester};
 use sha2::{Digest, Sha256};
 use std::io::{self, Read};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Prefix supplied to the Ark for file identification and upload preparation.
 const IDENTIFY_SIZE: usize = 1024 * 1024;
@@ -62,7 +63,8 @@ pub struct Dataset {
 
 /// Identifies once, resends that same head in the authorized start request and
 /// streams the rest. A failed session is cancelled within the remaining deadline;
-/// cleanup never replaces the original error or retries an upload.
+/// cleanup never replaces the original error or retries an upload. Deadlines
+/// are measured on the clock of the requester's session.
 pub(crate) fn upload(
     requester: &Requester,
     dataset: &Dataset,
@@ -70,6 +72,7 @@ pub(crate) fn upload(
     timing: impl Into<Timing>,
     mut progress: impl FnMut(UploadProgress),
 ) -> Result<(), Error> {
+    let clock = &requester.clock();
     let timing = timing.into();
     if dataset.size == 0 {
         return Err(Error::Dataset("dataset is empty".into()));
@@ -77,6 +80,7 @@ pub(crate) fn upload(
     let head = read_chunk(
         reader,
         dataset.size.min(IDENTIFY_SIZE as u64) as usize,
+        clock,
         timing,
         None,
     )?;
@@ -85,7 +89,7 @@ pub(crate) fn upload(
         hash.update(&head);
     }
     if head.len() as u64 == dataset.size {
-        finish_read(reader, hash.take(), dataset, timing)?;
+        finish_read(reader, hash.take(), dataset, clock, timing)?;
     }
     let kind = match dataset.slot {
         Some(kind) => kind,
@@ -99,7 +103,7 @@ pub(crate) fn upload(
                         chunk: head.clone(),
                         kinds: Vec::new(),
                     },
-                    timing.io(),
+                    timing.io(clock),
                 )?
                 .wait::<schema::SlotIdentifyResponse>()?;
             if !identified.rejection.is_empty() {
@@ -120,7 +124,7 @@ pub(crate) fn upload(
                 size: dataset.size,
                 chunk: head,
             },
-            timing.approval(),
+            timing.approval(clock),
         )?
         .wait::<schema::SlotUploadStartResponse>()?
         .session;
@@ -134,20 +138,20 @@ pub(crate) fn upload(
         let mut pending: Option<(Promise<Message>, u64)> = None;
         while sent < dataset.size {
             let size = (dataset.size - sent).min(CHUNK_SIZE as u64) as usize;
-            let chunk = read_chunk(reader, size, timing, Some(CHUNK_INTERVAL))?;
+            let chunk = read_chunk(reader, size, clock, timing, Some(CHUNK_INTERVAL))?;
             let size = chunk.len() as u64;
             if let Some(hash) = &mut hash {
                 hash.update(&chunk);
             }
             sent += size;
             if sent == dataset.size {
-                finish_read(reader, hash.take(), dataset, timing)?;
+                finish_read(reader, hash.take(), dataset, clock, timing)?;
             }
             // Keep at most two chunks outstanding so device writes can overlap
             // the next transfer. The last acknowledgement is awaited too.
             let next = requester.request(
                 schema::SlotUploadChunkRequest { session, chunk },
-                timing.io(),
+                timing.io(clock),
             )?;
             if let Some((previous, bytes)) = pending.take() {
                 previous.wait::<schema::SlotUploadChunkResponse>()?;
@@ -169,7 +173,10 @@ pub(crate) fn upload(
         }
         loop {
             let status = requester
-                .request(schema::SlotUploadProcessRequest { session }, timing.io())?
+                .request(
+                    schema::SlotUploadProcessRequest { session },
+                    timing.io(clock),
+                )?
                 .wait::<schema::SlotUploadProcessResponse>()?;
             if !status.failure.is_empty() {
                 return Err(Error::Dataset(status.failure));
@@ -188,11 +195,11 @@ pub(crate) fn upload(
             if done {
                 return Ok(());
             }
-            timing.pause(POLL_INTERVAL)?;
+            timing.pause(clock, POLL_INTERVAL)?;
         }
     })();
     if result.is_err() {
-        let cleanup = timing.io().min(Instant::now() + Duration::from_secs(1));
+        let cleanup = timing.io(clock).min(clock.now() + Duration::from_secs(1));
         let _ = requester
             .request(schema::SlotUploadCancelRequest { session }, cleanup)
             .and_then(|pending| pending.wait::<schema::SlotUploadCancelResponse>());
@@ -206,25 +213,26 @@ pub(crate) fn upload(
 fn read_chunk(
     reader: &mut impl Read,
     size: usize,
+    clock: &Clock,
     timing: Timing,
     interval: Option<Duration>,
 ) -> Result<Vec<u8>, Error> {
-    let start = Instant::now();
+    let start = clock.now();
     let mut chunk = vec![0; size];
     let mut filled = 0;
     while filled < size {
-        timing.check()?;
+        timing.check(clock)?;
         match reader.read(&mut chunk[filled..]) {
             Ok(0) => return Err(read_error(io::ErrorKind::UnexpectedEof.into())),
             Ok(count) => filled += count,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(read_error(err)),
         }
-        if interval.is_some_and(|interval| start.elapsed() >= interval) {
+        if interval.is_some_and(|interval| clock.elapsed(start) >= interval) {
             break;
         }
     }
-    timing.check()?;
+    timing.check(clock)?;
     chunk.truncate(filled);
     Ok(chunk)
 }
@@ -235,10 +243,11 @@ fn finish_read(
     reader: &mut impl Read,
     hash: Option<Sha256>,
     dataset: &Dataset,
+    clock: &Clock,
     timing: Timing,
 ) -> Result<(), Error> {
     loop {
-        timing.check()?;
+        timing.check(clock)?;
         match reader.read(&mut [0]) {
             Ok(0) => break,
             Ok(_) => {
@@ -250,7 +259,7 @@ fn finish_read(
             Err(error) => return Err(read_error(error)),
         }
     }
-    timing.check()?;
+    timing.check(clock)?;
     if let (Some(hash), Some(expected)) = (hash, dataset.sha256)
         && hash.finalize().as_slice() != expected
     {
@@ -274,11 +283,13 @@ fn read_error(error: io::Error) -> Error {
 mod tests {
     use super::*;
     use crate::TrustMode;
-    use crate::testing::Peer;
+    use crate::testing::{Peer, test_clock, wait_deadline};
+    use darkbio_clock::TestClock;
     use darkbio_wire::protocol::{self, Session};
     use schema::host_to_ark::Content;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -288,6 +299,8 @@ mod tests {
         head: Vec<u8>,
         bytes: Vec<u8>,
         kind: Option<i32>,
+        /// Notifies a test each time an upload chunk reaches the Ark.
+        chunks: Option<mpsc::Sender<()>>,
     }
 
     fn status(phase: u64, progress: u64) -> schema::SlotUploadProcessResponse {
@@ -321,96 +334,103 @@ mod tests {
     /// Records the actual wire exchange, optionally refusing a stage. A cancel
     /// refusal must never replace the failure that caused cleanup.
     fn peer(
+        clock: &Clock,
         fail: Option<&'static str>,
         reports: Vec<schema::SlotUploadProcessResponse>,
     ) -> (Peer, Arc<Mutex<Observed>>) {
         let observed = Arc::new(Mutex::new(Observed::default()));
         let shared = observed.clone();
         let mut reports = VecDeque::from(reports);
-        let peer = Peer::spawn(Box::new(move |session, request, responder| {
-            if matches!(request, Content::DeviceInfo(_)) {
-                return crate::testing::answering(session, request, responder);
-            }
-            let deadline = Instant::now() + TIMEOUT;
-            let mut observed = shared.lock().unwrap();
-            let (stage, response): (_, Message) = match request {
-                Content::CloudSyncStart(_) => (
-                    "sync-start",
-                    schema::CloudSyncStartResponse { challenge: vec![3] }.into(),
-                ),
-                Content::CloudSyncFinish(_) => (
-                    "sync-finish",
-                    schema::CloudSyncFinishResponse { accepted: 123 }.into(),
-                ),
-                Content::SlotIdentify(request) => {
-                    assert_eq!(request.name, "sample.vcf.gz");
-                    assert!(request.kinds.is_empty());
-                    observed.head = request.chunk;
-                    (
-                        "peek",
-                        schema::SlotIdentifyResponse {
-                            kind: 2,
-                            summary: "Variant calls".into(),
-                            rejection: if fail == Some("identify") {
-                                "unrecognized dataset".into()
-                            } else {
-                                String::new()
-                            },
-                            ..Default::default()
-                        }
-                        .into(),
-                    )
+        let peer = Peer::spawn(
+            clock,
+            Box::new(move |session, request, responder| {
+                if matches!(request, Content::DeviceInfo(_)) {
+                    return crate::testing::answering(session, request, responder);
                 }
-                Content::SlotUploadStart(request) => {
-                    assert_eq!(request.name, "sample.vcf.gz");
-                    if !observed.head.is_empty() {
-                        assert_eq!(request.chunk, observed.head);
-                    }
-                    observed.bytes.extend(request.chunk);
-                    observed.kind = Some(request.kind);
-                    (
-                        "start",
-                        schema::SlotUploadStartResponse { session: 7 }.into(),
-                    )
-                }
-                Content::SlotUploadChunk(request) => {
-                    assert_eq!(request.session, 7);
-                    assert!(request.chunk.len() <= CHUNK_SIZE);
-                    observed.bytes.extend(request.chunk);
-                    ("chunk", schema::SlotUploadChunkResponse {}.into())
-                }
-                Content::SlotUploadProcess(request) => {
-                    assert_eq!(request.session, 7);
-                    (
-                        "process",
-                        reports
-                            .pop_front()
-                            .unwrap_or_else(|| status(2, 10_000))
+                let deadline = session.clock().now() + TIMEOUT;
+                let mut observed = shared.lock().unwrap();
+                let (stage, response): (_, Message) = match request {
+                    Content::CloudSyncStart(_) => (
+                        "sync-start",
+                        schema::CloudSyncStartResponse { challenge: vec![3] }.into(),
+                    ),
+                    Content::CloudSyncFinish(_) => (
+                        "sync-finish",
+                        schema::CloudSyncFinishResponse { accepted: 123 }.into(),
+                    ),
+                    Content::SlotIdentify(request) => {
+                        assert_eq!(request.name, "sample.vcf.gz");
+                        assert!(request.kinds.is_empty());
+                        observed.head = request.chunk;
+                        (
+                            "peek",
+                            schema::SlotIdentifyResponse {
+                                kind: 2,
+                                summary: "Variant calls".into(),
+                                rejection: if fail == Some("identify") {
+                                    "unrecognized dataset".into()
+                                } else {
+                                    String::new()
+                                },
+                                ..Default::default()
+                            }
                             .into(),
-                    )
+                        )
+                    }
+                    Content::SlotUploadStart(request) => {
+                        assert_eq!(request.name, "sample.vcf.gz");
+                        if !observed.head.is_empty() {
+                            assert_eq!(request.chunk, observed.head);
+                        }
+                        observed.bytes.extend(request.chunk);
+                        observed.kind = Some(request.kind);
+                        (
+                            "start",
+                            schema::SlotUploadStartResponse { session: 7 }.into(),
+                        )
+                    }
+                    Content::SlotUploadChunk(request) => {
+                        assert_eq!(request.session, 7);
+                        assert!(request.chunk.len() <= CHUNK_SIZE);
+                        observed.bytes.extend(request.chunk);
+                        if let Some(chunks) = &observed.chunks {
+                            let _ = chunks.send(());
+                        }
+                        ("chunk", schema::SlotUploadChunkResponse {}.into())
+                    }
+                    Content::SlotUploadProcess(request) => {
+                        assert_eq!(request.session, 7);
+                        (
+                            "process",
+                            reports
+                                .pop_front()
+                                .unwrap_or_else(|| status(2, 10_000))
+                                .into(),
+                        )
+                    }
+                    Content::SlotUploadCancel(request) => {
+                        assert_eq!(request.session, 7);
+                        ("cancel", schema::SlotUploadCancelResponse {}.into())
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                observed.stages.push(stage);
+                if fail == Some(stage) || stage == "cancel" && fail.is_some() {
+                    responder
+                        .fail(
+                            schema::Error {
+                                code: 0x778,
+                                msg: format!("refused {stage}"),
+                            },
+                            deadline,
+                        )
+                        .unwrap();
+                } else {
+                    responder.reply(response, deadline).unwrap();
                 }
-                Content::SlotUploadCancel(request) => {
-                    assert_eq!(request.session, 7);
-                    ("cancel", schema::SlotUploadCancelResponse {}.into())
-                }
-                _ => panic!("unexpected request"),
-            };
-            observed.stages.push(stage);
-            if fail == Some(stage) || stage == "cancel" && fail.is_some() {
-                responder
-                    .fail(
-                        schema::Error {
-                            code: 0x778,
-                            msg: format!("refused {stage}"),
-                        },
-                        deadline,
-                    )
-                    .unwrap();
-            } else {
-                responder.reply(response, deadline).unwrap();
-            }
-            true
-        }));
+                true
+            }),
+        );
         (peer, observed)
     }
 
@@ -418,19 +438,36 @@ mod tests {
     /// arrive exactly once, and an early phase reaching 100% is not completion.
     #[test]
     fn test_upload() {
+        let mut tester = test_clock();
+        let clock = tester.clock();
         for size in [17, IDENTIFY_SIZE, IDENTIFY_SIZE + 2 * CHUNK_SIZE + 29] {
+            // Upload and process the source, the first report asking for another poll
             let bytes: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
-            let (mut peer, observed) = peer(None, vec![status(1, 10_000), status(2, 10_000)]);
+            let (mut peer, observed) =
+                peer(&clock, None, vec![status(1, 10_000), status(2, 10_000)]);
             let session = attach(&mut peer);
-            let mut progress = Vec::new();
-            upload(
-                &session.requester(),
-                &source(size, None),
-                &mut bytes.as_slice(),
-                Instant::now() + TIMEOUT,
-                |stage| progress.push(stage),
-            )
-            .unwrap();
+            let deadline = clock.now() + TIMEOUT;
+            let uploading = thread::spawn({
+                let requester = session.requester();
+                let bytes = bytes.clone();
+                move || {
+                    let mut progress = Vec::new();
+                    let result = upload(
+                        &requester,
+                        &source(size, None),
+                        &mut bytes.as_slice(),
+                        deadline,
+                        |stage| progress.push(stage),
+                    );
+                    result.map(|()| progress)
+                }
+            });
+
+            // End the pause between the two reports once the uploader sleeps in it
+            let poll = clock.now() + POLL_INTERVAL;
+            wait_deadline(&tester, poll);
+            tester.advance_to(poll);
+            let progress = uploading.join().unwrap().unwrap();
             let observed = observed.lock().unwrap();
             assert_eq!(observed.bytes, bytes);
             assert_eq!(observed.kind, Some(2));
@@ -457,24 +494,21 @@ mod tests {
     /// reader models a source that only continues once the Ark receives it.
     #[test]
     fn test_slow_source_flushes_partial_chunks() {
+        /// Source whose second read takes a whole flush interval of the test
+        /// clock, and whose third waits until the Ark received a chunk.
         struct Slow<'a> {
+            tester: &'a mut TestClock,
             bytes: &'a [u8],
             reads: usize,
-            observed: Arc<Mutex<Observed>>,
+            chunks: mpsc::Receiver<()>,
         }
         impl Read for Slow<'_> {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 self.reads += 1;
                 if self.reads == 2 {
-                    std::thread::sleep(CHUNK_INTERVAL);
+                    self.tester.advance(CHUNK_INTERVAL);
                 } else if self.reads == 3 {
-                    let deadline = Instant::now() + Duration::from_secs(1);
-                    while self.observed.lock().unwrap().bytes.len() <= IDENTIFY_SIZE {
-                        if Instant::now() >= deadline {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                        std::thread::yield_now();
-                    }
+                    self.chunks.recv().unwrap();
                 }
                 let size = if self.reads == 1 {
                     IDENTIFY_SIZE
@@ -485,19 +519,24 @@ mod tests {
                 self.bytes.read(&mut buffer[..size])
             }
         }
+        let mut tester = test_clock();
+        let clock = tester.clock();
         let bytes = vec![42; IDENTIFY_SIZE + 128 * 1024];
-        let (mut peer, observed) = peer(None, vec![]);
+        let (mut peer, observed) = peer(&clock, None, vec![]);
+        let (arrived, chunks) = mpsc::channel();
+        observed.lock().unwrap().chunks = Some(arrived);
         let session = attach(&mut peer);
         let mut reader = Slow {
+            tester: &mut tester,
             bytes: &bytes,
             reads: 0,
-            observed: observed.clone(),
+            chunks,
         };
         upload(
             &session.requester(),
             &source(bytes.len(), None),
             &mut reader,
-            Instant::now() + TIMEOUT,
+            clock.now() + TIMEOUT,
             |_| {},
         )
         .unwrap();
@@ -517,15 +556,16 @@ mod tests {
     /// malformed progress report can be mistaken for completed processing.
     #[test]
     fn test_failures() {
+        let clock = test_clock().clock();
         for fail in ["identify", "peek", "start", "chunk", "process"] {
             let bytes = vec![42; IDENTIFY_SIZE + 2 * CHUNK_SIZE + 1];
-            let (mut peer, observed) = peer(Some(fail), vec![]);
+            let (mut peer, observed) = peer(&clock, Some(fail), vec![]);
             let session = attach(&mut peer);
             let result = upload(
                 &session.requester(),
                 &source(bytes.len(), None),
                 &mut bytes.as_slice(),
-                Instant::now() + TIMEOUT,
+                clock.now() + TIMEOUT,
                 |_| {},
             );
             if fail == "identify" {
@@ -564,13 +604,13 @@ mod tests {
             status(3, 10_000),
             status(2, 10_001),
         ] {
-            let (mut peer, observed) = peer(None, vec![report]);
+            let (mut peer, observed) = peer(&clock, None, vec![report]);
             let session = attach(&mut peer);
             let result = upload(
                 &session.requester(),
                 &source(1, None),
                 &mut [42].as_slice(),
-                Instant::now() + TIMEOUT,
+                clock.now() + TIMEOUT,
                 |_| {},
             );
             assert!(matches!(result, Err(Error::Dataset(_))));
@@ -582,6 +622,7 @@ mod tests {
     /// bad length or hash prevents processing, for both small and large files.
     #[test]
     fn test_integrity() {
+        let clock = test_clock().clock();
         for size in [17, IDENTIFY_SIZE + CHUNK_SIZE + 17] {
             let original = vec![42; size];
             let hash = Sha256::digest(&original).into();
@@ -595,13 +636,13 @@ mod tests {
                     "corrupt" => bytes[size - 1] ^= 1,
                     _ => {}
                 }
-                let (mut peer, observed) = peer(None, vec![]);
+                let (mut peer, observed) = peer(&clock, None, vec![]);
                 let session = attach(&mut peer);
                 let result = upload(
                     &session.requester(),
                     &source(size, Some(hash)),
                     &mut bytes.as_slice(),
-                    Instant::now() + TIMEOUT,
+                    clock.now() + TIMEOUT,
                     |_| {},
                 );
                 let observed = observed.lock().unwrap();
@@ -622,43 +663,47 @@ mod tests {
     /// Responses arriving in reverse order must not advance the source early.
     #[test]
     fn test_transfer_window() {
-        let (notice, notices) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel();
+        let clock = test_clock().clock();
+        let (notice, notices) = mpsc::channel();
+        let (release, released) = mpsc::channel();
         let mut held = None;
         let mut chunks = 0;
-        let mut peer = Peer::spawn(Box::new(move |_, request, responder| {
-            let deadline = Instant::now() + TIMEOUT;
-            match request {
-                Content::SlotUploadStart(_) => {
-                    responder
-                        .reply(schema::SlotUploadStartResponse { session: 7 }, deadline)
-                        .unwrap();
-                }
-                Content::SlotUploadChunk(_) => {
-                    chunks += 1;
-                    if chunks == 1 {
-                        held = Some(responder);
-                    } else {
+        let mut peer = Peer::spawn(
+            &clock,
+            Box::new(move |session, request, responder| {
+                let deadline = session.clock().now() + TIMEOUT;
+                match request {
+                    Content::SlotUploadStart(_) => {
                         responder
-                            .reply(schema::SlotUploadChunkResponse {}, deadline)
+                            .reply(schema::SlotUploadStartResponse { session: 7 }, deadline)
                             .unwrap();
-                        if chunks == 2 {
-                            notice.send(()).unwrap();
-                            released.recv_timeout(TIMEOUT).unwrap();
-                            held.take()
-                                .unwrap()
+                    }
+                    Content::SlotUploadChunk(_) => {
+                        chunks += 1;
+                        if chunks == 1 {
+                            held = Some(responder);
+                        } else {
+                            responder
                                 .reply(schema::SlotUploadChunkResponse {}, deadline)
                                 .unwrap();
+                            if chunks == 2 {
+                                notice.send(()).unwrap();
+                                released.recv().unwrap();
+                                held.take()
+                                    .unwrap()
+                                    .reply(schema::SlotUploadChunkResponse {}, deadline)
+                                    .unwrap();
+                            }
                         }
                     }
+                    Content::SlotUploadProcess(_) => {
+                        responder.reply(status(2, 10_000), deadline).unwrap();
+                    }
+                    _ => panic!("unexpected request"),
                 }
-                Content::SlotUploadProcess(_) => {
-                    responder.reply(status(2, 10_000), deadline).unwrap();
-                }
-                _ => panic!("unexpected request"),
-            }
-            true
-        }));
+                true
+            }),
+        );
         let session = attach(&mut peer);
         let bytes = vec![42; IDENTIFY_SIZE + 3 * CHUNK_SIZE];
         let source = source(bytes.len(), Some(Sha256::digest(&bytes).into()));
@@ -677,7 +722,8 @@ mod tests {
         }
         let counted = read.clone();
         let requester = session.requester();
-        let worker = std::thread::spawn(move || {
+        let deadline = clock.now() + TIMEOUT;
+        let worker = thread::spawn(move || {
             upload(
                 &requester,
                 &source,
@@ -685,11 +731,11 @@ mod tests {
                     bytes: &bytes,
                     count: counted,
                 },
-                Instant::now() + TIMEOUT,
+                deadline,
                 |_| {},
             )
         });
-        notices.recv_timeout(TIMEOUT).unwrap();
+        notices.recv().unwrap();
         assert_eq!(
             read.load(std::sync::atomic::Ordering::SeqCst),
             IDENTIFY_SIZE + 2 * CHUNK_SIZE
@@ -715,7 +761,8 @@ mod tests {
                 self.bytes.read(&mut buf[..size])
             }
         }
-        let (mut peer, _) = peer(None, vec![]);
+        let clock = test_clock().clock();
+        let (mut peer, _) = peer(&clock, None, vec![]);
         let session = attach(&mut peer);
         let mut reader = Fragmented {
             calls: 0,
@@ -725,7 +772,7 @@ mod tests {
             &session.requester(),
             &source(5, None),
             &mut reader,
-            Instant::now() + TIMEOUT,
+            clock.now() + TIMEOUT,
             |_| {},
         )
         .unwrap();
@@ -740,24 +787,19 @@ mod tests {
     #[test]
     fn test_client_setup() {
         use crate::cloud::tests::{response, serve};
+        let clock = test_clock().clock();
         let (url, requests) = serve(vec![
-            (
-                Duration::ZERO,
-                response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
-            ),
-            (
-                Duration::ZERO,
-                response(200, r#"{"unixmilli":123,"signature":"BA=="}"#),
-            ),
+            response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
+            response(200, r#"{"unixmilli":123,"signature":"BA=="}"#),
         ]);
-        let (mut peer, observed) = peer(None, vec![]);
+        let (mut peer, observed) = peer(&clock, None, vec![]);
         let ark = crate::cloud::tests::attach(&mut peer, url);
         for _ in 0..2 {
             ark.client()
                 .upload_dataset(
                     &source(1, None),
                     &mut [42].as_slice(),
-                    Instant::now() + TIMEOUT,
+                    clock.now() + TIMEOUT,
                     |_| {},
                 )
                 .unwrap();
@@ -775,15 +817,10 @@ mod tests {
             &observed.stages[..3],
             &["sync-start", "sync-finish", "peek"]
         );
+        assert!(requests.recv().unwrap().contains("/cloudsync/identity"));
         assert!(
             requests
-                .recv_timeout(TIMEOUT)
-                .unwrap()
-                .contains("/cloudsync/identity")
-        );
-        assert!(
-            requests
-                .recv_timeout(TIMEOUT)
+                .recv()
                 .unwrap()
                 .contains("/cloudsync/time?challenge=03")
         );
@@ -792,21 +829,35 @@ mod tests {
     /// successive replies report the same progress percentage.
     #[test]
     fn test_processing_renews_waits() {
+        // Upload with a machine allowance shorter than the pause between polls
+        let mut tester = test_clock();
+        let clock = tester.clock();
         let (mut peer, observed) = peer(
+            &clock,
             None,
             vec![status(1, 100), status(1, 100), status(2, 10_000)],
         );
         let session = attach(&mut peer);
-        let started = Instant::now();
-        upload(
-            &session.requester(),
-            &source(1, None),
-            &mut [42].as_slice(),
-            Timing::inactivity(Duration::from_millis(250)),
-            |_| {},
-        )
-        .unwrap();
-        assert!(started.elapsed() >= 2 * POLL_INTERVAL);
+        let uploading = thread::spawn({
+            let requester = session.requester();
+            move || {
+                upload(
+                    &requester,
+                    &source(1, None),
+                    &mut [42].as_slice(),
+                    Timing::inactivity(Duration::from_millis(250)),
+                    |_| {},
+                )
+            }
+        });
+
+        // Each pause lasts a whole poll interval, each report renewing the allowance
+        for _ in 0..2 {
+            let poll = clock.now() + POLL_INTERVAL;
+            wait_deadline(&tester, poll);
+            tester.advance_to(poll);
+        }
+        uploading.join().unwrap().unwrap();
         assert!(!observed.lock().unwrap().stages.contains(&"cancel"));
     }
 }

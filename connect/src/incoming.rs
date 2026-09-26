@@ -10,7 +10,6 @@ use crate::cloud::Services;
 use darkbio_wire::protocol::{self, Responder, Session, schema};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
 
 /// Bounded application queue. Closure discards requests and retains the first
 /// ending reason for every subsequent receive.
@@ -73,13 +72,12 @@ impl Incoming {
             || bytes > protocol::DEFAULT_MAX_INBOUND_BYTES.saturating_sub(state.bytes)
         {
             drop(state);
-            let _ = responder.fail(
-                schema::Error::reserved(
-                    schema::ReservedErrors::Unavailable,
-                    "host request queue full",
-                ),
-                Instant::now() + protocol::DEFAULT_AUTOREPLY_TIMEOUT,
+            let error = schema::Error::reserved(
+                schema::ReservedErrors::Unavailable,
+                "host request queue full",
             );
+            let deadline = responder.clock().now() + protocol::DEFAULT_AUTOREPLY_TIMEOUT;
+            let _ = responder.fail(error, deadline);
             return;
         }
         state.bytes += bytes;

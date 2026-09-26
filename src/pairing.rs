@@ -12,7 +12,6 @@ use darkbio_connect::{
     trust::{Environment, Realm},
 };
 use serde_json::json;
-use std::time::{Duration, UNIX_EPOCH};
 
 /// Pairs an unpaired Ark, translating connector stages into the owner's scan and
 /// approval instructions. Link construction and terminal presentation stay in the CLI.
@@ -71,9 +70,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                     }
                 );
                 if context.output.terminal() {
-                    context
-                        .output
-                        .pairing(&url, UNIX_EPOCH + Duration::from_secs(deadline));
+                    context.output.pairing(&url, deadline);
                     previous = Some("rendezvous");
                 } else {
                     context

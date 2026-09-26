@@ -10,11 +10,16 @@
 //! The wire dispatcher only admits reverse requests to a bounded queue. Relay
 //! failure refuses retained Ark requests; a later operation may attach again,
 //! but no request is replayed and the underlying wire session stays independent.
+//!
+//! The worker waits on the socket through mio, so its heartbeat and write
+//! timers run on real time. Exchange deadlines belong to the wire session and
+//! are measured on its clock.
 
 use super::{
     Failure,
-    socket::{self, Socket, io_error, remaining, socket_error, socket_mut},
+    socket::{self, Socket, io_error, socket_error, socket_mut},
 };
+use crate::timing::ClockExt;
 use darkbio_crypto::cbor::{self, Cbor};
 use darkbio_wire::protocol::{self, Promise, Requester, Responder, schema};
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -72,8 +77,11 @@ struct Worker {
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>, // Admission and closure are atomic with respect to each other
-    wake: Waker,         // Signals queued Ark traffic or local closure
+    wake: Arc<Waker>,    // signals queued Ark traffic, wire completions or local closure
     socket: TcpStream,   // Interrupts reads even inside WebSocket message assembly
+    /// Notifies a test once the last handle to this relay is gone.
+    #[cfg(test)]
+    dropped: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 /// Reverse requests awaiting admission and the first attachment failure.
@@ -95,7 +103,7 @@ impl Relay {
         deadline: Instant,
     ) -> Result<Self, Failure> {
         let mut socket = socket::connect(api, url, auth, "Relaying", deadline)?;
-        remaining(deadline).map_err(io_error)?;
+        api.clock.remaining(deadline).map_err(io_error)?;
         let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
             unreachable!()
         };
@@ -115,8 +123,10 @@ impl Relay {
         *socket_mut(&mut socket) = Socket::Connected(connected);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
-            wake: Waker::new(poll.registry(), WAKE).map_err(io_error)?,
+            wake: Arc::new(Waker::new(poll.registry(), WAKE).map_err(io_error)?),
             socket: shutdown,
+            #[cfg(test)]
+            dropped: Mutex::new(None),
         });
         Ok(Self {
             shared,
@@ -124,7 +134,7 @@ impl Relay {
                 socket,
                 poll,
                 requester,
-                heartbeat: Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT),
+                heartbeat: Heartbeat::attach(),
             }),
         })
     }
@@ -211,6 +221,16 @@ impl Shared {
     }
 }
 
+#[cfg(test)]
+impl Drop for Shared {
+    /// Notifies the test that the relay and its worker released their handles.
+    fn drop(&mut self) {
+        if let Some(sender) = self.dropped.get_mut().unwrap().take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 /// Recognizes an incomplete nonblocking operation that the poll loop can resume.
 fn would_block(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
@@ -219,10 +239,9 @@ fn would_block(error: &tungstenite::Error) -> bool {
 /// An unavailable relay fails the Ark's reverse request, allowing its original
 /// operation to finish with an error. Enqueueing the reply does not wait on I/O.
 pub(super) fn fail(responder: Responder, reason: &str) {
-    let _ = responder.fail(
-        schema::Error::reserved(schema::ReservedErrors::Unavailable, reason),
-        Instant::now() + protocol::DEFAULT_AUTOREPLY_TIMEOUT,
-    );
+    let error = schema::Error::reserved(schema::ReservedErrors::Unavailable, reason);
+    let deadline = responder.clock().now() + protocol::DEFAULT_AUTOREPLY_TIMEOUT;
+    let _ = responder.fail(error, deadline);
 }
 
 /// Current cloud envelope. Only the envelope is interpreted; all bodies stay sealed.
@@ -316,12 +335,23 @@ struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// Schedules the first probe without sending traffic during attachment.
-    fn new(interval: Duration, timeout: Duration) -> Self {
+    /// Schedules the first probe of a relay attaching now. The worker's socket
+    /// timers run on real time, so the schedule starts on it too.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the heartbeat is one of the worker's socket timers, which run on real time from attachment"
+    )]
+    fn attach() -> Self {
+        Self::new(PING_INTERVAL, PONG_TIMEOUT, Instant::now())
+    }
+
+    /// Schedules the first probe an interval after `now`, sending no traffic
+    /// during attachment.
+    fn new(interval: Duration, timeout: Duration, now: Instant) -> Self {
         Self {
             interval,
             timeout,
-            next: Instant::now() + interval,
+            next: now + interval,
             sequence: 0,
             pending: None,
         }
@@ -358,8 +388,51 @@ impl Heartbeat {
     }
 }
 
+/// Bounds output the cloud socket has not taken yet. The first write or
+/// deferred flush starts the bound, later ones keep its deadline, and only a
+/// completed flush ends it.
+#[derive(Debug, Default)]
+struct Backlog {
+    /// Time the pending output must be flushed by, while there is some.
+    deadline: Option<Instant>,
+}
+
+impl Backlog {
+    /// Starts the bound at `now` for output left to flush, keeping the
+    /// deadline of a bound already running.
+    fn start(&mut self, now: Instant) {
+        self.deadline.get_or_insert(now + WRITE_TIMEOUT);
+    }
+
+    /// Ends the bound once a flush took all output.
+    fn flushed(&mut self) {
+        self.deadline = None;
+    }
+
+    /// Whether output is left to flush, which holds back the next frame.
+    fn active(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    /// Whether the output left to flush missed its deadline by `now`.
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Time left after `now` before the deadline, bounding the next poll.
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+}
+
 /// Writes one frame at a time while receiving concurrently. Wire completions
-/// are polled only while app requests are in flight; idle wakeups check liveness.
+/// and queued Ark requests wake the poll; idle wakeups check liveness. The
+/// socket's own timers read real time and exchange deadlines the session's clock.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the worker waits on the cloud socket through mio, so its heartbeat and write timers run on real time"
+)]
 fn pump(
     mut socket: WebSocket<MaybeTlsStream<Socket>>,
     mut poll: Poll,
@@ -367,6 +440,7 @@ fn pump(
     shared: Arc<Shared>,
     mut heartbeat: Heartbeat,
 ) {
+    let clock = requester.clock();
     let mut events = Events::with_capacity(8);
     // The two directions have independent ID spaces. Only the worker changes
     // these maps, so completions never need the shared admission lock.
@@ -375,7 +449,7 @@ fn pump(
     let (answered, answers) = mpsc::channel();
     let mut output = VecDeque::new();
     let mut bytes = 0usize;
-    let mut writing = None;
+    let mut writing = Backlog::default();
     let result = (|| -> Result<(), Failure> {
         loop {
             {
@@ -386,12 +460,12 @@ fn pump(
                 // Admission stops while the socket is backlogged; reading and
                 // completion handling continue independently of that backlog.
                 if output.is_empty()
-                    && writing.is_none()
+                    && !writing.active()
                     && pending.len() < MAX_INFLIGHT
                     && let Some((request, responder, deadline)) = state.queue.pop_front()
                 {
                     state.bytes -= request.req.len();
-                    if deadline <= Instant::now() {
+                    if deadline <= clock.now() {
                         fail(responder, "relay request timed out in queue");
                     } else if let std::collections::hash_map::Entry::Vacant(entry) =
                         pending.entry(request.id)
@@ -409,9 +483,10 @@ fn pump(
             }
             // Expired exchanges release their responder even if no further
             // traffic arrives. Responses without a pending responder are discarded.
+            let now = clock.now();
             let expired: Vec<_> = pending
                 .iter()
-                .filter(|(_, (_, deadline))| Instant::now() >= *deadline)
+                .filter(|(_, (_, deadline))| now >= *deadline)
                 .map(|(id, _)| *id)
                 .collect();
             for id in expired {
@@ -438,11 +513,11 @@ fn pump(
                     enqueue(&mut output, &mut bytes, Frame::Response(id, response.res))?;
                 }
             }
-            if writing.is_none()
+            if !writing.active()
                 && let Some(frame) = output.pop_front()
             {
                 bytes -= frame.len();
-                writing = Some(Instant::now() + WRITE_TIMEOUT);
+                writing.start(Instant::now());
                 match socket.write(Message::Binary(frame.into())) {
                     Ok(()) => {}
                     Err(error) if would_block(&error) => {}
@@ -463,9 +538,14 @@ fn pump(
                             }
                             let mut promise = requester.request(
                                 schema::RelayAppToArkRequest { id, req },
-                                Instant::now() + EXCHANGE_TIMEOUT,
+                                clock.now() + EXCHANGE_TIMEOUT,
                             )?;
-                            promise.notify(answered.clone(), id);
+                            let answered = answered.clone();
+                            let wake = shared.wake.clone();
+                            promise.notify(move || {
+                                let _ = answered.send(id);
+                                let _ = wake.wake();
+                            });
                             inbound.insert(id, promise);
                         }
                         Frame::Response(id, res) => {
@@ -488,7 +568,7 @@ fn pump(
                 batch_full = index == 31;
             }
             if let Some(ping) = heartbeat.ping(Instant::now())? {
-                writing.get_or_insert_with(|| Instant::now() + WRITE_TIMEOUT);
+                writing.start(Instant::now());
                 match socket.write(Message::Ping(ping.to_vec().into())) {
                     Ok(()) => {}
                     Err(error) if would_block(&error) => {}
@@ -496,14 +576,12 @@ fn pump(
                 }
             }
             match socket.flush() {
-                Ok(()) => writing = None,
-                Err(error) if would_block(&error) => {
-                    writing.get_or_insert_with(|| Instant::now() + WRITE_TIMEOUT);
-                }
+                Ok(()) => writing.flushed(),
+                Err(error) if would_block(&error) => writing.start(Instant::now()),
                 Err(error) => return Err(socket_error(error)),
             }
-            if let Some(deadline) = writing {
-                remaining(deadline).map_err(io_error)?;
+            if writing.expired(Instant::now()) {
+                return Err(Failure::Wire(protocol::Error::Timeout));
             }
             let queued = !shared
                 .state
@@ -512,22 +590,20 @@ fn pump(
                 .queue
                 .is_empty();
             if batch_full
-                || (writing.is_none()
+                || (!writing.active()
                     && (!output.is_empty() || (queued && pending.len() < MAX_INFLIGHT)))
             {
                 continue;
             }
-            // Wire completions arrive on a channel without a mio wakeup. Poll
-            // briefly only while those requests exist; otherwise wait for I/O.
-            let deadline = pending
+            // Wait for readiness, a wakeup or the earliest deadline. Exchanges end
+            // on the session's clock, the socket's own timers on real time.
+            let (now, session) = (Instant::now(), clock.now());
+            let timeout = pending
                 .values()
-                .map(|(_, deadline)| *deadline)
-                .chain(writing)
-                .chain(Some(heartbeat.deadline()))
-                .chain((!inbound.is_empty()).then(|| Instant::now() + Duration::from_millis(10)))
+                .map(|(_, deadline)| deadline.saturating_duration_since(session))
+                .chain(writing.remaining(now))
+                .chain(Some(heartbeat.deadline().saturating_duration_since(now)))
                 .min();
-            let timeout =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             match poll.poll(&mut events, timeout) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -566,9 +642,10 @@ fn enqueue(output: &mut VecDeque<Vec<u8>>, bytes: &mut usize, frame: Frame) -> R
 mod tests {
     use super::*;
     use crate::cloud::tests::{TIMEOUT, attach, response};
-    use crate::testing::{Peer, answering};
+    use crate::testing::{Peer, answering, test_clock, wait_deadline};
     use crate::{Error, schema::host_to_ark::Content};
     use crate::{cloud::http, trust::Realm};
+    use darkbio_clock::Clock;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -577,23 +654,12 @@ mod tests {
     /// IDs retain all sixty-four bits, including numbers beyond JSON precision.
     const ID: u64 = (1 << 63) + 7;
 
+    /// Accepts the next cloud connection, bounding its I/O in case a test fails.
     fn accept(listener: &TcpListener) -> TcpStream {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-                    stream.set_write_timeout(Some(TIMEOUT)).unwrap();
-                    return stream;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "test cloud was never contacted");
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => panic!("test accept: {error}"),
-            }
-        }
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+        stream
     }
 
     /// Reads headers without consuming any bytes of the first WebSocket frame.
@@ -613,7 +679,6 @@ mod tests {
         mut serve: impl FnMut(usize, TcpStream) + Send + 'static,
     ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let worker = thread::spawn(move || {
             for (path, body) in [
@@ -664,199 +729,214 @@ mod tests {
         }
     }
 
+    /// Makes the relay probe at attachment and again right after every pong,
+    /// giving each pong `timeout`.
+    fn probe_at_once(relay: &mut Relay, timeout: Duration) {
+        let heartbeat = &mut relay.worker.as_mut().unwrap().heartbeat;
+        let attached = heartbeat.deadline() - PING_INTERVAL;
+        *heartbeat = Heartbeat::new(Duration::ZERO, timeout, attached);
+    }
+
     /// Keeps serving app requests while an unlock waits for its reverse response.
-    fn peer() -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn peer(clock: &Clock) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let joins = Arc::new(AtomicUsize::new(0));
         let syncs = Arc::new(AtomicUsize::new(0));
-        let peer = Peer::spawn(Box::new({
-            let joins = joins.clone();
-            let syncs = syncs.clone();
-            let mut synced = false;
-            let mut next_id = ID;
-            move |session, request, responder| {
-                let deadline = Instant::now() + TIMEOUT;
-                match request {
-                    Content::DeviceInfo(_) => {
-                        let clock = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                        responder
-                            .reply(
-                                schema::DeviceInfoResponse {
-                                    cloud_clock: clock,
-                                    cloud_synced: syncs.load(Ordering::SeqCst) > 0,
-                                    ..Default::default()
-                                },
-                                deadline,
-                            )
-                            .unwrap();
-                    }
-
-                    Content::CloudSyncStart(request) => {
-                        assert_eq!(request.signer, [1]);
-                        assert_eq!(request.crypto, [2]);
-                        syncs.fetch_add(1, Ordering::SeqCst);
-                        responder
-                            .reply(
-                                schema::CloudSyncStartResponse { challenge: vec![3] },
-                                deadline,
-                            )
-                            .unwrap();
-                    }
-                    Content::CloudSyncFinish(request) => {
-                        assert_eq!(request.unixmilli, 123);
-                        assert_eq!(request.signature, [4]);
-                        synced = true;
-                        responder
-                            .reply(schema::CloudSyncFinishResponse { accepted: 123 }, deadline)
-                            .unwrap();
-                    }
-                    Content::RelayJoin(_) => {
-                        assert!(synced);
-                        joins.fetch_add(1, Ordering::SeqCst);
-                        responder
-                            .reply(
-                                schema::RelayJoinResponse {
-                                    auth: vec![0xfb, 0xff],
-                                },
-                                deadline,
-                            )
-                            .unwrap();
-                    }
-                    Content::ExecUploadStart(request) => {
-                        assert!(synced);
-                        assert_eq!(request.bytes, 4);
-                        responder
-                            .reply(
-                                schema::ExecutionUploadStartResponse { taskid: 42 },
-                                deadline,
-                            )
-                            .unwrap();
-                    }
-                    Content::ExecUploadChunk(request) => {
-                        assert_eq!(request.taskid, 42);
-                        assert_eq!(request.chunk, [0, 97, 115, 109]);
-                        responder
-                            .reply(schema::ExecutionUploadChunkResponse {}, deadline)
-                            .unwrap();
-                    }
-                    Content::ExecStatus(request) => {
-                        assert_eq!(request.taskid, 42);
-                        responder
-                            .reply(
-                                schema::ExecutionStatusResponse {
-                                    pending: false,
-                                    result: Some(schema::ExecutionResultResponse {
-                                        success: true,
-                                        ..Default::default()
-                                    }),
-                                },
-                                deadline,
-                            )
-                            .unwrap();
-                    }
-                    request @ (Content::Unlock(_)
-                    | Content::ExecSched(_)
-                    | Content::SlotRepair(_)
-                    | Content::SlotDelete(_)
-                    | Content::FirmwareUpdatePrep(_)
-                    | Content::SlotUploadStart(_)) => {
-                        let (reply, preflight, authorize): (protocol::Message, _, _) = match request
-                        {
-                            Content::Unlock(_) => (schema::UnlockResponse {}.into(), true, true),
-                            Content::ExecSched(_) => {
-                                (schema::ExecutionScheduleResponse {}.into(), true, true)
-                            }
-                            Content::SlotRepair(_) => {
-                                (schema::SlotRepairResponse {}.into(), true, true)
-                            }
-                            Content::SlotDelete(_) => {
-                                (schema::SlotDeleteResponse {}.into(), true, true)
-                            }
-                            Content::FirmwareUpdatePrep(request) => (
-                                schema::FirmwareUpdatePrepResponse::default().into(),
-                                false,
-                                request.version != "unpaired",
-                            ),
-                            Content::SlotUploadStart(request) => (
-                                schema::SlotUploadStartResponse { session: 42 }.into(),
-                                false,
-                                request.kind() != schema::SlotKind::SlotReferenceGenome,
-                            ),
-                            _ => unreachable!(),
-                        };
-                        if !authorize {
-                            responder.reply(reply, deadline).unwrap();
-                            return true;
-                        }
-                        let id = next_id;
-                        next_id += 1;
-                        assert!(
-                            !preflight || joins.load(Ordering::SeqCst) > 0,
-                            "request preceded relay attachment"
-                        );
-                        let promise = session
-                            .requester()
-                            .request(
-                                schema::RelayArkToAppRequest {
-                                    id,
-                                    req: vec![1, 2, 3],
-                                },
-                                deadline,
-                            )
-                            .unwrap();
-                        thread::spawn(move || {
-                            let result = match promise.wait::<schema::RelayAppToArkResponse>() {
-                                Ok(answer) => {
-                                    assert_eq!(answer.id, id);
-                                    match answer.res.as_slice() {
-                                        [4, 5, 6] => responder.reply(reply, deadline),
-                                        [0] => responder.fail(
-                                            schema::Error::new(0x506, "authorization denied"),
-                                            deadline,
-                                        ),
-                                        _ => panic!("companion response was altered"),
-                                    }
-                                }
-                                Err(protocol::Error::Remote(error)) => {
-                                    responder.fail(error, deadline)
-                                }
-                                Err(_) => return,
-                            };
-                            let _ = result;
-                        });
-                    }
-                    Content::RelayReq(request) => {
-                        if request.req == [0] {
+        let peer = Peer::spawn(
+            clock,
+            Box::new({
+                let joins = joins.clone();
+                let syncs = syncs.clone();
+                let mut synced = false;
+                let mut next_id = ID;
+                move |session, request, responder| {
+                    let deadline = session.clock().now() + TIMEOUT;
+                    match request {
+                        Content::DeviceInfo(_) => {
+                            let clock = session
+                                .clock()
+                                .system_time()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
                             responder
-                                .fail(
-                                    schema::Error::reserved(
-                                        schema::ReservedErrors::Unsupported,
-                                        "test refusal",
-                                    ),
+                                .reply(
+                                    schema::DeviceInfoResponse {
+                                        cloud_clock: clock,
+                                        cloud_synced: syncs.load(Ordering::SeqCst) > 0,
+                                        ..Default::default()
+                                    },
                                     deadline,
                                 )
                                 .unwrap();
-                            return true;
                         }
-                        assert_eq!(request.id, ID);
-                        assert_eq!(request.req, [9, 8, 7]);
-                        responder
-                            .reply(
-                                schema::RelayArkToAppResponse {
-                                    id: ID,
-                                    res: vec![6, 5, 4],
-                                },
-                                deadline,
-                            )
-                            .unwrap();
+
+                        Content::CloudSyncStart(request) => {
+                            assert_eq!(request.signer, [1]);
+                            assert_eq!(request.crypto, [2]);
+                            syncs.fetch_add(1, Ordering::SeqCst);
+                            responder
+                                .reply(
+                                    schema::CloudSyncStartResponse { challenge: vec![3] },
+                                    deadline,
+                                )
+                                .unwrap();
+                        }
+                        Content::CloudSyncFinish(request) => {
+                            assert_eq!(request.unixmilli, 123);
+                            assert_eq!(request.signature, [4]);
+                            synced = true;
+                            responder
+                                .reply(schema::CloudSyncFinishResponse { accepted: 123 }, deadline)
+                                .unwrap();
+                        }
+                        Content::RelayJoin(_) => {
+                            assert!(synced);
+                            joins.fetch_add(1, Ordering::SeqCst);
+                            responder
+                                .reply(
+                                    schema::RelayJoinResponse {
+                                        auth: vec![0xfb, 0xff],
+                                    },
+                                    deadline,
+                                )
+                                .unwrap();
+                        }
+                        Content::ExecUploadStart(request) => {
+                            assert!(synced);
+                            assert_eq!(request.bytes, 4);
+                            responder
+                                .reply(
+                                    schema::ExecutionUploadStartResponse { taskid: 42 },
+                                    deadline,
+                                )
+                                .unwrap();
+                        }
+                        Content::ExecUploadChunk(request) => {
+                            assert_eq!(request.taskid, 42);
+                            assert_eq!(request.chunk, [0, 97, 115, 109]);
+                            responder
+                                .reply(schema::ExecutionUploadChunkResponse {}, deadline)
+                                .unwrap();
+                        }
+                        Content::ExecStatus(request) => {
+                            assert_eq!(request.taskid, 42);
+                            responder
+                                .reply(
+                                    schema::ExecutionStatusResponse {
+                                        pending: false,
+                                        result: Some(schema::ExecutionResultResponse {
+                                            success: true,
+                                            ..Default::default()
+                                        }),
+                                    },
+                                    deadline,
+                                )
+                                .unwrap();
+                        }
+                        request @ (Content::Unlock(_)
+                        | Content::ExecSched(_)
+                        | Content::SlotRepair(_)
+                        | Content::SlotDelete(_)
+                        | Content::FirmwareUpdatePrep(_)
+                        | Content::SlotUploadStart(_)) => {
+                            let (reply, preflight, authorize): (protocol::Message, _, _) =
+                                match request {
+                                    Content::Unlock(_) => {
+                                        (schema::UnlockResponse {}.into(), true, true)
+                                    }
+                                    Content::ExecSched(_) => {
+                                        (schema::ExecutionScheduleResponse {}.into(), true, true)
+                                    }
+                                    Content::SlotRepair(_) => {
+                                        (schema::SlotRepairResponse {}.into(), true, true)
+                                    }
+                                    Content::SlotDelete(_) => {
+                                        (schema::SlotDeleteResponse {}.into(), true, true)
+                                    }
+                                    Content::FirmwareUpdatePrep(request) => (
+                                        schema::FirmwareUpdatePrepResponse::default().into(),
+                                        false,
+                                        request.version != "unpaired",
+                                    ),
+                                    Content::SlotUploadStart(request) => (
+                                        schema::SlotUploadStartResponse { session: 42 }.into(),
+                                        false,
+                                        request.kind() != schema::SlotKind::SlotReferenceGenome,
+                                    ),
+                                    _ => unreachable!(),
+                                };
+                            if !authorize {
+                                responder.reply(reply, deadline).unwrap();
+                                return true;
+                            }
+                            let id = next_id;
+                            next_id += 1;
+                            assert!(
+                                !preflight || joins.load(Ordering::SeqCst) > 0,
+                                "request preceded relay attachment"
+                            );
+                            let promise = session
+                                .requester()
+                                .request(
+                                    schema::RelayArkToAppRequest {
+                                        id,
+                                        req: vec![1, 2, 3],
+                                    },
+                                    deadline,
+                                )
+                                .unwrap();
+                            thread::spawn(move || {
+                                let result = match promise.wait::<schema::RelayAppToArkResponse>() {
+                                    Ok(answer) => {
+                                        assert_eq!(answer.id, id);
+                                        match answer.res.as_slice() {
+                                            [4, 5, 6] => responder.reply(reply, deadline),
+                                            [0] => responder.fail(
+                                                schema::Error::new(0x506, "authorization denied"),
+                                                deadline,
+                                            ),
+                                            _ => panic!("companion response was altered"),
+                                        }
+                                    }
+                                    Err(protocol::Error::Remote(error)) => {
+                                        responder.fail(error, deadline)
+                                    }
+                                    Err(_) => return,
+                                };
+                                let _ = result;
+                            });
+                        }
+                        Content::RelayReq(request) => {
+                            if request.req == [0] {
+                                responder
+                                    .fail(
+                                        schema::Error::reserved(
+                                            schema::ReservedErrors::Unsupported,
+                                            "test refusal",
+                                        ),
+                                        deadline,
+                                    )
+                                    .unwrap();
+                                return true;
+                            }
+                            assert_eq!(request.id, ID);
+                            assert_eq!(request.req, [9, 8, 7]);
+                            responder
+                                .reply(
+                                    schema::RelayArkToAppResponse {
+                                        id: ID,
+                                        res: vec![6, 5, 4],
+                                    },
+                                    deadline,
+                                )
+                                .unwrap();
+                        }
+                        other => return answering(session, other, responder),
                     }
-                    other => return answering(session, other, responder),
+                    true
                 }
-                true
-            }
-        }));
+            }),
+        );
         (peer, joins, syncs)
     }
 
@@ -915,17 +995,18 @@ mod tests {
                     Frame::Response(id, vec![0]).encode().into(),
                 ))
                 .unwrap();
-            pause.recv_timeout(TIMEOUT).unwrap();
+            pause.recv().unwrap();
         });
-        let (mut peer, joins, syncs) = peer();
+        let clock = test_clock().clock();
+        let (mut peer, joins, syncs) = peer(&clock);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
         assert_eq!(joins.load(Ordering::SeqCst), 0);
         assert_eq!(syncs.load(Ordering::SeqCst), 0);
         client.call(schema::UnlockRequest {}, deadline).unwrap();
-        stages.recv_timeout(TIMEOUT).unwrap();
+        stages.recv().unwrap();
         assert!(
             matches!(client.clone().call(schema::UnlockRequest {}, deadline), Err(Error::Remote(error)) if error.code == 0x506)
         );
@@ -959,9 +1040,9 @@ mod tests {
                     Frame::Response(id, vec![4, 5, 6]).encode().into(),
                 ))
                 .unwrap();
-            pause.recv_timeout(TIMEOUT).unwrap();
+            pause.recv().unwrap();
         });
-        let (mut peer, joins, _) = peer();
+        let (mut peer, joins, _) = peer(&test_clock().clock());
         let ark = attach(&mut peer, url);
         ark.client()
             .call_timeout(schema::UnlockRequest {}, TIMEOUT)
@@ -996,13 +1077,14 @@ mod tests {
                 let result = client.execute(
                     4,
                     &mut [0, 97, 115, 109].as_slice(),
-                    Instant::now() + TIMEOUT,
+                    client.clock().now() + TIMEOUT,
                     |_| {},
                 )?;
                 assert!(result.success);
                 Ok(())
             },
         ];
+        let clock = test_clock().clock();
         for call in calls {
             let (release, pause) = mpsc::channel();
             let (url, server) = cloud(1, move |_, stream| {
@@ -1015,9 +1097,9 @@ mod tests {
                         Frame::Response(id, vec![4, 5, 6]).encode().into(),
                     ))
                     .unwrap();
-                pause.recv_timeout(TIMEOUT).unwrap();
+                pause.recv().unwrap();
             });
-            let (mut peer, joins, _) = peer();
+            let (mut peer, joins, _) = peer(&clock);
             let ark = attach(&mut peer, url);
             call(&ark.client()).unwrap();
             assert_eq!(joins.load(Ordering::SeqCst), 1);
@@ -1030,6 +1112,7 @@ mod tests {
     /// counterparts attach when the Ark first requests authorization.
     #[test]
     fn test_conditional_authorization() {
+        let clock = test_clock().clock();
         for firmware in [false, true] {
             let (release, pause) = mpsc::channel();
             let (url, server) = cloud(1, move |_, stream| {
@@ -1042,9 +1125,9 @@ mod tests {
                         Frame::Response(id, vec![4, 5, 6]).encode().into(),
                     ))
                     .unwrap();
-                pause.recv_timeout(TIMEOUT).unwrap();
+                pause.recv().unwrap();
             });
-            let (mut peer, joins, _) = peer();
+            let (mut peer, joins, _) = peer(&clock);
             let ark = attach(&mut peer, url);
             let client = ark.client();
             for authorize in [false, true] {
@@ -1084,12 +1167,13 @@ mod tests {
     /// while local requests and two concurrent authorizations remain available.
     #[test]
     fn test_shared_attachment() {
+        // Hold the leader's relay attachment at its upgrade
         let (seen, attempts) = mpsc::channel();
         let (release, pause) = mpsc::channel();
         let (finish, done) = mpsc::channel();
         let (url, server) = cloud(1, move |_, stream| {
             seen.send(()).unwrap();
-            pause.recv_timeout(TIMEOUT).unwrap();
+            pause.recv().unwrap();
             let mut socket = upgrade(stream);
             for _ in 0..2 {
                 let Frame::Request(id, req) = frame(&mut socket) else {
@@ -1102,24 +1186,33 @@ mod tests {
                     ))
                     .unwrap();
             }
-            done.recv_timeout(TIMEOUT).unwrap();
+            done.recv().unwrap();
         });
-        let (mut peer, joins, syncs) = peer();
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (mut peer, joins, syncs) = peer(&clock);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         let leader = thread::spawn({
             let client = client.clone();
             move || client.call(schema::UnlockRequest {}, deadline)
         });
-        attempts.recv_timeout(TIMEOUT).unwrap();
+        attempts.recv().unwrap();
         client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
-        assert!(matches!(
-            client
-                .clone()
-                .call_timeout(schema::UnlockRequest {}, Duration::from_millis(20)),
-            Err(Error::Timeout)
-        ));
+
+        // A short caller joining the attachment expires alone, at the earliest
+        // deadline on the clock
+        let short = clock.now() + Duration::from_millis(20);
+        let waiter = thread::spawn({
+            let client = client.clone();
+            move || client.call_timeout(schema::UnlockRequest {}, Duration::from_millis(20))
+        });
+        wait_deadline(&tester, short);
+        tester.advance_to(short);
+        assert!(matches!(waiter.join().unwrap(), Err(Error::Timeout)));
+
+        // The leader and a later caller authorize over the one attachment
         let follower = thread::spawn({
             let client = client.clone();
             move || client.call(schema::UnlockRequest {}, deadline)
@@ -1136,19 +1229,32 @@ mod tests {
     /// A call deadline still bounds authorization after successful cloud setup.
     #[test]
     fn test_authorization_deadline() {
+        // The companion receives the authorization request but never answers
+        let (reached, authorizing) = mpsc::channel();
         let (release, pause) = mpsc::channel();
         let (url, server) = cloud(1, move |_, stream| {
             let mut socket = upgrade(stream);
             assert!(matches!(frame(&mut socket), Frame::Request(_, _)));
-            pause.recv_timeout(TIMEOUT).unwrap();
+            reached.send(()).unwrap();
+            pause.recv().unwrap();
         });
-        let (mut peer, _, _) = peer();
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (mut peer, _, _) = peer(&clock);
         let ark = attach(&mut peer, url);
         let client = ark.client();
-        assert!(matches!(
-            client.call_timeout(schema::UnlockRequest {}, Duration::from_millis(500)),
-            Err(Error::Timeout)
-        ));
+
+        // The unlock waits for approval until the clock reaches its deadline
+        let deadline = clock.now() + Duration::from_millis(500);
+        let unlock = thread::spawn({
+            let client = client.clone();
+            move || client.call(schema::UnlockRequest {}, deadline)
+        });
+        authorizing.recv().unwrap();
+        tester.advance_to(deadline);
+        assert!(matches!(unlock.join().unwrap(), Err(Error::Timeout)));
+
+        // Local requests keep working on the same connection
         client
             .call_timeout(schema::DeviceInfoRequest {}, TIMEOUT)
             .unwrap();
@@ -1160,6 +1266,7 @@ mod tests {
     /// replaying the unlock or disrupting local device requests.
     #[test]
     fn test_reconnect() {
+        let clock = test_clock().clock();
         for refused in [false, true] {
             let (release, pause) = mpsc::channel();
             let (url, server) = cloud(2, move |attempt, mut stream| {
@@ -1182,13 +1289,13 @@ mod tests {
                             Frame::Response(id, vec![4, 5, 6]).encode().into(),
                         ))
                         .unwrap();
-                    pause.recv_timeout(TIMEOUT).unwrap();
+                    pause.recv().unwrap();
                 }
             });
-            let (mut peer, joins, syncs) = peer();
+            let (mut peer, joins, syncs) = peer(&clock);
             let ark = attach(&mut peer, url);
             let client = ark.client();
-            let deadline = Instant::now() + TIMEOUT;
+            let deadline = clock.now() + TIMEOUT;
             let error = client.call(schema::UnlockRequest {}, deadline).unwrap_err();
             if refused {
                 assert!(matches!(error, Error::Cloud(message) if message.contains("503")));
@@ -1218,17 +1325,18 @@ mod tests {
             seen.send(()).unwrap();
             assert!(matches!(socket.read(), Err(_) | Ok(Message::Close(_))));
         });
-        let (mut peer, _, _) = peer();
+        let clock = test_clock().clock();
+        let (mut peer, _, _) = peer(&clock);
         let ark = attach(&mut peer, url);
         let client = ark.client();
         let pending = client
-            .send(schema::UnlockRequest {}, Instant::now() + TIMEOUT)
+            .send(schema::UnlockRequest {}, clock.now() + TIMEOUT)
             .unwrap();
-        requests.recv_timeout(TIMEOUT).unwrap();
+        requests.recv().unwrap();
         drop(ark);
         assert!(matches!(pending.wait(), Err(Error::Closed)));
         assert!(matches!(
-            client.call(schema::UnlockRequest {}, Instant::now() + TIMEOUT),
+            client.call(schema::UnlockRequest {}, clock.now() + TIMEOUT),
             Err(Error::Closed)
         ));
         server.join().unwrap();
@@ -1238,65 +1346,152 @@ mod tests {
     /// its deadline. A valid pong schedules a fresh probe with a different ID.
     #[test]
     fn test_heartbeat() {
-        let mut heartbeat = Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT);
-        let now = heartbeat.deadline();
+        // Probe first once an interval has passed since the start
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let mut heartbeat = Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT, clock.now());
+        assert!(heartbeat.ping(clock.now()).unwrap().is_none());
+        tester.advance(PING_INTERVAL);
+        let now = clock.now();
         let first = heartbeat.ping(now).unwrap().unwrap();
         let deadline = heartbeat.deadline();
         assert!(heartbeat.ping(now).unwrap().is_none());
+
+        // Only the pong echoing the probe acknowledges it and schedules the next
         heartbeat.pong(&[0; 8], now);
         assert_eq!(heartbeat.deadline(), deadline);
         heartbeat.pong(&first, now);
         assert_eq!(heartbeat.deadline(), now + PING_INTERVAL);
-        let second = heartbeat.ping(heartbeat.deadline()).unwrap().unwrap();
+
+        // An old probe's pong or one arriving at the deadline leaves the probe to expire
+        tester.advance(PING_INTERVAL);
+        let second = heartbeat.ping(clock.now()).unwrap().unwrap();
         assert_ne!(first, second);
         let deadline = heartbeat.deadline();
-        heartbeat.pong(&first, deadline - Duration::from_millis(1));
-        heartbeat.pong(&second, deadline);
-        assert!(heartbeat.ping(deadline).is_err());
+        tester.advance_to(deadline - Duration::from_millis(1));
+        heartbeat.pong(&first, clock.now());
+        tester.advance_to(deadline);
+        heartbeat.pong(&second, clock.now());
+        assert!(heartbeat.ping(clock.now()).is_err());
+    }
+
+    /// Output left to flush starts the backlog bound once. Later blockage keeps
+    /// the original deadline, where the bound expires, and a completed flush
+    /// clears it for the next output.
+    #[test]
+    fn test_backlog() {
+        // The first blockage starts the bound
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let mut backlog = Backlog::default();
+        assert!(!backlog.active());
+        let start = clock.now();
+        backlog.start(start);
+        assert!(backlog.active());
+        assert_eq!(backlog.remaining(start), Some(WRITE_TIMEOUT));
+
+        // Blocking again keeps the original deadline, which ends the bound on time
+        tester.advance(Duration::from_secs(3));
+        backlog.start(clock.now());
+        assert_eq!(
+            backlog.remaining(clock.now()),
+            Some(WRITE_TIMEOUT - Duration::from_secs(3))
+        );
+        tester.advance_to(start + WRITE_TIMEOUT - Duration::from_millis(1));
+        assert!(!backlog.expired(clock.now()));
+        tester.advance_to(start + WRITE_TIMEOUT);
+        assert!(backlog.expired(clock.now()));
+
+        // A completed flush clears the bound, and the next output starts afresh
+        backlog.flushed();
+        assert!(!backlog.active());
+        assert!(!backlog.expired(clock.now()));
+        backlog.start(clock.now());
+        assert_eq!(backlog.remaining(clock.now()), Some(WRITE_TIMEOUT));
+    }
+
+    /// The first probe is due an interval after attachment, so a worker that
+    /// starts that late probes at once.
+    #[test]
+    fn test_heartbeat_starts_at_attachment() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
+        let (probed, probes) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut socket = upgrade(accept(&listener));
+            assert!(matches!(socket.read().unwrap(), Message::Ping(_)));
+            probed.send(()).unwrap();
+            let _ = socket.get_mut().read_to_end(&mut Vec::new());
+        });
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, Box::new(answering));
+        let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
+        let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
+        let api = http::tests::api(url.clone(), Realm::Hardware, &clock);
+        let deadline = clock.now() + TIMEOUT;
+        let mut relay =
+            Relay::connect(&api, &url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
+
+        // Start the worker as if a whole interval passed since attachment
+        relay.worker.as_mut().unwrap().heartbeat.next -= PING_INTERVAL;
+        relay.start().unwrap();
+        probes.recv().unwrap();
+        relay.close();
+        server.join().unwrap();
     }
 
     /// The socket pump accepts matching pongs, then ends an unresponsive relay
     /// without disrupting local wire calls. A replacement can attach afterward.
+    /// Both relays probe at once. The first gives every pong an hour, and the
+    /// test waits for the server to answer three probes. The second gives its
+    /// pong no time, and the test waits for the server to see its socket end.
     #[test]
     fn test_heartbeat_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
+        let (answered, pongs) = mpsc::channel();
+        let (gone, ended) = mpsc::channel();
         let (release, pause) = mpsc::channel();
-        let (seen, pings) = mpsc::channel();
         let server = thread::spawn(move || {
+            // Answer three probes, each one sent only once the previous pong matched
             let mut socket = upgrade(accept(&listener));
             for _ in 0..3 {
                 assert!(matches!(socket.read().unwrap(), Message::Ping(_)));
                 socket.flush().unwrap();
             }
-            assert!(matches!(socket.read().unwrap(), Message::Ping(_)));
-            // Replace tungstenite's automatic pong with one that does not match.
-            socket.send(Message::Pong(vec![0].into())).unwrap();
-            seen.send(()).unwrap();
-            assert!(matches!(socket.read(), Err(_) | Ok(Message::Close(_))));
+            answered.send(()).unwrap();
+            let _ = socket.get_mut().read_to_end(&mut Vec::new());
+
+            // Leave the next relay's probe unanswered until the relay goes away
+            let mut socket = upgrade(accept(&listener));
+            let _ = socket.get_mut().read_to_end(&mut Vec::new());
+            gone.send(()).unwrap();
+
+            // Hold a replacement attachment open until the test ends
             let _replacement = upgrade(accept(&listener));
-            pause.recv_timeout(TIMEOUT).unwrap();
+            pause.recv().unwrap();
         });
-        let mut peer = Peer::spawn(Box::new(answering));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, Box::new(answering));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
-        let deadline = Instant::now() + TIMEOUT;
-        let mut relay = Relay::connect(
-            &http::tests::api(url.clone(), Realm::Hardware),
-            &url,
-            &[0xfb, 0xff],
-            session.requester(),
-            deadline,
-        )
-        .unwrap();
-        relay.worker.as_mut().unwrap().heartbeat =
-            Heartbeat::new(Duration::from_millis(20), Duration::from_millis(200));
+        let api = http::tests::api(url.clone(), Realm::Hardware, &clock);
+        let deadline = clock.now() + TIMEOUT;
+
+        // A relay whose probes are answered keeps probing
+        let mut relay =
+            Relay::connect(&api, &url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
+        probe_at_once(&mut relay, Duration::from_secs(3600));
         relay.start().unwrap();
-        pings.recv_timeout(TIMEOUT).unwrap();
-        while relay.connected() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
+        pongs.recv().unwrap();
+        relay.close();
+
+        // A relay whose probe expires at once ends, leaving the wire session usable
+        let mut relay =
+            Relay::connect(&api, &url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
+        probe_at_once(&mut relay, Duration::ZERO);
+        relay.start().unwrap();
+        ended.recv().unwrap();
         let error = relay.shared.state.lock().unwrap().error.clone();
         assert_eq!(
             error.as_deref(),
@@ -1308,14 +1503,10 @@ mod tests {
             .unwrap()
             .wait::<schema::DeviceInfoResponse>()
             .unwrap();
-        let mut replacement = Relay::connect(
-            &http::tests::api(url.clone(), Realm::Hardware),
-            &url,
-            &[0xfb, 0xff],
-            session.requester(),
-            deadline,
-        )
-        .unwrap();
+
+        // A replacement attaches afterward
+        let mut replacement =
+            Relay::connect(&api, &url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
         replacement.start().unwrap();
         assert!(replacement.connected());
         release.send(()).unwrap();
@@ -1326,9 +1517,9 @@ mod tests {
     /// while it is assembling an unfinished fragmented message.
     #[test]
     fn test_close_fragmented_message() {
+        let clock = test_clock().clock();
         for started in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
             let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
             let (sent, fragments) = mpsc::channel();
             let server = thread::spawn(move || {
@@ -1339,56 +1530,56 @@ mod tests {
                 sent.send(()).unwrap();
                 assert!(matches!(socket.get_mut().read(&mut [0]), Ok(0) | Err(_)));
             });
-            let mut peer = Peer::spawn(Box::new(answering));
+            let mut peer = Peer::spawn(&clock, Box::new(answering));
             let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
             let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
-            let deadline = Instant::now() + TIMEOUT;
+            let deadline = clock.now() + TIMEOUT;
             let mut relay = Relay::connect(
-                &http::tests::api(url.clone(), Realm::Hardware),
+                &http::tests::api(url.clone(), Realm::Hardware, &clock),
                 &url,
                 &[0xfb, 0xff],
                 session.requester(),
                 deadline,
             )
             .unwrap();
+            let (dropped, released) = mpsc::channel();
+            *relay.shared.dropped.lock().unwrap() = Some(dropped);
             if started {
                 relay.start().unwrap();
             }
-            fragments.recv_timeout(TIMEOUT).unwrap();
+            fragments.recv().unwrap();
             relay.close();
             server.join().unwrap();
-            while Arc::strong_count(&relay.shared) != 1 && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(
-                Arc::strong_count(&relay.shared),
-                1,
-                "relay worker must exit"
-            );
+
+            // The worker exits, so dropping this attachment releases the last handle
+            drop(relay);
+            released.recv().unwrap();
         }
     }
 
     /// Every read of a stalled upgrade retains the caller's original deadline.
+    /// The socket's own timeout is real, so the upgrade stalls for the whole
+    /// 100 ms budget that the clock leaves it.
     #[test]
     fn test_handshake_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
         let (release, pause) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             headers(&mut stream);
-            pause.recv_timeout(TIMEOUT).unwrap();
+            pause.recv().unwrap();
         });
-        let mut peer = Peer::spawn(Box::new(answering));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(&clock, Box::new(answering));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
         let result = Relay::connect(
-            &http::tests::api(url.clone(), Realm::Hardware),
+            &http::tests::api(url.clone(), Realm::Hardware, &clock),
             &url,
             &[1],
             session.requester(),
-            Instant::now() + Duration::from_millis(100),
+            clock.now() + Duration::from_millis(100),
         );
         assert!(
             matches!(result, Err(Failure::Wire(protocol::Error::Timeout))),

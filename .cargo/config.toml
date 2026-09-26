@@ -1,0 +1,6 @@
+# Settings for every cargo command run inside this repository.
+
+[env]
+# Clippy only searches the crate directory and its parents for its settings,
+# so point it at the ones kept here.
+CLIPPY_CONF_DIR = { value = ".cargo", relative = true }

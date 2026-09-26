@@ -11,14 +11,16 @@ pub(crate) mod human;
 use crate::args::Options;
 use crate::error::Error;
 use crate::style::{self, Role, Theme};
+use darkbio_clock::{Clock, crossbeam_channel};
 use darkbio_connect::trust::Environment;
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Clonable output handle for one invocation. Result emission is claimed once;
 /// events and live stderr lines share terminal state across clones.
@@ -42,8 +44,59 @@ struct State {
     environment_noted: AtomicBool,
     /// Serializes result claims and writes; acquired before the terminal lock.
     result: Mutex<()>,
+    /// Clock of the latest connection, which times every wait display.
+    clock: Mutex<Option<Clock>>,
+    /// Worker redrawing the active wait. Its lock orders every change of the
+    /// wait display with the worker's replacement, and comes before the
+    /// terminal lock.
+    ticker: Mutex<Option<Ticker>>,
     /// Serializes stderr line changes and spacing around human result blocks.
-    terminal: Mutex<Terminal>,
+    /// The redraw worker shares it, but never the rest of the output.
+    terminal: Arc<Mutex<Terminal>>,
+}
+
+/// Owner of a worker that redraws a wait display once a second on a clock.
+/// Dropping it stops the worker and waits for it to exit. The worker holds
+/// only what it draws with, never its owner, so the owner is never dropped on
+/// the worker's own thread.
+struct Ticker {
+    /// Disconnects when dropped, which wakes the worker to exit.
+    stop: Option<crossbeam_channel::Sender<()>>,
+    /// Joined on drop, so no redraw outlives the display.
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Ticker {
+    /// Starts a worker that draws a second after its start and then a second
+    /// after each draw, until the owner drops it.
+    fn start(clock: Clock, mut draw: impl FnMut(Instant) + Send + 'static) -> Self {
+        let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
+        let worker = std::thread::spawn(move || {
+            loop {
+                let next = clock.now() + Duration::from_secs(1);
+                if clock.recv_deadline(&stopped, next)
+                    != Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                {
+                    break;
+                }
+                draw(clock.now());
+            }
+        });
+        Self {
+            stop: Some(stop),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for Ticker {
+    /// Wakes the worker and waits for it to exit.
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// Current terminal layout, guarded independently of the result claim.
@@ -53,8 +106,6 @@ struct Terminal {
     live: Option<(String, bool)>,
     /// Active elapsed-time or countdown display, if any.
     waiting: Option<Waiting>,
-    /// Monotonic timer generation used to retire previous wait workers.
-    generation: u64,
     /// Whether stderr has printed content that needs spacing before a result.
     err_printed: bool,
     /// Whether a human stdout block needs separation from the next stderr event.
@@ -63,11 +114,9 @@ struct Terminal {
 
 /// Presentation-only wait state; it never controls an operation's deadline.
 struct Waiting {
-    /// Identifies the worker allowed to redraw this wait after each timer tick.
-    generation: u64,
     /// Short activity name displayed beside the elapsed or remaining time.
     label: String,
-    /// Host time when this wait display began.
+    /// Clock time when this wait display began.
     started: Instant,
     /// Fixed countdown bound, absent for an elapsed-time display.
     until: Option<Instant>,
@@ -85,8 +134,14 @@ impl Output {
             printed: AtomicBool::new(false),
             environment_noted: AtomicBool::new(false),
             result: Mutex::new(()),
-            terminal: Mutex::new(Terminal::default()),
+            clock: Mutex::new(None),
+            ticker: Mutex::new(None),
+            terminal: Arc::new(Mutex::new(Terminal::default())),
         }))
+    }
+    /// Times later wait displays on the clock of a newly opened connection.
+    pub fn connection(&self, clock: Clock) {
+        *self.0.clock.lock().expect("output not poisoned") = Some(clock);
     }
     /// Whether the caller requested JSON for both output streams.
     pub fn json(&self) -> bool {
@@ -172,8 +227,7 @@ impl Output {
     /// Ends live stderr activity and writes a complete stdout result block.
     /// The caller holds the result lock; terminal state is acquired second.
     fn write_result(&self, text: &str) -> Result<(), Error> {
-        let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-        terminal.waiting = None;
+        let mut terminal = self.end_wait();
         close_line(&mut terminal, &mut io::stderr().lock());
         let mut stdout = io::stdout().lock();
         if self.0.out.interactive && self.0.err.interactive && terminal.err_printed {
@@ -230,10 +284,11 @@ impl Output {
             return;
         }
         {
-            let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-            if !matches!(kind, "note" | "warning" | "step" | "log") {
-                terminal.waiting = None;
-            }
+            let mut terminal = if matches!(kind, "note" | "warning" | "step" | "log") {
+                self.0.terminal.lock().expect("output not poisoned")
+            } else {
+                self.end_wait()
+            };
             let mut stderr = io::stderr().lock();
             close_line(&mut terminal, &mut stderr);
             if self.json() {
@@ -267,8 +322,7 @@ impl Output {
         if self.0.quiet {
             return;
         }
-        let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-        terminal.waiting = None;
+        let mut terminal = self.end_wait();
         let mut stderr = io::stderr().lock();
         if terminal
             .live
@@ -350,7 +404,7 @@ impl Output {
 
     /// Presents a scan URL and a QR code when terminal width and Unicode permit.
     /// The caller uses this renderer only outside JSON, where the URL is structured.
-    pub fn pairing(&self, url: &str, deadline: SystemTime) {
+    pub fn pairing(&self, url: &str, deadline: Instant) {
         self.event("approve", "scan in Ark Companion");
         self.finish();
         {
@@ -392,54 +446,49 @@ impl Output {
     }
 
     /// The timer only draws while a wait is active. It never bounds the call.
-    pub fn wait(&self, label: &str, until: Option<SystemTime>) {
+    /// It runs on the latest connection's clock and stays hidden before one.
+    pub fn wait(&self, label: &str, until: Option<Instant>) {
         if !self.0.err.interactive || self.0.quiet {
             return;
         }
-        let generation;
+        self.show_wait(label, until, || io::stderr().lock());
+    }
+
+    /// Replaces any earlier wait display with one drawn to `screen`, which the
+    /// worker then redraws every second. The replacement happens under the
+    /// ticker lock, so a concurrent change of the display lands before or after
+    /// it as a whole.
+    fn show_wait<W: Write>(
+        &self,
+        label: &str,
+        until: Option<Instant>,
+        screen: impl Fn() -> W + Send + 'static,
+    ) {
+        let Some(clock) = self.0.clock.lock().expect("output not poisoned").clone() else {
+            return;
+        };
+        // Stop the earlier worker before touching the terminal, which it draws on
+        let mut ticker = self.0.ticker.lock().expect("output not poisoned");
+        drop(ticker.take());
+
+        // Publish the new display and draw its first frame at once
         {
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-            terminal.generation += 1;
-            generation = terminal.generation;
+            let now = clock.now();
             terminal.waiting = Some(Waiting {
-                generation,
                 label: label.into(),
-                started: Instant::now(),
-                until: until.and_then(|end| {
-                    Instant::now()
-                        .checked_add(end.duration_since(SystemTime::now()).unwrap_or_default())
-                }),
+                started: now,
+                until,
             });
-            tick(
-                &self.0.err,
-                &mut terminal,
-                &mut io::stderr().lock(),
-                Instant::now(),
-            );
+            tick(&self.0.err, &mut terminal, &mut screen(), now);
         }
-        // A replacement wait invalidates this generation. The weak reference
-        // also lets the worker exit when the invocation releases its output.
-        let state = Arc::downgrade(&self.0);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let Some(state) = state.upgrade() else { break };
-                let mut terminal = state.terminal.lock().expect("output not poisoned");
-                if !terminal
-                    .waiting
-                    .as_ref()
-                    .is_some_and(|wait| wait.generation == generation)
-                {
-                    break;
-                }
-                tick(
-                    &state.err,
-                    &mut terminal,
-                    &mut io::stderr().lock(),
-                    Instant::now(),
-                );
-            }
-        });
+        // Install the worker before another change can take the ticker lock
+        let theme = self.0.err.clone();
+        let terminal = self.0.terminal.clone();
+        *ticker = Some(Ticker::start(clock, move |now| {
+            let mut terminal = terminal.lock().expect("output not poisoned");
+            tick(&theme, &mut terminal, &mut screen(), now);
+        }));
     }
 
     /// Prints and flushes a prompt without reading stdin or deciding whether to ask.
@@ -509,11 +558,21 @@ impl Output {
 
     /// Stops the active timer and closes its live line; safe to call repeatedly.
     pub fn finish(&self) {
-        let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-        terminal.waiting = None;
+        let mut terminal = self.end_wait();
         let mut stderr = io::stderr().lock();
         close_line(&mut terminal, &mut stderr);
         let _ = stderr.flush();
+    }
+
+    /// Ends the wait display and returns the terminal for the caller's next
+    /// write. The worker is stopped under the ticker lock and joined before
+    /// the terminal lock is taken, since each redraw takes that lock too.
+    fn end_wait(&self) -> MutexGuard<'_, Terminal> {
+        let mut ticker = self.0.ticker.lock().expect("output not poisoned");
+        drop(ticker.take());
+        let mut terminal = self.0.terminal.lock().expect("output not poisoned");
+        terminal.waiting = None;
+        terminal
     }
 }
 
@@ -603,7 +662,162 @@ pub(crate) fn scalar(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::style::Color;
+    use crate::testing::wait_deadline;
     use clap::Parser;
+    use darkbio_clock::TestClock;
+    use std::sync::{TryLockError, mpsc};
+    use std::thread;
+
+    /// Captures the frames that wait displays draw in place of stderr.
+    #[derive(Clone, Default)]
+    struct Screen(Arc<Mutex<Vec<u8>>>);
+
+    impl Screen {
+        /// Returns the frames drawn so far, oldest first.
+        fn frames(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .split(style::CLEAR_LINE)
+                .filter(|frame| !frame.is_empty())
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    impl Write for Screen {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Builds an output whose waits run on the clock.
+    fn output(clock: Clock) -> Output {
+        let options = crate::args::Cli::try_parse_from(["ark"]).unwrap().options;
+        let output = Output::new(&options);
+        output.connection(clock);
+        output
+    }
+
+    /// Shows a wait on a thread of its own, drawing it on the screen.
+    fn spawn_wait(output: &Output, label: &'static str, screen: &Screen) -> thread::JoinHandle<()> {
+        let (output, screen) = (output.clone(), screen.clone());
+        thread::spawn(move || output.show_wait(label, None, move || screen.clone()))
+    }
+
+    /// Waits until another thread holds the output's ticker lock.
+    fn ticker_held(output: &Output) {
+        loop {
+            match output.0.ticker.try_lock() {
+                Err(TryLockError::WouldBlock) => return,
+                free => drop(free),
+            }
+            thread::yield_now();
+        }
+    }
+
+    /// A wait arriving while another replaces the display goes after it, so its
+    /// display is the one that its sole worker redraws. Dropping the output then
+    /// stops that worker while it waits for the next redraw.
+    #[test]
+    fn test_concurrent_waits_keep_one_worker() {
+        // Hold the terminal, so the first wait stops inside its replacement
+        let mut tester = TestClock::new();
+        let start = tester.clock().now();
+        let output = output(tester.clock());
+        let screen = Screen::default();
+        let terminal = output.0.terminal.lock().unwrap();
+        let first = spawn_wait(&output, "first", &screen);
+        ticker_held(&output);
+
+        // The second wait queues behind the first one's replacement
+        let second = spawn_wait(&output, "second", &screen);
+        drop(terminal);
+        first.join().unwrap();
+        second.join().unwrap();
+        let frames = screen.frames();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].contains("first") && frames[0].contains("0 s elapsed"));
+        assert!(frames[1].contains("second") && frames[1].contains("0 s elapsed"));
+
+        // Its worker alone redraws it a second later, then waits another second
+        wait_deadline(&tester, start + Duration::from_secs(1));
+        tester.advance_to(start + Duration::from_secs(1));
+        wait_deadline(&tester, start + Duration::from_secs(2));
+        let frames = screen.frames();
+        assert_eq!(frames.len(), 3);
+        assert!(frames[2].contains("second") && frames[2].contains("1 s elapsed"));
+
+        // Dropping the output stops the waiting worker
+        drop(output);
+        assert_eq!(tester.next_deadline(), None);
+        assert_eq!(screen.frames().len(), 3);
+    }
+
+    /// Ending the display while a wait replaces it lands after the replacement,
+    /// so no worker is left once the end returns.
+    #[test]
+    fn test_end_stops_a_pending_worker() {
+        // Hold the terminal, so the wait stops inside its replacement
+        let tester = TestClock::new();
+        let output = output(tester.clock());
+        let screen = Screen::default();
+        let terminal = output.0.terminal.lock().unwrap();
+        let waiting = spawn_wait(&output, "waiting", &screen);
+        ticker_held(&output);
+
+        // The end queues behind the replacement and stops its worker
+        let ending = thread::spawn({
+            let output = output.clone();
+            move || drop(output.end_wait())
+        });
+        drop(terminal);
+        waiting.join().unwrap();
+        ending.join().unwrap();
+        assert!(output.0.ticker.lock().unwrap().is_none());
+        assert!(output.0.terminal.lock().unwrap().waiting.is_none());
+        assert_eq!(tester.next_deadline(), None);
+    }
+
+    /// Dropping a ticker during a redraw returns only after the redraw finished
+    /// and the worker exited, without another redraw.
+    #[test]
+    fn test_ticker_drop_waits_for_a_redraw() {
+        // The worker redraws a second after its start and holds the redraw open
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let (entered, redraws) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let mut ticker = Ticker::start(clock.clone(), move |now| {
+            entered.send(now).unwrap();
+            gate.recv().unwrap();
+        });
+        let first = clock.now() + Duration::from_secs(1);
+        wait_deadline(&tester, first);
+        tester.advance_to(first);
+        assert_eq!(redraws.recv().unwrap(), first);
+
+        // Pass the stop signal through a helper, which lets the redraw finish
+        // only once the drop has started cancelling the worker
+        let (tap, tapped) = crossbeam_channel::bounded::<()>(0);
+        let stop = ticker.stop.replace(tap);
+        let releasing = thread::spawn(move || {
+            assert_eq!(tapped.recv(), Err(crossbeam_channel::RecvError));
+            drop(stop);
+            release.send(()).unwrap();
+        });
+
+        // The drop itself waits for the worker, so its closure is gone the
+        // moment the drop returns
+        drop(ticker);
+        assert_eq!(redraws.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        releasing.join().unwrap();
+        assert_eq!(tester.next_deadline(), None);
+    }
 
     #[test]
     fn events_keep_prefixes_and_style_inline_commands() {
@@ -625,10 +839,9 @@ mod tests {
     #[test]
     fn waiting_line_is_erased_but_completed_progress_stays() {
         let theme = Theme::test(80, Color::Off, true);
-        let started = Instant::now();
+        let started = TestClock::new().clock().now();
         let mut terminal = Terminal {
             waiting: Some(Waiting {
-                generation: 1,
                 label: "waiting".into(),
                 started,
                 until: None,

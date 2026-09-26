@@ -6,12 +6,14 @@
 
 //! Authenticated cloud sockets with blocking deadlines and relay readiness.
 
-use super::{Failure, dns, http::Api};
+use super::{Failure, http::Api};
+use crate::timing::ClockExt;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use darkbio_clock::Clock;
 use darkbio_wire::protocol;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tungstenite::{
     WebSocket, client::IntoClientRequest, handshake::HandshakeError, protocol::WebSocketConfig,
     stream::MaybeTlsStream,
@@ -62,14 +64,15 @@ pub(super) fn connect(
             80
         });
 
-    let addresses = dns::resolve(&host, port, deadline)?;
+    let addresses = api.resolver.resolve(&host, port, deadline)?;
     let mut failure = io::Error::new(
         io::ErrorKind::AddrNotAvailable,
         "cloud socket has no address",
     );
     let mut connected = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, remaining(deadline).map_err(io_error)?) {
+        let left = api.clock.remaining(deadline).map_err(io_error)?;
+        match TcpStream::connect_timeout(&address, left) {
             Ok(stream) => {
                 connected = Some(stream);
                 break;
@@ -86,7 +89,11 @@ pub(super) fn connect(
         .max_frame_size(Some(MAX_MESSAGE));
     let (socket, response) = tungstenite::client_tls_with_config(
         request,
-        Socket::Blocking { stream, deadline },
+        Socket::Blocking {
+            clock: api.clock.clone(),
+            stream,
+            deadline,
+        },
         Some(config),
         None,
     )
@@ -119,6 +126,8 @@ pub(super) fn connect(
 pub(super) enum Socket {
     /// Handshake or pairing stream with a shared read and write bound.
     Blocking {
+        /// Clock of the connection, which the deadline is measured on.
+        clock: Clock,
         /// Connected TCP socket, optionally wrapped by TLS above this adapter.
         stream: TcpStream,
         /// Absolute bound checked again before each blocking I/O.
@@ -132,8 +141,12 @@ impl Read for Socket {
     /// Applies the remaining blocking deadline or returns readiness-based I/O.
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Blocking { stream, deadline } => {
-                stream.set_read_timeout(Some(remaining(*deadline)?))?;
+            Self::Blocking {
+                clock,
+                stream,
+                deadline,
+            } => {
+                stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.read(bytes)
             }
             Self::Connected(stream) => stream.read(bytes),
@@ -145,8 +158,12 @@ impl Write for Socket {
     /// Applies the remaining blocking deadline or writes through the relay socket.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Blocking { stream, deadline } => {
-                stream.set_write_timeout(Some(remaining(*deadline)?))?;
+            Self::Blocking {
+                clock,
+                stream,
+                deadline,
+            } => {
+                stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.write(bytes)
             }
             Self::Connected(stream) => stream.write(bytes),
@@ -155,8 +172,12 @@ impl Write for Socket {
     /// Flushes the underlying stream under the same bound as a write.
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Blocking { stream, deadline } => {
-                stream.set_write_timeout(Some(remaining(*deadline)?))?;
+            Self::Blocking {
+                clock,
+                stream,
+                deadline,
+            } => {
+                stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.flush()
             }
             Self::Connected(stream) => stream.flush(),
@@ -171,14 +192,6 @@ pub(super) fn socket_mut(socket: &mut WebSocket<MaybeTlsStream<Socket>>) -> &mut
         MaybeTlsStream::Rustls(stream) => &mut stream.sock,
         _ => unreachable!("only plain and rustls sockets are enabled"),
     }
-}
-
-/// Returns a positive OS timeout; zero would mean an unbounded wait on some APIs.
-pub(super) fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
 }
 
 /// Preserves timeout classification across blocking socket error conventions.
@@ -208,6 +221,7 @@ mod tests {
         http::tests::api,
         tests::TIMEOUT,
     };
+    use crate::testing::test_clock;
     use crate::{Timing, trust::Realm};
     use std::net::TcpListener;
     use std::sync::{Arc, atomic::Ordering};
@@ -216,6 +230,7 @@ mod tests {
     #[test]
     #[allow(clippy::result_large_err)] // Tungstenite's server callback owns its HTTP response.
     fn socket_upgrades_and_reconnects_use_refreshed_credentials() {
+        let clock = test_clock().clock();
         for subprotocol in ["Pairing", "Relaying"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("ws://{}/v1/{subprotocol}", listener.local_addr().unwrap());
@@ -251,14 +266,14 @@ mod tests {
                     drop(socket);
                 }
             });
-            let cloud = api(url.clone(), Realm::Hardware);
+            let cloud = api(url.clone(), Realm::Hardware, &clock);
             let login = Login::default();
             cloud.auth.set(Arc::new(login.clone()));
             let timing = Timing::inactivity(TIMEOUT);
             for _ in 0..2 {
                 let socket = cloud
                     .with_auth(timing, || {
-                        connect(&cloud, &url, &[0xfb, 0xff], subprotocol, timing.io())
+                        connect(&cloud, &url, &[0xfb, 0xff], subprotocol, timing.io(&clock))
                     })
                     .unwrap();
                 drop(socket);

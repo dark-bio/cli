@@ -16,8 +16,6 @@ use darkbio_wire::protocol::Requester;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
-#[cfg(test)]
-use std::time::Instant;
 
 /// Archive bytes per acknowledged transfer, amortizing USB and device write latency.
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -87,10 +85,11 @@ impl Services {
             .try_lock()
             .map_err(|_| Error::Firmware("another firmware update is already running".into()))?;
         self.sync(requester, timing)?;
+        let clock = &self.clock;
         // Finish any browser login before asking the Ark to prepare an update.
         // A protected host can need login even when device sync is still fresh.
         if cloud.auth.configured() {
-            cloud.with_auth(timing, || cloud.identity(timing.io()))?;
+            cloud.with_auth(timing, || cloud.identity(timing.io(clock)))?;
         }
         progress(UpdateProgress::Preparing);
         let prepared = requester
@@ -100,7 +99,7 @@ impl Services {
                     sha256: firmware.sha256.to_vec(),
                     bytes: firmware.size,
                 },
-                timing.approval(),
+                timing.approval(clock),
             )?
             .wait::<schema::FirmwareUpdatePrepResponse>()?;
         let access: Access = match http::get_authenticated(
@@ -111,12 +110,12 @@ impl Services {
                 .query("version", &firmware.version)
                 .query("sha256", hex::encode(firmware.sha256))
                 .header("Dark-Auth", BASE64_URL_SAFE_NO_PAD.encode(prepared.auth)),
-            timing.io(),
+            timing.io(clock),
         ) {
             Err(Failure::AuthRequired) => {
                 // Browser login can outlive the prepared proof. Leave a second
                 // preparation and its possible approval to an explicit rerun.
-                cloud.auth.login(&cloud.origin, timing)?;
+                cloud.auth.login(&cloud.origin, clock, timing)?;
                 return Err(Error::CloudAuth {
                     origin: cloud.origin.clone(),
                     message: "signed in to the cloud; rerun the firmware update".into(),
@@ -134,7 +133,10 @@ impl Services {
             Error::Firmware(format!("invalid firmware access encoding: {error}"))
         })?;
         requester
-            .request(schema::FirmwareUpdateInitRequest { access }, timing.io())?
+            .request(
+                schema::FirmwareUpdateInitRequest { access },
+                timing.io(clock),
+            )?
             .wait::<schema::FirmwareUpdateInitResponse>()?;
 
         progress(UpdateProgress::Uploading {
@@ -145,11 +147,11 @@ impl Services {
 
         progress(UpdateProgress::Verifying);
         requester
-            .request(schema::FirmwareUpdateVerifyRequest {}, timing.io())?
+            .request(schema::FirmwareUpdateVerifyRequest {}, timing.io(clock))?
             .wait::<schema::FirmwareUpdateVerifyResponse>()?;
         progress(UpdateProgress::Installing);
         requester
-            .request(schema::FirmwareUpdateInstallRequest {}, timing.io())?
+            .request(schema::FirmwareUpdateInstallRequest {}, timing.io(clock))?
             .wait::<schema::FirmwareUpdateInstallResponse>()?;
         Ok(())
     }
@@ -164,16 +166,20 @@ fn upload(
     timing: Timing,
     progress: &mut impl FnMut(UpdateProgress),
 ) -> Result<(), Error> {
+    let clock = &requester.clock();
     let mut uploaded = 0;
     let mut hash = Sha256::new();
     while uploaded < firmware.size {
-        timing.check()?;
+        timing.check(clock)?;
         let size = (firmware.size - uploaded).min(CHUNK_SIZE as u64) as usize;
         let mut chunk = vec![0; size];
         reader.read_exact(&mut chunk).map_err(Error::FirmwareRead)?;
         hash.update(&chunk);
         requester
-            .request(schema::FirmwareUpdateUploadRequest { chunk }, timing.io())?
+            .request(
+                schema::FirmwareUpdateUploadRequest { chunk },
+                timing.io(clock),
+            )?
             .wait::<schema::FirmwareUpdateUploadResponse>()?;
         uploaded += size as u64;
         progress(UpdateProgress::Uploading {
@@ -181,7 +187,7 @@ fn upload(
             total: firmware.size,
         });
     }
-    timing.check()?;
+    timing.check(clock)?;
     if reader.read(&mut [0]).map_err(Error::FirmwareRead)? != 0 {
         return Err(Error::Integrity(
             "archive exceeds its advertised size".into(),
@@ -200,11 +206,13 @@ mod tests {
     use super::*;
     use crate::cloud::tests::{TIMEOUT, attach};
     use crate::schema::host_to_ark::Content;
-    use crate::testing::{Peer, answering};
+    use crate::testing::{Peer, answering, test_clock};
     use crate::trust::Realm;
+    use darkbio_clock::Clock;
     use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -220,80 +228,85 @@ mod tests {
     /// request means later HTTP stages must never be contacted.
     struct Cloud {
         url: String,
-        stop: mpsc::Sender<()>,
+        address: SocketAddr,      // listener that the stopping connection wakes
+        stopped: Arc<AtomicBool>, // marks the next connection as the signal to stop
         worker: Option<thread::JoinHandle<Vec<String>>>,
     }
 
     impl Cloud {
         fn start(firmware: &Firmware, _bytes: Vec<u8>, access_status: u16) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let address = listener.local_addr().unwrap();
+            let url = format!("http://{address}/v1");
             let key = format!(
                 "/v1/firmware?version={}&sha256={}",
                 firmware.version,
                 hex::encode(firmware.sha256)
             );
-            let (stop, stopped) = mpsc::channel();
-            let worker = thread::spawn(move || {
-                let mut paths = Vec::new();
-                let deadline = Instant::now() + TIMEOUT;
-                while stopped.try_recv().is_err() && Instant::now() < deadline {
-                    let mut stream = match listener.accept() {
-                        Ok((stream, _)) => stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(1));
-                            continue;
+            let stopped = Arc::new(AtomicBool::new(false));
+            let worker = thread::spawn({
+                let stopped = stopped.clone();
+                move || {
+                    let mut paths = Vec::new();
+                    loop {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        if stopped.load(Ordering::SeqCst) {
+                            break paths;
                         }
-                        Err(error) => panic!("test cloud: {error}"),
-                    };
-                    stream.set_nonblocking(false).unwrap();
-                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-                    stream.set_write_timeout(Some(TIMEOUT)).unwrap();
-                    let headers = headers(&mut stream);
-                    let path = headers.split_whitespace().nth(1).unwrap();
-                    let (status, body) = match path {
-                        "/v1/cloudsync/identity" => {
-                            (200, br#"{"signer":"AQ==","crypto":"Ag=="}"#.as_slice())
-                        }
-                        "/v1/cloudsync/time?challenge=03" => {
-                            (200, br#"{"unixmilli":123,"signature":"BA=="}"#.as_slice())
-                        }
-                        path if path == key => {
-                            assert!(headers.to_lowercase().contains("dark-auth: -_8\r\n"));
-                            (access_status, br#"{"access":"/w=="}"#.as_slice())
-                        }
-                        other => panic!("unexpected HTTP request: {other}"),
-                    };
-                    paths.push(path.to_owned());
-                    let header = format!(
-                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    // A failed wire upload may close the download mid-response.
-                    let _ = stream
-                        .write_all(header.as_bytes())
-                        .and_then(|()| stream.write_all(body));
+                        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+                        let headers = headers(&mut stream);
+                        let path = headers.split_whitespace().nth(1).unwrap();
+                        let (status, body) = match path {
+                            "/v1/cloudsync/identity" => {
+                                (200, br#"{"signer":"AQ==","crypto":"Ag=="}"#.as_slice())
+                            }
+                            "/v1/cloudsync/time?challenge=03" => {
+                                (200, br#"{"unixmilli":123,"signature":"BA=="}"#.as_slice())
+                            }
+                            path if path == key => {
+                                assert!(headers.to_lowercase().contains("dark-auth: -_8\r\n"));
+                                (access_status, br#"{"access":"/w=="}"#.as_slice())
+                            }
+                            other => panic!("unexpected HTTP request: {other}"),
+                        };
+                        paths.push(path.to_owned());
+                        let header = format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        // A failed wire upload may close the download mid-response.
+                        let _ = stream
+                            .write_all(header.as_bytes())
+                            .and_then(|()| stream.write_all(body));
+                    }
                 }
-                paths
             });
             Self {
                 url,
-                stop,
+                address,
+                stopped,
                 worker: Some(worker),
             }
         }
 
         fn finish(mut self) -> Vec<String> {
-            let _ = self.stop.send(());
+            self.stop();
             self.worker.take().unwrap().join().unwrap()
+        }
+
+        /// Wakes the accept loop with a connection of its own, which it takes as
+        /// the signal to stop.
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
         }
     }
 
     impl Drop for Cloud {
         fn drop(&mut self) {
-            let _ = self.stop.send(());
             if let Some(worker) = self.worker.take() {
+                self.stop();
                 let _ = worker.join();
             }
         }
@@ -312,6 +325,7 @@ mod tests {
     /// Records the update sequence and optionally refuses or disconnects during
     /// one stage. Only a fully uploaded archive is eligible for verification.
     fn peer(
+        clock: &Clock,
         firmware: &Firmware,
         fail: Option<&'static str>,
     ) -> (Peer, Arc<Mutex<Vec<&'static str>>>) {
@@ -319,79 +333,83 @@ mod tests {
         let stages = Arc::new(Mutex::new(Vec::new()));
         let observed = stages.clone();
         let mut uploaded = Vec::new();
-        let peer = Peer::spawn(Box::new(move |session, request, responder| {
-            let (stage, response): (_, darkbio_wire::protocol::Message) = match request {
-                Content::CloudSyncStart(request) => {
-                    assert_eq!((request.signer, request.crypto), (vec![1], vec![2]));
-                    (
-                        "sync-start",
-                        schema::CloudSyncStartResponse { challenge: vec![3] }.into(),
-                    )
+        let peer = Peer::spawn(
+            clock,
+            Box::new(move |session, request, responder| {
+                let (stage, response): (_, darkbio_wire::protocol::Message) = match request {
+                    Content::CloudSyncStart(request) => {
+                        assert_eq!((request.signer, request.crypto), (vec![1], vec![2]));
+                        (
+                            "sync-start",
+                            schema::CloudSyncStartResponse { challenge: vec![3] }.into(),
+                        )
+                    }
+                    Content::CloudSyncFinish(request) => {
+                        assert_eq!((request.unixmilli, request.signature), (123, vec![4]));
+                        (
+                            "sync-finish",
+                            schema::CloudSyncFinishResponse { accepted: 123 }.into(),
+                        )
+                    }
+                    Content::FirmwareUpdatePrep(request) => {
+                        assert_eq!(request.version, firmware.version);
+                        assert_eq!(request.sha256, firmware.sha256);
+                        assert_eq!(request.bytes, firmware.size);
+                        (
+                            "prepare",
+                            schema::FirmwareUpdatePrepResponse {
+                                auth: vec![0xfb, 0xff],
+                            }
+                            .into(),
+                        )
+                    }
+                    Content::FirmwareUpdateInit(request) => {
+                        assert_eq!(request.access, [0xff]);
+                        ("init", schema::FirmwareUpdateInitResponse {}.into())
+                    }
+                    Content::FirmwareUpdateUpload(request) => {
+                        assert!(!request.chunk.is_empty() && request.chunk.len() <= CHUNK_SIZE);
+                        uploaded.extend(request.chunk);
+                        ("upload", schema::FirmwareUpdateUploadResponse {}.into())
+                    }
+                    Content::FirmwareUpdateVerify(_) => {
+                        assert_eq!(uploaded.len() as u64, firmware.size);
+                        assert_eq!(Sha256::digest(&uploaded).as_slice(), firmware.sha256);
+                        ("verify", schema::FirmwareUpdateVerifyResponse {}.into())
+                    }
+                    Content::FirmwareUpdateInstall(_) => {
+                        ("install", schema::FirmwareUpdateInstallResponse {}.into())
+                    }
+                    other => return answering(session, other, responder),
+                };
+                observed.lock().unwrap().push(stage);
+                if fail == Some("disconnect") && stage == "install" {
+                    return false;
                 }
-                Content::CloudSyncFinish(request) => {
-                    assert_eq!((request.unixmilli, request.signature), (123, vec![4]));
-                    (
-                        "sync-finish",
-                        schema::CloudSyncFinishResponse { accepted: 123 }.into(),
-                    )
+                let deadline = session.clock().now() + TIMEOUT;
+                if fail == Some(stage) {
+                    responder
+                        .fail(schema::Error::new(0x777, "test update refusal"), deadline)
+                        .unwrap();
+                } else {
+                    responder.reply(response, deadline).unwrap();
                 }
-                Content::FirmwareUpdatePrep(request) => {
-                    assert_eq!(request.version, firmware.version);
-                    assert_eq!(request.sha256, firmware.sha256);
-                    assert_eq!(request.bytes, firmware.size);
-                    (
-                        "prepare",
-                        schema::FirmwareUpdatePrepResponse {
-                            auth: vec![0xfb, 0xff],
-                        }
-                        .into(),
-                    )
-                }
-                Content::FirmwareUpdateInit(request) => {
-                    assert_eq!(request.access, [0xff]);
-                    ("init", schema::FirmwareUpdateInitResponse {}.into())
-                }
-                Content::FirmwareUpdateUpload(request) => {
-                    assert!(!request.chunk.is_empty() && request.chunk.len() <= CHUNK_SIZE);
-                    uploaded.extend(request.chunk);
-                    ("upload", schema::FirmwareUpdateUploadResponse {}.into())
-                }
-                Content::FirmwareUpdateVerify(_) => {
-                    assert_eq!(uploaded.len() as u64, firmware.size);
-                    assert_eq!(Sha256::digest(&uploaded).as_slice(), firmware.sha256);
-                    ("verify", schema::FirmwareUpdateVerifyResponse {}.into())
-                }
-                Content::FirmwareUpdateInstall(_) => {
-                    ("install", schema::FirmwareUpdateInstallResponse {}.into())
-                }
-                other => return answering(session, other, responder),
-            };
-            observed.lock().unwrap().push(stage);
-            if fail == Some("disconnect") && stage == "install" {
-                return false;
-            }
-            let deadline = Instant::now() + TIMEOUT;
-            if fail == Some(stage) {
-                responder
-                    .fail(schema::Error::new(0x777, "test update refusal"), deadline)
-                    .unwrap();
-            } else {
-                responder.reply(response, deadline).unwrap();
-            }
-            true
-        }));
+                true
+            }),
+        );
         (peer, stages)
     }
 
     #[test]
     fn test_update() {
+        let clock = test_clock().clock();
         let bytes = vec![42; CHUNK_SIZE + 17];
         let expected = firmware(&bytes);
         let cloud = Cloud::start(&expected, bytes.clone(), 200);
-        let (mut peer, stages) = peer(&expected, None);
+        let (mut peer, stages) = peer(&clock, &expected, None);
         let ark = attach(&mut peer, cloud.url.clone());
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         let mut progress = Vec::new();
         client
             .clone()
@@ -445,6 +463,7 @@ mod tests {
     /// does not count as a successful reboot or trigger an installation retry.
     #[test]
     fn test_refusals() {
+        let clock = test_clock().clock();
         for failure in [
             "prepare",
             "init",
@@ -456,14 +475,14 @@ mod tests {
             let bytes = vec![42; 17];
             let firmware = firmware(&bytes);
             let cloud = Cloud::start(&firmware, bytes.clone(), 200);
-            let (mut peer, stages) = peer(&firmware, Some(failure));
+            let (mut peer, stages) = peer(&clock, &firmware, Some(failure));
             let ark = attach(&mut peer, cloud.url.clone());
             let error = ark
                 .client()
                 .update_firmware(
                     &firmware,
                     &mut bytes.as_slice(),
-                    Instant::now() + TIMEOUT,
+                    clock.now() + TIMEOUT,
                     |_| {},
                 )
                 .unwrap_err();
@@ -491,17 +510,18 @@ mod tests {
     /// installation, even if earlier upload chunks were accepted by the device.
     #[test]
     fn test_download_integrity() {
+        let clock = test_clock().clock();
         for bytes in [vec![42; 16], vec![42; 18], vec![43; 17]] {
             let firmware = firmware(&[42; 17]);
             let cloud = Cloud::start(&firmware, bytes.clone(), 200);
-            let (mut peer, stages) = peer(&firmware, None);
+            let (mut peer, stages) = peer(&clock, &firmware, None);
             let ark = attach(&mut peer, cloud.url.clone());
             assert!(
                 ark.client()
                     .update_firmware(
                         &firmware,
                         &mut bytes.as_slice(),
-                        Instant::now() + TIMEOUT,
+                        clock.now() + TIMEOUT,
                         |_| {}
                     )
                     .is_err()
@@ -515,18 +535,20 @@ mod tests {
     /// an upload. Expiring the deadline after transfer also prevents verification.
     #[test]
     fn test_access_and_deadline() {
+        let mut tester = test_clock();
+        let clock = tester.clock();
         for expire in [false, true] {
             let bytes = vec![42; 17];
             let firmware = firmware(&bytes);
             let cloud = Cloud::start(&firmware, bytes.clone(), if expire { 200 } else { 403 });
-            let (mut peer, stages) = peer(&firmware, None);
+            let (mut peer, stages) = peer(&clock, &firmware, None);
             let ark = attach(&mut peer, cloud.url.clone());
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = clock.now() + Duration::from_secs(1);
             let error = ark
                 .client()
                 .update_firmware(&firmware, &mut bytes.as_slice(), deadline, |stage| {
                     if expire && stage == UpdateProgress::Verifying {
-                        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                        tester.advance_to(deadline);
                     }
                 })
                 .unwrap_err();
@@ -564,25 +586,22 @@ mod tests {
             auth::tests::{Login, refused},
             tests::{response, serve, sync_responses},
         };
-        use std::sync::atomic::Ordering;
+        let clock = test_clock().clock();
         for expires_after_preparation in [false, true] {
             let bytes = vec![42; 17];
             let firmware = firmware(&bytes);
             let mut responses = sync_responses();
             if !expires_after_preparation {
-                responses.push((Duration::ZERO, refused(302)));
+                responses.push(refused(302));
             }
             responses.push(sync_responses().remove(0));
-            responses.push((
-                Duration::ZERO,
-                if expires_after_preparation {
-                    refused(403)
-                } else {
-                    response(200, r#"{"access":"/w=="}"#)
-                },
-            ));
+            responses.push(if expires_after_preparation {
+                refused(403)
+            } else {
+                response(200, r#"{"access":"/w=="}"#)
+            });
             let (url, requests) = serve(responses);
-            let (mut peer, stages) = peer(&firmware, None);
+            let (mut peer, stages) = peer(&clock, &firmware, None);
             let mut ark = attach(&mut peer, url);
             let login = Login::default();
             ark.set_cloud_auth(login.clone());
@@ -630,18 +649,23 @@ mod tests {
     /// The refusal stops the sequence before access keys or archives are fetched.
     #[test]
     fn test_emulator_refusal() {
+        let clock = test_clock().clock();
         let bytes = vec![42];
         let expected = firmware(&bytes);
         let cloud = Cloud::start(&expected, bytes.clone(), 200);
-        let (mut peer, stages) = peer(&expected, Some("prepare"));
+        let (mut peer, stages) = peer(&clock, &expected, Some("prepare"));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, identity) =
             darkbio_wire::protocol::connect(peer.stream(), &verifier).unwrap();
-        let mut services = Services::new(&identity, None);
-        services.cloud = Some(http::tests::api(cloud.url.clone(), Realm::Emulator));
+        let mut services = Services::new(&identity, None, &session.clock());
+        services.cloud = Some(http::tests::api(
+            cloud.url.clone(),
+            Realm::Emulator,
+            &session.clock(),
+        ));
         let ark = crate::Ark::start(session, Arc::new(services)).unwrap();
         let client = ark.client();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         let error = client
             .update_firmware(&expected, &mut bytes.as_slice(), deadline, |_| {})
             .unwrap_err();
@@ -662,13 +686,17 @@ mod tests {
     /// Firmware discovery needs a selected environment and a live owner.
     #[test]
     fn test_identity_and_closure() {
-        let mut peer = Peer::spawn(Box::new(|_, _, _| panic!("unexpected device request")));
+        let clock = test_clock().clock();
+        let mut peer = Peer::spawn(
+            &clock,
+            Box::new(|_, _, _| panic!("unexpected device request")),
+        );
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
         let (session, identity) =
             darkbio_wire::protocol::connect(peer.stream(), &verifier).unwrap();
-        let services = Services::new(&identity, None);
+        let services = Services::new(&identity, None, &session.clock());
         let firmware = firmware(&[42]);
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = clock.now() + TIMEOUT;
         assert!(matches!(
             services.update_firmware(
                 &session.requester(),

@@ -16,7 +16,7 @@ damage, requires, size_bytes, build, version and download. show adds required_by
 and cached. The reading list keeps to short columns, while show also prints the
 full description and format. Both show dependency state alongside each name.
 
-- description explains the slot's data to its owner. format tells whoever fills
+- description explains the slot's data to its owner. format shows whoever fills
   the slot which file it accepts, the shape that file needs, what the Ark
   refuses and whether the owner approves the upload.
 - size_bytes is the bytes on the Ark's disk for this slot, zero when empty.

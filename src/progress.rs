@@ -7,6 +7,7 @@
 //! Transfer rates and per-step estimates for terminal progress.
 
 use crate::style::{Role, Theme};
+use darkbio_clock::Clock;
 use darkbio_connect::schema::SlotUploadProcessResponse;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -119,6 +120,8 @@ impl Update {
 /// Samples only acknowledged bytes, starting with the first upload report so
 /// cloud setup and approval do not enter the rate estimate.
 pub(super) struct Transfer {
+    /// Connection's clock, which times the samples.
+    clock: Clock,
     /// Rolling counter samples, in bytes for uploads and basis points for processing.
     rate: Rate,
     /// Emission cadence, independent of the sampling cadence.
@@ -127,8 +130,9 @@ pub(super) struct Transfer {
 
 impl Transfer {
     /// Starts without rate history so setup and approval cannot skew the first estimate.
-    pub(super) fn new(human: bool) -> Self {
+    pub(super) fn new(human: bool, clock: Clock) -> Self {
         Self {
+            clock,
             rate: Rate::default(),
             report: Report::new(human),
         }
@@ -136,10 +140,10 @@ impl Transfer {
 
     /// Samples acknowledged bytes and emits an observation only when reporting is due.
     pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<Update> {
-        self.update_at(uploaded, total, Instant::now())
+        self.update_at(uploaded, total, self.clock.now())
     }
 
-    /// Updates byte-rate history at the supplied host time, even if output is throttled.
+    /// Updates byte-rate history at the supplied clock time, even if output is throttled.
     fn update_at(&mut self, uploaded: u64, total: u64, now: Instant) -> Option<Update> {
         let rate = self.rate.sample(uploaded, now);
         let percent = percent(uploaded, total);
@@ -187,8 +191,10 @@ impl Transfer {
 }
 
 /// Progress percentages belong to individual steps. Device timestamps identify
-/// a restarted step; elapsed time is measured by the host's monotonic clock.
+/// a restarted step; elapsed time is measured on the connection's monotonic clock.
 pub(super) struct Processing {
+    /// Connection's clock, which times the samples.
+    clock: Clock,
     /// Last report, retained to finish a phase when the next report advances past it.
     previous: Option<SlotUploadProcessResponse>,
     /// Basis-point progress samples for the current processing step only.
@@ -199,8 +205,9 @@ pub(super) struct Processing {
 
 impl Processing {
     /// Starts without a step identity or estimate; the first report establishes both.
-    pub(super) fn new(human: bool) -> Self {
+    pub(super) fn new(human: bool, clock: Clock) -> Self {
         Self {
+            clock,
             previous: None,
             rate: Rate::default(),
             report: Report::new(human),
@@ -227,12 +234,11 @@ impl Processing {
                 completed.phase_progress = 10_000;
                 Self::observation(&completed, None)
             });
-        completed
-            .into_iter()
-            .chain(self.update_at(status, Instant::now()))
+        let now = self.clock.now();
+        completed.into_iter().chain(self.update_at(status, now))
     }
 
-    /// Builds a step-specific estimate from basis points and monotonic host time.
+    /// Builds a step-specific estimate from basis points and monotonic clock time.
     fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<Update> {
         let phase = (status.proc_start, status.phase_in, status.phase_start);
         if self.previous.as_ref().is_none_or(|previous| {
@@ -416,6 +422,7 @@ fn human_eta(remaining: u64, rate: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkbio_clock::TestClock;
 
     #[test]
     fn bar_keeps_speed_and_eta_in_the_available_width() {
@@ -457,8 +464,9 @@ mod tests {
     /// newly transferred would inflate speed and shorten the ETA.
     #[test]
     fn test_transfer_estimate() {
-        let start = Instant::now();
-        let mut transfer = Transfer::new(false);
+        let clock = TestClock::new().clock();
+        let start = clock.now();
+        let mut transfer = Transfer::new(false, clock);
         let mib = 1024 * 1024;
         let first = transfer.update_at(25 * mib, 100 * mib, start).unwrap().text;
         assert!(first.contains("speed estimating... | ETA estimating..."));
@@ -528,9 +536,10 @@ mod tests {
         use crate::style::Color;
         for width in [60, 80, 100, 140] {
             let theme = Theme::test(width, Color::True, true);
-            let start = Instant::now();
+            let clock = TestClock::new().clock();
+            let start = clock.now();
             let total = 290 * 1024 * 1024;
-            let mut transfer = Transfer::new(true);
+            let mut transfer = Transfer::new(true, clock.clone());
             transfer.update_at(0, total, start);
             let mut upload = transfer
                 .update_at(total, total, start + Duration::from_secs(8))
@@ -549,7 +558,7 @@ mod tests {
             if width >= 140 {
                 assert!(rendered.contains("290.0/290.0 MiB"));
             }
-            let mut processing = Processing::new(true);
+            let mut processing = Processing::new(true, clock);
             for (phase, progress) in [(1, 8200), (2, 9200), (2, 10_000)] {
                 report.phase_in = phase;
                 report.phase_progress = progress;
@@ -579,7 +588,7 @@ mod tests {
 
     #[test]
     fn advancing_completes_the_previous_phase_before_rendering_the_next() {
-        let mut processing = Processing::new(true);
+        let mut processing = Processing::new(true, TestClock::new().clock());
         let first: Vec<_> = processing.update(&status(1, 8200)).collect();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].percent, 82);
@@ -613,7 +622,7 @@ mod tests {
                 ..status(2, 2000)
             },
         ] {
-            let mut processing = Processing::new(true);
+            let mut processing = Processing::new(true, TestClock::new().clock());
             assert_eq!(processing.update(&status(1, 8200)).count(), 1);
             assert!(processing.update(&next).all(|update| update.percent != 100));
         }
@@ -623,8 +632,9 @@ mod tests {
     /// partway through it. A restarted step must not inherit its previous rate.
     #[test]
     fn test_step_estimate() {
-        let start = Instant::now();
-        let mut processing = Processing::new(false);
+        let clock = TestClock::new().clock();
+        let start = clock.now();
+        let mut processing = Processing::new(false, clock);
         assert!(
             processing
                 .update_at(&status(1, 1000), start)
@@ -681,7 +691,7 @@ mod tests {
     /// over instead of underflowing or producing an estimate from another run.
     #[test]
     fn test_rate_stall_and_reset() {
-        let start = Instant::now();
+        let start = TestClock::new().clock().now();
         let mut rate = Rate::default();
         assert_eq!(rate.sample(0, start), None);
         assert_eq!(
@@ -702,7 +712,7 @@ mod tests {
     /// stay quiet. Completion is printed even inside the normal interval.
     #[test]
     fn test_report_cadence() {
-        let start = Instant::now();
+        let start = TestClock::new().clock().now();
         let mut report = Report::new(false);
         assert!(report.due(91, start));
         assert!(!report.due(92, start + Duration::from_secs(1)));
@@ -713,8 +723,9 @@ mod tests {
 
     #[test]
     fn test_human_transfer_cadence() {
-        let start = Instant::now();
-        let mut transfer = Transfer::new(true);
+        let clock = TestClock::new().clock();
+        let start = clock.now();
+        let mut transfer = Transfer::new(true, clock);
         assert!(transfer.update_at(0, 100, start).is_some());
         assert!(
             transfer
@@ -737,8 +748,9 @@ mod tests {
 
     #[test]
     fn test_human_step_cadence() {
-        let start = Instant::now();
-        let mut processing = Processing::new(true);
+        let clock = TestClock::new().clock();
+        let start = clock.now();
+        let mut processing = Processing::new(true, clock);
         assert!(processing.update_at(&status(1, 1000), start).is_some());
         let next = start + Duration::from_millis(500);
         assert!(processing.update_at(&status(2, 1000), next).is_some());
