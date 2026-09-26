@@ -28,9 +28,12 @@ use serde_json::{Value, json};
 use std::io::Seek;
 
 /// Dispatches dataset commands after applying CLI unlock and dry-run policy.
-/// Path entries, slot metadata and refusal messages come from the Ark; the CLI
-/// does not predict whether a requested delete, repair or upload will be accepted.
+///
+/// Path entries, slot metadata and refusal messages come from the Ark. The CLI
+/// does not predict whether a requested delete, repair or upload will be
+/// accepted.
 pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
+    // An upload opens its file before it connects, so it runs on its own
     if let args::Data::Upload {
         file,
         slot,
@@ -39,6 +42,8 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
     {
         return upload(context, &file, slot, dry_run);
     }
+
+    // Every other command needs an unlocked Ark, which a dry run never unlocks
     let connection = context.connect(None)?;
     let dry_run = match &command {
         args::Data::Fetch { dry_run, .. } => *dry_run,
@@ -46,12 +51,16 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         _ => false,
     };
     context.require_unlocked(&connection, dry_run)?;
+
+    // The path map needs no slot inventory
     if matches!(command, args::Data::Paths) {
         let paths = connection
             .client
             .call(schema::DatasetPathsRequest {}, context.timing())?;
         return paths::print(&context.output, &paths.paths);
     }
+
+    // The rest work from the Ark's slot inventory
     let slots = connection
         .client
         .call(schema::SlotListRequest {}, context.timing())?
@@ -63,10 +72,15 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         args::Data::Delete(args) | args::Data::Repair(args) => {
             let slot = select(&slots, args.slot)?;
             let mut value = json!({"slot":slot_name(slot.kind),"id":slot.kind,"state":state(slot),"changed":false});
+
+            // A dry run reports the slot and its dependents without changing it
             if args.dry_run {
                 value["required_by"] = json!(required_by(&slots, slot.kind));
                 return context.output.document(&value);
             }
+
+            // Empty the slot once the owner approves, where only a filled or
+            // damaged slot counts as changed
             context.output.event(
                 "approve",
                 format!(
@@ -111,6 +125,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
 
 /// Prints the compact slot inventory and hints for missing or damaged data.
 fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), Error> {
+    // JSON keeps plain dependency names, and the table shows their state
     let rows: Vec<_> = slots.iter().map(metadata).collect();
     let document = json!({"slots":rows});
     let rows: Vec<_> = rows
@@ -131,6 +146,9 @@ fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), E
             ("REQUIRES", "requires"),
         ],
     )?;
+
+    // Hint at repairing damage, fetching missing references and filling
+    // missing dependencies
     for slot in slots {
         if slot.state == SlotState::StateDamaged as i32 {
             output.event(
@@ -174,13 +192,18 @@ fn show(output: &crate::output::Output, slots: &[SlotStatus], id: i32) -> Result
 }
 
 /// Identifies a local file, checks an optional target constraint and either plans
-/// or uploads it. Rewinds the consumed prefix and preserves progress on failure.
+/// or uploads it.
+///
+/// The upload rewinds the prefix that identification consumed, and a failure
+/// still prints the progress reached.
 fn upload(
     context: &Context,
     path: &std::path::Path,
     required: Option<i32>,
     dry_run: bool,
 ) -> Result<(), Error> {
+    // Open the file and connect to an unlocked Ark, which a dry run never
+    // unlocks
     let (mut file, size) = open_file(path)?;
     let name = path
         .file_name()
@@ -188,6 +211,9 @@ fn upload(
         .ok_or_else(|| Error::new(1, "file-unreadable", "filename is not valid UTF-8"))?;
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, dry_run)?;
+
+    // Let the Ark identify the file, refusing a rejection or a slot other than
+    // the required one
     context
         .output
         .event("progress", format!("identifying {}", path.display()));
@@ -208,6 +234,8 @@ fn upload(
             ),
         ));
     }
+
+    // Report the identification, warning when the Ark is unsure of it
     let mut value = json!({
         "slot": slot_name(identified.kind),
         "id": identified.kind,
@@ -231,6 +259,8 @@ fn upload(
             "low identification confidence; the Ark will validate during processing",
         );
     }
+
+    // A dry run plans against the target slot's state and dependencies
     if dry_run {
         let slots = connection
             .client
@@ -250,6 +280,8 @@ fn upload(
             .output
             .document_with(&value, |theme| crate::output::human::document(theme, &view));
     }
+
+    // Upload from the start, keeping the partial result current on every stage
     file.rewind()?;
     let clock = connection.client.clock();
     let started = clock.now();
@@ -272,6 +304,8 @@ fn upload(
             context.interrupt.partial(value.clone());
         },
     );
+
+    // Print the result, complete or partial, before any error
     context.interrupt.clear();
     value["uploaded_bytes"] = json!(progress.uploaded);
     value["phases"] = json!(progress.phases);
@@ -280,7 +314,8 @@ fn upload(
     result.map_err(Into::into)
 }
 
-/// Upload presentation and partial-result facts shared by local and reference sources.
+/// Upload presentation and partial-result facts shared by local and reference
+/// sources.
 pub(crate) struct Progress<'a> {
     /// Output and interruption handles for this invocation.
     context: &'a Context,
@@ -297,8 +332,10 @@ pub(crate) struct Progress<'a> {
     /// Processing phase names from the latest report, in device order.
     pub phases: Vec<String>,
 }
+
 impl<'a> Progress<'a> {
-    /// Starts a new dataset's progress without inheriting a previous transfer's estimates.
+    /// Starts a new dataset's progress without inheriting a previous transfer's
+    /// estimates.
     pub fn new(context: &'a Context, clock: Clock, slot: i32) -> Self {
         Self {
             context,
@@ -310,7 +347,9 @@ impl<'a> Progress<'a> {
             phases: Vec::new(),
         }
     }
-    /// Updates cancellation and result facts on every callback, throttling only presentation.
+
+    /// Updates cancellation and result facts on every callback, throttling only
+    /// presentation.
     pub fn update(&mut self, stage: UploadProgress) {
         match stage {
             UploadProgress::Identifying => {
@@ -371,8 +410,10 @@ impl<'a> Progress<'a> {
     }
 }
 
-/// Predicts whether to show a phone approval prompt; known public references need none.
-/// This is presentation only. The Ark remains responsible for authorization.
+/// Predicts whether to show a phone approval prompt for an upload to `slot`.
+///
+/// Known public references need none. This is presentation only, and the Ark
+/// remains responsible for authorization.
 fn upload_approval(slot: i32) -> bool {
     !matches!(
         schema::SlotKind::try_from(slot),
@@ -404,10 +445,12 @@ pub(crate) fn select(slots: &[SlotStatus], id: i32) -> Result<&SlotStatus, Error
         )
     })
 }
-/// Whether the Ark explicitly reports usable, filled data in this slot.
+
+/// Checks whether the Ark explicitly reports usable, filled data in this slot.
 pub(crate) fn filled(slot: &SlotStatus) -> bool {
     slot.state == SlotState::StateFilled as i32
 }
+
 /// Names known slot states while retaining future state numbers.
 pub(crate) fn state(slot: &SlotStatus) -> String {
     SlotState::try_from(slot.state)
@@ -419,6 +462,7 @@ pub(crate) fn state(slot: &SlotStatus) -> String {
         })
         .unwrap_or_else(|_| slot.state.to_string())
 }
+
 /// Lists advertised direct dependents, regardless of whether their slots are filled.
 fn required_by(slots: &[SlotStatus], id: i32) -> Vec<String> {
     slots
@@ -427,7 +471,9 @@ fn required_by(slots: &[SlotStatus], id: i32) -> Vec<String> {
         .map(|slot| slot_name(slot.kind))
         .collect()
 }
-/// Borrows the advertised URL, length and digest without validating or fetching them.
+
+/// Borrows the advertised URL, length and digest without validating or
+/// fetching them.
 pub(crate) fn download(slot: &SlotStatus) -> Option<(&str, u64, &str)> {
     slot.download.as_ref().map(|download| {
         (
@@ -437,7 +483,11 @@ pub(crate) fn download(slot: &SlotStatus) -> Option<(&str, u64, &str)> {
         )
     })
 }
-/// Shows dependency state without changing the advertised JSON dependency names.
+
+/// Marks each dependency in `requires` as filled or not, for the human view.
+///
+/// The JSON result is built apart from this view, so it keeps the advertised
+/// dependency names.
 fn dependency_view(mut value: Value, slot: &SlotStatus, slots: &[SlotStatus]) -> Value {
     value["requires"] = json!(
         slot.deps
@@ -455,7 +505,8 @@ fn dependency_view(mut value: Value, slot: &SlotStatus, slots: &[SlotStatus]) ->
     value
 }
 
-/// Builds generic slot output, preserving future IDs and optional advertised details.
+/// Builds generic slot output, preserving future IDs and optional advertised
+/// details.
 pub(crate) fn metadata(slot: &SlotStatus) -> Value {
     let origin = schema::SlotOrigin::try_from(slot.origin)
         .map(|origin| {
@@ -479,10 +530,13 @@ pub(crate) fn metadata(slot: &SlotStatus) -> Value {
     })
 }
 
+/// Tests of the approval prediction and the generic slot metadata.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Checks that uploads to the public reference slots predict no approval
+    /// prompt, while personal data does.
     #[test]
     fn reference_uploads_do_not_request_approval() {
         use schema::SlotKind::*;
@@ -492,9 +546,11 @@ mod tests {
         assert!(upload_approval(SlotSnpIndelCalls as i32));
     }
 
-    /// A slot kind this CLI doesn't know keeps its texts and dependency state.
+    /// Checks that a slot kind this CLI does not know keeps its texts and
+    /// dependency state.
     #[test]
     fn future_slots_keep_generic_metadata() {
+        // An unknown kind keeps its id as its name and every advertised text
         let slot = SlotStatus {
             kind: 42,
             name: "Future dataset".into(),
@@ -516,6 +572,8 @@ mod tests {
         assert!(value["download"].is_null());
         assert_eq!(value["description"], slot.desc);
         assert_eq!(value["format"], slot.format);
+
+        // The human view marks whether the known dependency is filled
         let dependency = SlotStatus {
             kind: 1,
             state: SlotState::StateFilled as i32,
@@ -529,6 +587,8 @@ mod tests {
             dependency_view(value, &slot, &[])["requires"],
             json!(["reference-genome (not filled)"])
         );
+
+        // A missing slot is an invalid selection, and a damaged one is not filled
         let error = select(&[], 5).unwrap_err();
         assert_eq!((error.class, error.code), (1, "invalid-slot"));
         assert!(!filled(&SlotStatus {

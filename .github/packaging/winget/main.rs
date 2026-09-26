@@ -17,7 +17,7 @@ use std::process::ExitCode;
 /// Manifest generation failure reported by the standalone release helper.
 type Error = Box<dyn std::error::Error>;
 
-// Inputs supplied by the release workflow; clap doc comments remain user-facing.
+// Inputs supplied by the release workflow; clap doc comments remain user-facing
 #[derive(Parser)]
 #[command(about = "Generate winget manifests from a released Windows executable")]
 struct Args {
@@ -55,16 +55,24 @@ fn parse_version(value: &str) -> Result<Version, String> {
     Ok(version)
 }
 
-/// Checks the executable name, hashes its bytes and writes the three winget manifests.
+/// Checks the executable name, hashes its bytes and writes the three winget
+/// manifests.
+///
 /// Generation performs no network requests or repository publication.
 fn generate(args: &Args) -> Result<(), Error> {
+    // The executable must carry the release's own name
     let binary = format!("ark-{}-windows-amd64.exe", args.version);
     if args.binary.file_name().and_then(|name| name.to_str()) != Some(binary.as_str()) {
         return Err(format!("expected {binary}").into());
     }
+
+    // The installer manifest pins the executable's uppercase SHA-256
     let mut hash = Sha256::new();
     io::copy(&mut File::open(&args.binary)?, &mut hash)?;
     let digest = hex::encode_upper(hash.finalize());
+
+    // Every manifest shares the package identity and the quoted version, then
+    // adds its own fields
     let version = serde_json::to_string(&args.version.to_string())?;
     let base = format!("PackageIdentifier: DarkBio.Ark\nPackageVersion: {version}\n");
     let root = format!(
@@ -104,6 +112,8 @@ Installers:
             ),
         ),
     ];
+
+    // Write the version, locale and installer manifests side by side
     fs::create_dir_all(&args.output)?;
     for (suffix, kind, content) in manifests {
         fs::write(
@@ -114,10 +124,13 @@ Installers:
     Ok(())
 }
 
+/// Tests of the release version parsing.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Checks that plain and prerelease versions parse, while prefixed, partial,
+    /// malformed, build-tagged and path-like ones fail.
     #[test]
     fn release_versions() {
         for version in ["0.1.0", "0.1.0-rc.1"] {

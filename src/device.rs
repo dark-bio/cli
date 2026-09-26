@@ -16,8 +16,10 @@ use crate::{
 use darkbio_connect::{DeviceKind, Identity, schema};
 use serde_json::{Value, json};
 
-/// Lists discovery metadata without opening devices, retaining useful partial results.
+/// Lists discovery metadata without opening devices, retaining useful partial
+/// results.
 pub(crate) fn devices(context: &Context) -> Result<(), Error> {
+    // Nothing found fails only when some discovery source failed too
     let found = context.discover();
     if found.devices.is_empty() && !found.errors.is_empty() {
         return Err(Error::new(
@@ -26,12 +28,16 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
             "no Arks found; discovery was incomplete",
         ));
     }
+
+    // Each row carries discovery metadata alone, since no device is opened
     let rows: Vec<_> = found.devices.iter().map(|device| json!({
         "locator":device.locator().to_string(), "kind":match device.kind() { DeviceKind::Hardware=>"hardware", DeviceKind::Emulator=>"emulator" },
         "name":device.name(),"serial":device.serial(),"image":device.image(),"environment":device.env(),"ready":device.ready(),
     })).collect();
-    // environment and ready are launcher metadata; discovery leaves them unset for
-    // hardware, and a dash under READY reads as "not ready" rather than "not asked".
+
+    // The `environment` and `ready` columns are launcher metadata, which
+    // discovery leaves unset for hardware. They show only when a row has them,
+    // since a dash under READY reads as "not ready" rather than "not asked".
     let mut columns = vec![
         ("LOCATOR", "locator"),
         ("NAME", "name"),
@@ -43,6 +49,8 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
             columns.push((label, key));
         }
     }
+
+    // Print the table, pointing at --device when several Arks answer
     context
         .output
         .table(&json!({"devices":rows}), &rows, &columns)?;
@@ -54,7 +62,10 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
-/// Prints offline device state before reporting an outdated firmware error.
+/// Prints the Ark's status, then fails on outdated firmware or hints at the
+/// next step.
+///
+/// The status comes first, so an outdated Ark still shows its state.
 pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), Error> {
     let connection = context.connect_recovery(recovery.pubkey.as_deref())?;
     let value = status_value(&connection);
@@ -65,12 +76,17 @@ pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), 
 }
 
 /// Combines authenticated identity with reported hardware and firmware snapshots.
-/// Fields absent from older protocols stay unknown; routing overrides do not become
-/// attested environment labels.
+///
+/// Sync, pairing and lock state stay unknown on firmware this tool does not
+/// support. The environment comes from the attestation alone, since routing
+/// overrides do not become attested environment labels.
 fn status_value(connection: &Connection) -> Value {
     let current = connection.require_current().is_ok();
     let info = &connection.info;
     let clock = connection.client.clock();
+
+    // Serial, realm and model come only from an attestation, which also flags a
+    // reported hardware version that differs from the attested one
     let reported = format!("{} - {}", info.version_str, info.revision_str);
     let (trust, serial, realm, model, mismatch, env) = match &connection.identity {
         Identity::Attested { env, device } => (
@@ -97,6 +113,8 @@ fn status_value(connection: &Connection) -> Value {
         ),
         Identity::Recovered(_) => ("pinned", Value::Null, Value::Null, Value::Null, None, None),
     };
+
+    // Assemble the document, leaving state that needs supported firmware null
     json!({"name":connection.device.name(),"serial":serial,
         "hardware":{"version":info.version_str,"revision":info.revision_str,"model":model},
         "firmware":{"version":info.firmware_version,"published":timestamp(info.firmware_publish)},
@@ -105,7 +123,7 @@ fn status_value(connection: &Connection) -> Value {
         "pubkey":hex::encode(connection.identity.key().to_bytes()),"mismatch":mismatch})
 }
 
-/// Uses the compact human status layout with the same complete machine document.
+/// Prints a status document, as the compact block for people and whole in JSON.
 fn print_status(context: &Context, value: &Value) -> Result<(), Error> {
     context
         .output
@@ -201,10 +219,14 @@ pub(crate) fn unlock(context: &Context) -> Result<(), Error> {
         .document(&json!({"unlocked":true,"changed":!state.unlocked}))
 }
 
-/// Forces cloud synchronization and reports registry state before failing an inactive check.
+/// Syncs with the cloud, then prints the Ark's registration and fails when it
+/// is inactive.
 pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
+    // Refresh the cloud keys and signed clock before asking the registry
     let connection = context.connect(None)?;
     connection.client.sync(context.timing())?;
+
+    // A refused proof from a self-signed emulator points at enrollment
     let registration = connection
         .client
         .genuine(context.timing())
@@ -220,6 +242,8 @@ pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
             }
             error
         })?;
+
+    // Print the registration first, so an inactive one still shows its flags
     context.output.document(&json!({"serial":registration.serial,"enrolled":timestamp(registration.enrolled.max(0) as u64),
         "active":registration.active(),"disabled":registration.disabled,"expired":registration.expired,"superseded":registration.superseded}))?;
     if !registration.active() {
@@ -238,9 +262,11 @@ pub(crate) fn genuine(context: &Context) -> Result<(), Error> {
 }
 
 /// Installs a supplied attestation or directs online enrollment to Ark Hub.
-/// After installation, reconnects without recovery pinning to verify the new identity;
-/// a reconnect failure still reports that enrollment was acknowledged.
+///
+/// After installation, it reconnects without recovery pinning to verify the new
+/// identity. A reconnect failure still reports that enrollment was acknowledged.
 pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error> {
+    // Read a supplied attestation before connecting
     let certificate = args
         .cwt
         .as_ref()
@@ -251,11 +277,17 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
             })
         })
         .transpose()?;
+
+    // Installing an attestation crosses the compatibility gate, since it may
+    // enroll an old device
     let connection = if certificate.is_some() {
         context.connect_recovery(args.recovery.pubkey.as_deref())?
     } else {
         context.connect(args.recovery.pubkey.as_deref())?
     };
+
+    // Without an attestation, an attested Ark is already enrolled, and any
+    // other one is sent to Ark Hub
     let Some(certificate) = certificate else {
         if matches!(connection.identity, Identity::Attested { .. }) {
             let mut error = Error::new(
@@ -289,6 +321,8 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
             "online enrollment happens at Ark Hub",
         ));
     };
+
+    // Install the attestation, then reconnect without the pin to verify it
     connection.client.call(
         schema::OnboardingRequest {
             device_attestation: certificate,
@@ -332,13 +366,17 @@ pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
     }
 }
 
+/// Tests of the human status layout.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::style::Color;
 
+    /// Checks that the status block marks unknown state with a dash, keeps a
+    /// mismatch visible and leaves the full public key to JSON.
     #[test]
     fn status_distinguishes_unknown_state_and_keeps_mismatches_visible() {
+        // Unknown state renders as a dash, and a mismatch keeps its own row
         let theme = Theme::test(80, Color::Basic, true);
         let mut value = json!({
             "name":"Example Ark", "serial":null,
@@ -352,9 +390,13 @@ mod tests {
             status_block(&theme, &value),
             "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware     Ark I, revision B, model 01\n\n  Firmware     0.11.5, published -\n  Trust        \x1b[1m! self-signed\x1b[0m\n  Environment  -\n  Realm        -\n\n  Cloud        -\n  Pairing      \x1b[1m\u{2713} paired\x1b[0m\n  Lock         \x1b[1m! locked\x1b[0m\n  Identity     \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch     \x1b[1mArk II - A\x1b[0m"
         );
+
+        // The fingerprint shows, while the full public key does not
         let rendered = status_block(&theme, &value);
         assert!(rendered.contains("0123456789abcdef"));
         assert!(!rendered.contains("abcdef0123456789"));
+
+        // A known negative sync state reads as an attention mark
         value["synced"] = json!(false);
         assert!(status_block(&theme, &value).contains("! not synced"));
     }

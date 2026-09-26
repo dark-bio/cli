@@ -15,21 +15,30 @@ use std::time::Duration;
 
 /// Prefix supplied to the Ark for file identification and upload preparation.
 const IDENTIFY_SIZE: usize = 1024 * 1024;
-const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024; // Leave room for sealing and framing
-/// Flushes partial chunks from slow sources before the device upload window expires.
+/// Largest upload chunk, 32 KiB short of a 2 MiB frame to leave room for
+/// sealing and framing.
+const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024;
+/// Interval after which a chunk goes out partial, keeping the Ark's upload
+/// session alive while the source is slow.
+///
+/// It is checked between source reads, so it never interrupts a read that
+/// blocks.
 const CHUNK_INTERVAL: Duration = Duration::from_secs(1);
 /// Delay between processing reports, independent of each response's deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Upload stages reported on the caller's thread. Acknowledged bytes may still
-/// need writing or validation; only successful processing completes the upload.
+/// Upload stages reported on the caller's thread.
+///
+/// Acknowledged bytes may still need writing or validation; only successful
+/// processing completes the upload.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UploadProgress {
     /// Asking the Ark to identify the file from its first chunk.
     Identifying,
     /// The Ark's identification, including its summary and confidence.
     Identified(schema::SlotIdentifyResponse),
-    /// Opening an upload session. The Ark may request companion approval.
+    /// Opening an upload session, for which the Ark may request companion
+    /// approval.
     Preparing,
     /// The upload session is available for explicit cancellation.
     Started {
@@ -47,6 +56,8 @@ pub enum UploadProgress {
     Processing(schema::SlotUploadProcessResponse),
 }
 
+/// Source to upload, either identified by the Ark or naming its target slot.
+///
 /// A local file needs identification; a reference already names its target
 /// slot and carries the hash advertised alongside the download.
 #[derive(Clone, Debug)]
@@ -55,16 +66,19 @@ pub struct Dataset {
     pub name: String,
     /// Exact source length in bytes; truncation and trailing bytes are errors.
     pub size: u64,
-    /// Target slot, or None to let the Ark identify the file.
+    /// Target slot, or `None` to let the Ark identify the file.
     pub slot: Option<i32>,
     /// Optional SHA-256 checked before processing.
     pub sha256: Option<[u8; 32]>,
 }
 
-/// Identifies once, resends that same head in the authorized start request and
-/// streams the rest. A failed session is cancelled within the remaining deadline;
-/// cleanup never replaces the original error or retries an upload. Deadlines
-/// are measured on the clock of the requester's session.
+/// Uploads a dataset, identifying it once, resending that head in the start
+/// request and streaming the rest.
+///
+/// After a failure it requests the session's cancellation within the remaining
+/// deadline, at most 1 s. Cancellation errors are ignored, so cleanup never
+/// replaces the original error, and it never retries an upload. Deadlines are
+/// measured on the clock of the requester's session.
 pub(crate) fn upload(
     requester: &Requester,
     dataset: &Dataset,
@@ -77,6 +91,8 @@ pub(crate) fn upload(
     if dataset.size == 0 {
         return Err(Error::Dataset("dataset is empty".into()));
     }
+
+    // Read and hash the identification head, checking a source ending there
     let head = read_chunk(
         reader,
         dataset.size.min(IDENTIFY_SIZE as u64) as usize,
@@ -91,6 +107,8 @@ pub(crate) fn upload(
     if head.len() as u64 == dataset.size {
         finish_read(reader, hash.take(), dataset, clock, timing)?;
     }
+
+    // Identify the dataset unless the caller named its slot
     let kind = match dataset.slot {
         Some(kind) => kind,
         None => {
@@ -114,6 +132,8 @@ pub(crate) fn upload(
             kind
         }
     };
+
+    // Open the session with the same head, which may wait for approval
     progress(UploadProgress::Preparing);
     let mut uploaded = head.len() as u64;
     let session = requester
@@ -128,12 +148,16 @@ pub(crate) fn upload(
         )?
         .wait::<schema::SlotUploadStartResponse>()?
         .session;
+
+    // Run the session's steps as one outcome, so any failure can cancel it
     let result = (|| {
         progress(UploadProgress::Started { session });
         progress(UploadProgress::Uploading {
             uploaded,
             total: dataset.size,
         });
+
+        // Stream the rest, checking the source ends at its declared size
         let mut sent = uploaded;
         let mut pending: Option<(Promise<Message>, u64)> = None;
         while sent < dataset.size {
@@ -148,7 +172,7 @@ pub(crate) fn upload(
                 finish_read(reader, hash.take(), dataset, clock, timing)?;
             }
             // Keep at most two chunks outstanding so device writes can overlap
-            // the next transfer. The last acknowledgement is awaited too.
+            // the next transfer. The last acknowledgment is awaited too.
             let next = requester.request(
                 schema::SlotUploadChunkRequest { session, chunk },
                 timing.io(clock),
@@ -171,6 +195,8 @@ pub(crate) fn upload(
                 total: dataset.size,
             });
         }
+
+        // Poll processing until its last phase completes
         loop {
             let status = requester
                 .request(
@@ -181,7 +207,7 @@ pub(crate) fn upload(
             if !status.failure.is_empty() {
                 return Err(Error::Dataset(status.failure));
             }
-            // An empty or malformed report must not turn into false success.
+            // An empty or malformed report must not turn into false success
             let phases = status.phases.len() as u64;
             if phases == 0
                 || status.phase_in == 0
@@ -198,6 +224,9 @@ pub(crate) fn upload(
             timing.pause(clock, POLL_INTERVAL)?;
         }
     })();
+
+    // Request a failed session's cancellation within the remaining deadline, at
+    // most 1 s, ignoring the outcome
     if result.is_err() {
         let cleanup = timing.io(clock).min(clock.now() + Duration::from_secs(1));
         let _ = requester
@@ -207,9 +236,14 @@ pub(crate) fn upload(
     result
 }
 
-/// Fill the identification head before opening a session. Later chunks flush
-/// available bytes periodically so a slow source keeps the Ark's session alive.
-/// The caller's reader still owns the timeout of each individual read.
+/// Reads up to `size` bytes, returning early once a read completes after
+/// `interval` has passed since the call started.
+///
+/// The identification head is read without an interval, so it fills before a
+/// session opens. Later chunks go out partial so a slow source keeps the Ark's
+/// session alive. The interval is checked between reads and never interrupts
+/// a blocking one. A source ending early is an error, and the caller's reader
+/// still owns the timeout of each individual read.
 fn read_chunk(
     reader: &mut impl Read,
     size: usize,
@@ -237,8 +271,10 @@ fn read_chunk(
     Ok(chunk)
 }
 
-/// Checks EOF and the advertised hash before sending the final chunk. Earlier
-/// chunks may already be accepted, but a bad source never reaches processing.
+/// Checks EOF and the advertised hash before sending the final chunk.
+///
+/// Earlier chunks may already be accepted, but a bad source never reaches
+/// processing.
 fn finish_read(
     reader: &mut impl Read,
     hash: Option<Sha256>,
@@ -279,6 +315,7 @@ fn read_error(error: io::Error) -> Error {
     }
 }
 
+/// Dataset upload regressions against a scripted Ark.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,18 +328,26 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
+    /// Budget for test I/O that is not exercising expiration.
     const TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Wire exchange recorded by the scripted peer.
     #[derive(Default)]
     struct Observed {
+        /// Stages the peer served, in arrival order.
         stages: Vec<&'static str>,
+        /// Head the Ark was asked to identify.
         head: Vec<u8>,
+        /// Dataset bytes the upload delivered, head included.
         bytes: Vec<u8>,
+        /// Slot kind the upload session was opened for.
         kind: Option<i32>,
-        /// Notifies a test each time an upload chunk reaches the Ark.
+        /// Channel notifying a test each time an upload chunk reaches the Ark.
         chunks: Option<mpsc::Sender<()>>,
     }
 
+    /// Builds a processing report of two phases, at `phase` with `progress` out
+    /// of 10,000.
     fn status(phase: u64, progress: u64) -> schema::SlotUploadProcessResponse {
         schema::SlotUploadProcessResponse {
             phases: ["Validate", "Index"]
@@ -317,6 +362,8 @@ mod tests {
         }
     }
 
+    /// Creates a dataset of `size` bytes, a reference into slot 3 when given
+    /// its hash.
     fn source(size: usize, reference: Option<[u8; 32]>) -> Dataset {
         Dataset {
             name: "sample.vcf.gz".into(),
@@ -326,13 +373,18 @@ mod tests {
         }
     }
 
+    /// Connects a raw wire session to the peer, pinning its identity key.
     fn attach(peer: &mut Peer) -> Session {
         let trust = TrustMode::Recover(Box::new(peer.identity.clone()));
         protocol::connect(peer.stream(), &trust).unwrap().0
     }
 
-    /// Records the actual wire exchange, optionally refusing a stage. A cancel
-    /// refusal must never replace the failure that caused cleanup.
+    /// Spawns a peer recording the wire exchange, optionally failing a stage.
+    ///
+    /// Failing `identify` rejects the file in the identification answer, and
+    /// any other stage name refuses that stage. A failing peer refuses the
+    /// cancel too, which must never replace the failure that caused cleanup.
+    /// Processing reports come from `reports`, then a finished one.
     fn peer(
         clock: &Clock,
         fail: Option<&'static str>,
@@ -434,14 +486,15 @@ mod tests {
         (peer, observed)
     }
 
-    /// Start includes the same head used for identification. Remaining chunks
-    /// arrive exactly once, and an early phase reaching 100% is not completion.
+    /// An upload resends its identified head, delivers every byte once, and
+    /// polls on past an early phase at 100%.
     #[test]
     fn test_upload() {
         let mut tester = test_clock();
         let clock = tester.clock();
         for size in [17, IDENTIFY_SIZE, IDENTIFY_SIZE + 2 * CHUNK_SIZE + 29] {
-            // Upload and process the source, the first report asking for another poll
+            // Upload and process the source, the first report asking for
+            // another poll
             let bytes: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
             let (mut peer, observed) =
                 peer(&clock, None, vec![status(1, 10_000), status(2, 10_000)]);
@@ -468,6 +521,8 @@ mod tests {
             wait_deadline(&tester, poll);
             tester.advance_to(poll);
             let progress = uploading.join().unwrap().unwrap();
+
+            // Every byte arrived once, and processing took both reports
             let observed = observed.lock().unwrap();
             assert_eq!(observed.bytes, bytes);
             assert_eq!(observed.kind, Some(2));
@@ -490,19 +545,27 @@ mod tests {
         }
     }
 
-    /// A slow source must send a partial chunk before reading the rest. The
-    /// reader models a source that only continues once the Ark receives it.
+    /// A slow source sends a partial chunk before reading the rest.
+    ///
+    /// The reader continues only once the Ark receives that chunk.
     #[test]
     fn test_slow_source_flushes_partial_chunks() {
         /// Source whose second read takes a whole flush interval of the test
         /// clock, and whose third waits until the Ark received a chunk.
         struct Slow<'a> {
+            /// Test clock the second read advances.
             tester: &'a mut TestClock,
+            /// Bytes left to serve.
             bytes: &'a [u8],
+            /// Count of reads served so far.
             reads: usize,
+            /// Chunk arrivals at the Ark, awaited by the third read.
             chunks: mpsc::Receiver<()>,
         }
         impl Read for Slow<'_> {
+            /// Serves the head, then 64 KiB reads, advancing the clock by one
+            /// chunk interval on the second read and awaiting a chunk arrival
+            /// on the third.
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 self.reads += 1;
                 if self.reads == 2 {
@@ -519,6 +582,8 @@ mod tests {
                 self.bytes.read(&mut buffer[..size])
             }
         }
+
+        // Upload from the slow source through a peer reporting each chunk
         let mut tester = test_clock();
         let clock = tester.clock();
         let bytes = vec![42; IDENTIFY_SIZE + 128 * 1024];
@@ -540,6 +605,8 @@ mod tests {
             |_| {},
         )
         .unwrap();
+
+        // The rest arrives in two chunks, the first flushed early
         let observed = observed.lock().unwrap();
         assert_eq!(observed.bytes, bytes);
         assert_eq!(
@@ -552,10 +619,12 @@ mod tests {
         );
     }
 
-    /// A successful transfer may still fail validation. Neither a refusal nor a
-    /// malformed progress report can be mistaken for completed processing.
+    /// Neither a failed stage nor a failed or malformed processing report
+    /// passes as a completed upload.
     #[test]
     fn test_failures() {
+        // Each failed stage fails the upload and requests cancellation of any
+        // session it opened
         let clock = test_clock().clock();
         for fail in ["identify", "peek", "start", "chunk", "process"] {
             let bytes = vec![42; IDENTIFY_SIZE + 2 * CHUNK_SIZE + 1];
@@ -594,6 +663,8 @@ mod tests {
                 assert!(!observed.stages.contains(&"process"));
             }
         }
+
+        // A failed or malformed processing report fails and cancels the upload
         for report in [
             schema::SlotUploadProcessResponse {
                 failure: "invalid genome".into(),
@@ -618,10 +689,11 @@ mod tests {
         }
     }
 
-    /// References bypass identification and retain their advertised kind. A
-    /// bad length or hash prevents processing, for both small and large files.
+    /// References skip identification and keep their kind, while a bad length
+    /// or hash stops processing in small and large files alike.
     #[test]
     fn test_integrity() {
+        // Upload each size's original and damaged copies as references
         let clock = test_clock().clock();
         for size in [17, IDENTIFY_SIZE + CHUNK_SIZE + 17] {
             let original = vec![42; size];
@@ -645,6 +717,10 @@ mod tests {
                     clock.now() + TIMEOUT,
                     |_| {},
                 );
+
+                // References skip identification, and only the original is
+                // processed, a large damaged copy requesting its open session's
+                // cancellation
                 let observed = observed.lock().unwrap();
                 assert!(!observed.stages.contains(&"peek"));
                 assert_eq!(result.is_ok(), change == "none");
@@ -659,10 +735,12 @@ mod tests {
         }
     }
 
-    /// Two chunks may be queued, but a third cannot precede their acknowledgement.
-    /// Responses arriving in reverse order must not advance the source early.
+    /// The source is read no further than two outstanding chunks, even while
+    /// their acknowledgments arrive reversed.
     #[test]
     fn test_transfer_window() {
+        // The peer answers the second chunk first, holding the first chunk's
+        // acknowledgment until the test releases it
         let clock = test_clock().clock();
         let (notice, notices) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -704,15 +782,22 @@ mod tests {
                 true
             }),
         );
+
+        // Upload through a source counting what the uploader read
         let session = attach(&mut peer);
         let bytes = vec![42; IDENTIFY_SIZE + 3 * CHUNK_SIZE];
         let source = source(bytes.len(), Some(Sha256::digest(&bytes).into()));
         let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        /// Source counting the bytes read from it.
         struct Counting<'a> {
+            /// Bytes left to serve.
             bytes: &'a [u8],
+            /// Bytes read so far, shared with the test.
             count: Arc<std::sync::atomic::AtomicUsize>,
         }
         impl Read for Counting<'_> {
+            /// Reads from the source and adds the byte count to the shared
+            /// total.
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 let count = self.bytes.read(buf)?;
                 self.count
@@ -735,6 +820,8 @@ mod tests {
                 |_| {},
             )
         });
+
+        // With two chunks outstanding, the source is read no further
         notices.recv().unwrap();
         assert_eq!(
             read.load(std::sync::atomic::Ordering::SeqCst),
@@ -744,14 +831,19 @@ mod tests {
         worker.join().unwrap().unwrap();
     }
 
-    /// Caller-owned readers may yield short reads or interrupted syscalls.
+    /// Short reads and interrupted calls of a caller's reader still upload the
+    /// whole source, and a timed out read is a timeout.
     #[test]
     fn test_reader_errors() {
+        /// Source serving one byte per read, interrupting every other call.
         struct Fragmented {
+            /// Read calls made so far.
             calls: usize,
+            /// Bytes left to serve.
             bytes: &'static [u8],
         }
         impl Read for Fragmented {
+            /// Interrupts every odd call and serves a single byte on the others.
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 self.calls += 1;
                 if self.calls % 2 == 1 {
@@ -761,6 +853,8 @@ mod tests {
                 self.bytes.read(&mut buf[..size])
             }
         }
+
+        // A fragmenting and interrupting reader still delivers the whole source
         let clock = test_clock().clock();
         let (mut peer, _) = peer(&clock, None, vec![]);
         let session = attach(&mut peer);
@@ -776,17 +870,21 @@ mod tests {
             |_| {},
         )
         .unwrap();
+
+        // A timed out read maps to a timeout
         assert!(matches!(
             read_error(io::ErrorKind::TimedOut.into()),
             Error::Timeout
         ));
     }
 
-    /// The public helper establishes cloud setup once across repeated uploads.
-    /// It does not eagerly attach a relay when the Ark needs no approval.
+    /// Repeated uploads through a client sync with the cloud once, attaching no
+    /// relay the Ark does not ask for.
     #[test]
     fn test_client_setup() {
         use crate::cloud::tests::{response, serve};
+
+        // Upload twice through a client of a cloud-routed connection
         let clock = test_clock().clock();
         let (url, requests) = serve(vec![
             response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
@@ -804,6 +902,8 @@ mod tests {
                 )
                 .unwrap();
         }
+
+        // Only the first upload synced, before identifying the dataset
         let observed = observed.lock().unwrap();
         assert_eq!(
             observed
@@ -825,6 +925,7 @@ mod tests {
                 .contains("/cloudsync/time?challenge=03")
         );
     }
+
     /// The processing operation may outlive one wait allowance, even when
     /// successive replies report the same progress percentage.
     #[test]

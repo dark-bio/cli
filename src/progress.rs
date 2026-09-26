@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Transfer rates and per-step estimates for terminal progress.
+//! Transfer rates and per-step estimates for progress reports.
 
 use crate::style::{Role, Theme};
 use darkbio_clock::Clock;
@@ -12,9 +12,10 @@ use darkbio_connect::schema::SlotUploadProcessResponse;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Binary megabyte divisor used for byte-rate formatting.
+/// Bytes in one MiB, the divisor for displayed sizes and rates.
 const MIB: f64 = 1024.0 * 1024.0;
-/// Rolling rate history, retaining one sample before the boundary.
+/// Span of the rolling rate history, which also keeps the last sample from
+/// before it.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 /// Minimum observation span before publishing an estimate.
 const WARMUP: Duration = Duration::from_secs(1);
@@ -23,7 +24,8 @@ const HUMAN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Maximum silence between machine progress lines when reports keep arriving.
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One observation, with the established log line and facts for the terminal.
+/// One progress observation, with its stable text line and the facts for a
+/// terminal.
 pub(crate) struct Update {
     /// Stable text observation used by plain text and JSON events.
     pub text: String,
@@ -33,7 +35,8 @@ pub(crate) struct Update {
     pub stage_width: usize,
     /// Completion percentage for this stage, not for the entire workflow.
     pub percent: u64,
-    /// Human facts in discard order; the leftmost is dropped first on narrow terminals.
+    /// Human facts in discard order; the leftmost is dropped first on narrow
+    /// terminals.
     pub details: Vec<String>,
     /// Shared fact column widths, allowing narrower layouts without moving the bars.
     pub detail_widths: Vec<usize>,
@@ -42,6 +45,8 @@ pub(crate) struct Update {
 impl Update {
     /// Shares label and fact columns with another stage of the same operation.
     pub(super) fn align(&mut self, other: &mut Self) {
+        // Measure what each update can show, from all its facts down to the
+        // last one, unless it already carries shared widths
         let stage_width = self.stage_width.max(other.stage_width);
         let mut detail_widths = Vec::new();
         for update in [&*self, &*other] {
@@ -55,6 +60,9 @@ impl Update {
                 detail_widths.extend_from_slice(&update.detail_widths);
             }
         }
+
+        // Both updates take the widest label and every fact width, so their
+        // bars line up
         detail_widths.sort_unstable();
         detail_widths.dedup();
         self.stage_width = stage_width;
@@ -65,6 +73,8 @@ impl Update {
 
     /// Fits a stage, progress bar and optional facts into one terminal line.
     pub fn render(&self, theme: &Theme) -> String {
+        // Pad the stage to its shared column, capped at half the line or 8
+        // cells on a narrow one
         let width = theme.width.saturating_sub(1);
         let stage_width = self.stage_width.min((width / 2).max(8));
         let stage = theme.truncate(&self.stage, stage_width);
@@ -72,11 +82,17 @@ impl Update {
             "{stage}{}",
             " ".repeat(stage_width.saturating_sub(console::measure_text_width(&stage)))
         );
+
+        // Measure the fixed parts, and keep 9 cells for the bar on terminals of
+        // 60 cells or more
         let prefix = theme.paint(Role::Muted, "progress:");
         let percent = format!("{:3} %", self.percent);
         let fixed = console::measure_text_width(&format!("progress: {stage} {percent}"));
         let reserve = if theme.width >= 60 { 9 } else { 0 };
         let available = width.saturating_sub(fixed + reserve);
+
+        // Drop facts from the left until the rest fits, in the widest shared
+        // column that fits when there is one
         let shared = (!self.detail_widths.is_empty()).then(|| {
             self.detail_widths
                 .iter()
@@ -98,6 +114,8 @@ impl Update {
             }
             details.remove(0);
         };
+
+        // Draw a bar of up to 40 cells in the space left, or none below 8 cells
         let used = fixed + facts_width;
         let size = width.saturating_sub(used + 1).min(40);
         let bar = if size >= 8 {
@@ -117,19 +135,22 @@ impl Update {
     }
 }
 
-/// Samples only acknowledged bytes, starting with the first upload report so
-/// cloud setup and approval do not enter the rate estimate.
+/// Upload rate tracker that samples only acknowledged bytes, from the first
+/// upload report on.
+///
+/// Cloud setup and approval therefore never enter the rate estimate.
 pub(super) struct Transfer {
     /// Connection's clock, which times the samples.
     clock: Clock,
-    /// Rolling counter samples, in bytes for uploads and basis points for processing.
+    /// Rolling samples of acknowledged bytes.
     rate: Rate,
     /// Emission cadence, independent of the sampling cadence.
     report: Report,
 }
 
 impl Transfer {
-    /// Starts without rate history so setup and approval cannot skew the first estimate.
+    /// Starts without rate history so setup and approval cannot skew the first
+    /// estimate.
     pub(super) fn new(human: bool, clock: Clock) -> Self {
         Self {
             clock,
@@ -138,18 +159,23 @@ impl Transfer {
         }
     }
 
-    /// Samples acknowledged bytes and emits an observation only when reporting is due.
+    /// Samples acknowledged bytes and emits an observation only when reporting
+    /// is due.
     pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<Update> {
         self.update_at(uploaded, total, self.clock.now())
     }
 
-    /// Updates byte-rate history at the supplied clock time, even if output is throttled.
+    /// Updates byte-rate history at the supplied clock time, even if output is
+    /// throttled.
     fn update_at(&mut self, uploaded: u64, total: u64, now: Instant) -> Option<Update> {
+        // Sample every report, and emit only when the cadence is due
         let rate = self.rate.sample(uploaded, now);
         let percent = percent(uploaded, total);
         if !self.report.due(percent, now) {
             return None;
         }
+
+        // Word the speed, or why there is none yet, and the stable text line
         let speed = rate.map_or_else(
             || {
                 if uploaded >= total {
@@ -166,6 +192,8 @@ impl Transfer {
             total as f64 / MIB,
             eta(total.saturating_sub(uploaded), rate),
         );
+
+        // Show the human sizes in GiB from 1 GiB up, and in MiB below
         let (divisor, unit) = if total >= 1 << 30 {
             ((1_u64 << 30) as f64, "GiB")
         } else {
@@ -190,12 +218,15 @@ impl Transfer {
     }
 }
 
+/// Tracker of the Ark's processing steps, estimating each step on its own.
+///
 /// Progress percentages belong to individual steps. Device timestamps identify
 /// a restarted step; elapsed time is measured on the connection's monotonic clock.
 pub(super) struct Processing {
     /// Connection's clock, which times the samples.
     clock: Clock,
-    /// Last report, retained to finish a phase when the next report advances past it.
+    /// Last report, retained to finish a phase when the next report advances
+    /// past it.
     previous: Option<SlotUploadProcessResponse>,
     /// Basis-point progress samples for the current processing step only.
     rate: Rate,
@@ -204,7 +235,8 @@ pub(super) struct Processing {
 }
 
 impl Processing {
-    /// Starts without a step identity or estimate; the first report establishes both.
+    /// Starts without a step identity or estimate; the first report establishes
+    /// both.
     pub(super) fn new(human: bool, clock: Clock) -> Self {
         Self {
             clock,
@@ -215,11 +247,15 @@ impl Processing {
     }
 
     /// Finishes an observed phase before starting a later one in the same run.
-    /// Restarts and failures never imply successful completion of the previous phase.
+    ///
+    /// Restarts and failures never imply successful completion of the previous
+    /// phase.
     pub(super) fn update(
         &mut self,
         status: &SlotUploadProcessResponse,
     ) -> impl Iterator<Item = Update> {
+        // A later phase of the same run, without a failure, first completes the
+        // unfinished previous one
         let completed = self
             .previous
             .as_ref()
@@ -240,6 +276,7 @@ impl Processing {
 
     /// Builds a step-specific estimate from basis points and monotonic clock time.
     fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<Update> {
+        // A new or restarted step starts its estimate and cadence afresh
         let phase = (status.proc_start, status.phase_in, status.phase_start);
         if self.previous.as_ref().is_none_or(|previous| {
             (previous.proc_start, previous.phase_in, previous.phase_start) != phase
@@ -247,6 +284,8 @@ impl Processing {
             self.rate = Rate::default();
             self.report.last = None;
         }
+
+        // Keep and sample every report, and emit only when the cadence is due
         self.previous = Some(status.clone());
         let rate = self.rate.sample(status.phase_progress, now);
         let percent = percent(status.phase_progress, 10_000);
@@ -256,8 +295,11 @@ impl Processing {
         Some(Self::observation(status, rate))
     }
 
-    /// Reserves the widest phase label and the initial ETA before rendering any step.
+    /// Builds a step's observation, reserving room for the widest phase label and
+    /// ETA so the bars never move.
     fn observation(status: &SlotUploadProcessResponse, rate: Option<f64>) -> Update {
+        // Word both lines with the step's name, or a generic one when the
+        // report lists no such phase
         let percent = percent(status.phase_progress, 10_000);
         let name = status
             .phase_in
@@ -277,6 +319,9 @@ impl Processing {
             status.phase_in,
             status.phases.len()
         );
+
+        // Size the stage column for every phase label, and the facts for every
+        // estimate
         let stage_width = status
             .phases
             .iter()
@@ -305,16 +350,20 @@ impl Processing {
     }
 }
 
-/// Keep the sample immediately before the rolling window's boundary so a
-/// stalled or sparse counter does not retain an old, optimistic speed.
+/// Rolling rate of a counter over the last [`RATE_WINDOW`].
+///
+/// It keeps the sample just before the window's start, so a stalled or sparse
+/// counter does not hold on to a stale speed.
 #[derive(Default)]
 struct Rate {
-    /// Time and monotonically increasing counter observations around the rolling window.
+    /// Time and monotonically increasing counter observations around the
+    /// rolling window.
     samples: VecDeque<(Instant, u64)>,
 }
 
 impl Rate {
-    /// Returns units per second after warmup; counter or clock regression resets history.
+    /// Returns units per second after warmup; counter or clock regression
+    /// resets history.
     fn sample(&mut self, value: u64, now: Instant) -> Option<f64> {
         if self
             .samples
@@ -333,10 +382,14 @@ impl Rate {
     }
 }
 
-/// Refresh terminal progress once a second as reports arrive. Line output uses
-/// ten-percent boundaries or five seconds to keep logs readable.
+/// Cadence at which progress observations are emitted.
+///
+/// A terminal refreshes once a second as reports arrive, and shows completion
+/// at once. Line output waits for the next 10 % boundary or 5 s, which keeps
+/// logs readable.
 struct Report {
-    /// Selects one-second human cadence instead of sparse log boundaries.
+    /// Whether the one-second terminal cadence applies instead of sparse log
+    /// boundaries.
     human: bool,
     /// Time and percentage of the last emitted observation.
     last: Option<(Instant, u64)>,
@@ -348,7 +401,8 @@ impl Report {
         Self { human, last: None }
     }
 
-    /// Claims an emission slot for elapsed cadence or a required completion boundary.
+    /// Claims an emission slot for elapsed cadence or a required completion
+    /// boundary.
     fn due(&mut self, percent: u64, now: Instant) -> bool {
         if self.last.is_none_or(|(time, previous)| {
             if self.human {
@@ -419,11 +473,14 @@ fn human_eta(remaining: u64, rate: Option<f64>) -> String {
     )
 }
 
+/// Tests of progress rendering, rate estimates and report cadence.
 #[cfg(test)]
 mod tests {
     use super::*;
     use darkbio_clock::TestClock;
 
+    /// A progress line fits every width, keeping the bar, speed and ETA from 60
+    /// cells up.
     #[test]
     fn bar_keeps_speed_and_eta_in_the_available_width() {
         use crate::style::Color;
@@ -460,8 +517,11 @@ mod tests {
         }
     }
 
-    /// The initial bytes were accepted before sampling began. Counting them as
-    /// newly transferred would inflate speed and shorten the ETA.
+    /// A transfer estimate counts only the bytes acknowledged after sampling
+    /// began.
+    ///
+    /// Counting the initial bytes as newly transferred would inflate speed and
+    /// shorten the ETA.
     #[test]
     fn test_transfer_estimate() {
         let clock = TestClock::new().clock();
@@ -485,6 +545,8 @@ mod tests {
         assert!(done.ends_with("ETA 0s"));
     }
 
+    /// Builds a report of a two-step run, in `phase` at `progress` basis
+    /// points.
     fn status(phase: u64, progress: u64) -> SlotUploadProcessResponse {
         SlotUploadProcessResponse {
             proc_start: 100,
@@ -501,6 +563,7 @@ mod tests {
         }
     }
 
+    /// Processing bars stay in one column across phase labels and estimates.
     #[test]
     fn processing_bars_align_across_labels_and_estimates() {
         use crate::style::Color;
@@ -531,10 +594,13 @@ mod tests {
         }
     }
 
+    /// Upload and processing lines share their bar column, and the upload keeps
+    /// its facts where the width allows.
     #[test]
     fn upload_and_processing_share_columns_without_losing_transfer_facts() {
         use crate::style::Color;
         for width in [60, 80, 100, 140] {
+            // Finish an upload and align it with a processing observation
             let theme = Theme::test(width, Color::True, true);
             let clock = TestClock::new().clock();
             let start = clock.now();
@@ -548,6 +614,9 @@ mod tests {
             report.phases[0].name = "Compressing".into();
             report.phases[1].name = "Indexing".into();
             Processing::observation(&report, None).align(&mut upload);
+
+            // The aligned upload keeps its speed and estimate from 100 cells
+            // wide, and its sizes from 140 cells
             let rendered = upload.render(&theme);
             let expected = bar_position(&rendered);
             assert!(console::measure_text_width(&rendered) < width);
@@ -558,6 +627,8 @@ mod tests {
             if width >= 140 {
                 assert!(rendered.contains("290.0/290.0 MiB"));
             }
+
+            // Every processing line puts its bar where the upload's is
             let mut processing = Processing::new(true, clock);
             for (phase, progress) in [(1, 8200), (2, 9200), (2, 10_000)] {
                 report.phase_in = phase;
@@ -572,6 +643,8 @@ mod tests {
         }
     }
 
+    /// Returns where a line's progress bar starts and how long it is, in
+    /// terminal cells.
     fn bar_position(line: &str) -> (usize, usize) {
         let line = console::strip_ansi_codes(line);
         let bar = line
@@ -586,6 +659,7 @@ mod tests {
         )
     }
 
+    /// Advancing to a later phase first completes the previous one at 100 %.
     #[test]
     fn advancing_completes_the_previous_phase_before_rendering_the_next() {
         let mut processing = Processing::new(true, TestClock::new().clock());
@@ -606,6 +680,8 @@ mod tests {
         assert_eq!(done[0].details, ["eta 0 s"]);
     }
 
+    /// A restarted step, a restarted run or a failure never completes the
+    /// previous phase.
     #[test]
     fn restarts_and_failures_do_not_complete_the_previous_phase() {
         for next in [
@@ -629,9 +705,12 @@ mod tests {
     }
 
     /// Every step gets its own estimate, even if the first observation arrives
-    /// partway through it. A restarted step must not inherit its previous rate.
+    /// partway through it.
+    ///
+    /// A restarted step must not inherit its previous rate.
     #[test]
     fn test_step_estimate() {
+        // The first step estimates from its second report on
         let clock = TestClock::new().clock();
         let start = clock.now();
         let mut processing = Processing::new(false, clock);
@@ -649,6 +728,8 @@ mod tests {
                 .text,
             "Processing [1/2] Validate: 30% | step ETA ~18s"
         );
+
+        // The next step starts a fresh estimate, although first seen at 40 %
         assert_eq!(
             processing
                 .update_at(&status(2, 4000), start + Duration::from_secs(6))
@@ -663,6 +744,8 @@ mod tests {
                 .text,
             "Processing [2/2] Index: 50% | step ETA ~25s"
         );
+
+        // A restart drops the step's rate, and a finished step needs none
         let restarted = SlotUploadProcessResponse {
             phase_start: 999,
             ..status(2, 6000)
@@ -687,10 +770,13 @@ mod tests {
         );
     }
 
-    /// Recent stalls age out a formerly fast rate. A regressing counter starts
-    /// over instead of underflowing or producing an estimate from another run.
+    /// Recent stalls age out a formerly fast rate, and a regressing counter
+    /// starts over.
+    ///
+    /// Starting over avoids an underflow and an estimate from another run.
     #[test]
     fn test_rate_stall_and_reset() {
+        // A rate shows once the warmup has passed
         let start = TestClock::new().clock().now();
         let mut rate = Rate::default();
         assert_eq!(rate.sample(0, start), None);
@@ -698,18 +784,25 @@ mod tests {
             rate.sample(100, start + Duration::from_secs(1)),
             Some(100.0)
         );
+
+        // A stall across the whole window drops the rate to zero, which gives
+        // no estimate
         for seconds in 2..=11 {
             rate.sample(100, start + Duration::from_secs(seconds));
         }
         let stopped = rate.sample(100, start + Duration::from_secs(12));
         assert_eq!(stopped, Some(0.0));
         assert_eq!(eta(100, stopped), "estimating...");
+
+        // A regressing counter starts its history over
         assert_eq!(rate.sample(50, start + Duration::from_secs(13)), None);
         assert_eq!(rate.sample(75, start + Duration::from_secs(14)), Some(25.0));
     }
 
     /// Time-based reporting refreshes a stuck percentage, while short bursts
-    /// stay quiet. Completion is printed even inside the normal interval.
+    /// stay quiet.
+    ///
+    /// Completion is printed even inside the normal interval.
     #[test]
     fn test_report_cadence() {
         let start = TestClock::new().clock().now();
@@ -721,6 +814,8 @@ mod tests {
         assert!(!report.due(100, start + REPORT_INTERVAL + Duration::from_millis(2)));
     }
 
+    /// Terminal transfer reports refresh once a second and show completion at
+    /// once.
     #[test]
     fn test_human_transfer_cadence() {
         let clock = TestClock::new().clock();
@@ -746,6 +841,8 @@ mod tests {
         );
     }
 
+    /// Terminal step reports show a new step at once and then refresh once a
+    /// second.
     #[test]
     fn test_human_step_cadence() {
         let clock = TestClock::new().clock();

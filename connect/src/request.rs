@@ -5,7 +5,9 @@
 // license that can be found in the LICENSE file.
 
 //! Request/response pairings used by typed client calls.
-//! Wire checks message direction and content; this table selects the response type.
+//!
+//! Wire checks message direction and content; this table selects the response
+//! type.
 
 use crate::timing::{APPROVAL_WINDOW, PAIRING_WINDOW};
 use darkbio_wire::protocol::schema::*;
@@ -23,30 +25,41 @@ pub enum Setup {
     Relay,
 }
 
-/// Request body with the response type selected by [`crate::Client::call`].
-/// Implemented for the public request bodies. Callers may also pair their own
-/// wrappers when those wrappers convert into wire's [`Message`].
+/// Request body paired with the response type that [`crate::Client::call`]
+/// returns.
+///
+/// It is implemented for the public request bodies. Callers may also pair
+/// their own wrappers when those wrappers convert into wire's [`Message`].
 pub trait Request: Into<Message> {
     /// Body the Ark answers this request with.
     type Response: TryFrom<Message, Error = protocol::Error>;
 
-    /// Setup required before sending. Wrappers default to cloud synchronization.
+    /// Setup required before sending.
+    ///
+    /// Wrappers default to cloud synchronization.
     const SETUP: Setup = Setup::Cloud;
 
     /// Protocol wait window, including a reply margin, for requests that wait
-    /// on a person or device formatting. Replaces an inactivity allowance only;
-    /// an absolute caller deadline still applies.
+    /// on a person or on the device formatting storage.
+    ///
+    /// It replaces an inactivity allowance only; an absolute caller deadline
+    /// still applies.
     const WINDOW: Option<Duration> = None;
 }
 
 /// Pairs request and response bodies with their setup and reply-window policy.
+///
 /// Protocol direction checks remain in wire; caller convenience belongs here.
 macro_rules! pairs {
     ($setup:expr, $window:expr; $($request:ident => $response:ident,)*) => {
         $(
             impl Request for $request {
+                /// Body the Ark answers this request with.
                 type Response = $response;
+                /// Setup this request needs before sending.
                 const SETUP: Setup = $setup;
+                /// Wait window of this request, set when it waits on a person
+                /// or on the device.
                 const WINDOW: Option<Duration> = $window;
             }
         )*

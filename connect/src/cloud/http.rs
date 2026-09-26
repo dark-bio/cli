@@ -20,35 +20,48 @@ use serde::{Deserialize, de::DeserializeOwned};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Maximum JSON response, enough for cloud certificates, signed time or registry state.
+/// Largest JSON response body read, 64 KiB, enough for cloud certificates,
+/// signed time or registry state.
 const MAX_RESPONSE: u64 = 64 * 1024;
 
-/// Cloud operations selected by the attestation or an explicit environment.
+/// Cloud API client for the environment the attestation or the caller selects.
 #[derive(Debug)]
 pub(super) struct Api {
-    pub(super) clock: Clock, // clock that the deadlines are measured on
+    /// Clock that the deadlines are measured on.
+    pub(super) clock: Clock,
 
-    pub(super) auth: auth::Authorization, // Caller credentials, independent of the Ark proof
-    pub(super) origin: String,            // HTTPS origin shared by API and socket credentials
-    pub(super) agent: ureq::Agent,        // HTTP connections reused across the cloud exchange
-    pub(super) url: String,               // API of the selected environment
-    pub(super) realm: Realm,              // Realm selecting the device registry
-    pub(super) resolver: Arc<dns::Resolver>, // lookups shared by this connection's cloud sockets
-    serial: Option<String>, // Attested serial, when available, checked against the registry
+    /// Caller credentials, independent of the Ark's proof.
+    pub(super) auth: auth::Authorization,
+    /// HTTPS origin of the API, which the caller's credentials are kept for.
+    pub(super) origin: String,
+    /// HTTP client, reusing its connections across the cloud exchange.
+    pub(super) agent: ureq::Agent,
+    /// Base URL of the selected environment's API.
+    pub(super) url: String,
+    /// Realm selecting the registry and the socket routes.
+    pub(super) realm: Realm,
+    /// DNS lookups shared by this connection's cloud sockets.
+    pub(super) resolver: Arc<dns::Resolver>,
+    /// Serial from the attestation, when there is one, which the registry's
+    /// answer must match.
+    serial: Option<String>,
 }
 
 impl Api {
-    /// Uses the selected environment and realm for relay attachment.
+    /// Returns the WebSocket URL for relay attachment in the selected
+    /// environment and realm.
     pub(super) fn relay_url(&self) -> String {
         self.socket_url("relaying")
     }
 
-    /// Uses the same realm for the companion pairing rendezvous.
+    /// Returns the WebSocket URL of the pairing rendezvous in the selected
+    /// environment and realm.
     pub(super) fn pairing_url(&self) -> String {
         self.socket_url("pairing")
     }
 
-    /// Converts the API origin to WebSocket and selects the realm-specific route.
+    /// Converts the API URL to its WebSocket form and appends the route, under
+    /// `sandbox/` for the emulator realm.
     fn socket_url(&self, route: &str) -> String {
         let url = self
             .url
@@ -60,8 +73,11 @@ impl Api {
         }
     }
 
-    /// Prepares cloud access without I/O. An explicit environment overrides the
-    /// attested one. Its discovery realm is used only without an attested realm.
+    /// Prepares cloud access without I/O, or returns `None` when neither the
+    /// attestation nor the caller selects an environment.
+    ///
+    /// An explicit environment overrides the attested one. The caller's realm
+    /// applies only when no attestation fixes it.
     pub(super) fn new(
         identity: &Identity,
         cloud: Option<(Environment, Realm)>,
@@ -104,8 +120,8 @@ impl Api {
         fetch_time(self, challenge, deadline)
     }
 
-    /// Checks the registry with the Ark's opaque proof and matches its serial
-    /// against the identity authenticated during the handshake, when attested.
+    /// Checks the registry with the Ark's opaque proof, requiring the registered
+    /// serial to match an attested one.
     pub(super) fn genuine(&self, proof: &[u8], deadline: Instant) -> Result<Registration, Failure> {
         let registration = fetch_registration(self, proof, deadline)?;
         if self
@@ -120,8 +136,13 @@ impl Api {
         Ok(registration)
     }
 
-    /// Retries only authentication or read-only requests after login. Callers
-    /// recreate short-lived Ark proofs inside the attempt, after browser login.
+    /// Runs a cloud step, logging in and running it once more when the host
+    /// refuses the caller's credentials.
+    ///
+    /// Only authentication or read-only steps go through it, since a step can
+    /// run twice. A step creates its Ark proof inside itself, so the run after
+    /// a browser login carries a fresh one. A refusal after the login ends in
+    /// [`Failure::CloudAuth`].
     pub(super) fn with_auth<T>(
         &self,
         timing: Timing,
@@ -143,7 +164,8 @@ impl Api {
 }
 
 impl Failure {
-    /// Adds HTTP operation context without erasing a timeout or device error.
+    /// Prefixes a cloud failure with the operation that failed, leaving other
+    /// kinds unchanged.
     fn context(self, context: &str) -> Self {
         match self {
             Self::Cloud(error) => Self::Cloud(format!("{context}: {error}")),
@@ -153,7 +175,8 @@ impl Failure {
 }
 
 impl From<ureq::Error> for Failure {
-    /// Keeps HTTP timeouts actionable without treating other failures as wire loss.
+    /// Maps an HTTP client timeout to a wire timeout and any other error to a
+    /// cloud failure.
     fn from(error: ureq::Error) -> Self {
         match error {
             ureq::Error::Timeout(_) => Self::Wire(protocol::Error::Timeout),
@@ -162,7 +185,8 @@ impl From<ureq::Error> for Failure {
     }
 }
 
-/// Cloud sync serves hardware and emulators through the same environment routes.
+/// Returns the API base URL of an environment, the same for hardware and
+/// emulators.
 fn api_url(env: Environment) -> &'static str {
     match env {
         Environment::Release => "https://api.dark.bio/v1",
@@ -171,8 +195,10 @@ fn api_url(env: Environment) -> &'static str {
     }
 }
 
-/// HTTP client for cloud operations. Each request receives the remaining
-/// operation budget; redirects are refused rather than changing the endpoint.
+/// Builds the HTTP client for cloud operations, which never follows a redirect.
+///
+/// Each request gets the remaining operation budget as its timeout, and error
+/// statuses come back as responses.
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .max_redirects(0)
@@ -184,19 +210,26 @@ fn agent() -> ureq::Agent {
 /// Cloud attestations encoded as standard base64 by the identity route.
 #[derive(Deserialize)]
 struct Certificates {
-    signer: String, // CWT attesting the cloud signing key
-    crypto: String, // CWT attesting the cloud encryption key
+    /// CWT attesting the cloud's signing key.
+    signer: String,
+    /// CWT attesting the cloud's encryption key.
+    crypto: String,
 }
 
 /// Cloud time and signature binding it to the Ark's challenge.
 #[derive(Deserialize)]
 struct SignedTime {
-    unixmilli: u64,    // Unix timestamp in milliseconds, decoded without floating point
-    signature: String, // Detached COSE signature encoded as standard base64
+    /// Cloud time in Unix milliseconds, decoded as an integer.
+    unixmilli: u64,
+    /// Detached COSE signature, encoded as standard base64.
+    signature: String,
 }
 
-/// Registry state returned after the cloud verifies the Ark's proof. A registered
-/// device may still be disabled, expired or superseded.
+/// Registry state of an Ark, as [`Client::genuine`](crate::Client::genuine)
+/// returns it from the cloud.
+///
+/// A registered device may still be disabled, expired or superseded, which
+/// [`Self::active`] sums up.
 #[derive(Debug, Deserialize)]
 pub struct Registration {
     /// Serial registered for the identity that produced the proof.
@@ -212,7 +245,7 @@ pub struct Registration {
 }
 
 impl Registration {
-    /// Whether the registered device is currently permitted to use the cloud.
+    /// Checks whether the device is neither disabled, expired nor superseded.
     pub fn active(&self) -> bool {
         !self.disabled && !self.expired && !self.superseded
     }
@@ -257,7 +290,9 @@ fn fetch_time(
     })
 }
 
-/// Sends the opaque proof to the registry of the authenticated realm.
+/// Sends the opaque proof to the registry of the connection's realm.
+///
+/// The proof travels in the `Dark-Auth` header as unpadded base64url.
 fn fetch_registration(api: &Api, proof: &[u8], deadline: Instant) -> Result<Registration, Failure> {
     let route = match api.realm {
         Realm::Hardware => "genuine",
@@ -273,7 +308,8 @@ fn fetch_registration(api: &Api, proof: &[u8], deadline: Instant) -> Result<Regi
     .map_err(|err| err.context("genuinity check failed"))
 }
 
-/// Reads a proof-authenticated response, retaining refusal as a typed error.
+/// Sends a request carrying an Ark proof and decodes its JSON response,
+/// reporting a 403 answer as [`Failure::ProofRejected`].
 pub(super) fn get_authenticated<T: DeserializeOwned>(
     api: &Api,
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
@@ -286,7 +322,8 @@ pub(super) fn get_authenticated<T: DeserializeOwned>(
     json(response)
 }
 
-/// Reads one successful JSON response under the remaining deadline and size limit.
+/// Sends a request and decodes its successful JSON response, within the
+/// deadline and the response size limit.
 pub(super) fn get<T: DeserializeOwned>(
     api: &Api,
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
@@ -295,15 +332,22 @@ pub(super) fn get<T: DeserializeOwned>(
     json(send(api, request, deadline)?)
 }
 
-/// Sends a GET under the remaining operation deadline without following redirects.
+/// Sends a GET with the caller's credentials under the remaining deadline,
+/// without following redirects.
+///
+/// An expired deadline fails without sending. A response the caller's provider
+/// recognizes as refusing its credentials becomes [`Failure::AuthRequired`].
 fn send(
     api: &Api,
     mut request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     deadline: Instant,
 ) -> Result<ureq::http::Response<ureq::Body>, Failure> {
+    // Carry the caller's cached credentials
     for (name, value) in &api.auth.headers(&api.origin, deadline) {
         request = request.header(name, value);
     }
+
+    // Bound the whole exchange by the time left on the deadline
     let remaining = deadline
         .checked_duration_since(api.clock.now())
         .filter(|remaining| !remaining.is_zero())
@@ -313,6 +357,8 @@ fn send(
         .timeout_global(Some(remaining))
         .build()
         .call()?;
+
+    // Hand a refusal of the caller's credentials back for a login
     if api
         .auth
         .rejected(&api.origin, response.status(), response.headers())
@@ -347,8 +393,8 @@ pub(super) mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// Redirects an attested connection to the loopback cloud, measuring its
-    /// deadlines on the clock.
+    /// Builds an API client for a loopback cloud, attested as `test-serial` and
+    /// measuring its deadlines on the clock.
     pub(in crate::cloud) fn api(url: String, realm: Realm, clock: &Clock) -> Api {
         Api {
             clock: clock.clone(),
@@ -362,13 +408,14 @@ pub(super) mod tests {
         }
     }
 
-    /// Overrides select the cloud without replacing a verified realm or serial.
-    /// Without attestation, the supplied discovery realm selects the registry.
+    /// An explicit environment selects the cloud without replacing an attested
+    /// realm or serial, and only unattested identities take the caller's realm.
     #[test]
     fn test_cloud_routing() {
         let clock = test_clock().clock();
         let key = darkbio_crypto::xdsa::SecretKey::generate().public_key();
         for &env in crate::identity::ENVIRONMENTS {
+            // The attestation alone selects its environment and realm
             let identity = Identity::Attested {
                 env,
                 device: crate::trust::device::Device {
@@ -385,6 +432,8 @@ pub(super) mod tests {
             let cloud = Api::new(&identity, None, &clock).unwrap();
             assert_eq!(cloud.url, api_url(env));
             assert_eq!(cloud.realm, Realm::Emulator);
+
+            // An explicit environment keeps the attested realm and serial
             for &selected in crate::identity::ENVIRONMENTS {
                 let cloud = Api::new(&identity, Some((selected, Realm::Hardware)), &clock).unwrap();
                 assert_eq!(cloud.url, api_url(selected));
@@ -392,6 +441,8 @@ pub(super) mod tests {
                 assert!(cloud.relay_url().ends_with("/sandbox/relaying"));
                 assert_eq!(cloud.serial.as_deref(), Some("attested-serial"));
             }
+
+            // Unattested identities need an explicit route, whose realm applies
             for identity in [
                 Identity::SelfSigned(key.clone()),
                 Identity::Recovered(key.clone()),
@@ -412,10 +463,11 @@ pub(super) mod tests {
         }
     }
 
-    /// Certificates and signatures reach the Ark byte-for-byte. Timestamps retain
-    /// integer precision, and the challenge is encoded in the time route's query.
+    /// Sync payloads reach the Ark unchanged, with timestamps at integer
+    /// precision and the challenge in the time route's query.
     #[test]
     fn test_sync_messages() {
+        // Serve binary certificates and a timestamp beyond a double's precision
         let signer = [0, 0xff, 0xfb, 3];
         let crypto = [0xff, 0, 4, 5, 6];
         let signature = [0, 1, 0xfe, 0xff];
@@ -438,6 +490,8 @@ pub(super) mod tests {
                 .to_string(),
             ),
         ]);
+
+        // Both payloads decode unchanged
         let clock = test_clock().clock();
         let cloud = api(url, Realm::Hardware, &clock);
         let deadline = clock.now() + TIMEOUT;
@@ -447,6 +501,8 @@ pub(super) mod tests {
         let finish = fetch_time(&cloud, &[0, 0xfb, 0xff], deadline).unwrap();
         assert_eq!(finish.unixmilli, unixmilli);
         assert_eq!(finish.signature, signature);
+
+        // Each request took its route, with the challenge hex encoded in the query
         assert!(
             requests
                 .recv()
@@ -461,8 +517,8 @@ pub(super) mod tests {
         );
     }
 
-    /// The attested realm selects the registry, and the proof travels in an
-    /// unpadded URL-safe authentication header. Inactive flags are retained.
+    /// Each realm reaches its own registry with the proof in an unpadded
+    /// base64url header, and inactive flags come back intact.
     #[test]
     fn test_registry_routes() {
         let clock = test_clock().clock();
@@ -470,6 +526,7 @@ pub(super) mod tests {
             (Realm::Hardware, "/v1/genuine"),
             (Realm::Emulator, "/v1/sandbox/genuine"),
         ] {
+            // Serve a registration with every inactive flag set
             let (url, requests) = serve(vec![response(
                 200,
                 &json!({
@@ -491,6 +548,8 @@ pub(super) mod tests {
             assert_eq!(registration.enrolled, 123);
             assert!(registration.disabled && registration.expired && registration.superseded);
             assert!(!registration.active());
+
+            // The request took the realm's route, with the proof in `Dark-Auth`
             let request = requests.recv().unwrap();
             assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
             assert!(
@@ -519,6 +578,7 @@ pub(super) mod tests {
     /// responses fail before a cloud payload can be forwarded to the Ark.
     #[test]
     fn test_bad_responses() {
+        // Every broken identity response fails
         let clock = test_clock().clock();
         for (status, body) in [
             (503, "unavailable".into()),
@@ -540,13 +600,15 @@ pub(super) mod tests {
             let cloud = api(url, Realm::Hardware, &clock);
             assert!(fetch_identity(&cloud, clock.now() + TIMEOUT).is_err());
         }
+
+        // So does a signed time whose signature is not base64
         let (url, _requests) = serve(vec![response(200, r#"{"unixmilli":123,"signature":"!"}"#)]);
         let cloud = api(url, Realm::Hardware, &clock);
         assert!(fetch_time(&cloud, &[1], clock.now() + TIMEOUT).is_err());
     }
 
-    /// A later HTTP request retains the original deadline. A stalled response
-    /// also expires instead of leaving setup waiting indefinitely.
+    /// A later request keeps the original deadline, and a stalled response
+    /// expires instead of leaving setup waiting.
     #[test]
     fn test_deadlines() {
         // A request after the clock reached the shared deadline fails without HTTP

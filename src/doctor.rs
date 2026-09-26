@@ -12,9 +12,12 @@ use darkbio_connect::schema;
 use serde_json::{Value, json};
 
 /// Collects independent diagnostics, skipping checks whose prerequisites failed.
-/// Cloud sync is explicit; doctor never pairs or unlocks the Ark to complete checks.
-/// The full checklist is printed before the first failure determines the exit class.
+///
+/// Cloud sync is explicit, and doctor never pairs or unlocks the Ark to complete
+/// a check. The full checklist is printed before the first failure determines
+/// the exit class.
 pub(crate) fn run(context: &Context) -> Result<(), Error> {
+    // Start with the tool itself, its versions and whether a newer release exists
     let mut checks = Checks {
         context,
         rows: Vec::new(),
@@ -30,6 +33,9 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         ),
     );
     checks.update();
+
+    // Each discovery source reports on its own, so one failure keeps the other's
+    // result
     let mut discovered = 0;
     for (name, result) in [
         ("usb", darkbio_connect::hardware::list()),
@@ -52,6 +58,9 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         }
     }
     checks.ok("devices", &format!("{discovered} Arks discovered"));
+
+    // Connect past the compatibility gate, so outdated firmware is checked too,
+    // and skip every device check when that fails
     match context.connect_recovery(None) {
         Err(error) => {
             checks.fail("connection", error);
@@ -69,6 +78,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             }
         }
         Ok(connection) => {
+            // Report the connection, the firmware's compatibility and the
+            // environment
             checks.ok("connection", "connected and authenticated");
             let current = match connection.require_current() {
                 Ok(()) => {
@@ -89,6 +100,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                         .hint("select one with --env"),
                 );
             }
+
+            // The firmware catalog and the cloud sync need a known environment
             if connection.env.is_none() {
                 checks.skip("firmware", "cloud environment unknown");
             } else {
@@ -124,6 +137,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                     }
                 }
             };
+
+            // The registry answers only after a successful sync
             if synced {
                 match connection.client.genuine(context.timing()) {
                     Ok(registration) if registration.active() => checks.ok("registry", "active"),
@@ -136,6 +151,9 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             } else {
                 checks.skip("registry", "cloud sync unavailable");
             }
+
+            // The pairing, relay and slot checks need supported firmware, and
+            // take the pairing and lock state as they find it
             if !current {
                 for name in ["pairing", "relay", "slots"] {
                     checks.skip(name, "firmware update required");
@@ -176,6 +194,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             }
         }
     }
+
+    // Measure the reference cache on this computer
     let cache = crate::data::cache::directory();
     match crate::data::cache::size(&cache) {
         Ok(size) => checks.ok(
@@ -184,23 +204,29 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         ),
         Err(error) => checks.fail("cache", error.into()),
     }
+
+    // Print the whole checklist, then fail with the first failure
     let mut document = crate::versions();
     document["checks"] = json!(checks.rows);
     context.output.checklist(&document, &checks.rows)?;
     checks.failure.map_or(Ok(()), Err)
 }
+
 /// Ordered diagnostic results and the first failure used for command status.
 struct Checks<'a> {
-    /// Invocation output used to emit optional step diagnostics.
+    /// Invocation context, for step diagnostics and the `--timeout` allowance.
     context: &'a Context,
     /// Checks in execution order, including explicit skips and local hints.
     rows: Vec<Value>,
     /// First failed check, retained while later independent checks continue.
     failure: Option<Error>,
 }
+
 impl Checks<'_> {
-    /// Looks up the newest ark afresh. A newer one is a warn and a failed
-    /// lookup a skip, so neither sets the exit code.
+    /// Looks up the newest ark afresh.
+    ///
+    /// A newer one is a warn and a failed lookup a skip, so neither sets the
+    /// exit code.
     fn update(&mut self) {
         // Under CI nothing is looked up
         if update::disabled() {
@@ -219,7 +245,8 @@ impl Checks<'_> {
             std::time::Duration::from_secs(self.context.options.timeout),
         );
 
-        // Only a newer version needs action; an unpublished local build is current too
+        // Only a newer version needs action; an unpublished local build is
+        // current too
         match result {
             Ok(newest) if newest.cmp_precedence(&running).is_gt() => self.warn(
                 "update",
@@ -238,14 +265,17 @@ impl Checks<'_> {
     fn ok(&mut self, name: &str, detail: &str) {
         self.add(name, "ok", detail, None);
     }
+
     /// Records something to act on with its hint, never failing the command.
     fn warn(&mut self, name: &str, detail: &str, hint: &str) {
         self.add(name, "warn", detail, Some(hint));
     }
+
     /// Records an unmet prerequisite without making the command fail by itself.
     fn skip(&mut self, name: &str, detail: &str) {
         self.add(name, "skip", detail, None);
     }
+
     /// Records the failure and first hint, preserving the earliest command error.
     fn fail(&mut self, name: &str, error: Error) {
         self.add(
@@ -258,6 +288,7 @@ impl Checks<'_> {
             self.failure = Some(error);
         }
     }
+
     /// Appends one structured check and its optional verbose event.
     fn add(&mut self, name: &str, result: &str, detail: &str, hint: Option<&str>) {
         self.context

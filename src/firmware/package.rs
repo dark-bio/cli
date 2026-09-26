@@ -24,6 +24,7 @@ pub(crate) struct Package {
     /// Decoded archive digest used for routing and end-to-end download integrity.
     pub sha256: [u8; 32],
 }
+
 impl Package {
     /// Retains only the metadata connect needs to authorize and verify the update.
     pub fn firmware(&self) -> darkbio_connect::Firmware {
@@ -40,24 +41,34 @@ fn invalid(message: String) -> Error {
     Error::new(1, "invalid-version", message)
 }
 
-/// Ark versions carry three u16 components and a seven-character build suffix.
+/// Parsed Ark firmware version, three `u16` components and a seven-character
+/// build suffix.
+///
+/// Versions order by their numbers, then a stable build after develop, then
+/// the suffix.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Version {
     /// Major, minor and patch components compared numerically.
     numbers: [u16; 3],
-    stable: bool, // A stable build follows develop at the same semantic version
+    /// Whether the build is stable, which orders it after develop at the same
+    /// semantic version.
+    stable: bool,
     /// Seven-character suffix, breaking ties after semantic version and stability.
     commit: String,
 }
 
 impl Version {
-    /// Whether the suffix names the mutable develop build instead of a commit.
+    /// Reports whether the suffix names the mutable develop build instead of a
+    /// commit.
     pub(super) fn is_develop(&self) -> bool {
         !self.stable
     }
 
-    /// Requires three u16 components and either develop or seven hexadecimal characters.
+    /// Parses three `u16` components and a suffix of `develop` or seven
+    /// hexadecimal characters.
     pub(super) fn parse(value: &str) -> Result<Self, Error> {
+        // Split off the suffix, and parse three numbers of plain digits that
+        // fit a `u16`
         let invalid = || invalid(format!("invalid firmware version {value:?}"));
         let (version, commit) = value.split_once('-').ok_or_else(invalid)?;
         let mut parts = version.split('.');
@@ -69,6 +80,9 @@ impl Version {
             }
             *number = part.parse().map_err(|_| invalid())?;
         }
+
+        // Nothing may follow the third number, and the suffix is `develop` or
+        // a short commit hash
         if parts.next().is_some()
             || commit.len() != 7
             || (commit != "develop" && !commit.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -86,7 +100,7 @@ impl Version {
 /// Unvalidated package index decoded before artifact routes are accepted.
 #[derive(Deserialize)]
 pub(super) struct Listing {
-    /// Package family, required to be arkos before any artifact is used.
+    /// Package family, required to be `arkos` before any artifact is used.
     package: String,
     /// Published entries awaiting version, length, hash and path checks.
     artifacts: Vec<Artifact>,
@@ -110,12 +124,17 @@ struct Artifact {
 }
 
 impl Listing {
-    /// Validate routing before any archive or device access. Archive paths must
-    /// name the same version and hash as the cloud access-key request.
+    /// Validates every artifact into packages sorted newest first.
+    ///
+    /// It runs before any archive download or firmware change. Archive paths
+    /// must name the same version and hash as the cloud access-key request.
     pub(super) fn firmwares(self) -> Result<Vec<Package>, Error> {
         if self.package != "arkos" {
             return Err(invalid("package listing is not arkos".into()));
         }
+
+        // Each artifact needs a valid version and digest, a nonzero size and
+        // its canonical path
         let mut firmwares = Vec::new();
         for artifact in self.artifacts {
             let version = Version::parse(&artifact.version)?;
@@ -134,6 +153,8 @@ impl Listing {
             }
             firmwares.push((version, firmware));
         }
+
+        // Sort the packages newest first by their parsed versions
         firmwares.sort_by(|(a, _), (b, _)| b.cmp(a));
         Ok(firmwares
             .into_iter()
@@ -150,7 +171,9 @@ pub(super) fn path(firmware: &Package) -> String {
         hex::encode(firmware.sha256)
     )
 }
-/// Accepts a higher semantic version or any build replacing develop at the same version.
+
+/// Accepts a higher semantic version or any build replacing develop at the
+/// same version.
 pub(super) fn candidate(firmware: &Package, installed: &str) -> Result<bool, Error> {
     let current = Version::parse(installed)?;
     let proposed = Version::parse(&firmware.version)?;
@@ -158,11 +181,13 @@ pub(super) fn candidate(firmware: &Package, installed: &str) -> Result<bool, Err
         || (proposed.numbers == current.numbers && !current.stable))
 }
 
+/// Tests of listing validation and update candidate selection.
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Builds a package of `version` with a fixed digest and size.
     fn package(version: &str) -> Package {
         Package {
             version: version.into(),
@@ -172,11 +197,15 @@ mod tests {
             sha256: [42; 32],
         }
     }
+
+    /// Builds a listing that publishes `package` at its canonical path.
     fn listing(package: &Package) -> serde_json::Value {
         json!({"package":"arkos","artifacts":[{"version":package.version,"summary":package.summary,
             "published":package.published,"size":package.size,"sha256":hex::encode(package.sha256),"path":path(package)}]})
     }
 
+    /// A listing is refused for a foreign package, a bad version, a short hash,
+    /// a zero size or a foreign path.
     #[test]
     fn package_paths_and_hashes_must_agree() {
         let package = package("2.0.0-1234567");
@@ -202,8 +231,11 @@ mod tests {
         }
     }
 
+    /// Listings sort newest first, and candidates are higher versions or builds
+    /// replacing develop.
     #[test]
     fn candidates_follow_semantic_versions_and_replace_develop_builds() {
+        // A mixed listing sorts newest first, with a stable build above develop
         let mut value = listing(&package("2.0.0-1234567"));
         for version in ["1.0.0-develop", "3.0.0-develop", "3.0.0-1234567"] {
             value["artifacts"]
@@ -227,13 +259,17 @@ mod tests {
                 "1.0.0-develop"
             ]
         );
+
+        // A candidate is a higher version, or any build replacing develop at the
+        // same version
         let proposed = package("2.0.0-1234567");
         assert!(candidate(&proposed, "1.0.0-fffffff").unwrap());
         assert!(!candidate(&proposed, "2.0.0-0000000").unwrap());
         assert!(!candidate(&proposed, "3.0.0-develop").unwrap());
         assert!(candidate(&proposed, "2.0.0-develop").unwrap());
         assert!(candidate(&proposed, "not-a-version").is_err());
-        // Explicit versions may be a downgrade or reinstallation; the Ark decides.
+
+        // Explicit versions may be a downgrade or reinstallation; the Ark decides
         assert_eq!(
             super::super::select(&sorted, Some("1.0.0-develop"), "3.0.0-1234567")
                 .unwrap()

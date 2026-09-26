@@ -20,15 +20,16 @@ use std::marker::PhantomData;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-/// Owner of a connection to an Ark. Closing or dropping it ends the session,
-/// including requests issued through its [`Client`] handles.
+/// Owner of a connection to an Ark, whose closing or dropping ends the session.
 ///
-/// Connect dispatches relay traffic internally when a cloud is selected. Other requests
-/// wait in a bounded queue for [`Self::recv`] while clients issue outgoing calls.
+/// Ending the session also ends the requests issued through its [`Client`]
+/// handles. Relay traffic is dispatched internally when a cloud is selected.
+/// Other requests wait in a bounded queue for [`Self::recv`] while clients
+/// issue outgoing calls.
 pub struct Ark {
     /// Request handle of the wire session owned by the dispatcher.
     requester: Requester,
-    /// Stops wire, cloud setup and application receives together.
+    /// Handle that stops wire, cloud setup and application receives together.
     closer: Closer,
     /// Requests not claimed by cloud services.
     incoming: Arc<Incoming>,
@@ -37,16 +38,20 @@ pub struct Ark {
 }
 
 impl Ark {
-    /// Installs cloud credentials before using the session's clients. The provider
-    /// is shared across cloud requests and reconnects, and is never called by status.
+    /// Installs the cloud credentials provider for this session's clients.
+    ///
+    /// Install it before using the clients. The provider serves every cloud
+    /// request and reconnect, and status requests never call it. A connection
+    /// without a cloud route ignores it.
     pub fn set_cloud_auth(&mut self, auth: impl crate::CloudAuth + 'static) {
         self.services.set_cloud_auth(Arc::new(auth));
     }
 
     /// Authenticates the peer under wire's handshake timeout, then selects cloud
-    /// routing for the session. Returns the verifier's identity information.
-    /// Every operation of the connection reads time from the stream's clock.
-    /// Failure closes the stream.
+    /// routing for the session.
+    ///
+    /// It returns the verifier's identity information. Every operation of the
+    /// connection reads time from the stream's clock. Failure closes the stream.
     pub(crate) fn attach<R, W, V>(
         stream: transport::Stream<R, W>,
         verifier: &V,
@@ -57,7 +62,10 @@ impl Ark {
         W: transport::Write + Send + 'static,
         V: Verifier<Info = Identity>,
     {
+        // Take the stream's clock before the handshake consumes the stream
         let clock = stream.clock();
+
+        // Authenticate the peer, stream I/O running out of time being a timeout
         let (session, info) = protocol::connect(stream, verifier).map_err(|err| {
             if let protocol::Error::Transport(cause) = &err
                 && let transport::Error::RecvFailed(io) | transport::Error::SendFailed(io) =
@@ -71,6 +79,8 @@ impl Ark {
             }
             Error::Handshake(err)
         })?;
+
+        // Route cloud traffic by the authenticated identity, then start dispatch
         let services = Arc::new(Services::new(&info, cloud(&info), &clock));
         Ok((Self::start(session, services)?, info))
     }
@@ -95,8 +105,9 @@ impl Ark {
         Ok(ark)
     }
 
-    /// Returns a clonable request handle bound to this session. The handle
-    /// does not keep the connection open.
+    /// Returns a clonable request handle bound to this session.
+    ///
+    /// The handle does not keep the connection open.
     pub fn client(&self) -> Client {
         Client {
             requester: self.requester.clone(),
@@ -105,9 +116,11 @@ impl Ark {
     }
 
     /// Blocks for a request not handled by cloud services, or returns the
-    /// session's ending reason. Closing discards any queued requests.
-    /// Wire answers unknown request types automatically.
-    /// The responder retains wire's reply completion and automatic reply semantics.
+    /// session's ending reason.
+    ///
+    /// Closing discards any queued requests. Wire answers unknown request types
+    /// automatically. The responder keeps wire's reply completion and automatic
+    /// reply semantics.
     pub fn recv(&mut self) -> Result<(schema::ark_to_host::Content, Responder), Error> {
         Ok(self.incoming.recv()?)
     }
@@ -119,7 +132,9 @@ impl Ark {
     }
 
     /// Closes the session, wakes blocked receives and fails pending requests.
-    /// Does not join application handlers or wait for the peer to observe closure.
+    ///
+    /// It does not join application handlers or wait for the peer to observe
+    /// closure.
     pub fn close(&self) {
         self.closer().close();
     }
@@ -132,18 +147,25 @@ impl Drop for Ark {
     }
 }
 
-/// Clonable handle for closing the connection and waking callers waiting for setup.
+/// Clonable handle for closing the connection and waking callers waiting for
+/// setup.
+///
 /// Holding the handle does not keep the Ark session open.
 #[derive(Clone, Debug)]
 pub struct Closer {
-    wire: protocol::Closer,  // Closes the original wire session
-    services: Arc<Services>, // Ends prerequisite waits on that session
-    incoming: Arc<Incoming>, // Wakes application receives when the owner closes
+    /// Closer of the original wire session.
+    wire: protocol::Closer,
+    /// Cloud setup state, whose prerequisite waits end with the session.
+    services: Arc<Services>,
+    /// Application queue, whose receives wake when the session closes.
+    incoming: Arc<Incoming>,
 }
 
 impl Closer {
-    /// Closes the original connection and relay. Setup I/O already in progress
-    /// retains its deadline; setup waiters are released immediately.
+    /// Closes the original connection and its relay.
+    ///
+    /// Setup I/O already in progress keeps its deadline; setup waiters are
+    /// released immediately.
     pub fn close(&self) {
         self.wire.close();
         self.services.close();
@@ -152,26 +174,33 @@ impl Closer {
 }
 
 /// Clonable handle for issuing typed requests through its original session.
+///
 /// Each request carries its own deadline. Handles do not keep the session open.
 #[derive(Clone, Debug)]
 pub struct Client {
-    requester: Requester,    // Wire handle bound to the original session
-    services: Arc<Services>, // Prerequisite state shared with the owner and other clients
+    /// Wire request handle bound to the original session.
+    requester: Requester,
+    /// Prerequisite state shared with the owner and the other clients.
+    services: Arc<Services>,
 }
 
 impl Client {
-    /// Returns the clock of this client's connection. Every deadline passed to
-    /// the client is measured on it, so callers build their deadlines from it.
+    /// Returns the clock of this client's connection.
+    ///
+    /// Every deadline passed to the client is measured on it, so callers build
+    /// their deadlines from it.
     pub fn clock(&self) -> Clock {
         self.services.clock().clone()
     }
 
     /// Sends a request and waits for its typed response under the chosen timing.
+    ///
     /// An absolute deadline covers setup, queueing, sending and accepting the
-    /// response; decoding is outside it. Reuse it to bound several calls.
-    /// An inactivity allowance is renewed for each prerequisite and the request.
+    /// response; decoding is outside it. Reuse it to bound several calls. An
+    /// inactivity allowance is renewed for each prerequisite and the request.
     /// Expiration does not cancel an operation the Ark has already received.
-    /// A reserved UNAVAILABLE refusal is retried once after sync only if the
+    ///
+    /// A reserved `UNAVAILABLE` refusal is retried once after sync, only if the
     /// device reports lost cloud setup. Other refusals are returned unchanged.
     pub fn call<R: Request>(
         &self,
@@ -180,9 +209,13 @@ impl Client {
     ) -> Result<R::Response, Error> {
         let timing = timing.into();
         let request = request.into();
+
+        // A request needing no cloud setup has no lost setup to retry
         if matches!(R::SETUP, Setup::None) {
             return self.send_message::<R>(request, timing)?.wait();
         }
+
+        // Keep a copy of the request for one retry after a reported setup loss
         let result = self.send_message::<R>(request.clone(), timing)?.wait();
         if matches!(&result, Err(Error::Remote(error)) if error.code == schema::ReservedErrors::Unavailable as u64)
             && !self.services.synced(&self.requester, timing)?
@@ -195,8 +228,10 @@ impl Client {
         result
     }
 
-    /// Sends a request and waits with a budget starting now. Use [`Self::call`]
-    /// with one deadline when several requests must share a budget.
+    /// Sends a request and waits with a budget starting now.
+    ///
+    /// Use [`Self::call`] with one deadline when several requests must share a
+    /// budget.
     pub fn call_timeout<R: Request>(
         &self,
         request: R,
@@ -211,13 +246,15 @@ impl Client {
         self.call(request, deadline)
     }
 
-    /// Establishes the request's prerequisites, then queues it without waiting for
-    /// output or a response. The first cloud-dependent send may wait for sync
-    /// and relay attachment, according to the request's prerequisites.
-    /// Unlike [`Self::call`], a refusal is returned without retrying lost setup.
-    /// Waiting on the promise does not refresh the deadline; dropping
-    /// it does not cancel the request. Wire's output queue has no capacity limit,
-    /// so the caller bounds the number of outstanding requests.
+    /// Establishes the request's prerequisites, then queues it without waiting
+    /// for output or a response.
+    ///
+    /// The first cloud-dependent send may wait for sync and relay attachment,
+    /// according to the request's prerequisites. Unlike [`Self::call`], a
+    /// refusal is returned without retrying lost setup. Waiting on the promise
+    /// does not refresh the deadline; dropping it does not cancel the request.
+    /// Wire's output queue has no capacity limit, so the caller bounds the
+    /// number of outstanding requests.
     pub fn send<R: Request>(
         &self,
         request: R,
@@ -227,21 +264,29 @@ impl Client {
     }
 
     /// Establishes typed prerequisites before starting the wire response window.
-    /// Device-info results retain their request time for clock observations.
+    ///
+    /// A device info request keeps its request time, so its answer can inform
+    /// the lazy cloud setup.
     fn send_message<R: Request>(
         &self,
         request: Message,
         timing: Timing,
     ) -> Result<Pending<R::Response>, Error> {
         tracing::debug!("sending request {}", std::any::type_name::<R>());
+
+        // Establish the prerequisites the request type needs
         match R::SETUP {
             Setup::None => {}
             Setup::Cloud => self.services.sync(&self.requester, timing)?,
             Setup::Relay => self.services.relay(&self.requester, timing)?,
         }
+
+        // Bound the response by its protocol window or the inactivity allowance
         let clock = self.services.clock();
         let deadline =
             R::WINDOW.map_or_else(|| timing.io(clock), |window| timing.window(clock, window));
+
+        // Queue the request, noting when a device info query was sent
         let setup = matches!(request, Message::DeviceInfoRequest(_))
             .then(|| (self.services.clone(), clock.now()));
         let promise = self
@@ -256,7 +301,8 @@ impl Client {
     }
 
     /// Establishes prerequisites and queues a request with a budget starting now.
-    /// Waiting on the returned promise retains that deadline, even if done later.
+    ///
+    /// Waiting on the returned promise keeps that deadline, even if done later.
     pub fn send_timeout<R: Request>(
         &self,
         request: R,
@@ -271,22 +317,28 @@ impl Client {
         self.send(request, deadline)
     }
 
-    /// Checks the cloud registry for this Ark, synchronizing first if
-    /// necessary. Setup, proof generation and HTTP share the supplied deadline.
-    /// A refused proof triggers one refresh and a retry with a new proof.
-    /// The returned registration may be inactive; its flags explain why.
+    /// Checks the cloud registry for this Ark, synchronizing first if necessary.
+    ///
+    /// Setup, proof generation and HTTP share the supplied deadline. A refused
+    /// proof triggers one refresh and a retry with a new proof. The returned
+    /// registration may be inactive; its flags explain why.
     pub fn genuine(&self, timing: impl Into<Timing>) -> Result<Registration, Error> {
         self.services.genuine(&self.requester, timing.into())
     }
 
-    /// Authorizes, streams, verifies and installs firmware under the chosen timing.
-    /// Reads and callbacks run on this thread and must return promptly; a blocking
-    /// reader cannot be interrupted by the deadline. Success acknowledges installation;
-    /// the Ark then reboots, and this call does not verify the subsequent boot.
-    /// Failed updates are never replayed automatically. Raw firmware requests
-    /// must not run concurrently with this operation.
-    /// A cloud proof rejection refreshes keys, then returns [`Error::ProofRejected`]
-    /// so the caller can start a new attempt with a new approval.
+    /// Authorizes, streams, verifies and installs firmware under the chosen
+    /// timing.
+    ///
+    /// Reads and callbacks run on this thread and must return promptly; the
+    /// deadline cannot interrupt a blocking reader. Success acknowledges
+    /// installation; the Ark then reboots, and this call does not verify the
+    /// subsequent boot. Failed updates are never replayed automatically. A
+    /// concurrent update through another clone fails at once, and raw firmware
+    /// requests must not run concurrently with this operation.
+    ///
+    /// A cloud proof rejection refreshes keys, then returns
+    /// [`Error::ProofRejected`] so the caller can start a new attempt with a new
+    /// approval.
     pub fn update_firmware(
         &self,
         firmware: &Firmware,
@@ -298,10 +350,11 @@ impl Client {
             .update_firmware(&self.requester, firmware, reader, timing.into(), progress)
     }
 
-    /// Pairs an unpaired Ark through the cloud rendezvous. The caller presents
-    /// the rendezvous to the owner; the Ark authenticates every opaque exchange.
-    /// Authentication may refresh cloud keys and retry once. The pairing
-    /// exchange itself is never retried automatically.
+    /// Pairs an unpaired Ark through the cloud rendezvous.
+    ///
+    /// The caller presents the rendezvous to the owner; the Ark authenticates
+    /// every opaque exchange. Authentication may refresh cloud keys and retry
+    /// once. The pairing exchange itself is never retried automatically.
     /// Progress callbacks run on this thread and must return promptly so the
     /// rendezvous and approval windows can be serviced.
     pub fn pair(
@@ -312,21 +365,26 @@ impl Client {
         self.services.pair(&self.requester, timing.into(), progress)
     }
 
-    /// Refreshes the cloud keys and signed clock explicitly. Other requests
-    /// synchronize lazily, reusing the Ark's reported setup while fresh.
+    /// Refreshes the cloud keys and signed clock explicitly.
+    ///
+    /// Other requests synchronize lazily, reusing the Ark's reported setup while
+    /// fresh.
     pub fn sync(&self, timing: impl Into<Timing>) -> Result<(), Error> {
         self.services.resync(&self.requester, timing.into())
     }
 
-    /// Attaches the companion relay after sync, reusing an existing attachment.
+    /// Attaches the companion relay after sync, reusing a connected attachment.
     pub fn attach_relay(&self, timing: impl Into<Timing>) -> Result<(), Error> {
         self.services.relay(&self.requester, timing.into())
     }
 
-    /// Identifies a dataset from its first MiB without opening an upload session.
-    /// Consumes that prefix from the reader; rewind it before uploading.
-    /// A shorter source is an error. The reader must enforce its own read timeout;
-    /// the operation deadline is checked before and after reading.
+    /// Identifies a dataset from its first 1 MiB without opening an upload
+    /// session.
+    ///
+    /// It consumes that prefix from the reader; rewind it before uploading. A
+    /// source shorter than the prefix is an error. The reader must enforce its
+    /// own read timeout; the operation deadline is checked before and after
+    /// reading.
     pub fn identify_dataset(
         &self,
         name: &str,
@@ -337,6 +395,8 @@ impl Client {
         let timing = timing.into();
         let clock = self.services.clock();
         timing.check(clock)?;
+
+        // Read the prefix, a timed out source read being a timeout
         let mut chunk = vec![0; size.min(1024 * 1024) as usize];
         reader.read_exact(&mut chunk).map_err(|error| {
             if error.kind() == io::ErrorKind::TimedOut {
@@ -346,6 +406,8 @@ impl Client {
             }
         })?;
         timing.check(clock)?;
+
+        // Ask the Ark to identify the prefix as any dataset kind
         self.call(
             schema::SlotIdentifyRequest {
                 name: name.into(),
@@ -357,11 +419,13 @@ impl Client {
         )
     }
 
-    /// Streams exactly the declared bytes and waits for processing. The Ark
-    /// identifies the target when no slot is supplied. An expected SHA-256 is
-    /// checked before processing; no URLs, caching or retries are involved.
-    /// Reads and progress callbacks run on this thread and must return promptly.
-    /// Failures attempt cancellation without replacing the original error.
+    /// Streams exactly the declared bytes and waits for processing.
+    ///
+    /// The Ark identifies the target when no slot is supplied. An expected
+    /// SHA-256 is checked before processing; no URLs, caching or retries are
+    /// involved. Reads and progress callbacks run on this thread and must
+    /// return promptly. Failures attempt cancellation without replacing the
+    /// original error.
     pub fn upload_dataset(
         &self,
         dataset: &Dataset,
@@ -375,20 +439,23 @@ impl Client {
     }
 
     /// Uploads an app, obtains companion approval and waits for its result.
+    ///
     /// The source must contain exactly `size` bytes. The Ark validates the app
     /// and its dataset requirements. An unsuccessful app still returns its
-    /// result; inspect its `success` flag. Output is retained as returned by the
-    /// Ark. Failed apps only retain their streams when developer output is enabled.
+    /// result; inspect its `success` flag. Output is kept as the Ark returns it,
+    /// and a failed app's streams come back only when its manifest sets
+    /// `develop`.
     ///
     /// Setup, upload, approval and execution share the deadline. Reads and
-    /// progress callbacks run on this thread and must return promptly. A blocking
-    /// reader cannot be interrupted by the deadline. Failed operations attempt
-    /// cancellation within the remaining time and are never retried.
+    /// progress callbacks run on this thread and must return promptly. The
+    /// deadline cannot interrupt a blocking reader. Failed operations attempt
+    /// cancellation within the remaining time, at most 1 s, and are never
+    /// retried.
     ///
     /// [`ExecutionProgress::Started`] supplies the task ID for cancellation with
     /// [`schema::ExecutionCancelRequest`] through another client clone. Closing
-    /// the connection alone does not cancel the task. Retrieving a completed
-    /// result consumes it, so only one caller should poll a task's status.
+    /// the connection sends no cancellation. Retrieving a completed result
+    /// consumes it, so only one caller should poll a task's status.
     pub fn execute(
         &self,
         size: u64,
@@ -406,12 +473,14 @@ impl Client {
 }
 
 /// Result of a typed request, decoded when [`Self::wait`] takes the response.
-/// Dropping it discards the result without cancelling the request.
+///
+/// Dropping it discards the result without canceling the request.
 #[derive(Debug)]
 pub struct Pending<T> {
     /// Encoded response and the notification registered for its completion.
     promise: Promise<Message>,
-    /// Device-info observations also inform this connection's lazy setup.
+    /// Setup state and request time of a device info query, whose answer
+    /// informs this connection's lazy setup.
     setup: Option<(Arc<Services>, Instant)>,
     /// Response type selected by the request, without owning a value of it.
     response: PhantomData<fn() -> T>,
@@ -419,6 +488,7 @@ pub struct Pending<T> {
 
 impl<T> Pending<T> {
     /// Sends an event when the request completes, successfully or with an error.
+    ///
     /// One channel can observe many requests. Registration leaves the response
     /// encoded until [`Self::wait`] and does not change its deadline.
     ///
@@ -433,8 +503,10 @@ impl<T> Pending<T> {
 }
 
 impl<T: TryFrom<Message, Error = protocol::Error>> Pending<T> {
-    /// Waits for completion and decodes the expected response. An accepted
-    /// response remains available after its deadline or the session's closure.
+    /// Waits for completion and decodes the expected response.
+    ///
+    /// An accepted response remains available after its deadline or the
+    /// session's closure.
     pub fn wait(self) -> Result<T, Error> {
         let message = self.promise.wait::<Message>()?;
         if let Some((services, requested)) = self.setup
@@ -465,11 +537,19 @@ mod tests {
     fn test_cloud_selection_after_handshake() {
         use crate::trust::{Environment, Realm};
 
-        struct Attested(Environment);
+        /// Verifier reporting every peer it accepts as attested under a fixed
+        /// environment.
+        struct Attested(
+            /// Environment the test fabricates for every accepted peer.
+            Environment,
+        );
 
         impl Verifier for Attested {
+            /// Identity the routing under test reads its cloud environment from.
             type Info = Identity;
 
+            /// Verifies the self-signed peer, then reports it as an attested
+            /// device in the fabricated environment.
             fn verify(
                 &self,
                 attestation: &transport::Attestation,
@@ -493,6 +573,8 @@ mod tests {
             }
         }
 
+        // Each environment's attested identity reaches the selector once, and
+        // the session it routes still serves requests
         let clock = test_clock().clock();
         for &env in crate::identity::ENVIRONMENTS {
             let mut peer = Peer::spawn(&clock, Box::new(answering));
@@ -531,7 +613,8 @@ mod tests {
         assert!(matches!(result, Err(Error::Handshake(_))));
     }
 
-    /// Exercises manual reverse requests without automatic cloud attachment.
+    /// Unlock request needing no setup, for exercising reverse requests without
+    /// automatic cloud attachment.
     struct ManualUnlock;
 
     impl From<ManualUnlock> for Message {
@@ -542,7 +625,9 @@ mod tests {
     }
 
     impl Request for ManualUnlock {
+        /// Unlock response the scripted peer returns.
         type Response = UnlockResponse;
+        /// No automatic prerequisites, leaving the relay to the test.
         const SETUP: Setup = Setup::None;
     }
 
@@ -562,6 +647,7 @@ mod tests {
             }
         }
 
+        // The peer relays each unlock to the host, then refuses it as unavailable
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(
             &clock,
@@ -594,6 +680,8 @@ mod tests {
                 true
             }),
         );
+
+        // The host refuses the relayed request with its own application error
         let (mut ark, _) = peer.attach().unwrap();
         let client = ark.client();
         let pending = client.send(ManualUnlock, clock.now() + TIMEOUT).unwrap();
@@ -608,6 +696,8 @@ mod tests {
             pending.wait(), Err(Error::Remote(error))
                 if error.code == schema::ReservedErrors::Unavailable as u64
         ));
+
+        // The refused unlock leaves the session open for later requests
         assert_eq!(
             client
                 .call(DeviceInfoRequest {}, clock.now() + TIMEOUT)
@@ -638,6 +728,7 @@ mod tests {
             content: Vec<u8>,
         }
 
+        // A raw peer sends unknown and known requests, then collects both replies
         let clock = test_clock().clock();
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
@@ -678,6 +769,8 @@ mod tests {
             }
             replies
         });
+
+        // The host refuses the known request itself, as unsupported
         let (mut ark, _) =
             Ark::attach(host, &crate::TrustMode::Recover(Box::new(identity)), |_| {
                 None
@@ -699,6 +792,7 @@ mod tests {
             .unwrap()
             .wait()
             .unwrap();
+
         // Both replies have been written. Close before joining so a missing reply
         // causes a peer EOF rather than leaving this test waiting indefinitely.
         ark.close();
@@ -713,10 +807,11 @@ mod tests {
         );
     }
 
-    /// Concurrent typed requests retain their responses and completion tokens.
-    /// A reserved peer refusal is returned through the same request interface.
+    /// Concurrent typed requests keep their responses and completion tokens, and
+    /// a reserved refusal returns through the same interface.
     #[test]
     fn test_requests() {
+        // A notified request signals its token before its response is taken
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(&clock, Box::new(answering));
         let (ark, _) = peer.attach().unwrap();
@@ -729,6 +824,7 @@ mod tests {
         assert_eq!(events.recv().unwrap(), 7);
         assert_eq!(pending.wait().unwrap().firmware_version, "1.0.0");
 
+        // Concurrent callers sharing one deadline each get their own response
         let deadline = clock.now() + TIMEOUT;
         let callers: Vec<_> = (0..8)
             .map(|_| {
@@ -744,6 +840,8 @@ mod tests {
         for caller in callers {
             assert_eq!(caller.join().unwrap(), "1.0.0");
         }
+
+        // A reserved refusal comes back as a remote error
         assert!(
             matches!(client.call(OnboardingRequest::default(), clock.now() + TIMEOUT), Err(Error::Remote(error)) if error.code == schema::ReservedErrors::Unsupported as u64)
         );
@@ -806,6 +904,7 @@ mod tests {
     /// A short request timeout leaves a concurrent request's budget intact.
     #[test]
     fn test_timeouts() {
+        // Leave a request outstanding under the long budget
         let mut tester = test_clock();
         let clock = tester.clock();
         let mut peer = Peer::spawn(&clock, silent());
@@ -813,7 +912,8 @@ mod tests {
         let client = ark.client();
         let pending = client.send_timeout(DeviceInfoRequest {}, TIMEOUT).unwrap();
 
-        // The short call's deadline is the earliest one, and reaching it expires the call
+        // The short call's deadline is the earliest one, and reaching it
+        // expires the call
         let deadline = clock.now() + Duration::from_millis(20);
         let short = thread::spawn({
             let client = client.clone();
@@ -831,6 +931,7 @@ mod tests {
     /// Reusing a deadline across calls and cloned handles does not renew its budget.
     #[test]
     fn test_deadlines() {
+        // A call within the shared deadline succeeds
         let mut tester = test_clock();
         let clock = tester.clock();
         let mut peer = Peer::spawn(&clock, Box::new(answering));
@@ -844,12 +945,15 @@ mod tests {
                 .firmware_version,
             "1.0.0"
         );
-        // Spend the remaining operation budget before issuing the next request.
+
+        // Spend the rest of the budget, which a cloned handle cannot renew
         tester.advance_to(deadline);
         assert!(matches!(
             client.clone().call(DeviceInfoRequest {}, deadline),
             Err(Error::Timeout)
         ));
+
+        // A budget starting now still serves a call
         assert_eq!(
             client
                 .call_timeout(DeviceInfoRequest {}, TIMEOUT)
@@ -862,13 +966,14 @@ mod tests {
     /// An unlock can wait for the host to return an opaque companion response.
     #[test]
     fn test_reverse_requests() {
+        // The peer answers an unlock after the host answers its relay request
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(
             &clock,
             Box::new(|session, _, responder| {
                 let deadline = session.clock().now() + TIMEOUT;
                 // Unlock cannot complete until the application returns the opaque
-                // companion response through this reverse request.
+                // companion response through this reverse request
                 let approval = session
                     .requester()
                     .request(
@@ -891,6 +996,8 @@ mod tests {
                 true
             }),
         );
+
+        // The application answers the relay request while the unlock waits
         let (mut ark, _) = peer.attach().unwrap();
         let client = ark.client();
         let deadline = clock.now() + TIMEOUT;
@@ -914,12 +1021,12 @@ mod tests {
         operation.join().unwrap().unwrap();
     }
 
-    /// Request handles can move between threads before selecting where to decode
-    /// a response, including a response type that cannot itself move between threads.
+    /// Request handles can move between threads before choosing where to
+    /// decode, even for a response type that is not `Send`.
     #[test]
     fn test_thread_capabilities() {
-        // Request completion handles remain Send even when a user's response wrapper
-        // isn't Send. The conversion runs in the caller that waits.
+        // Request completion handles remain Send even when a user's response
+        // wrapper isn't Send. The conversion runs in the caller that waits.
         /// Fails compilation if a handle loses its cross-thread guarantee.
         fn assert_send<T: Send>() {}
         assert_send::<Pending<std::rc::Rc<()>>>();

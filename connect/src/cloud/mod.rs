@@ -4,7 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Cloud prerequisites and registry checks for an Ark connection.
+//! Cloud services of an Ark connection, from setup and registry checks to
+//! relaying, pairing and firmware updates.
 //!
 //! Clients share one setup state per wire session. The caller that starts an
 //! attempt performs its I/O; concurrent callers wait on that attempt with their
@@ -34,10 +35,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// Whether the reported cloud identity and clock can be reused for a request.
-/// Sync is needed before the first use or at 15 seconds of drift from the
-/// clock's wall time, leaving headroom for proof verification. Key rotation is
-/// detected by a refused proof; the marker only records setup since boot.
+/// Checks whether the cloud setup that a
+/// [`DeviceInfoResponse`](crate::schema::DeviceInfoResponse) reports can be
+/// reused for a request.
+///
+/// Sync is needed when the Ark reports no setup since boot, or when its clock
+/// is 15 s or more away from the wall time of the [`Clock`]. That bound leaves
+/// headroom for proof verification. The marker records only setup since boot,
+/// so it cannot reveal changed cloud keys.
 pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse, clock: &Clock) -> bool {
     let now = clock
         .system_time()
@@ -47,56 +52,82 @@ pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse, clock: &Clock) -> 
     synced_at(info, now)
 }
 
-/// Compares the boot marker and device clock with host time in Unix seconds.
+/// Checks the boot marker and compares the device clock with `now`, the host
+/// time in Unix seconds.
 fn synced_at(info: &crate::schema::DeviceInfoResponse, now: u64) -> bool {
     info.cloud_synced && info.cloud_clock.abs_diff(now) < 15
 }
 
-/// Setup state shared by every client of one connection. Network and device I/O
-/// run outside its lock so independent requests and closure remain available.
+/// Cloud setup shared by every client of one connection.
+///
+/// Network and device I/O run outside its lock, so independent requests and
+/// closure stay available.
 #[derive(Debug)]
 pub(crate) struct Services {
-    clock: Clock,             // clock of the wire session, which every operation reads
-    cloud: Option<http::Api>, // Absent without an attested or caller-supplied environment
-    state: Mutex<State>,      // Current initialization attempt and connection lifecycle
-    updating: Mutex<()>,      // One firmware transfer at a time across client clones
+    /// Clock of the wire session, which every operation reads.
+    clock: Clock,
+    /// Cloud API client, absent when neither the attestation nor the caller
+    /// selects an environment.
+    cloud: Option<http::Api>,
+    /// Setup attempts in flight, their reusable results and the session's
+    /// ending reason.
+    state: Mutex<State>,
+    /// Lock admitting one firmware update at a time across client clones.
+    updating: Mutex<()>,
 }
 
-/// Initialization progresses once at a time and becomes reusable only on success.
+/// Setup attempts, results and ending reason of one connection.
+///
+/// Each step runs one attempt at a time and becomes reusable only on success.
 #[derive(Debug, Default)]
 struct State {
-    synced: Option<(Instant, bool)>, // Last sync decision and when it was observed
-    error: Option<protocol::Error>,  // Why the owning wire session ended
-    syncing: Option<Arc<Attempt>>,   // Cloud sync joined by concurrent callers
-    relay: Option<relay::Relay>,     // Relay attached lazily to this connection
-    joining: Option<Arc<Attempt>>,   // Relay attachment joined by concurrent callers
+    /// Last sync decision and when it was observed.
+    synced: Option<(Instant, bool)>,
+    /// Reason the owning wire session ended, once it has.
+    error: Option<protocol::Error>,
+    /// Cloud sync attempt in flight, which concurrent callers join.
+    syncing: Option<Arc<Attempt>>,
+    /// Relay attached to this connection, once a request needs it.
+    relay: Option<relay::Relay>,
+    /// Relay attachment in flight, which concurrent callers join.
+    joining: Option<Arc<Attempt>>,
 }
 
 /// One attempt's outcome, retained by its waiters even after a retry starts.
 #[derive(Debug)]
 struct Attempt {
-    result: sync::Mutex<Option<Result<(), Failure>>>, // Shared success or the original failure
-    refreshed: AtomicBool,                            // This attempt exchanged keys and signed time
-    ready: sync::Condvar,                             // Wakes waiters on completion or closure
+    /// Outcome shared by every waiter, set once.
+    result: sync::Mutex<Option<Result<(), Failure>>>,
+    /// Whether this attempt exchanged keys and signed time with the cloud.
+    refreshed: AtomicBool,
+    /// Signal that wakes the waiters on completion or closure.
+    ready: sync::Condvar,
 }
 
 /// Failures shareable between callers joining the same initialization attempt.
 #[derive(Clone, Debug)]
 enum Failure {
-    /// The identity and caller supplied no route for cloud operations.
+    /// Neither the attestation nor the caller selected a cloud environment.
     MissingEnvironment,
-    /// The cloud refused the Ark's proof, possibly after a key rotation.
+    /// The cloud answered a request carrying the Ark's proof with HTTP 403.
     ProofRejected,
-    /// Caller authentication was rejected before reaching the cloud application.
+    /// The caller's provider recognized a response as refusing its credentials.
     AuthRequired,
-    /// Login failed or the caller cannot prompt for it.
+    /// A login failed, no provider could log in, or the host refused even fresh
+    /// credentials.
     CloudAuth {
-        origin: String,  // Selected host whose credentials need attention
-        message: String, // Safe diagnostic shared with setup waiters
+        /// Origin of the host whose credentials need attention.
+        origin: String,
+        /// Diagnostic without credentials, shared with setup waiters.
+        message: String,
     },
-    Cloud(String),         // HTTP or response decoding failure
-    Relay(String),         // Relay connection or envelope failure
-    Wire(protocol::Error), // Device failure, retaining remote codes and disconnect reasons
+    /// A cloud request or socket failed, or its response could not be used.
+    Cloud(String),
+    /// The relay ended, or an exchange on it broke the protocol or its limits.
+    Relay(String),
+    /// A wire request failed or an operation timed out, keeping the Ark's
+    /// refusal or the disconnect reason.
+    Wire(protocol::Error),
 }
 
 impl From<String> for Failure {
@@ -129,14 +160,19 @@ impl From<Failure> for Error {
 }
 
 impl Services {
-    /// Installs caller-owned credentials without contacting the selected cloud.
+    /// Installs the caller's authentication provider without contacting the
+    /// cloud, doing nothing without a cloud route.
     pub(crate) fn set_cloud_auth(&self, auth: Arc<dyn CloudAuth>) {
         if let Some(cloud) = &self.cloud {
             cloud.auth.set(auth);
         }
     }
-    /// A stopped dispatcher has dropped its wire session. Preserve its ending
-    /// reason when a surviving weak requester can only report that it is gone.
+
+    /// Converts a request error, replacing a bare closure with the session's
+    /// recorded ending reason.
+    ///
+    /// A stopped dispatcher drops its wire session, after which a surviving
+    /// requester can only report it closed.
     pub(crate) fn wire_error(&self, error: protocol::Error) -> Error {
         if matches!(error, protocol::Error::Closed)
             && let Some(ended) = &self.state.lock().expect("cloud setup not poisoned").error
@@ -146,8 +182,10 @@ impl Services {
         error.into()
     }
 
-    /// Records cloud routing without starting network I/O. Every operation of the
-    /// connection reads its time from the clock of the wire session.
+    /// Records cloud routing for a connection without starting network I/O.
+    ///
+    /// Every operation of the connection reads its time from `clock`, the wire
+    /// session's clock.
     pub(crate) fn new(
         identity: &Identity,
         cloud: Option<(crate::trust::Environment, crate::trust::Realm)>,
@@ -166,8 +204,10 @@ impl Services {
         &self.clock
     }
 
-    /// Reuses fresh device state, caching that decision for one minute. Each
-    /// caller bounds its own wait; only one exchange runs at a time.
+    /// Ensures cloud sync, reusing the Ark's fresh setup and caching that
+    /// decision for 60 s.
+    ///
+    /// Each caller bounds its own wait, and only one exchange runs at a time.
     pub(crate) fn sync(
         &self,
         requester: &Requester,
@@ -177,15 +217,20 @@ impl Services {
             .map_err(Into::into)
     }
 
-    /// An explicit diagnostic refresh invalidates the reused setup, joining an
-    /// exchange already in flight if another caller is synchronizing.
+    /// Refreshes cloud keys and signed time explicitly, dropping the reused
+    /// setup.
+    ///
+    /// A sync already in flight is joined, and a fresh exchange follows when
+    /// that sync reused device state.
     pub(crate) fn resync(&self, requester: &Requester, timing: Timing) -> Result<(), Error> {
         self.ensure(requester, Step::Refresh, timing)
             .map_err(Into::into)
     }
 
-    /// Attaches the relay after cloud sync, reusing a healthy connection. A
-    /// failed relay is replaced on the next call without replaying any operation.
+    /// Attaches the relay after cloud sync, reusing a healthy attachment.
+    ///
+    /// A failed relay is replaced on the next call, without replaying any
+    /// operation.
     pub(crate) fn relay(
         &self,
         requester: &Requester,
@@ -197,10 +242,14 @@ impl Services {
             .map_err(Into::into)
     }
 
-    /// Serializes one prerequisite while allowing unrelated device traffic.
-    /// Waiters retain the attempt they joined, even if a later caller retries it.
+    /// Establishes one prerequisite, one attempt at a time, while unrelated
+    /// device traffic continues.
+    ///
+    /// Waiters keep the attempt they joined, even if a later caller retries it.
     fn ensure(&self, requester: &Requester, step: Step, timing: Timing) -> Result<(), Failure> {
         let deadline = timing.io(&self.clock);
+
+        // Under the lock, reuse a fresh result, or join or lead the step's attempt
         let (attempt, leader) = {
             let mut state = self.state.lock().expect("cloud setup not poisoned");
             if let Some(error) = &state.error {
@@ -220,6 +269,8 @@ impl Services {
                 }
                 _ => {}
             }
+
+            // A caller out of time neither starts nor joins an attempt
             if self.clock.now() >= deadline {
                 return Err(protocol::Error::Timeout.into());
             }
@@ -239,6 +290,8 @@ impl Services {
                 }
             }
         };
+
+        // A follower waits for the leader's outcome under its own deadline
         if !leader {
             attempt.wait(deadline)?;
             // A joined freshness check may have reused device state. An explicit
@@ -249,6 +302,7 @@ impl Services {
                 Ok(())
             };
         }
+
         // Run setup without the state lock, then publish only if the session
         // remains open. Closure wins over a late successful network response.
         let result = match step {
@@ -279,6 +333,8 @@ impl Services {
                 Ok(())
             })
         };
+
+        // Clear the attempt for the next caller and release its waiters
         match step {
             Step::Sync | Step::Refresh => state.syncing = None,
             Step::Relay => state.joining = None,
@@ -304,9 +360,13 @@ impl Services {
         })
     }
 
-    /// A cloud key can rotate while the Ark still reports sync. Refresh once
-    /// after a refused proof, then obtain a new proof for the same authentication.
-    /// Callers must stop here before any pairing, approval or transfer begins.
+    /// Runs an authenticated cloud step, refreshing cloud keys and running it
+    /// once more after a refused proof.
+    ///
+    /// The Ark's sync marker cannot reveal changed cloud keys, so a refused
+    /// proof is taken as a sign of stale ones. The step obtains a new proof on
+    /// each run. Since it may run twice, callers use it only before any
+    /// pairing, approval or transfer begins.
     fn authenticate<T>(
         &self,
         requester: &Requester,
@@ -322,9 +382,12 @@ impl Services {
         result
     }
 
-    /// Attaches on demand when the Ark conditionally needs authorization. Wire
-    /// replies progress independently of this dispatcher waiting for attachment.
-    /// Connections without a cloud route retain their explicit receive interface.
+    /// Forwards an Ark request to the companion, attaching the relay on demand.
+    ///
+    /// Replies to wire requests keep arriving while dispatch waits for the
+    /// attachment, and a failed attachment refuses the request with
+    /// `UNAVAILABLE`. Without a cloud route, the request comes back for the
+    /// application's own receive queue.
     pub(crate) fn forward(
         &self,
         requester: &Requester,
@@ -334,11 +397,15 @@ impl Services {
         if self.cloud.is_none() {
             return Some((request, responder));
         }
+
+        // Attach within the exchange's own time, refusing the request on failure
         let deadline = self.clock.now() + relay::EXCHANGE_TIMEOUT;
         if let Err(error) = self.relay(requester, deadline) {
             relay::fail(responder, &error.to_string());
             return None;
         }
+
+        // Hand the request to the relay, unless it ended meanwhile
         let state = self.state.lock().expect("cloud setup not poisoned");
         match &state.relay {
             Some(relay) => {
@@ -349,7 +416,8 @@ impl Services {
         None
     }
 
-    /// Verifies the Ark's registration after establishing its cloud prerequisites.
+    /// Fetches the Ark's registration with a fresh proof, once cloud sync is
+    /// established.
     pub(crate) fn genuine(
         &self,
         requester: &Requester,
@@ -366,14 +434,18 @@ impl Services {
         .map_err(Into::into)
     }
 
-    /// Exchanges cloud keys and signed time with raw wire requests, bypassing
-    /// the prerequisite gate that this exchange is completing.
+    /// Exchanges cloud keys and signed time with the Ark, unless `force` is off
+    /// and its setup is fresh.
+    ///
+    /// The exchange uses raw wire requests, bypassing the prerequisite gate that
+    /// it completes. Returns whether an exchange ran.
     fn synchronize(
         &self,
         requester: &Requester,
         timing: Timing,
         force: bool,
     ) -> Result<bool, Failure> {
+        // Reuse a recent observation of the Ark's setup, or ask the Ark
         if !force {
             let reported = self
                 .state
@@ -391,6 +463,9 @@ impl Services {
                 return Ok(false);
             }
         }
+
+        // Pass the cloud's certificates to the Ark, then signed time for its
+        // challenge
         let cloud = self.cloud.as_ref().expect("cloud route available");
         let identity = cloud.with_auth(timing, || cloud.identity(timing.io(&self.clock)))?;
         let started = requester
@@ -418,8 +493,11 @@ impl Services {
         Ok(cloud_synced(&info, &self.clock))
     }
 
-    /// Reuses device info already requested by the caller. A delayed response
-    /// must not overwrite a newer observation or an active sync exchange.
+    /// Records the cloud setup that a caller's own device info request
+    /// observed.
+    ///
+    /// A delayed response never overwrites a newer observation or a sync
+    /// exchange in flight.
     pub(crate) fn reported(&self, info: &crate::schema::DeviceInfoResponse, requested: Instant) {
         let mut state = self.state.lock().expect("cloud setup not poisoned");
         if state.error.is_none()
@@ -435,7 +513,10 @@ impl Services {
         self.end(protocol::Error::Closed);
     }
 
-    /// Retains the wire's original ending reason for setup waiters as well.
+    /// Ends setup with the wire's ending reason, releasing waiters and closing
+    /// the relay.
+    ///
+    /// Only the first reason is kept, and later calls do nothing.
     pub(crate) fn end(&self, error: protocol::Error) {
         let mut state = self.state.lock().expect("cloud setup not poisoned");
         if state.error.is_some() {
@@ -454,19 +535,22 @@ impl Services {
     }
 }
 
-/// Setup action to join or start. Relay callers establish cloud sync first.
+/// Setup step that callers join or start.
+///
+/// Relay callers establish cloud sync first.
 #[derive(Clone, Copy)]
 enum Step {
-    /// Reuse fresh device state or exchange cloud keys and signed time.
+    /// Cloud sync, reusing fresh device state when it can.
     Sync,
-    /// Exchange keys and time even if the device reports usable setup.
+    /// Cloud sync that exchanges keys and time even when the device reports
+    /// usable setup.
     Refresh,
-    /// Authenticate and start a relay worker, reusing a healthy attachment.
+    /// Relay attachment with its own worker, reusing a healthy one.
     Relay,
 }
 
 impl Attempt {
-    /// Starts an attempt whose waiters measure their deadlines on the clock.
+    /// Creates an attempt whose waiters measure their deadlines on the clock.
     fn new(clock: &Clock) -> Self {
         Self {
             result: sync::Mutex::new(None),
@@ -484,7 +568,8 @@ impl Attempt {
         }
     }
 
-    /// Waits for this attempt without extending or shortening another caller's budget.
+    /// Waits for this attempt without extending or shortening another caller's
+    /// budget.
     fn wait(&self, deadline: Instant) -> Result<(), Failure> {
         let mut outcome = self.result.lock().expect("cloud attempt not poisoned");
         loop {
@@ -524,14 +609,18 @@ pub(crate) mod tests {
     /// Budget for loopback I/O that is not exercising expiration.
     pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Serves scripted responses and captures requests, closing each connection
-    /// after its response. A server left waiting by a failed test blocks only
-    /// its own thread.
+    /// Serves scripted responses in order and captures each request's headers.
+    ///
+    /// Each connection closes after its response. A server left waiting by a
+    /// failed test blocks only its own thread.
     pub(crate) fn serve(responses: Vec<String>) -> (String, mpsc::Receiver<String>) {
         serve_inner(responses, None)
     }
 
-    /// Holds the first response until released, making setup races deterministic.
+    /// Serves like [`serve`], holding the first response until `pause` releases
+    /// it.
+    ///
+    /// Holding a response makes setup races deterministic.
     pub(super) fn serve_inner(
         responses: Vec<String>,
         mut pause: Option<mpsc::Receiver<()>>,
@@ -546,6 +635,8 @@ pub(crate) mod tests {
                 };
                 stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                 stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+
+                // Capture the request up to the end of its headers
                 let mut request = Vec::new();
                 let mut bytes = [0; 1024];
                 while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
@@ -555,6 +646,8 @@ pub(crate) mod tests {
                     }
                 }
                 sender.send(String::from_utf8(request).unwrap()).unwrap();
+
+                // Hold the first response until released, then answer
                 if let Some(pause) = pause.take()
                     && pause.recv().is_err()
                 {
@@ -574,7 +667,8 @@ pub(crate) mod tests {
         )
     }
 
-    /// Loopback tests ignore ambient proxy settings.
+    /// Builds the HTTP client of the loopback tests, configured like the cloud's
+    /// own but ignoring ambient proxy settings.
     pub(super) fn http() -> ureq::Agent {
         ureq::Agent::config_builder()
             .proxy(None)
@@ -584,7 +678,8 @@ pub(crate) mod tests {
             .into()
     }
 
-    /// Attaches a real wire session with cloud routes redirected to the test server.
+    /// Attaches a real wire session whose cloud routes lead to the test server.
+    ///
     /// The connection runs on the clock of the peer's stream.
     pub(crate) fn attach(peer: &mut Peer, url: String) -> Ark {
         let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
@@ -599,8 +694,10 @@ pub(crate) mod tests {
         Ark::start(session, services).unwrap()
     }
 
-    /// Peer that only issues a proof after sync, retaining counts for duplicate
-    /// initialization checks. Optionally refuses its first start request.
+    /// Spawns an Ark peer that issues proofs and lists slots only after sync,
+    /// counting its sync starts and proofs.
+    ///
+    /// With `refuse_first` set, it refuses its first sync start.
     fn peer(clock: &Clock, refuse_first: bool) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let starts = Arc::new(AtomicUsize::new(0));
         let proofs = Arc::new(AtomicUsize::new(0));
@@ -674,7 +771,7 @@ pub(crate) mod tests {
         (peer, starts, proofs)
     }
 
-    /// JSON replies used by the real wire peer's cloud synchronization exchange.
+    /// Returns the cloud's identity and time replies for one sync exchange.
     pub(super) fn sync_responses() -> Vec<String> {
         vec![
             response(200, r#"{"signer":"AQ==","crypto":"Ag=="}"#),
@@ -713,7 +810,8 @@ pub(crate) mod tests {
         );
         assert_eq!(starts.load(Ordering::SeqCst), 0);
 
-        // A short waiter on the pending setup expires alone, at the earliest deadline on the clock
+        // A short waiter on the pending setup expires alone, at the earliest
+        // deadline on the clock
         let short = clock.now() + Duration::from_millis(20);
         let waiter = thread::spawn({
             let client = client.clone();
@@ -746,6 +844,7 @@ pub(crate) mod tests {
     /// A refused attempt preserves its device error and does not poison a retry.
     #[test]
     fn test_setup_retry() {
+        // The Ark refuses the first sync start, whose error comes back unchanged
         let clock = test_clock().clock();
         let mut responses = sync_responses();
         responses.insert(0, responses[0].clone());
@@ -756,6 +855,8 @@ pub(crate) mod tests {
         let deadline = clock.now() + TIMEOUT;
         assert!(matches!(client.call(GenuinityProofRequest {}, deadline),
             Err(Error::Remote(error)) if error.code == 0x111));
+
+        // A retry syncs afresh and gets its proof
         client.call(GenuinityProofRequest {}, deadline).unwrap();
         assert_eq!(starts.load(Ordering::SeqCst), 2);
         assert_eq!(proofs.load(Ordering::SeqCst), 1);
@@ -765,6 +866,7 @@ pub(crate) mod tests {
     /// and prevents that response from starting any request on the closed Ark.
     #[test]
     fn test_close_during_setup() {
+        // Hold the leader's sync at its first HTTP request
         let clock = test_clock().clock();
         let (release, pause) = mpsc::channel();
         let (url, requests) = serve_inner(vec![sync_responses().remove(0)], Some(pause));
@@ -777,23 +879,28 @@ pub(crate) mod tests {
             move || client.call(GenuinityProofRequest {}, deadline)
         });
         requests.recv().unwrap();
+
+        // Closing releases a waiter on the held sync at once
         let waiter = thread::spawn({
             let client = client.clone();
             move || client.call(GenuinityProofRequest {}, deadline)
         });
         ark.closer().close();
         assert!(matches!(waiter.join().unwrap(), Err(Error::Closed)));
+
+        // The leader fails once its response arrives, starting no Ark request
         release.send(()).unwrap();
         assert!(matches!(leader.join().unwrap(), Err(Error::Closed)));
         assert_eq!(starts.load(Ordering::SeqCst), 0);
     }
 
-    /// Self-signed and recovery sessions retain local operations. Cloud-dependent
-    /// requests fail clearly when the caller did not supply an environment.
+    /// Self-signed and recovery sessions without an environment fail cloud
+    /// requests clearly and keep local ones.
     #[test]
     fn test_unattested_setup() {
         let clock = test_clock().clock();
         for recover in [false, true] {
+            // Attach without attestation or an environment
             let mut peer = Peer::spawn(&clock, Box::new(answering));
             let policy = if recover {
                 TrustMode::Recover(Box::new(peer.identity.clone()))
@@ -801,6 +908,8 @@ pub(crate) mod tests {
                 TrustMode::RootOrSelf
             };
             let (ark, _) = Ark::attach(peer.stream(), &policy, |_| None).unwrap();
+
+            // Cloud requests fail for want of an environment, while status works
             let client = ark.client();
             assert!(matches!(
                 client.call(GenuinityProofRequest {}, clock.now() + TIMEOUT),
@@ -820,19 +929,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// Explicit routing lets self-signed and recovery peers sync and query slots.
-    /// Registry authentication uses their opaque proofs without an attested serial.
+    /// An explicit route lets self-signed and recovery peers sync, query slots
+    /// and pass registry checks with no attested serial.
     #[test]
     fn test_unattested_cloud() {
         let clock = test_clock().clock();
         for recover in [false, true] {
             for realm in [Realm::Hardware, Realm::Emulator] {
+                // Serve one sync and registration, then two refusals around a
+                // second sync
                 let mut responses = sync_responses();
                 responses.push(response(200, r#"{"serial":"registry-serial","enrolled":123,"disabled":false,"expired":false,"superseded":false}"#));
                 responses.push(response(403, "registry refused proof"));
                 responses.extend(sync_responses());
                 responses.push(response(403, "registry refused proof"));
                 let (url, requests) = serve(responses);
+
+                // Connect without attestation, which leaves the realm unset
                 let (mut peer, starts, proofs) = peer(&clock, false);
                 let policy = if recover {
                     TrustMode::Recover(Box::new(peer.identity.clone()))
@@ -843,6 +956,7 @@ pub(crate) mod tests {
                 assert_eq!(identity.realm(), None);
                 assert_eq!(matches!(identity, Identity::Recovered(_)), recover);
 
+                // Route the cloud explicitly, then point it at the loopback server
                 let env = crate::identity::ENVIRONMENTS[0];
                 let mut services = Services::new(&identity, Some((env, realm)), &session.clock());
                 let cloud = services.cloud.as_mut().unwrap();
@@ -852,6 +966,7 @@ pub(crate) mod tests {
                 let client = ark.client();
                 let deadline = clock.now() + TIMEOUT;
 
+                // Status needs no sync, and two slot queries share one
                 client.call(DeviceInfoRequest {}, deadline).unwrap();
                 assert_eq!(starts.load(Ordering::SeqCst), 0);
                 for _ in 0..2 {
@@ -859,6 +974,9 @@ pub(crate) mod tests {
                         .call(crate::schema::SlotListRequest {}, deadline)
                         .unwrap();
                 }
+
+                // The registry answers with no attested serial to match, and a
+                // later refusal persists through one resync
                 let registration = client.genuine(deadline).unwrap();
                 assert_eq!(registration.serial, "registry-serial");
                 assert!(registration.active());
@@ -869,6 +987,7 @@ pub(crate) mod tests {
                 assert_eq!(starts.load(Ordering::SeqCst), 2);
                 assert_eq!(proofs.load(Ordering::SeqCst), 3);
 
+                // Every request took the realm's routes, in order
                 let registry = match realm {
                     Realm::Hardware => "/v1/genuine",
                     Realm::Emulator => "/v1/sandbox/genuine",
@@ -889,6 +1008,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Device setup counts as fresh only with the boot marker set and a clock
+    /// less than 15 s away from the host's.
     #[test]
     fn test_sync_freshness() {
         use crate::schema::DeviceInfoResponse;
@@ -917,8 +1038,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A refused authentication refreshes the cloud identity and obtains a new
-    /// proof once. Other HTTP failures and a second refusal keep their errors.
+    /// A refused proof triggers one resync and a new proof, while other HTTP
+    /// failures and a second refusal keep their errors.
     #[test]
     fn test_authentication_refresh() {
         use crate::schema;
@@ -928,6 +1049,9 @@ pub(crate) mod tests {
                 if retried == 200 && operation != "genuine" {
                     continue;
                 }
+
+                // Answer the first attempt with the status, and the retry after
+                // a 403 with the retry status
                 let mut responses = vec![response(status, "refused")];
                 if status == 403 {
                     responses.extend(sync_responses());
@@ -936,6 +1060,8 @@ pub(crate) mod tests {
                     } else { "still refused" }));
                 }
                 let (url, requests) = serve(responses);
+
+                // An Ark reporting fresh setup, whose proofs change once it resyncs
                 let proofs = Arc::new(AtomicUsize::new(0));
                 let mut peer = Peer::spawn(
                     &clock,
@@ -987,6 +1113,9 @@ pub(crate) mod tests {
                         }
                     }),
                 );
+
+                // Run the operation, which never starts pairing before it
+                // authenticates
                 let ark = attach(&mut peer, url);
                 let client = ark.client();
                 let deadline = clock.now() + TIMEOUT;
@@ -998,6 +1127,9 @@ pub(crate) mod tests {
                     }
                     _ => unreachable!(),
                 };
+
+                // A successful retry passes, a second 403 stays a refused proof,
+                // and other statuses stay cloud failures
                 if retried == 200 {
                     result.unwrap();
                 } else if status == 403 {
@@ -1007,6 +1139,8 @@ pub(crate) mod tests {
                     let error = result.unwrap_err();
                     assert!(matches!(error, Error::Cloud(_)), "{error:?}");
                 }
+
+                // A 403 resyncs between two attempts, each with its own proof
                 let requests: Vec<_> = requests.try_iter().collect();
                 assert!(requests[0].starts_with(&format!("GET /v1/{operation} ")));
                 assert_eq!(
@@ -1038,12 +1172,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// Refused credentials trigger one login and a retry with a fresh proof and
+    /// no resync, and a failed login or a second refusal ends the operation.
     #[test]
     fn caller_authentication_retries_fresh_proofs_without_cloud_sync() {
         use auth::tests::{Login, refused};
         let clock = test_clock().clock();
         for operation in ["genuine", "relaying", "pairing"] {
             for fail_login in [false, true] {
+                // Refuse the caller's credentials, and after a login accept only
+                // the registry check
                 let mut responses = vec![refused(403)];
                 if !fail_login {
                     responses.push(if operation == "genuine" {
@@ -1051,6 +1189,8 @@ pub(crate) mod tests {
                     } else { refused(403) });
                 }
                 let (url, requests) = serve(responses);
+
+                // An Ark reporting fresh setup, numbering each proof it issues
                 let proofs = Arc::new(AtomicUsize::new(0));
                 let mut peer = Peer::spawn(
                     &clock,
@@ -1093,6 +1233,8 @@ pub(crate) mod tests {
                         }
                     }),
                 );
+
+                // Status never consults the login stand-in
                 let mut ark = attach(&mut peer, url);
                 let login = Login {
                     fail: fail_login,
@@ -1103,6 +1245,8 @@ pub(crate) mod tests {
                 let timing = Timing::inactivity(TIMEOUT);
                 client.call(DeviceInfoRequest {}, timing).unwrap();
                 assert_eq!(login.lookups.load(Ordering::SeqCst), 0);
+
+                // Only a registry check after a successful login passes
                 let result = match operation {
                     "genuine" => client.genuine(timing).map(drop),
                     "relaying" => client.attach_relay(timing),
@@ -1116,6 +1260,9 @@ pub(crate) mod tests {
                 } else {
                     assert!(matches!(result, Err(Error::CloudAuth { .. })), "{result:?}");
                 }
+
+                // Every case logs in once, and a retry carries refreshed
+                // credentials and a fresh proof, with no resync in between
                 let requests: Vec<_> = requests.try_iter().collect();
                 assert_eq!(requests.len(), if fail_login { 1 } else { 2 });
                 assert_eq!(proofs.load(Ordering::SeqCst), requests.len());
@@ -1142,12 +1289,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Cloud sync logs in when the identity request is refused, before any
+    /// certificate reaches the Ark.
     #[test]
     fn cloud_sync_logs_in_before_sending_certificates_to_the_ark() {
         use auth::tests::{Login, refused};
+
+        // Refuse the caller's credentials on the first identity request
         let mut responses = vec![refused(302)];
         responses.extend(sync_responses());
         let (url, requests) = serve(responses);
+
+        // An explicit sync logs in once and hands the Ark a single identity
         let (mut peer, starts, _) = peer(&test_clock().clock(), false);
         let mut ark = attach(&mut peer, url);
         let login = Login::default();
@@ -1155,6 +1308,9 @@ pub(crate) mod tests {
         ark.client().sync(Timing::inactivity(TIMEOUT)).unwrap();
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(login.logins.load(Ordering::SeqCst), 1);
+
+        // The refused request carried the cached credentials, and the two after
+        // the login carried refreshed ones
         let requests: Vec<_> = requests.try_iter().collect();
         assert_eq!(requests.len(), 3);
         assert!(requests[0].contains("authorization: cached\r\n"));
@@ -1162,11 +1318,13 @@ pub(crate) mod tests {
         assert!(requests[2].contains("authorization: refreshed\r\n"));
     }
 
-    /// Reusing device state needs no HTTP, while explicit diagnostics always
-    /// refresh it. Dataset paths keep every field across the connection.
+    /// Reported device setup spares the sync exchange, an explicit sync always
+    /// runs it, and dataset paths keep every field across the connection.
     #[test]
     fn test_reported_sync_and_explicit_refresh() {
         use crate::schema;
+
+        // A dataset path with every field set
         let expected = schema::DatasetPathsResponse {
             paths: vec![schema::DatasetPath {
                 path: "v1/sample/<item>".into(),
@@ -1180,11 +1338,14 @@ pub(crate) mod tests {
         };
         let clock = test_clock().clock();
         for initially_synced in [false, true] {
+            // Serve the explicit sync, plus a first one for an unsynced Ark
             let mut responses = sync_responses();
             if !initially_synced {
                 responses.extend(sync_responses());
             }
             let (url, requests) = serve(responses);
+
+            // An Ark counting status requests, serving paths only once synced
             let infos = Arc::new(AtomicUsize::new(0));
             let mut peer = Peer::spawn(
                 &clock,
@@ -1228,6 +1389,9 @@ pub(crate) mod tests {
                     }
                 }),
             );
+
+            // Requests after a status reuse what it reported, syncing only when
+            // the Ark was not synced
             let ark = attach(&mut peer, url);
             let client = ark.client();
             let deadline = clock.now() + TIMEOUT;
@@ -1244,6 +1408,8 @@ pub(crate) mod tests {
                 requests.try_iter().count(),
                 if initially_synced { 0 } else { 2 }
             );
+
+            // An explicit sync always runs the exchange, without asking the Ark
             client.sync(deadline).unwrap();
             assert!(requests.recv().unwrap().contains("/cloudsync/identity"));
             assert!(requests.recv().unwrap().contains("/cloudsync/time"));
@@ -1251,9 +1417,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// Waiting on an older status response must not undo a completed refresh.
+    /// An older status response read after a refresh does not undo it.
     #[test]
     fn test_delayed_device_info_retains_newer_sync() {
+        // Read a status sent before an explicit sync only after the sync
         let clock = test_clock().clock();
         let (url, requests) = serve(sync_responses());
         let (mut peer, starts, _) = peer(&clock, false);
@@ -1263,6 +1430,8 @@ pub(crate) mod tests {
         let pending = client.send(DeviceInfoRequest {}, deadline).unwrap();
         client.sync(deadline).unwrap();
         assert!(!pending.wait().unwrap().cloud_synced);
+
+        // A later request reuses the sync instead of running another
         client
             .call(crate::schema::SlotListRequest {}, deadline)
             .unwrap();
@@ -1270,12 +1439,15 @@ pub(crate) mod tests {
         assert_eq!(requests.try_iter().count(), 2);
     }
 
-    /// A core restart can invalidate setup without losing the wire session.
-    /// Retry only its reserved refusal and only with evidence of lost sync.
+    /// Only an `UNAVAILABLE` refusal with lost sync reported triggers a resync
+    /// and one retry, and every other refusal comes back unchanged.
     #[test]
     fn test_unavailable_retry_requires_lost_sync() {
         use crate::schema::{self, ReservedErrors};
         let clock = test_clock().clock();
+
+        // Each case names the refusal, whether it drops the Ark's sync, whether
+        // it repeats and the retries expected
         for (code, reset, repeat, retries) in [
             (ReservedErrors::Unavailable as u64, true, false, 1),
             (ReservedErrors::Unavailable as u64, true, true, 1),
@@ -1283,11 +1455,15 @@ pub(crate) mod tests {
             (ReservedErrors::Unauthorized as u64, true, false, 0),
             (0x1234, true, false, 0),
         ] {
+            // Serve one sync exchange when the case retries
             let (url, requests) = serve(if retries == 1 {
                 sync_responses()
             } else {
                 vec![]
             });
+
+            // An Ark that refuses slot listings as the case asks, reporting its
+            // sync lost on reset
             let count = Arc::new(AtomicUsize::new(0));
             let mut peer = Peer::spawn(
                 &clock,
@@ -1341,6 +1517,9 @@ pub(crate) mod tests {
                     }
                 }),
             );
+
+            // The listing retries only as expected, ending in success or the
+            // original refusal
             let ark = attach(&mut peer, url);
             let result = ark
                 .client()

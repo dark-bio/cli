@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use darkbio_connect::trust::Environment;
 use std::path::PathBuf;
 
-// Parsed command and global options; cross-level conflicts are checked afterward.
+// Parsed command and global options; cross-level conflicts are checked afterward
 #[derive(Parser)]
 #[command(
     name = "ark",
@@ -24,7 +24,7 @@ use std::path::PathBuf;
     propagate_version = false
 )]
 pub(crate) struct Cli {
-    // Options propagated to every command level by clap.
+    // Options propagated to every command level by clap
     #[command(flatten)]
     pub options: Options,
     /// Tool, connect and wire versions
@@ -33,17 +33,21 @@ pub(crate) struct Cli {
     /// Print help; `ark help --all` prints the manual
     #[arg(short = 'h', long)]
     pub help: bool,
-    // Accept the common --help --all spelling of the manual.
+    // Accept the common --help --all spelling of the manual
     #[arg(long, hide = true, requires = "help", conflicts_with = "version")]
     pub all: bool,
-    // Absent for top-level help or the standalone version flag.
+    // Absent for top-level help or the standalone version flag
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 impl Cli {
-    /// Clap checks conflicts within one parser level. Global values may have
-    /// been supplied at an ancestor, so verify these after propagation too.
+    /// Checks the flag conflicts that span command levels, failing with a usage
+    /// error of class 2.
+    ///
+    /// Clap checks conflicts within one parser level, while a global flag may
+    /// come from any level. This rejects `--dry-run` with `--unlock`, `--quiet`
+    /// with `--verbose`, and `--version` with a command.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         let dry = matches!(
             &self.command,
@@ -72,7 +76,7 @@ impl Cli {
     }
 }
 
-// Invocation-wide presentation and device policy, independent of connect's API.
+// Invocation-wide presentation and device policy, independent of connect's API
 #[derive(Args, Clone)]
 pub(crate) struct Options {
     /// Which Ark: locator, unique serial, name, image, or hardware/emulator
@@ -107,14 +111,16 @@ pub(crate) struct Options {
     pub log: Option<Log>,
 }
 
-// Diagnostic detail, independent of step narration.
+// Diagnostic detail, independent of step narration
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub(crate) enum Log {
+    // Update and connect events up to debug level
     Debug,
+    // Update, connect and wire events at every level
     Trace,
 }
 
-// Top-level command palette, shared by parsing, help and shell completion.
+// Top-level command palette, shared by parsing, help and shell completion
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Find hardware Arks and running emulators
@@ -156,7 +162,7 @@ pub(crate) enum Command {
     },
 }
 
-// Explicit identity pin accepted by diagnostics and enrollment recovery.
+// Explicit identity pin accepted by diagnostics and enrollment recovery
 #[derive(Args)]
 pub(crate) struct Recovery {
     /// Pin an xDSA public key instead of verifying the attestation
@@ -169,18 +175,18 @@ pub(crate) struct Recovery {
     pub pubkey: Option<String>,
 }
 
-// Local attestation input and optional identity pin for enrollment.
+// Local attestation input and optional identity pin for enrollment
 #[derive(Args)]
 pub(crate) struct Enroll {
     /// Install an existing signed attestation
     #[arg(long, value_name = "FILE")]
     pub cwt: Option<PathBuf>,
-    // Recovery can authenticate a device whose stored attestation is unusable.
+    // Recovery can authenticate a device whose stored attestation is unusable
     #[command(flatten)]
     pub recovery: Recovery,
 }
 
-// Dataset inspection and mutation commands; slot names map to wire IDs below.
+// Dataset inspection and mutation commands; slot names map to wire IDs below
 #[derive(Subcommand)]
 pub(crate) enum Data {
     /// Map the data paths an app can read
@@ -228,7 +234,7 @@ pub(crate) enum Data {
     Repair(Change),
 }
 
-// Shared selection and planning arguments for slot deletion and repair.
+// Shared selection and planning arguments for slot deletion and repair
 #[derive(Args)]
 pub(crate) struct Change {
     /// Slot name or id from `ark data list`
@@ -239,7 +245,7 @@ pub(crate) struct Change {
     pub dry_run: bool,
 }
 
-// App execution and explicit cancellation by the task ID returned by the Ark.
+// App execution and explicit cancellation by the task ID returned by the Ark
 #[derive(Subcommand)]
 pub(crate) enum App {
     /// Run an app, approved on your phone; print its report
@@ -254,7 +260,7 @@ pub(crate) enum App {
     },
 }
 
-// Published firmware selection and installation, including read-only planning.
+// Published firmware selection and installation, including read-only planning
 #[derive(Subcommand)]
 pub(crate) enum Firmware {
     /// Show the installed build and update candidates
@@ -273,7 +279,7 @@ pub(crate) enum Firmware {
     },
 }
 
-/// Parses the three explicit cloud routes supported by the CLI.
+/// Parses a cloud environment name, one of `release`, `staging` or `develop`.
 pub(crate) fn parse_env(value: &str) -> Result<Environment, String> {
     match value {
         "release" => Ok(Environment::Release),
@@ -285,7 +291,10 @@ pub(crate) fn parse_env(value: &str) -> Result<Environment, String> {
     }
 }
 
-/// Protocol names remain exact; numeric IDs keep future slots addressable.
+/// Parses a slot selector, either a positive numeric id or an exact slot name.
+///
+/// A name must match the spelling [`slot_name`] prints. Any positive id is
+/// accepted, so slots this build does not know stay addressable.
 pub(crate) fn parse_slot(value: &str) -> Result<i32, String> {
     if let Ok(id) = value.parse::<i32>()
         && id > 0
@@ -311,7 +320,8 @@ pub(crate) fn slot_name(id: i32) -> String {
         .unwrap_or_else(|_| id.to_string())
 }
 
-/// Reject durations that cannot be represented as monotonic deadlines.
+/// Parses a `--timeout` value in seconds, rejecting zero and values too large
+/// for a deadline on the monotonic clock.
 #[expect(
     clippy::disallowed_methods,
     reason = "flags are parsed before any connection clock exists, and the timeout must fit a deadline on the real monotonic clock that connections run on"
@@ -330,10 +340,13 @@ fn parse_timeout(value: &str) -> Result<u64, String> {
     Ok(seconds)
 }
 
+/// Tests of the value parsers and the conflict checks across command levels.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Checks that every environment name parses, alone and as a global flag,
+    /// while an unknown name fails.
     #[test]
     fn all_environments_parse() {
         assert!(
@@ -341,6 +354,8 @@ mod tests {
                 .unwrap_err()
                 .starts_with("unknown environment")
         );
+
+        // Each name parses directly and through the flag before a command
         for (name, env) in [
             ("release", Environment::Release),
             ("staging", Environment::Staging),
@@ -352,6 +367,8 @@ mod tests {
         }
     }
 
+    /// Checks that slot names parse only in their exact spelling, while every
+    /// positive id parses, known or not.
     #[test]
     fn slots_are_exact_and_future_ids_remain_addressable() {
         for id in 1..=4 {
@@ -359,6 +376,8 @@ mod tests {
             assert_eq!(parse_slot(&id.to_string()), Ok(id));
         }
         assert_eq!(parse_slot("2147483647"), Ok(i32::MAX));
+
+        // Zero, negative, overflowing, unknown and misspelled selectors all fail
         for invalid in [
             "0",
             "unspecified",
@@ -372,6 +391,8 @@ mod tests {
         }
     }
 
+    /// Checks that `-v` and `--log` set independently, while a repeated `-v`
+    /// or an unknown log level fails.
     #[test]
     fn narration_and_diagnostics_are_independent() {
         let cli = Cli::try_parse_from(["ark", "-v", "status", "--log", "debug"]).unwrap();
@@ -380,6 +401,8 @@ mod tests {
         let cli = Cli::try_parse_from(["ark", "--log", "trace", "status"]).unwrap();
         assert!(!cli.options.verbose);
         assert_eq!(cli.options.log, Some(Log::Trace));
+
+        // Verbosity has no levels, and logs have no info level
         for args in [
             vec!["ark", "-vv"],
             vec!["ark", "-vvv"],
@@ -389,6 +412,8 @@ mod tests {
         }
     }
 
+    /// Checks that conflicting flags fail in the parser or in validation,
+    /// whichever command level they arrive at.
     #[test]
     fn parser_conflicts_protect_dry_runs_and_explicit_selection() {
         for args in [
@@ -411,6 +436,8 @@ mod tests {
                 "{args:?}"
             );
         }
+
+        // The largest 64-bit task id still parses
         assert!(Cli::try_parse_from(["ark", "app", "cancel", "18446744073709551615"]).is_ok());
     }
 }

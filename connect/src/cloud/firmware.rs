@@ -17,11 +17,16 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-/// Archive bytes per acknowledged transfer, amortizing USB and device write latency.
+/// Archive bytes per acknowledged upload request, 1 MiB to amortize each round
+/// trip.
 const CHUNK_SIZE: usize = 1024 * 1024;
 
-/// A published encrypted archive. The Ark verifies its signature, contents and
-/// version before installation; the host checks the download's length and hash.
+/// Published encrypted firmware archive, as
+/// [`Client::update_firmware`](crate::Client::update_firmware) streams it to the
+/// Ark.
+///
+/// The host checks the archive's length and SHA-256 while streaming it, and
+/// the Ark decrypts and verifies it before installation.
 #[derive(Clone, Debug)]
 pub struct Firmware {
     /// Published version authorized by the cloud and checked by the Ark.
@@ -32,33 +37,39 @@ pub struct Firmware {
     pub sha256: [u8; 32],
 }
 
-/// Update stages reported on the caller's thread. Uploaded bytes have been
-/// acknowledged by the Ark; installation completes only when the call returns.
+/// Stages of [`Client::update_firmware`](crate::Client::update_firmware),
+/// reported on the caller's thread.
+///
+/// Uploaded bytes count only what the Ark acknowledged, and installation
+/// completes only when the call returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateProgress {
-    /// Synchronization has completed; the Ark may now request approval.
+    /// Preparation after cloud sync, during which the Ark may ask for approval.
     Preparing,
-    /// Downloaded archive bytes acknowledged by the Ark so far.
+    /// Upload of the archive, with the bytes the Ark acknowledged so far.
     Uploading {
         /// Archive bytes acknowledged so far.
         uploaded: u64,
         /// Declared encrypted archive length in bytes.
         total: u64,
     },
-    /// The complete archive passed the host checks and is being verified by the Ark.
+    /// Verification by the Ark, once the complete archive passed the host's
+    /// checks.
     Verifying,
-    /// The verified firmware is being installed; success will reboot the Ark.
+    /// Installation of the verified firmware, which reboots the Ark on success.
     Installing,
 }
 
 /// Firmware authorization returned by the cloud for this prepared update.
 #[derive(Deserialize)]
 struct Access {
-    access: String, // Cloud response sealed to the Ark's ephemeral update key
+    /// Archive key sealed to the Ark's ephemeral update key, in standard base64.
+    access: String,
 }
 
 impl Services {
-    /// Requires a cloud route and preserves the owning session's ending reason.
+    /// Returns the cloud route, failing first with the session's ending reason
+    /// once it ended.
     fn firmware_cloud(&self) -> Result<&http::Api, Error> {
         if let Some(error) = &self.state.lock().expect("cloud setup not poisoned").error {
             return Err(error.clone().into());
@@ -66,8 +77,10 @@ impl Services {
         self.cloud.as_ref().ok_or(Error::MissingEnvironment)
     }
 
-    /// Holds one update across its cloud requests and wire calls. A failure ends
-    /// the sequence; upload chunks and installation are never retried implicitly.
+    /// Runs one firmware update, from cloud authorization through installation.
+    ///
+    /// One update runs at a time across client clones. A failure ends the
+    /// sequence, and upload chunks and installation are never retried.
     pub(crate) fn update_firmware(
         &self,
         requester: &Requester,
@@ -76,6 +89,7 @@ impl Services {
         timing: Timing,
         mut progress: impl FnMut(UpdateProgress),
     ) -> Result<(), Error> {
+        // Admit one update of a non-empty archive at a time, on a synced Ark
         let cloud = self.firmware_cloud()?;
         if firmware.size == 0 {
             return Err(Error::Firmware("firmware archive is empty".into()));
@@ -86,11 +100,14 @@ impl Services {
             .map_err(|_| Error::Firmware("another firmware update is already running".into()))?;
         self.sync(requester, timing)?;
         let clock = &self.clock;
+
         // Finish any browser login before asking the Ark to prepare an update.
         // A protected host can need login even when device sync is still fresh.
         if cloud.auth.configured() {
             cloud.with_auth(timing, || cloud.identity(timing.io(clock)))?;
         }
+
+        // Ask the Ark to prepare, which may wait for the owner's approval
         progress(UpdateProgress::Preparing);
         let prepared = requester
             .request(
@@ -102,6 +119,8 @@ impl Services {
                 timing.approval(clock),
             )?
             .wait::<schema::FirmwareUpdatePrepResponse>()?;
+
+        // Fetch the archive key for the prepared update and hand it to the Ark
         let access: Access = match http::get_authenticated(
             cloud,
             cloud
@@ -122,8 +141,8 @@ impl Services {
                 });
             }
             Err(Failure::ProofRejected) => {
-                // Preparation may already have required approval. Refresh keys
-                // for the next attempt, leaving the caller to start it explicitly.
+                // Preparation may already have required approval. Refresh keys for
+                // the next attempt, leaving the caller to start it explicitly.
                 self.resync(requester, timing)?;
                 return Err(Error::ProofRejected);
             }
@@ -139,12 +158,14 @@ impl Services {
             )?
             .wait::<schema::FirmwareUpdateInitResponse>()?;
 
+        // Stream the archive, checking its length and hash along the way
         progress(UpdateProgress::Uploading {
             uploaded: 0,
             total: firmware.size,
         });
         upload(requester, reader, firmware, timing, &mut progress)?;
 
+        // Let the Ark verify the archive, then install it
         progress(UpdateProgress::Verifying);
         requester
             .request(schema::FirmwareUpdateVerifyRequest {}, timing.io(clock))?
@@ -166,6 +187,7 @@ fn upload(
     timing: Timing,
     progress: &mut impl FnMut(UpdateProgress),
 ) -> Result<(), Error> {
+    // Send the declared bytes one acknowledged chunk at a time, hashing them
     let clock = &requester.clock();
     let mut uploaded = 0;
     let mut hash = Sha256::new();
@@ -187,6 +209,8 @@ fn upload(
             total: firmware.size,
         });
     }
+
+    // The source must end at the declared size and match the published hash
     timing.check(clock)?;
     if reader.read(&mut [0]).map_err(Error::FirmwareRead)? != 0 {
         return Err(Error::Integrity(
@@ -201,6 +225,8 @@ fn upload(
     Ok(())
 }
 
+/// Update sequencing, refusals, integrity checks and cloud access over real
+/// wire peers.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +242,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Describes an archive holding `bytes` as published firmware.
     fn firmware(bytes: &[u8]) -> Firmware {
         Firmware {
             version: "2.0.0-1234567".into(),
@@ -224,20 +251,31 @@ mod tests {
         }
     }
 
-    /// Stops accepting when the test finishes, including when a refused device
-    /// request means later HTTP stages must never be contacted.
+    /// Loopback cloud serving sync and firmware access, recording the paths it
+    /// serves.
+    ///
+    /// It stops accepting when the test finishes, including when a refused
+    /// device request means later HTTP stages are never contacted.
     struct Cloud {
+        /// Base URL of the loopback API.
         url: String,
-        address: SocketAddr,      // listener that the stopping connection wakes
-        stopped: Arc<AtomicBool>, // marks the next connection as the signal to stop
+        /// Listener address, which the stopping connection wakes.
+        address: SocketAddr,
+        /// Marks the next connection as the signal to stop.
+        stopped: Arc<AtomicBool>,
+        /// Serving thread, returning the paths it served.
         worker: Option<thread::JoinHandle<Vec<String>>>,
     }
 
     impl Cloud {
+        /// Starts serving sync and the access key for `firmware`, answering the
+        /// access request with `access_status`.
         fn start(firmware: &Firmware, _bytes: Vec<u8>, access_status: u16) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let url = format!("http://{address}/v1");
+
+            // The access route carries the version and hash in its query
             let key = format!(
                 "/v1/firmware?version={}&sha256={}",
                 firmware.version,
@@ -249,10 +287,13 @@ mod tests {
                 move || {
                     let mut paths = Vec::new();
                     loop {
+                        // A connection after the stop flag is the signal to end
                         let (mut stream, _) = listener.accept().unwrap();
                         if stopped.load(Ordering::SeqCst) {
                             break paths;
                         }
+
+                        // Answer the routes of one update and record each path
                         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                         stream.set_write_timeout(Some(TIMEOUT)).unwrap();
                         let headers = headers(&mut stream);
@@ -275,7 +316,7 @@ mod tests {
                             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         );
-                        // A failed wire upload may close the download mid-response.
+                        // The client may hang up before the response is written
                         let _ = stream
                             .write_all(header.as_bytes())
                             .and_then(|()| stream.write_all(body));
@@ -290,6 +331,7 @@ mod tests {
             }
         }
 
+        /// Stops the server and returns the paths it served, in order.
         fn finish(mut self) -> Vec<String> {
             self.stop();
             self.worker.take().unwrap().join().unwrap()
@@ -304,6 +346,7 @@ mod tests {
     }
 
     impl Drop for Cloud {
+        /// Stops a server the test did not finish, joining its thread.
         fn drop(&mut self) {
             if let Some(worker) = self.worker.take() {
                 self.stop();
@@ -312,6 +355,7 @@ mod tests {
         }
     }
 
+    /// Reads a request's headers one byte at a time, up to the blank line.
     fn headers(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();
         while !bytes.ends_with(b"\r\n\r\n") {
@@ -322,8 +366,11 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// Records the update sequence and optionally refuses or disconnects during
-    /// one stage. Only a fully uploaded archive is eligible for verification.
+    /// Spawns an Ark peer that records the update stages it serves, refusing
+    /// the stage `fail` names.
+    ///
+    /// A `fail` of `"disconnect"` hangs up at installation instead. Verification
+    /// checks that the whole archive arrived.
     fn peer(
         clock: &Clock,
         firmware: &Firmware,
@@ -382,6 +429,8 @@ mod tests {
                     }
                     other => return answering(session, other, responder),
                 };
+
+                // Record the stage, then hang up, refuse or answer as asked
                 observed.lock().unwrap().push(stage);
                 if fail == Some("disconnect") && stage == "install" {
                     return false;
@@ -400,8 +449,11 @@ mod tests {
         (peer, stages)
     }
 
+    /// An update runs every stage in order, reports progress per chunk and
+    /// refuses a concurrent update.
     #[test]
     fn test_update() {
+        // Serve an archive of two chunks through a cloud and Ark accepting all
         let clock = test_clock().clock();
         let bytes = vec![42; CHUNK_SIZE + 17];
         let expected = firmware(&bytes);
@@ -410,6 +462,8 @@ mod tests {
         let ark = attach(&mut peer, cloud.url.clone());
         let client = ark.client();
         let deadline = clock.now() + TIMEOUT;
+
+        // Update, starting a second update while the first one prepares
         let mut progress = Vec::new();
         client
             .clone()
@@ -423,6 +477,9 @@ mod tests {
                 progress.push(stage);
             })
             .unwrap();
+
+        // The Ark saw every stage in order, progress tracked each chunk, and the
+        // cloud served sync and one access request
         assert_eq!(
             *stages.lock().unwrap(),
             [
@@ -489,6 +546,8 @@ mod tests {
             if failure != "disconnect" {
                 assert!(matches!(error, Error::Remote(error) if error.code == 0x777));
             }
+
+            // The failing stage came last, and installation ran at most once
             let stages = stages.lock().unwrap().clone();
             assert_eq!(
                 stages.last().copied(),
@@ -506,8 +565,8 @@ mod tests {
         }
     }
 
-    /// Truncated, oversized or corrupt downloads never reach verification or
-    /// installation, even if earlier upload chunks were accepted by the device.
+    /// Truncated, oversized or corrupt archives never reach verification or
+    /// installation, even after the Ark accepted earlier upload chunks.
     #[test]
     fn test_download_integrity() {
         let clock = test_clock().clock();
@@ -531,8 +590,8 @@ mod tests {
         }
     }
 
-    /// A rejected proof refreshes keys without repeating preparation or starting
-    /// an upload. Expiring the deadline after transfer also prevents verification.
+    /// A refused proof refreshes keys without preparing again or uploading, and
+    /// a deadline passing after the transfer prevents verification.
     #[test]
     fn test_access_and_deadline() {
         let mut tester = test_clock();
@@ -544,6 +603,8 @@ mod tests {
             let (mut peer, stages) = peer(&clock, &firmware, None);
             let ark = attach(&mut peer, cloud.url.clone());
             let deadline = clock.now() + Duration::from_secs(1);
+
+            // The cloud refuses the proof, or the deadline passes at verification
             let error = ark
                 .client()
                 .update_firmware(&firmware, &mut bytes.as_slice(), deadline, |stage| {
@@ -560,6 +621,8 @@ mod tests {
             let stages = stages.lock().unwrap().clone();
             assert!(!stages.contains(if expire { &"verify" } else { &"init" }));
             let paths = cloud.finish();
+
+            // A refused proof resyncs once and never prepares again
             if !expire {
                 assert_eq!(
                     stages,
@@ -580,6 +643,8 @@ mod tests {
         }
     }
 
+    /// A needed login runs before preparation, and one needed after it ends the
+    /// update for a rerun instead of preparing again.
     #[test]
     fn caller_login_precedes_preparation_and_never_repeats_approval() {
         use crate::cloud::{
@@ -588,6 +653,8 @@ mod tests {
         };
         let clock = test_clock().clock();
         for expires_after_preparation in [false, true] {
+            // The cloud refuses the caller's credentials either at the check
+            // before preparation or at the access request after it
             let bytes = vec![42; 17];
             let firmware = firmware(&bytes);
             let mut responses = sync_responses();
@@ -601,6 +668,8 @@ mod tests {
                 response(200, r#"{"access":"/w=="}"#)
             });
             let (url, requests) = serve(responses);
+
+            // Update through the login stand-in, noting its logins at preparation
             let (mut peer, stages) = peer(&clock, &firmware, None);
             let mut ark = attach(&mut peer, url);
             let login = Login::default();
@@ -618,6 +687,8 @@ mod tests {
                     }
                 },
             );
+
+            // The Ark prepared and synced once, and the stand-in logged in once
             let stages = stages.lock().unwrap();
             assert_eq!(
                 stages.iter().filter(|stage| **stage == "prepare").count(),
@@ -631,6 +702,9 @@ mod tests {
                 1
             );
             assert_eq!(login.logins.load(Ordering::SeqCst), 1);
+
+            // A login after preparation ends the update for a rerun, while one
+            // before it lets the update finish
             if expires_after_preparation {
                 assert!(
                     matches!(result, Err(Error::CloudAuth { message, .. }) if message.contains("rerun"))
@@ -645,10 +719,11 @@ mod tests {
         }
     }
 
-    /// An emulator receives the update request and supplies its own refusal.
-    /// The refusal stops the sequence before access keys or archives are fetched.
+    /// An emulator's own refusal of the update stops the sequence before the
+    /// access key is requested.
     #[test]
     fn test_emulator_refusal() {
+        // Route an unattested peer that refuses preparation to the emulator realm
         let clock = test_clock().clock();
         let bytes = vec![42];
         let expected = firmware(&bytes);
@@ -666,6 +741,8 @@ mod tests {
         let ark = crate::Ark::start(session, Arc::new(services)).unwrap();
         let client = ark.client();
         let deadline = clock.now() + TIMEOUT;
+
+        // The refusal comes back unchanged, and the cloud served only sync
         let error = client
             .update_firmware(&expected, &mut bytes.as_slice(), deadline, |_| {})
             .unwrap_err();
@@ -683,9 +760,11 @@ mod tests {
         );
     }
 
-    /// Firmware discovery needs a selected environment and a live owner.
+    /// An update fails without a cloud route, and with the session's ending
+    /// reason once it closed.
     #[test]
     fn test_identity_and_closure() {
+        // Without a cloud route, every update fails the same way
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(
             &clock,
@@ -717,6 +796,8 @@ mod tests {
             ),
             Err(Error::MissingEnvironment)
         ));
+
+        // Once closed, the ending reason comes first
         services.close();
         assert!(matches!(
             services.update_firmware(

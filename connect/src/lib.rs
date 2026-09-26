@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! Authenticated connections and protocol workflows for Ark hosts.
+//!
 //! Internal library target of the CLI package. Its Rust API is unstable and is
 //! not a supported integration interface.
 //!
@@ -16,7 +17,7 @@
 //! connection and its companion relay.
 //!
 //! The CLI compiles the release, staging and develop device roots. Self-signed
-//! and pinned connections remain available; choosing a cloud route does not
+//! and pinned connections are available too; choosing a cloud route does not
 //! change which roots authenticate an attestation.
 //!
 //! ```no_run
@@ -40,11 +41,12 @@
 //! proof triggers one refresh and authentication retry. Relay attachment follows
 //! only when required and is reused while healthy. [`Client::sync`] explicitly
 //! refreshes the signed clock and cloud keys; [`Client::attach_relay`] exposes
-//! attachment for diagnostics.
-//! Status and enrollment work before either step. [`Device::connect_with_env`]
-//! selects cloud routing after authentication on the same connection. Self-signed
-//! and recovery peers need a caller-selected environment for cloud operations.
-//! Routing never changes the handshake's trust result.
+//! attachment for diagnostics. Status and enrollment work before either step.
+//!
+//! [`Device::connect_with_env`] selects cloud routing after authentication on
+//! the same connection. Self-signed and recovery peers need a caller-selected
+//! environment for cloud operations. Routing never changes the handshake's
+//! trust result.
 //!
 //! Calls and workflows accept an [`Instant`](std::time::Instant) for one fixed
 //! deadline or [`Timing`] for an inactivity allowance, optionally combined with
@@ -54,15 +56,16 @@
 //! supplied. Arbitrary readers and progress callbacks run on the caller's thread
 //! and must bound their own blocking work.
 //!
-//! [`Client::identify_dataset`] identifies a file without opening an upload session.
-//! [`Client::upload_dataset`] streams a [`Dataset`] and waits for processing.
-//! [`Client::update_firmware`] streams a [`Firmware`], obtains cloud access keys,
-//! verifies and installs it; success acknowledges installation, not the later
-//! reboot. [`Client::execute`] uploads an app, obtains approval and retrieves its
-//! result. A failed app returns `success: false`, preserving any output the Ark
-//! includes. Failed-app streams require developer output to be enabled in the app.
-//! Firmware preparation may require approval, so a rejected proof refreshes cloud
-//! keys and returns an error for the caller to retry explicitly.
+//! [`Client::identify_dataset`] identifies a file without opening an upload
+//! session. [`Client::upload_dataset`] streams a [`Dataset`] and waits for
+//! processing. [`Client::update_firmware`] streams a [`Firmware`], obtains
+//! cloud access keys, verifies and installs it; success acknowledges
+//! installation, not the later reboot. [`Client::execute`] uploads an app,
+//! obtains approval and retrieves its result. A failed app returns
+//! `success: false` and whatever output the Ark includes, which is none unless
+//! the app's manifest sets `develop`. Firmware preparation may require
+//! approval, so a rejected proof refreshes cloud keys and returns an error for
+//! the caller to retry explicitly.
 //!
 //! Downloads, package catalogs, version selection, caches, prompts, signal
 //! handling and reboot waits belong to callers. Connect accepts readers, checks
@@ -70,9 +73,9 @@
 //! transfer. Progress supplies upload session and execution task IDs for explicit
 //! cancellation through another client clone.
 //!
-//! [`Client::pair`] forwards the existing cloud pairing exchange. Its progress
-//! callback supplies the rendezvous for presentation to the owner. Pairing and
-//! relay payloads stay opaque; the Ark and companion authenticate their content.
+//! [`Client::pair`] forwards the cloud pairing exchange. Its progress callback
+//! supplies the rendezvous for presentation to the owner. Pairing and relay
+//! payloads stay opaque; the Ark and companion authenticate their content.
 //! Connect interprets only rendezvous routing and relay envelope fields.
 //!
 //! [`Client::send`] establishes prerequisites and returns a typed [`Pending`]
@@ -151,8 +154,9 @@ pub enum Error {
     #[error("source verification failed: {0}")]
     Integrity(String),
 
-    /// The cloud refused the device proof; identity and timestamp failures share
-    /// this response deliberately.
+    /// The cloud answered a request carrying the device proof with HTTP 403.
+    ///
+    /// This client keeps no reason for the refusal.
     #[error("the cloud rejected the device proof")]
     ProofRejected,
 
@@ -175,6 +179,7 @@ pub enum Error {
     /// A connection worker could not be started.
     #[error("failed to start connection worker: {0}")]
     Worker(io::Error),
+
     /// Neither the attestation nor the caller selected a cloud environment.
     #[error("cloud environment unknown; specify an environment when connecting")]
     MissingEnvironment,
@@ -221,7 +226,7 @@ pub enum Error {
     #[error("failed to reach WebSocket endpoint: {0}")]
     Unreachable(io::Error),
 
-    /// The endpoint refused the WebSocket upgrade.
+    /// The WebSocket URL could not be parsed or the HTTP upgrade failed.
     #[error("failed to open websocket: {0}")]
     Upgrade(tungstenite::Error),
 
@@ -234,13 +239,15 @@ pub enum Error {
     #[error("handshake failed: {0}")]
     Handshake(protocol::Error),
 
-    /// A device or cloud request ran past its deadline, or the handshake past
-    /// the wire's budget.
+    /// A request, workflow or handshake ran past its deadline, or a source read
+    /// timed out.
     #[error("operation timed out")]
     Timeout,
 
     /// The Ark refused this request with an application or reserved protocol
-    /// error. These replies do not by themselves end the connection.
+    /// error.
+    ///
+    /// These replies do not by themselves end the connection.
     #[error("ark error: {} (code {})", .0.msg, .0.code)]
     Remote(schema::Error),
 
@@ -260,6 +267,7 @@ pub enum Error {
 
 impl From<protocol::Error> for Error {
     /// Maps a failure of the wire's protocol layer to the connection's error.
+    ///
     /// The failures ending the session surface as a disconnect, so a request
     /// refused after the Ark went away names the reason.
     fn from(err: protocol::Error) -> Self {

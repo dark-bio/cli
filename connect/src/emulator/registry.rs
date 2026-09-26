@@ -21,6 +21,7 @@ use std::time::Duration;
 const ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18180);
 
 /// Overall timeout for fetching a listing from the local registry.
+///
 /// Windows retries refused loopback connections before reporting the error.
 const TIMEOUT: Duration = Duration::from_secs(if cfg!(windows) { 5 } else { 1 });
 
@@ -28,20 +29,27 @@ const TIMEOUT: Duration = Duration::from_secs(if cfg!(windows) { 5 } else { 1 })
 const MAX_LISTING: u64 = 1024 * 1024;
 
 /// Emulator endpoint and metadata published by its launcher.
+///
 /// Optional reports remain absent until the launcher supplies them.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Instance {
-    pub port: u16, // Host port forwarded to the guest's WebSocket endpoint
+    /// Host port forwarded to the guest's WebSocket endpoint.
+    pub port: u16,
+    /// File name of the disk image, which several emulators may share.
     #[serde(default)]
-    pub disk: String, // Image basename, shared by copies of the same image
+    pub disk: String,
+    /// Readiness to accept clients, as the firmware reports it.
     #[serde(default)]
-    pub ready: Option<bool>, // Whether the firmware reports accepting clients
+    pub ready: Option<bool>,
+    /// Cloud environment the device reports.
     #[serde(default)]
-    pub env: Option<String>, // Environment reported by the device
+    pub env: Option<String>,
+    /// Device name, if reported.
     #[serde(default)]
-    pub name: Option<String>, // Device name, if reported
+    pub name: Option<String>,
+    /// Device serial, if reported.
     #[serde(default)]
-    pub serial: Option<String>, // Device serial, if reported
+    pub serial: Option<String>,
 }
 
 impl Instance {
@@ -51,32 +59,43 @@ impl Instance {
     }
 }
 
-/// The listing version this build understands. A breaking change to the
-/// registry bumps it, so a newer registry is refused rather than misread.
+/// Listing version this build understands.
+///
+/// A breaking change to the registry bumps it, so a newer registry is refused
+/// rather than misread.
 const VERSION: u64 = 1;
 
 /// Registry response with entries retained for individual decoding.
 #[derive(Deserialize)]
 struct Listing {
+    /// Schema version of the listing, absent when the body carries none.
     #[serde(default)]
-    version: Option<u64>, // Absent on a registry older than the contract
+    version: Option<u64>,
+    /// Raw entries, decoded one by one so an unreadable entry drops alone.
     #[serde(default)]
-    instances: Vec<serde_json::Value>, // Entries decoded independently for compatibility
+    instances: Vec<serde_json::Value>,
 }
 
-/// Lists emulators from the local registry. An absent registry returns an empty list.
+/// Lists emulators from the local registry.
+///
+/// An absent registry returns an empty list.
 pub(super) fn list() -> Result<Vec<Instance>, Error> {
     list_at(ADDRESS.into())
 }
 
-/// Fetches a registry at the supplied address. Only connection refusal is treated
-/// as an empty listing; transport, HTTP and decoding failures remain errors.
+/// Fetches a registry at the supplied address.
+///
+/// Only connection refusal is treated as an empty listing; transport, HTTP and
+/// decoding failures remain errors.
 fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
+    // Nobody listening means no registry is running
     let body = match fetch(addr) {
         Ok(body) => body,
         Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => return Ok(Vec::new()),
         Err(err) => return Err(Error::Registry(err)),
     };
+
+    // Decode the listing, refusing a version this build does not know
     let listing: Listing = serde_json::from_slice(&body)
         .map_err(|err| Error::Registry(io::Error::new(io::ErrorKind::InvalidData, err)))?;
     if listing.version != Some(VERSION) {
@@ -90,7 +109,7 @@ fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
     }
 
     // Skip entries this build cannot decode without losing compatible entries
-    // from the same registry response.
+    // from the same registry response
     Ok(listing
         .instances
         .into_iter()
@@ -100,6 +119,7 @@ fn list_at(addr: SocketAddr) -> Result<Vec<Instance>, Error> {
 
 /// Fetches a successful HTTP response under the registry's deadline and size limit.
 fn fetch(addr: SocketAddr) -> io::Result<Vec<u8>> {
+    // Ask the loopback registry directly, never through a proxy or redirect
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
@@ -114,13 +134,16 @@ fn fetch(addr: SocketAddr) -> io::Result<Vec<u8>> {
             ureq::Error::Io(err) => err,
             err => io::Error::other(err),
         })?;
+
+    // Only a successful status carries a listing
     if !response.status().is_success() {
         return Err(io::Error::other(format!(
             "listing refused with status {}",
             response.status()
         )));
     }
-    // One extra byte distinguishes a complete body from a truncated oversized one.
+
+    // One extra byte distinguishes a complete body from a truncated oversized one
     let mut body = Vec::new();
     response
         .body_mut()
@@ -136,6 +159,8 @@ fn fetch(addr: SocketAddr) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Registry listing, framing, size limit and refusal regressions against local
+/// listeners.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,8 +176,10 @@ mod tests {
         (listener, addr)
     }
 
-    /// Serves one HTTP request with the supplied response. Reads the complete
-    /// request first so the client does not write into a closed socket.
+    /// Serves one HTTP request with the supplied response, on its own thread.
+    ///
+    /// It reads the complete request first so the client does not write into a
+    /// closed socket.
     fn serve(listener: TcpListener, response: impl Into<String>) {
         let response = response.into();
         thread::spawn(move || {
@@ -169,9 +196,8 @@ mod tests {
         });
     }
 
-    // Tests that a listing is read leniently, the claims present taken, the
-    // absent ones left out, and the entries this build cannot make sense of
-    // dropped rather than failing the listing.
+    /// A listing is read leniently, taking the claims present, leaving absent
+    /// ones out and dropping entries this build cannot read.
     #[test]
     fn test_listing() {
         let (listener, addr) = bind();
@@ -198,8 +224,7 @@ mod tests {
         assert_eq!(instances[1].name, None);
     }
 
-    // Tests that nobody serving the listing is an empty one rather than a
-    // failure.
+    /// Nobody serving the listing yields an empty one rather than a failure.
     #[test]
     fn test_nobody_serving() {
         let (listener, addr) = bind();
@@ -238,8 +263,8 @@ mod tests {
         );
     }
 
-    // Tests that a listing of a version this build does not know, or of no
-    // version at all, is refused rather than read.
+    /// A listing of an unknown version, or of none at all, is refused rather
+    /// than read.
     #[test]
     fn test_unknown_version_is_refused() {
         for body in [
@@ -255,18 +280,21 @@ mod tests {
         }
     }
 
-    // Tests that a service answering with anything but a listing fails the
-    // lookup, a refusal, a body of another shape or no answer at all.
+    /// A refusing status, a body of another shape or no answer at all fails
+    /// the lookup.
     #[test]
     fn test_refusals() {
+        // A refusing status fails the lookup
         let (listener, addr) = bind();
         serve(listener, "HTTP/1.1 404 Not Found\r\n\r\nno such route");
         assert!(matches!(list_at(addr), Err(Error::Registry(_))));
 
+        // A body of another shape fails decoding
         let (listener, addr) = bind();
         serve(listener, "HTTP/1.1 200 OK\r\n\r\nnot a listing");
         assert!(matches!(list_at(addr), Err(Error::Registry(_))));
 
+        // A service that never answers runs out the registry's timeout
         let (listener, addr) = bind();
         let (release, held) = mpsc::channel::<()>();
         let stalled = thread::spawn(move || {

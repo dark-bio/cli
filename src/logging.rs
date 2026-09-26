@@ -4,6 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Tracing subscriber that routes allowlisted diagnostics to the CLI's stderr.
+//!
 //! Only update, connect and wire diagnostics enter the CLI's log stream. HTTP
 //! and subprocess logging is excluded so authorization headers cannot appear.
 
@@ -15,7 +17,9 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-/// Installs an allowlisted subscriber for steps and requested diagnostics.
+/// Installs an allowlisted subscriber for steps and requested diagnostics,
+/// when `-v` or `--log` asks for either.
+///
 /// An existing process subscriber is retained if installation is unavailable.
 pub(crate) fn init(output: Output, verbose: bool, level: Option<Level>) {
     if !verbose && level.is_none() {
@@ -29,7 +33,12 @@ pub(crate) fn init(output: Output, verbose: bool, level: Option<Level>) {
         .try_init();
 }
 
-/// Rejects every target outside update, connect and wire, regardless of diagnostic level.
+/// Rejects every target outside update, connect and wire, regardless of
+/// diagnostic level.
+///
+/// Setup messages from the connection library pass only with `-v`, whatever the
+/// log level. A debug log passes update and connect events up to debug level,
+/// and a trace log passes update, connect and wire events at every level.
 fn enabled(target: &str, severity: tracing::Level, verbose: bool, level: Option<Level>) -> bool {
     if target == "darkbio_connect::setup" {
         return verbose;
@@ -55,13 +64,20 @@ fn enabled(target: &str, severity: tracing::Level, verbose: bool, level: Option<
 }
 
 /// Tracing layer that routes selected events through the CLI's stderr policy.
-struct Log(Output);
+struct Log(
+    /// Invocation output the events are written to.
+    Output,
+);
+
 impl<S: Subscriber> Layer<S> for Log {
-    /// Renders setup messages as steps and other selected events as structured or text logs.
+    /// Renders setup messages as steps and other selected events as structured
+    /// or text logs.
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
         let mut fields = Fields(Map::new());
         event.record(&mut fields);
         let metadata = event.metadata();
+
+        // Setup messages become steps, and other events JSON or text log lines
         if metadata.target() == "darkbio_connect::setup" {
             if let Some(message) = fields.0.get("message").and_then(Value::as_str) {
                 self.0.event("step", message);
@@ -97,26 +113,35 @@ impl<S: Subscriber> Layer<S> for Log {
 }
 
 /// Collected tracing fields, preserving string values for message rendering.
-struct Fields(Map<String, Value>);
+struct Fields(
+    /// Field values by name.
+    Map<String, Value>,
+);
+
 impl Visit for Fields {
     /// Stores a debug-only field as its printable representation.
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.0
             .insert(field.name().into(), json!(format!("{value:?}")));
     }
+
     /// Retains a string field without adding debug quotes.
     fn record_str(&mut self, field: &Field, value: &str) {
         self.0.insert(field.name().into(), json!(value));
     }
 }
 
+/// Tests of the diagnostic allowlist.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Diagnostic selection includes update failures without exposing HTTP or subprocess logs.
+    /// Checks that diagnostic selection includes update failures without
+    /// exposing HTTP or subprocess logs.
     #[test]
     fn test_diagnostics_are_separate_from_steps_and_exclude_http_and_subprocesses() {
+        // Update logs follow --log, setup steps follow -v, and foreign targets
+        // never pass
         for level in [None, Some(Level::Debug), Some(Level::Trace)] {
             for verbose in [false, true] {
                 assert_eq!(
@@ -149,6 +174,9 @@ mod tests {
                 }
             }
         }
+
+        // Debug passes connect up to debug level, and trace adds wire at every
+        // level
         assert!(enabled(
             "darkbio_connect::hardware",
             tracing::Level::DEBUG,

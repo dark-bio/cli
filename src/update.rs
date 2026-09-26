@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Lookups of the newest published ark and the note that announces it.
+//! Lookups of the newest published `ark` and the note that announces it.
 
 use crate::output::Output;
 use chrono::{DateTime, Utc};
@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Hidden sole argument that makes ark run the detached lookup and nothing else.
+/// Hidden sole argument that makes `ark` run the detached lookup and exit.
 pub(crate) const ENTRY_POINT: &str = "__update";
 
 /// Largest kept answer read from disk, in bytes.
@@ -60,14 +60,17 @@ impl Channel {
 pub(crate) struct Answer {
     /// Channel the answer belongs to.
     pub channel: Channel,
-    /// When the last lookup started, whether or not it succeeded.
+    /// Start time of the last lookup, whether or not it succeeded.
     pub asked: DateTime<Utc>,
     /// Newest version found, absent until a lookup succeeds.
     pub newest: Option<Version>,
 }
 
 impl Answer {
-    /// Reads the kept answer for one channel. An unreadable file counts as no answer.
+    /// Reads the kept answer for one channel.
+    ///
+    /// An unreadable or malformed file, or an answer for the other channel,
+    /// counts as no answer.
     pub fn read(directory: &Path, channel: Channel) -> Option<Self> {
         // Read at most 4 KiB, far more than an answer ever takes
         let file = File::open(directory.join("update.json")).ok()?;
@@ -79,8 +82,10 @@ impl Answer {
         (answer.channel == channel).then_some(answer)
     }
 
-    /// Reports whether a lookup is due. It is when the answer is absent, belongs
-    /// to the other channel, is stamped in the future, or is an hour old.
+    /// Reports whether a lookup is due.
+    ///
+    /// It is when the answer is absent, belongs to the other channel, is stamped
+    /// in the future, or is an hour old.
     pub fn stale(answer: Option<&Self>, channel: Channel, now: DateTime<Utc>) -> bool {
         answer.is_none_or(|answer| {
             answer.channel != channel
@@ -129,7 +134,9 @@ pub(crate) fn running() -> Version {
 }
 
 /// Prints the note from the kept answer and starts a background lookup when
-/// one is due. The lookup runs in a detached copy of ark.
+/// one is due.
+///
+/// The lookup runs in a detached copy of `ark`.
 pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
     // Under CI nothing is read, printed or looked up
     if disabled() {
@@ -188,6 +195,7 @@ pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
 }
 
 /// Runs the lookup in the detached copy, which ends within 30 s whatever happens.
+///
 /// The copy opens no connection, so its clock is the real one.
 pub(crate) fn run() {
     // Under CI the copy does nothing
@@ -239,8 +247,9 @@ fn claim(directory: &Path, channel: Channel, now: DateTime<Utc>) -> io::Result<(
     .write(directory)
 }
 
-/// Looks up the newest version and keeps it. A failed lookup leaves the kept
-/// answer as it was.
+/// Looks up the newest version and keeps it.
+///
+/// A failed lookup leaves the kept answer as it was.
 pub(crate) fn refresh(
     directory: &Path,
     channel: Channel,
@@ -334,14 +343,16 @@ fn release(location: &str) -> Result<Version, &'static str> {
 
 /// Selects the highest semantic version among published prerelease entries.
 fn develop(bytes: &[u8]) -> Result<Version, &'static str> {
-    /// Only these public release fields participate in version selection.
+    /// Public release fields that version selection reads.
     #[derive(Deserialize)]
     struct Release {
         /// Version tag stamped by the publish workflow.
         tag_name: String,
-        /// Unpublished drafts never announce an available build.
+        /// Whether the entry is an unpublished draft, which never announces a
+        /// build.
         draft: bool,
-        /// Stable releases do not belong to the development channel.
+        /// Whether the entry is a prerelease, since stable releases do not
+        /// belong to the development channel.
         prerelease: bool,
     }
 
@@ -349,7 +360,8 @@ fn develop(bytes: &[u8]) -> Result<Version, &'static str> {
     let releases: Vec<Release> =
         serde_json::from_slice(bytes).map_err(|_| "GitHub returned an invalid release list")?;
 
-    // Ignore unpublished entries and invalid tags before comparing semantic precedence
+    // Ignore unpublished entries and invalid tags before comparing semantic
+    // precedence
     releases
         .into_iter()
         .filter(|release| !release.draft && release.prerelease)
@@ -385,9 +397,10 @@ pub(crate) fn hint(channel: Channel) -> String {
         .unwrap_or_else(|| "download it from https://github.com/dark-bio/cli".into())
 }
 
-/// Picks the upgrade command for an executable's location. The installer and
-/// crates.io carry releases only, so a development build gets a command only
-/// from Homebrew.
+/// Picks the upgrade command for an executable's location.
+///
+/// The installer and crates.io carry releases only, so a development build
+/// gets a command only from Homebrew.
 fn upgrade(
     channel: Channel,
     executable: &Path,
@@ -444,10 +457,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Distinguishes temporary test directories without relying on timestamps.
+    /// Counter that distinguishes temporary test directories without relying
+    /// on timestamps.
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-    /// Removes a test's cache and installation files on scope exit.
+    /// Temporary test directory, removed with its cache and installation files
+    /// on scope exit.
     struct Directory {
         /// Isolated root for one test's real filesystem operations.
         path: PathBuf,
@@ -564,10 +579,12 @@ mod tests {
         ));
     }
 
-    /// Claims keep only the same channel's previous version and require a writable cache.
+    /// Claims keep only the same channel's previous version and require a
+    /// writable cache.
     #[test]
     fn test_claim_preserves_only_the_same_channels_previous_answer() {
-        // Publish an expired answer through the same atomic writer used by the worker
+        // Publish an expired answer through the same atomic writer used by the
+        // worker
         let directory = Directory::new();
         let now = "2026-09-25T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
         Answer {
@@ -626,7 +643,8 @@ mod tests {
             "ark 0.3.7 is available, this is 0.3.6; download it from https://github.com/dark-bio/cli"
         );
 
-        // Numeric prerelease identifiers follow semantic precedence rather than text order
+        // Numeric prerelease identifiers follow semantic precedence rather than
+        // text order
         answer.channel = Channel::Develop;
         answer.newest = Some(Version::parse("0.3.6-dev.34").unwrap());
         assert_eq!(
@@ -662,11 +680,12 @@ mod tests {
         }
     }
 
-    /// Development selection ignores drafts and releases and does not depend on list order.
+    /// Development selection ignores drafts and releases and does not depend on
+    /// list order.
     #[test]
     fn test_development_selection_uses_the_highest_published_prerelease() {
-        // Captured 2026-09-25 from https://api.github.com/repos/dark-bio/cli/releases?per_page=10
-        // Only unrelated object fields are removed from this public response
+        // Captured 2026-09-25 from https://api.github.com/repos/dark-bio/cli/releases?per_page=10,
+        // with only unrelated object fields removed from this public response
         let bytes = br#"[
             {"tag_name":"v0.3.6-dev.34","draft":false,"prerelease":true},
             {"tag_name":"v0.3.5","draft":false,"prerelease":false},
@@ -684,7 +703,8 @@ mod tests {
             Version::parse("0.3.6-dev.34").unwrap()
         );
 
-        // Reverse the captured order so the winner is neither first nor assumed latest
+        // Reverse the captured order so the winner is neither first nor assumed
+        // latest
         let mut releases: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap();
         releases.reverse();
         assert_eq!(
@@ -692,12 +712,15 @@ mod tests {
             Version::parse("0.3.6-dev.34").unwrap()
         );
 
-        // Turning just the highest entry into a draft leaves a stable release above the winner
+        // Turning just the highest entry into a draft leaves a stable release
+        // above the winner
         releases.last_mut().unwrap()["draft"] = json!(true);
         assert_eq!(
             develop(&serde_json::to_vec(&releases).unwrap()).unwrap(),
             Version::parse("0.3.5-dev.32").unwrap()
         );
+
+        // Only drafts, invalid JSON or only invalid tags give no version
         for release in &mut releases {
             release["draft"] = json!(true);
         }
@@ -706,10 +729,12 @@ mod tests {
         assert!(develop(br#"[{"tag_name":"garbage","draft":false,"prerelease":true}]"#).is_err());
     }
 
-    /// Install advice follows canonical paths and keeps development builds off release installers.
+    /// Install advice follows canonical paths and keeps development builds off
+    /// release installers.
     #[test]
     fn test_upgrade_commands_follow_the_installation_layout() {
-        // Create the installed files because detection resolves the executable itself
+        // Create the installed files because detection resolves the executable
+        // itself
         let directory = Directory::new();
         let home = directory.path.join("home");
         let cargo = directory.path.join("custom-cargo");

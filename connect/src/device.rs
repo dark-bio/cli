@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! Discovered Arks, their reported details and authenticated connections.
+//!
 //! Discovery metadata is unverified. Connecting establishes the peer's identity.
 
 use crate::emulator::Instance;
@@ -13,8 +14,10 @@ use crate::{Ark, Error, Identity, TrustMode, emulator, hardware};
 use darkbio_clock::Clock;
 use std::fmt;
 
-/// Kind of Ark reported by discovery. Authentication establishes its identity
-/// separately; this classification does not verify the peer's realm.
+/// Kind of Ark reported by discovery.
+///
+/// Authentication establishes its identity separately; this classification
+/// does not verify the peer's realm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
     /// Physical Ark attached to the host.
@@ -54,10 +57,12 @@ impl fmt::Display for Locator {
 }
 
 /// Discovered Ark with the details needed to connect to it.
+///
 /// Reported metadata remains unverified; connecting returns a separate identity.
 #[derive(Clone)]
 pub struct Device {
-    source: Source, // Discovery record retained for connection and display
+    /// Discovery record retained for connection and display.
+    source: Source,
 }
 
 /// Origin of the discovery record, independent of the Ark's authenticated realm.
@@ -105,8 +110,10 @@ impl Device {
         }
     }
 
-    /// Returns the readiness last reported by an emulator launcher. Hardware
-    /// and launchers omitting readiness return `None`. A report may be stale.
+    /// Returns the readiness last reported by an emulator launcher.
+    ///
+    /// Hardware and launchers omitting readiness return `None`. A report may be
+    /// stale.
     pub fn ready(&self) -> Option<bool> {
         match &self.source {
             Source::Usb(_) => None,
@@ -115,6 +122,7 @@ impl Device {
     }
 
     /// Returns the unverified serial from USB enumeration or the launcher.
+    ///
     /// Empty serials are treated as absent.
     pub fn serial(&self) -> Option<&str> {
         match &self.source {
@@ -133,8 +141,10 @@ impl Device {
         .filter(|value| !value.is_empty())
     }
 
-    /// Returns the emulator image basename, if reported. Several emulators may
-    /// use the same basename, so it does not identify an endpoint uniquely.
+    /// Returns the emulator image basename, if reported.
+    ///
+    /// Several emulators may use the same basename, so it does not identify an
+    /// endpoint uniquely.
     pub fn image(&self) -> Option<&str> {
         match &self.source {
             Source::Usb(_) => None,
@@ -153,18 +163,23 @@ impl Device {
     }
 
     /// Connects using the retained endpoint details and authenticates the peer
-    /// with the supplied verifier. Does not repeat discovery or label selection.
-    /// The verifier's identity selects cloud routing for later operations;
-    /// connecting itself does not contact the cloud.
+    /// with the supplied verifier.
+    ///
+    /// It does not repeat discovery or label selection. The verifier's
+    /// identity selects cloud routing for later operations; connecting itself
+    /// does not contact the cloud.
     pub fn connect(&self, verifier: &TrustMode) -> Result<(Ark, Identity), Error> {
         self.open(verifier, |_| None)
     }
 
-    /// Selects the cloud environment from the authenticated identity without
-    /// reopening the connection. The callback runs once after a successful
-    /// handshake, before cloud services start. Cloud access stays lazy.
-    /// Self-signed and recovery peers use the discovered kind to select a registry;
-    /// attested peers retain their verified realm. Routing never changes trust.
+    /// Connects and selects the cloud environment from the authenticated
+    /// identity, without reopening the connection.
+    ///
+    /// The callback runs once after a successful handshake, before cloud
+    /// services start, and its environment takes precedence over an attested
+    /// one. Cloud access stays lazy. Self-signed and recovery peers use the
+    /// discovered kind to select a registry; attested peers keep their verified
+    /// realm. Routing never changes trust.
     pub fn connect_with_env(
         &self,
         verifier: &TrustMode,
@@ -173,8 +188,9 @@ impl Device {
         self.open(verifier, |identity| Some(env(identity)))
     }
 
-    /// Opens the retained transport with any caller-supplied cloud route. The
-    /// connection runs on the real clock, which its clients hand to callers.
+    /// Opens the retained transport with any caller-supplied cloud route.
+    ///
+    /// The connection runs on the real clock, which its clients hand to callers.
     fn open(
         &self,
         verifier: &TrustMode,

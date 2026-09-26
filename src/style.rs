@@ -59,8 +59,12 @@ pub(crate) struct Theme {
 }
 
 impl Theme {
-    /// Keeps reading layouts in pipes; only terminals get color and cursor control.
+    /// Resolves the capabilities of stdout, or of stderr when `stderr` is set.
+    ///
+    /// Only an attended terminal outside JSON mode gets color and cursor
+    /// control, so pipes keep the reading layouts.
     pub fn new(json: bool, stderr: bool) -> Self {
+        // Cursor control needs a human layout on an attended terminal
         let terminal = if stderr {
             console::Term::stderr()
         } else {
@@ -74,15 +78,19 @@ impl Theme {
         let human = !json;
         let term = std::env::var("TERM").unwrap_or_default();
         let interactive = human && attended && term != "dumb";
-        // Windows needs ANSI processing enabled for colors and live progress.
+        // Windows needs ANSI processing enabled for colors and live progress
         #[cfg(windows)]
         let interactive = interactive && terminal.features().colors_supported();
+
+        // A native Windows console gets exact colors without COLORTERM
         let native_console = {
             #[cfg(windows)]
             {
                 use std::os::windows::io::AsRawHandle;
                 use windows_sys::Win32::System::Console::GetConsoleMode;
                 let mut mode = 0;
+                // Sound, since the call takes the stream's own handle and
+                // writes only the local mode
                 unsafe { GetConsoleMode(terminal.as_raw_handle(), &mut mode) != 0 }
             }
             #[cfg(not(windows))]
@@ -90,6 +98,8 @@ impl Theme {
                 false
             }
         };
+
+        // Glyphs need a UTF-8 locale when one is set, except on Windows
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok())
@@ -99,6 +109,8 @@ impl Theme {
                 let locale = locale.to_ascii_uppercase().replace('-', "");
                 locale.contains("UTF8") || cfg!(windows)
             });
+
+        // Color honors the opt-outs, then takes the deepest palette on offer
         let color = if !interactive
             || std::env::var_os("NO_COLOR").is_some()
             || std::env::var("CLICOLOR").is_ok_and(|value| value == "0")
@@ -114,6 +126,8 @@ impl Theme {
         } else {
             Color::Basic
         };
+
+        // An unknown width falls back to 80 columns
         let width = terminal
             .size_checked()
             .map_or(80, |(_, width)| usize::from(width).max(1));
@@ -130,6 +144,8 @@ impl Theme {
         if self.color == Color::Off || matches!(role, Role::Default) {
             return Style::new();
         }
+
+        // Each role has one RGB color, except headings, which are only bold
         let rgb = match role {
             Role::Success => (148, 202, 110),
             Role::Attention => (232, 162, 74),
@@ -141,11 +157,17 @@ impl Theme {
             Role::Heading => return Style::new().bold(),
             Role::Default => unreachable!(),
         };
+
+        // Muted text and environment labels keep regular weight, and the other
+        // roles are bold
         let style = if matches!(role, Role::Muted | Role::Staging | Role::Develop) {
             Style::new()
         } else {
             Style::new().bold()
         };
+
+        // The 256-color cube rounds each channel to one of its six levels, and
+        // basic color keeps only the weight
         match self.color {
             Color::True => style.fg_color(Some(RgbColor(rgb.0, rgb.1, rgb.2).into())),
             Color::Ansi256 => {
@@ -164,7 +186,8 @@ impl Theme {
         format!("{style}{}{style:#}", text.as_ref())
     }
 
-    /// Chooses a decorative glyph without changing the surrounding message.
+    /// Picks the decorative Unicode glyph when the stream allows it, or its
+    /// ASCII stand-in otherwise.
     pub fn glyph<'a>(&self, unicode: &'a str, ascii: &'a str) -> &'a str {
         if self.unicode { unicode } else { ascii }
     }
@@ -228,6 +251,9 @@ impl Theme {
     }
 }
 
+/// Control sequence that returns the cursor to the line start and clears the
+/// line.
+///
 /// Terminal control sequences belong to the writer, never to result content.
 pub(crate) const CLEAR_LINE: &str = "\r\x1b[2K";
 
@@ -248,7 +274,8 @@ pub(crate) fn printable(text: &str) -> String {
         .collect()
 }
 
-/// Formats a byte count in binary units up to GiB with one decimal place.
+/// Formats a byte count in KiB, MiB or GiB with one decimal place, or in whole
+/// bytes below 1 KiB.
 pub(crate) fn bytes(bytes: u64) -> String {
     for (unit, divisor) in [("GiB", 1_u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
         if bytes >= divisor {
@@ -258,16 +285,23 @@ pub(crate) fn bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-/// Wraps styled text at words, splitting long tokens without dropping bytes.
+/// Wraps styled text at words to `width` terminal cells, indenting continued
+/// lines by `indent` cells.
+///
+/// A token too long for a line splits across lines. Only the whitespace at a
+/// break is dropped, and ANSI sequences stay in place.
 pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> String {
+    // Keep at least one cell of text beside the indent
     let width = width.max(1);
     let indent = indent.min(width.saturating_sub(1));
     let mut result = String::new();
     let mut column = 0;
+
+    // Append one word, moving it to a new line when it fits there but not here
     let mut append = |word: &str| {
         let size = console::measure_text_width(word.trim_end());
         if column > indent && column + size > width && size <= width - indent {
-            // The space that ended the previous word is not part of the line.
+            // The space that ended the previous word is not part of the line
             while result.ends_with(' ') {
                 result.pop();
             }
@@ -275,6 +309,9 @@ pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> String {
             result.push_str(&" ".repeat(indent));
             column = indent;
         }
+
+        // Copy the word, breaking wherever it still overflows and indenting
+        // after every newline
         for (part, ansi) in console::AnsiCodeIterator::new(word) {
             if ansi {
                 result.push_str(part);
@@ -301,6 +338,9 @@ pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> String {
             }
         }
     };
+
+    // Split the text into words that end at whitespace, keeping ANSI sequences
+    // inside the word they touch
     let mut word = String::new();
     for (part, ansi) in console::AnsiCodeIterator::new(text) {
         if ansi {
@@ -321,6 +361,8 @@ pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> String {
 
 #[cfg(test)]
 impl Theme {
+    /// Builds an interactive theme with fixed capabilities, independent of the
+    /// test's own terminal.
     pub fn test(width: usize, color: Color, unicode: bool) -> Self {
         Self {
             interactive: true,
@@ -331,10 +373,13 @@ impl Theme {
     }
 }
 
+/// Tests of the capability detection, the palette, wrapping and escaping.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Checks that a native Windows console gets exact colors without any
+    /// color variable, while the opt-outs still turn them off.
     #[cfg(windows)]
     #[test]
     fn windows_console_enables_color_without_environment() {
@@ -344,8 +389,11 @@ mod tests {
             GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
         };
 
-        // Isolate console handles and environment from the other tests.
+        /// Environment variable that marks a child run and names its case.
         const CHILD: &str = "ARK_TEST_WINDOWS_CONSOLE";
+
+        // Run each case in a child process, isolating console handles and
+        // environment from the other tests
         let Ok(case) = std::env::var(CHILD) else {
             for (name, value) in [
                 ("", ""),
@@ -376,10 +424,14 @@ mod tests {
             return;
         };
 
+        // Swap in a fresh console, saving the standard handles to restore. The
+        // console calls take no pointers, so they are sound.
         let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
         let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
         unsafe { FreeConsole() };
         assert_ne!(unsafe { AllocConsole() }, 0);
+
+        // Check both streams, catching a failure so the handles come back first
         let result = std::panic::catch_unwind(|| {
             let console = OpenOptions::new()
                 .read(true)
@@ -388,6 +440,9 @@ mod tests {
                 .unwrap();
             let handle = console.as_raw_handle();
             for (stream, stderr) in [(STD_OUTPUT_HANDLE, false), (STD_ERROR_HANDLE, true)] {
+                // Point the stream at the new console with ANSI processing off.
+                // The calls use the handle `console` keeps open and write only
+                // the local mode, so they are sound.
                 assert_ne!(unsafe { SetStdHandle(stream, handle) }, 0);
                 let mut mode = 0;
                 assert_ne!(unsafe { GetConsoleMode(handle, &mut mode) }, 0);
@@ -395,6 +450,9 @@ mod tests {
                     unsafe { SetConsoleMode(handle, mode & !ENABLE_VIRTUAL_TERMINAL_PROCESSING) },
                     0
                 );
+
+                // The theme gets exact colors unless an opt-out or a dumb TERM
+                // is set
                 let theme = Theme::new(false, stderr);
                 assert_eq!(theme.interactive, case != "TERM");
                 assert_eq!(
@@ -409,11 +467,17 @@ mod tests {
                     theme.paint(Role::Muted, "label").contains("\x1b[38;2;"),
                     case == "color"
                 );
+
+                // Resolving the theme turns ANSI processing back on, except
+                // under a dumb TERM. The call writes only the local mode, so it
+                // is sound.
                 assert_ne!(unsafe { GetConsoleMode(handle, &mut mode) }, 0);
                 assert_eq!(
                     mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0,
                     case != "TERM"
                 );
+
+                // JSON stays plain, and a second theme resolves the same way
                 let json = Theme::new(true, stderr);
                 assert!(!json.interactive);
                 assert_eq!(json.paint(Role::Muted, "label"), "label");
@@ -422,6 +486,9 @@ mod tests {
                 assert_eq!(repeated.interactive, theme.interactive);
             }
         });
+
+        // Restore the saved standard handles, then rethrow any failure. The
+        // console calls take no pointers, so they are sound.
         unsafe {
             FreeConsole();
             SetStdHandle(STD_OUTPUT_HANDLE, stdout);
@@ -432,6 +499,8 @@ mod tests {
         }
     }
 
+    /// Checks that styling degrades from exact colors to the 256-color cube to
+    /// plain marks, keeping the words.
     #[test]
     fn palette_degrades_without_losing_words() {
         let theme = Theme::test(80, Color::True, true);
@@ -457,8 +526,11 @@ mod tests {
         );
     }
 
+    /// Checks that wrapping and truncation measure terminal cells, and wrapping
+    /// keeps every character of a styled link.
     #[test]
     fn wrapping_preserves_links_and_measures_terminal_cells() {
+        // A styled link splits across lines but keeps every character
         let theme = Theme::test(24, Color::True, true);
         let url = "https://app.dark.bio/pair/0123456789abcdef";
         let wrapped = wrap(&theme.paint(Role::Accent, url), 24, 2);
@@ -473,6 +545,8 @@ mod tests {
                 .collect::<String>(),
             url
         );
+
+        // Wide characters count two cells each, and truncation fits its tail
         let wide = "\u{754c}".repeat(12);
         let wrapped = wrap(&wide, 10, 2);
         assert!(
@@ -485,6 +559,8 @@ mod tests {
         assert_eq!(theme.truncate("abcdef", 6), "abcdef");
     }
 
+    /// Checks that control characters are escaped, while plain text passes
+    /// unchanged.
     #[test]
     fn control_characters_cannot_reach_the_terminal() {
         assert_eq!(printable("plain name"), "plain name");
@@ -494,6 +570,8 @@ mod tests {
         );
     }
 
+    /// Checks that paired backticks become styled spans, while an unmatched one
+    /// stays literal.
     #[test]
     fn inline_code_keeps_unmatched_backticks() {
         let theme = Theme::test(80, Color::Basic, false);
@@ -504,6 +582,7 @@ mod tests {
         assert_eq!(theme.inline("an unmatched ` stays"), "an unmatched ` stays");
     }
 
+    /// Checks that inline styling does not move where text wraps.
     #[test]
     fn wrapping_ignores_style_boundaries_inside_words() {
         let theme = Theme::test(40, Color::True, true);

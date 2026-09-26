@@ -15,9 +15,11 @@ pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(40);
 /// Pairing approval window with time for the cloud and device exchanges.
 pub(crate) const PAIRING_WINDOW: Duration = Duration::from_secs(70);
 
-/// An absolute deadline, an inactivity limit, or both. Each expected I/O wait
-/// gets a fresh inactivity allowance; the absolute deadline never moves.
-/// Approval requests use their protocol window instead of the inactivity limit.
+/// Bound on an operation, as an absolute deadline, an inactivity limit, or both.
+///
+/// Each expected I/O wait gets a fresh inactivity allowance; the absolute
+/// deadline never moves. Approval requests use their protocol window instead of
+/// the inactivity limit.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
     /// Fixed bound shared by every step of an operation, when supplied.
@@ -27,7 +29,7 @@ pub struct Timing {
 }
 
 impl Timing {
-    /// Passes the fixed operation bound to caller-owned authentication.
+    /// Returns the fixed operation bound, for caller-owned authentication.
     pub(crate) fn deadline(self) -> Option<Instant> {
         self.deadline
     }
@@ -41,6 +43,7 @@ impl Timing {
     }
 
     /// Bounds each expected response without limiting the whole operation.
+    ///
     /// Readers supplied by the caller must impose their own read timeout.
     pub fn inactivity(timeout: Duration) -> Self {
         Self {
@@ -55,19 +58,25 @@ impl Timing {
         self
     }
 
-    /// Deadline for the next machine response, measured on the clock.
+    /// Returns the deadline for the next machine response, measured on the
+    /// clock.
     pub(crate) fn io(self, clock: &Clock) -> Instant {
         self.bound(clock, self.inactivity)
     }
 
-    /// Approval windows include a small allowance for forwarding and replies.
-    /// Callers using only an absolute deadline retain that exact bound.
+    /// Returns the deadline for a request that may wait on an approval.
+    ///
+    /// The approval window replaces the inactivity allowance and includes a
+    /// small allowance for forwarding and replies. A timing with only an
+    /// absolute deadline keeps that exact bound.
     pub(crate) fn approval(self, clock: &Clock) -> Instant {
         self.window(clock, APPROVAL_WINDOW)
     }
 
-    /// Replaces an inactivity allowance with a protocol-specific wait window.
-    /// An absolute-only timing retains its original deadline.
+    /// Returns the deadline for a request with its own protocol wait window,
+    /// which replaces the inactivity allowance.
+    ///
+    /// An absolute-only timing keeps its original deadline.
     pub(crate) fn window(self, clock: &Clock, window: Duration) -> Instant {
         self.bound(clock, self.inactivity.map(|_| window))
     }
@@ -77,7 +86,10 @@ impl Timing {
         self.deadline.map_or(deadline, |bound| bound.min(deadline))
     }
 
-    /// Caller-supplied readers own their per-read timeout. Only a workflow's
+    /// Checks the absolute deadline, failing with [`crate::Error::Timeout`] once
+    /// it has passed.
+    ///
+    /// Caller-supplied readers own their per-read timeout, so only a workflow's
     /// absolute deadline can expire while an otherwise active reader runs.
     pub(crate) fn check(self, clock: &Clock) -> Result<(), crate::Error> {
         if self
@@ -90,8 +102,10 @@ impl Timing {
         }
     }
 
-    /// Poll cadence is independent of the response allowance. The pause sleeps
-    /// on the clock, never past the absolute deadline.
+    /// Sleeps on the clock between polls, never past the absolute deadline.
+    ///
+    /// Poll cadence is independent of the response allowance. A deadline
+    /// already reached fails with [`crate::Error::Timeout`] without sleeping.
     pub(crate) fn pause(self, clock: &Clock, interval: Duration) -> Result<(), crate::Error> {
         let wait = match self.deadline {
             Some(deadline) => interval.min(
@@ -130,13 +144,15 @@ impl From<Instant> for Timing {
 
 /// Time left on a clock before a deadline, as blocking OS calls take it.
 pub(crate) trait ClockExt {
-    /// Returns the time left before the deadline as a positive OS timeout. A
-    /// passed deadline fails with `TimedOut`, since a zero timeout means an
-    /// unbounded wait on some APIs.
+    /// Returns the time left before the deadline as a positive OS timeout.
+    ///
+    /// A passed deadline fails with `TimedOut`, since the standard socket calls
+    /// refuse a zero timeout.
     fn remaining(&self, deadline: Instant) -> io::Result<Duration>;
 }
 
 impl ClockExt for Clock {
+    /// Measures the time left from this clock's current instant.
     fn remaining(&self, deadline: Instant) -> io::Result<Duration> {
         deadline
             .checked_duration_since(self.now())

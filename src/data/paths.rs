@@ -24,7 +24,8 @@ pub(super) fn print(output: &Output, paths: &[DatasetPath]) -> Result<(), Error>
     Ok(())
 }
 
-/// Converts one entry to JSON, naming desc description as slot output does.
+/// Converts one entry to JSON, naming its `desc` field `description` as slot
+/// output does.
 fn metadata(path: &DatasetPath) -> Value {
     json!({
         "path": path.path,
@@ -38,16 +39,19 @@ fn metadata(path: &DatasetPath) -> Value {
 }
 
 /// Renders the entries as a tree, nesting each under its closest listed parent.
+///
 /// Only the topmost unavailable entry of a subtree carries the mark. Examples
 /// line up in one column right of the widest row and wrap within it.
 fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
     if paths.is_empty() {
         return format!("  {}", theme.paint(Role::Muted, "No dataset paths"));
     }
+
+    // Lay out one row per entry, indented under its closest listed parent
     let mut rows = Vec::new();
     let mut parents: Vec<&DatasetPath> = Vec::new();
     for path in paths {
-        // Names shorten only under a listed parent, so a root keeps its full path.
+        // Names shorten only under a listed parent, so a root keeps its full path
         while parents.last().is_some_and(|parent| {
             !path
                 .path
@@ -84,6 +88,8 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
             parents.push(path);
         }
     }
+
+    // Examples start 2 cells right of the widest row, below a legend line
     let column = rows
         .iter()
         .map(|(line, _, _)| console::measure_text_width(line))
@@ -101,6 +107,9 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
         theme.width,
         2,
     )];
+
+    // Rows without examples wrap under their own indent, and examples wrap
+    // within their column
     for (line, indent, examples) in rows {
         if examples.is_empty() {
             lines.push(style::wrap(&line, theme.width, indent + 2));
@@ -117,16 +126,20 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
     lines.join("\n")
 }
 
+/// Tests of the path tree layout.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::style::Color;
 
-    /// Unknown roots, missing parents and long names keep every path component in
-    /// tree order, unavailable ancestors hide repeated marks, and examples share
-    /// one column that wraps within itself.
+    /// Checks that unknown roots, missing parents and long names keep every
+    /// path component in tree order.
+    ///
+    /// Unavailable ancestors hide repeated marks, and examples share one column
+    /// that wraps within itself.
     #[test]
     fn future_paths_keep_their_hierarchy() {
+        // The layout is exact at 80 columns without color
         let paths = [
             DatasetPath {
                 path: "v1/sample".into(),
@@ -171,6 +184,8 @@ mod tests {
                 " ".repeat(46)
             )
         );
+
+        // Every width and color depth fits the lines and keeps every component
         for width in [20, 40, 80] {
             for color in [Color::Off, Color::Basic, Color::True] {
                 let text = render(&Theme::test(width, color, true), &paths);
@@ -186,6 +201,8 @@ mod tests {
                 ));
             }
         }
+
+        // An empty map prints a placeholder
         assert_eq!(
             render(&Theme::test(80, Color::Off, false), &[]),
             "  No dataset paths"

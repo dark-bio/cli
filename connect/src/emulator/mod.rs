@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! Discovery of emulated Arks running on the host.
+//!
 //! Connect through [`Device::connect`] to authenticate a discovered Ark.
 
 mod registry;
@@ -16,6 +17,7 @@ pub(crate) use ws::connect;
 use crate::{Device, Error};
 
 /// Lists emulated Arks published by local launchers, without connecting to them.
+///
 /// An absent launcher registry returns an empty list.
 pub fn list() -> Result<Vec<Device>, Error> {
     Ok(registry::list()?
