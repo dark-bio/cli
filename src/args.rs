@@ -114,7 +114,9 @@ pub(crate) struct Options {
 // Diagnostic detail, independent of step narration
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub(crate) enum Log {
+    // Update and connect events up to debug level
     Debug,
+    // Update, connect and wire events at every level
     Trace,
 }
 

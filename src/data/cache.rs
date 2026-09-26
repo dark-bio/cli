@@ -309,7 +309,10 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     /// Temporary cache directory, removed when dropped.
-    struct Directory(PathBuf);
+    struct Directory(
+        /// Path of the temporary directory.
+        PathBuf,
+    );
 
     impl Directory {
         /// Creates an empty directory unique to this process and call.
@@ -325,6 +328,7 @@ mod tests {
     }
 
     impl Drop for Directory {
+        /// Tries to remove the directory and its contents, ignoring failures.
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }

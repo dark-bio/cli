@@ -354,7 +354,10 @@ fn remaining(clock: &Clock, deadline: Instant) -> Result<Duration, ConnectError>
 }
 
 /// Owned helper process, killed and reaped on every exit path.
-struct Child(std::process::Child);
+struct Child(
+    /// Helper process, owned until this wrapper drops.
+    std::process::Child,
+);
 
 impl Drop for Child {
     /// Kills and reaps the helper, even when output collection, validation or

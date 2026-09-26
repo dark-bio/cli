@@ -54,8 +54,12 @@ macro_rules! pairs {
     ($setup:expr, $window:expr; $($request:ident => $response:ident,)*) => {
         $(
             impl Request for $request {
+                /// Body the Ark answers this request with.
                 type Response = $response;
+                /// Setup this request needs before sending.
                 const SETUP: Setup = $setup;
+                /// Wait window of this request, set when it waits on a person
+                /// or on the device.
                 const WINDOW: Option<Duration> = $window;
             }
         )*

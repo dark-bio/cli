@@ -392,7 +392,7 @@ impl Backlog {
 /// Drives the WebSocket while preserving input progress during blocked output.
 ///
 /// One adapter writer submits flushes serially and waits for each
-/// acknowledgement. Frame deadlines are wire's and measured on the connection's
+/// acknowledgment. Frame deadlines are wire's and measured on the connection's
 /// clock; control replies are bounded on real time.
 #[expect(
     clippy::disallowed_methods,
@@ -470,7 +470,7 @@ fn pump(
             }
 
             // Flush data and automatic Pong/Close replies through the same owner.
-            // An acknowledgement covers everything queued before this flush.
+            // An acknowledgment covers everything queued before this flush.
             match socket.flush() {
                 Ok(()) => {
                     backlog.flushed();

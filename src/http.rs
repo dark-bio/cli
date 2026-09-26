@@ -82,7 +82,10 @@ pub(crate) fn read_error(error: std::io::Error) -> Error {
 /// Ureq's body timeout covers the entire body. This adapter instead limits each
 /// transport wait, preserving any shorter deadline supplied by the HTTP layer.
 #[derive(Debug)]
-struct Inactivity(Duration);
+struct Inactivity(
+    /// Longest a single transport wait may take.
+    Duration,
+);
 
 impl<T: Transport> Connector<T> for Inactivity {
     /// Original transport with a renewed bound on each wait.
@@ -178,14 +181,18 @@ mod tests {
     }
 
     impl Transport for Scripted {
+        /// Returns the buffers the client reads and writes through.
         fn buffers(&mut self) -> &mut dyn Buffers {
             &mut self.buffers
         }
 
+        /// Discards the output, since the test checks only the input side.
         fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
             Ok(())
         }
 
+        /// Reports the wait's deadline, if any, then receives the next scripted
+        /// input on the test clock, timing out at that deadline.
         fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
             let deadline =
                 (!timeout.after.is_not_happening()).then(|| self.clock.now() + *timeout.after);
@@ -202,10 +209,13 @@ mod tests {
             Ok(true)
         }
 
+        /// Reports the connection open, so the client keeps using it.
         fn is_open(&mut self) -> bool {
             true
         }
 
+        /// Reports TLS, so the fixture can serve an HTTPS request without a
+        /// TLS handshake.
         fn is_tls(&self) -> bool {
             true
         }
@@ -214,11 +224,17 @@ mod tests {
     /// Connector that opens the scripted transport for the one connection a
     /// test makes.
     #[derive(Debug)]
-    struct Script(Mutex<Option<Scripted>>);
+    struct Script(
+        /// Scripted transport, taken by the first connection.
+        Mutex<Option<Scripted>>,
+    );
 
     impl Connector for Script {
+        /// Scripted transport the test drives.
         type Out = Scripted;
 
+        /// Hands out the scripted transport to the first connection, and
+        /// nothing to any later one.
         fn connect(
             &self,
             _: &ConnectionDetails,

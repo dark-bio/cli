@@ -173,6 +173,7 @@ impl<D: EndpointDirection> Transfers for nusb::Endpoint<Bulk, D> {
         self.max_packet_size()
     }
 
+    /// Counts the transfers the system USB queue still holds for the endpoint.
     fn in_flight(&self) -> usize {
         self.pending()
     }
@@ -182,6 +183,7 @@ impl<D: EndpointDirection> Transfers for nusb::Endpoint<Bulk, D> {
         self.submit(buffer);
     }
 
+    /// Polls the system USB queue for the endpoint's next finished transfer.
     fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
         self.poll_next_complete(cx)
     }
@@ -590,19 +592,24 @@ mod tests {
     type Fake = Arc<Mutex<Ring>>;
 
     impl Transfers for Fake {
+        /// Returns the fixed `PACKET` size the tests use.
         fn packet_size(&self) -> usize {
             PACKET
         }
 
+        /// Counts the queued and finished transfers not yet taken back.
         fn in_flight(&self) -> usize {
             let ring = self.lock().unwrap();
             ring.queued.len() + ring.finished.len()
         }
 
+        /// Queues the buffer for the test to finish.
         fn queue(&mut self, buffer: Buffer) {
             self.lock().unwrap().queued.push_back(buffer);
         }
 
+        /// Takes the oldest finished transfer, or keeps the waker until the
+        /// test finishes one.
         fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
             let mut ring = self.lock().unwrap();
             match ring.finished.pop_front() {

@@ -154,7 +154,9 @@ pub enum Error {
     #[error("source verification failed: {0}")]
     Integrity(String),
 
-    /// The cloud refused the device proof, giving no reason for the refusal.
+    /// The cloud answered a request carrying the device proof with HTTP 403.
+    ///
+    /// This client keeps no reason for the refusal.
     #[error("the cloud rejected the device proof")]
     ProofRejected,
 

@@ -124,11 +124,10 @@ struct Artifact {
 }
 
 impl Listing {
-    /// Validates every artifact into packages sorted newest first, before any
-    /// archive or device access.
+    /// Validates every artifact into packages sorted newest first.
     ///
-    /// Archive paths must name the same version and hash as the cloud
-    /// access-key request.
+    /// It runs before any archive download or firmware change. Archive paths
+    /// must name the same version and hash as the cloud access-key request.
     pub(super) fn firmwares(self) -> Result<Vec<Package>, Error> {
         if self.package != "arkos" {
             return Err(invalid("package listing is not arkos".into()));

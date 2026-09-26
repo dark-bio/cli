@@ -30,11 +30,12 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Validates the whole reference plan before mutation, then installs in
-/// dependency order.
+/// Plans the references and validates every download offer before any change,
+/// then installs the planned slots.
 ///
-/// Stops at the first failure and reports completed, failed and unattempted
-/// slots. A dry run only plans.
+/// Planning all references also checks their dependencies and orders the work,
+/// while a slot picked by `id` is installed alone. Stops at the first failure
+/// and reports completed, failed and unattempted slots. A dry run only plans.
 pub(super) fn fetch(
     context: &Context,
     connection: &Connection,
@@ -122,9 +123,11 @@ pub(super) fn fetch(
 /// Orders the reference slots after their dependencies, or picks the one slot
 /// `id` names.
 ///
-/// Dependencies decide the order even for slot kinds this tool does not know.
-/// A cycle, or an empty slot's dependency that is neither filled nor planned
-/// before it, is refused.
+/// Dependency checks apply only when planning all references, where they
+/// decide the order even for slot kinds this tool does not know. There a
+/// cycle, or an empty slot's dependency that is neither filled nor planned
+/// before it, is refused. A slot `id` names is returned without checking its
+/// dependencies.
 fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error> {
     // A named slot is fetched alone
     if let Some(id) = id {
@@ -325,7 +328,7 @@ fn install(
         };
 
         // Upload through the reader, stamping each session start and
-        // acknowledgement for its stall check
+        // acknowledgment for its stall check
         let mut reader = Reader::new(&agent, source, &context.output, clock.clone(), entry)?;
         let last_upload = reader.last_upload.clone();
         let mut progress = Progress::new(
@@ -465,7 +468,7 @@ struct Reader<'a> {
     entry: Option<cache::Entry>,
     /// Retained byte count used for the range request after replay.
     offset: u64,
-    /// Session start or latest upload acknowledgement, shared with progress
+    /// Session start or latest upload acknowledgment, shared with progress
     /// callbacks.
     last_upload: Rc<Cell<Option<Instant>>>,
     /// Retained prefix with an independent cursor capped at the resume offset.
@@ -660,7 +663,7 @@ impl Read for Reader<'_> {
         self.read += count as u64;
 
         // Fail a download that stalled past the upload window since the last
-        // acknowledgement
+        // acknowledgment
         if self
             .last_upload
             .get()
@@ -693,7 +696,10 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     /// Temporary cache directory, removed with its files on drop.
-    struct Directory(PathBuf);
+    struct Directory(
+        /// Path of the temporary directory.
+        PathBuf,
+    );
 
     impl Directory {
         /// Creates an empty cache outside the user's real cache directory.
@@ -709,6 +715,7 @@ mod tests {
     }
 
     impl Drop for Directory {
+        /// Tries to remove the directory and its contents, ignoring failures.
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
@@ -910,7 +917,7 @@ mod tests {
     }
 
     /// A download read fails once the upload window has passed since the last
-    /// acknowledgement.
+    /// acknowledgment.
     #[test]
     fn download_stall_tracks_the_upload_window() {
         // Read a two-byte body on the test clock

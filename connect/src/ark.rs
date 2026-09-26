@@ -474,7 +474,7 @@ impl Client {
 
 /// Result of a typed request, decoded when [`Self::wait`] takes the response.
 ///
-/// Dropping it discards the result without cancelling the request.
+/// Dropping it discards the result without canceling the request.
 #[derive(Debug)]
 pub struct Pending<T> {
     /// Encoded response and the notification registered for its completion.
@@ -539,11 +539,17 @@ mod tests {
 
         /// Verifier reporting every peer it accepts as attested under a fixed
         /// environment.
-        struct Attested(Environment);
+        struct Attested(
+            /// Environment the test fabricates for every accepted peer.
+            Environment,
+        );
 
         impl Verifier for Attested {
+            /// Identity the routing under test reads its cloud environment from.
             type Info = Identity;
 
+            /// Verifies the self-signed peer, then reports it as an attested
+            /// device in the fabricated environment.
             fn verify(
                 &self,
                 attestation: &transport::Attestation,
@@ -619,7 +625,9 @@ mod tests {
     }
 
     impl Request for ManualUnlock {
+        /// Unlock response the scripted peer returns.
         type Response = UnlockResponse;
+        /// No automatic prerequisites, leaving the relay to the test.
         const SETUP: Setup = Setup::None;
     }
 

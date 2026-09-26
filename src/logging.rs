@@ -64,7 +64,10 @@ fn enabled(target: &str, severity: tracing::Level, verbose: bool, level: Option<
 }
 
 /// Tracing layer that routes selected events through the CLI's stderr policy.
-struct Log(Output);
+struct Log(
+    /// Invocation output the events are written to.
+    Output,
+);
 
 impl<S: Subscriber> Layer<S> for Log {
     /// Renders setup messages as steps and other selected events as structured
@@ -110,7 +113,10 @@ impl<S: Subscriber> Layer<S> for Log {
 }
 
 /// Collected tracing fields, preserving string values for message rendering.
-struct Fields(Map<String, Value>);
+struct Fields(
+    /// Field values by name.
+    Map<String, Value>,
+);
 
 impl Visit for Fields {
     /// Stores a debug-only field as its printable representation.

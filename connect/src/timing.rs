@@ -152,6 +152,7 @@ pub(crate) trait ClockExt {
 }
 
 impl ClockExt for Clock {
+    /// Measures the time left from this clock's current instant.
     fn remaining(&self, deadline: Instant) -> io::Result<Duration> {
         deadline
             .checked_duration_since(self.now())

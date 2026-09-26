@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 /// The first result claims stdout, and later ones are ignored. Events and live
 /// stderr lines share terminal state across clones.
 #[derive(Clone)]
-pub(crate) struct Output(Arc<State>);
+pub(crate) struct Output(
+    /// Output state shared by every clone.
+    Arc<State>,
+);
 
 /// Immutable stream policy and synchronization shared by output handles.
 struct State {
@@ -746,7 +749,10 @@ mod tests {
     /// In-memory screen holding the frames that wait displays draw in place of
     /// stderr.
     #[derive(Clone, Default)]
-    struct Screen(Arc<Mutex<Vec<u8>>>);
+    struct Screen(
+        /// Bytes written so far, shared by every clone.
+        Arc<Mutex<Vec<u8>>>,
+    );
 
     impl Screen {
         /// Returns the frames drawn so far, oldest first.
@@ -761,11 +767,13 @@ mod tests {
     }
 
     impl Write for Screen {
+        /// Appends every byte to the shared screen buffer.
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
+        /// Returns at once, since the screen holds no deferred output.
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -877,7 +885,7 @@ mod tests {
         assert_eq!(redraws.recv().unwrap(), first);
 
         // Pass the stop signal through a helper, which lets the redraw finish
-        // only once the drop has started cancelling the worker
+        // only once the drop has started canceling the worker
         let (tap, tapped) = crossbeam_channel::bounded::<()>(0);
         let stop = ticker.stop.replace(tap);
         let releasing = thread::spawn(move || {

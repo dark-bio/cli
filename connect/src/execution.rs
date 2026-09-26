@@ -41,7 +41,7 @@ pub enum ExecutionProgress {
     /// Requesting companion approval to run the uploaded app.
     Authorizing,
     /// The app is running, its elapsed time counted from the scheduling
-    /// acknowledgement.
+    /// acknowledgment.
     Running {
         /// Host time since scheduling succeeded, including status polling waits.
         elapsed: Duration,
@@ -51,9 +51,10 @@ pub enum ExecutionProgress {
 /// Uploads and runs an app, streaming at most two outstanding chunks, waiting
 /// for authorization and retrieving the result once.
 ///
-/// Scheduling establishes the relay through the caller's client. A failed task
-/// is cancelled within the remaining deadline, at most 1 s. Deadlines and the
-/// running time are measured on the clock of the requester's session.
+/// Scheduling establishes the relay through the caller's client. After a
+/// failure it requests the task's cancellation within the remaining deadline,
+/// at most 1 s, ignoring cancellation errors. Deadlines and the running time
+/// are measured on the clock of the requester's session.
 pub(crate) fn execute(
     requester: &Requester,
     size: u64,
@@ -78,7 +79,7 @@ pub(crate) fn execute(
         .wait::<schema::ExecutionUploadStartResponse>()?
         .taskid;
 
-    // Run the task's steps as one outcome, so any failure cancels it
+    // Run the task's steps as one outcome, so any failure can cancel it
     let result = (|| {
         progress(ExecutionProgress::Started { taskid });
         progress(ExecutionProgress::Uploading {
@@ -149,7 +150,8 @@ pub(crate) fn execute(
         }
     })();
 
-    // Cancel a failed task within the remaining deadline, at most 1 s
+    // Request a failed task's cancellation within the remaining deadline, at
+    // most 1 s, ignoring the outcome
     if result.is_err() {
         let cleanup = timing.io(clock).min(clock.now() + Duration::from_secs(1));
         let _ = requester
@@ -311,7 +313,7 @@ mod tests {
         })
     }
 
-    /// Scheduling follows the final acknowledgement, and polling stops at the
+    /// Scheduling follows the final acknowledgment, and polling stops at the
     /// result, keeping binary output even of a failed app.
     #[test]
     fn test_execution() {
@@ -357,7 +359,7 @@ mod tests {
             assert_eq!(actual, expected);
 
             // Every byte arrived, polling stopped at the result, and approval
-            // followed the final acknowledgement
+            // followed the final acknowledgment
             let observed = observed.lock().unwrap();
             assert_eq!(observed.bytes, bytes);
             assert_eq!(
@@ -388,8 +390,8 @@ mod tests {
     /// and a refused start attempts no cancellation.
     #[test]
     fn test_refusals() {
-        // Each refused stage fails the run without a retry, cancelling any
-        // task it allocated
+        // Each refused stage fails the run without a retry, requesting
+        // cancellation of any task it allocated
         let clock = test_clock().clock();
         for fail in ["start", "chunk", "schedule", "status"] {
             let (mut peer, observed) = peer(
@@ -468,7 +470,7 @@ mod tests {
         }
     }
 
-    /// Two chunks can be in flight with their acknowledgements reversed, and
+    /// Two chunks can be in flight with their acknowledgments reversed, and
     /// approval waits for the last one.
     #[test]
     fn test_upload_window() {
@@ -548,7 +550,7 @@ mod tests {
             )
         });
 
-        // Approval waits for the last chunk's acknowledgement
+        // Approval waits for the last chunk's acknowledgment
         notices.recv().unwrap();
         assert!(
             !progress
@@ -643,6 +645,8 @@ mod tests {
             interrupted: bool,
         }
         impl Read for Fragmented {
+            /// Serves one byte per call, interrupting once at the end of the
+            /// source.
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 if self.bytes.is_empty() && !self.interrupted {
                     self.interrupted = true;
@@ -689,6 +693,7 @@ mod tests {
         /// Source whose every read times out.
         struct TimedOut;
         impl Read for TimedOut {
+            /// Fails every read with `TimedOut`.
             fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
                 Err(io::ErrorKind::TimedOut.into())
             }

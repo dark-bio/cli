@@ -276,7 +276,8 @@ fn trust(pubkey: Option<&str>) -> Result<TrustMode, Error> {
 
 /// Opens a nonempty regular file and returns its current size without reading it.
 ///
-/// Upload workflows separately detect files that change after this snapshot.
+/// Upload workflows reject a file that ends before this size or runs past it.
+/// They do not detect a change that keeps the same length.
 pub(crate) fn open_file(path: &Path) -> Result<(std::fs::File, u64), Error> {
     let file = std::fs::File::open(path).map_err(|err| {
         Error::new(

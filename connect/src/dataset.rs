@@ -18,8 +18,11 @@ const IDENTIFY_SIZE: usize = 1024 * 1024;
 /// Largest upload chunk, 32 KiB short of a 2 MiB frame to leave room for
 /// sealing and framing.
 const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024;
-/// Longest time a chunk waits on a slow source before its partial bytes go out,
-/// keeping the Ark's upload session alive.
+/// Interval after which a chunk goes out partial, keeping the Ark's upload
+/// session alive while the source is slow.
+///
+/// It is checked between source reads, so it never interrupts a read that
+/// blocks.
 const CHUNK_INTERVAL: Duration = Duration::from_secs(1);
 /// Delay between processing reports, independent of each response's deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -72,9 +75,10 @@ pub struct Dataset {
 /// Uploads a dataset, identifying it once, resending that head in the start
 /// request and streaming the rest.
 ///
-/// A failed session is cancelled within the remaining deadline, at most 1 s;
-/// cleanup never replaces the original error or retries an upload. Deadlines
-/// are measured on the clock of the requester's session.
+/// After a failure it requests the session's cancellation within the remaining
+/// deadline, at most 1 s. Cancellation errors are ignored, so cleanup never
+/// replaces the original error, and it never retries an upload. Deadlines are
+/// measured on the clock of the requester's session.
 pub(crate) fn upload(
     requester: &Requester,
     dataset: &Dataset,
@@ -145,7 +149,7 @@ pub(crate) fn upload(
         .wait::<schema::SlotUploadStartResponse>()?
         .session;
 
-    // Run the session's steps as one outcome, so any failure cancels it
+    // Run the session's steps as one outcome, so any failure can cancel it
     let result = (|| {
         progress(UploadProgress::Started { session });
         progress(UploadProgress::Uploading {
@@ -168,7 +172,7 @@ pub(crate) fn upload(
                 finish_read(reader, hash.take(), dataset, clock, timing)?;
             }
             // Keep at most two chunks outstanding so device writes can overlap
-            // the next transfer. The last acknowledgement is awaited too.
+            // the next transfer. The last acknowledgment is awaited too.
             let next = requester.request(
                 schema::SlotUploadChunkRequest { session, chunk },
                 timing.io(clock),
@@ -221,7 +225,8 @@ pub(crate) fn upload(
         }
     })();
 
-    // Cancel a failed session within the remaining deadline, at most 1 s
+    // Request a failed session's cancellation within the remaining deadline, at
+    // most 1 s, ignoring the outcome
     if result.is_err() {
         let cleanup = timing.io(clock).min(clock.now() + Duration::from_secs(1));
         let _ = requester
@@ -231,13 +236,14 @@ pub(crate) fn upload(
     result
 }
 
-/// Reads up to `size` bytes, returning what arrived once `interval` has passed
-/// since the call started.
+/// Reads up to `size` bytes, returning early once a read completes after
+/// `interval` has passed since the call started.
 ///
 /// The identification head is read without an interval, so it fills before a
-/// session opens. Later chunks flush available bytes periodically so a slow
-/// source keeps the Ark's session alive. A source ending early is an error,
-/// and the caller's reader still owns the timeout of each individual read.
+/// session opens. Later chunks go out partial so a slow source keeps the Ark's
+/// session alive. The interval is checked between reads and never interrupts
+/// a blocking one. A source ending early is an error, and the caller's reader
+/// still owns the timeout of each individual read.
 fn read_chunk(
     reader: &mut impl Read,
     size: usize,
@@ -557,6 +563,9 @@ mod tests {
             chunks: mpsc::Receiver<()>,
         }
         impl Read for Slow<'_> {
+            /// Serves the head, then 64 KiB reads, advancing the clock by one
+            /// chunk interval on the second read and awaiting a chunk arrival
+            /// on the third.
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 self.reads += 1;
                 if self.reads == 2 {
@@ -614,7 +623,8 @@ mod tests {
     /// passes as a completed upload.
     #[test]
     fn test_failures() {
-        // Each failed stage fails the upload, cancelling any session it opened
+        // Each failed stage fails the upload and requests cancellation of any
+        // session it opened
         let clock = test_clock().clock();
         for fail in ["identify", "peek", "start", "chunk", "process"] {
             let bytes = vec![42; IDENTIFY_SIZE + 2 * CHUNK_SIZE + 1];
@@ -709,7 +719,8 @@ mod tests {
                 );
 
                 // References skip identification, and only the original is
-                // processed, a large damaged copy cancelling its open session
+                // processed, a large damaged copy requesting its open session's
+                // cancellation
                 let observed = observed.lock().unwrap();
                 assert!(!observed.stages.contains(&"peek"));
                 assert_eq!(result.is_ok(), change == "none");
@@ -725,11 +736,11 @@ mod tests {
     }
 
     /// The source is read no further than two outstanding chunks, even while
-    /// their acknowledgements arrive reversed.
+    /// their acknowledgments arrive reversed.
     #[test]
     fn test_transfer_window() {
         // The peer answers the second chunk first, holding the first chunk's
-        // acknowledgement until the test releases it
+        // acknowledgment until the test releases it
         let clock = test_clock().clock();
         let (notice, notices) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -785,6 +796,8 @@ mod tests {
             count: Arc<std::sync::atomic::AtomicUsize>,
         }
         impl Read for Counting<'_> {
+            /// Reads from the source and adds the byte count to the shared
+            /// total.
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 let count = self.bytes.read(buf)?;
                 self.count
@@ -830,6 +843,7 @@ mod tests {
             bytes: &'static [u8],
         }
         impl Read for Fragmented {
+            /// Interrupts every odd call and serves a single byte on the others.
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 self.calls += 1;
                 if self.calls % 2 == 1 {

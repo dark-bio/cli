@@ -14,7 +14,10 @@ use std::time::Duration;
 
 /// Shared cancellation registration used by commands and platform signal handlers.
 #[derive(Clone)]
-pub(crate) struct Interrupt(Arc<Mutex<State>>);
+pub(crate) struct Interrupt(
+    /// Registration shared with the signal handlers.
+    Arc<Mutex<State>>,
+);
 
 /// Active connection and cancellation target, held stable throughout interruption.
 #[derive(Default)]
