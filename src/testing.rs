@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Instant;
 
 /// Blocks until the earliest wait or timer on the clock is due at `deadline`.
+///
 /// The advance that reaches the deadline then wakes it, whenever the test makes
 /// that advance.
 pub(crate) fn wait_deadline(tester: &TestClock, deadline: Instant) {

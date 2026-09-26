@@ -13,9 +13,12 @@ use darkbio_connect::{
 };
 use serde_json::json;
 
-/// Pairs an unpaired Ark, translating connector stages into the owner's scan and
-/// approval instructions. Link construction and terminal presentation stay in the CLI.
+/// Pairs an unpaired Ark, translating connection library stages into the
+/// owner's scan and approval instructions.
+///
+/// Link construction and terminal presentation stay in the CLI.
 pub(crate) fn run(context: &Context) -> Result<(), Error> {
+    // Pairing needs an unpaired Ark and a known cloud environment
     let connection = context.connect(None)?;
     if connection.info.paired {
         return Err(Error::new(5, "already-paired", "the Ark is already paired")
@@ -25,6 +28,9 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         Error::new(4, "environment-unknown", "cloud environment unknown")
             .hint("select one with --env")
     })?;
+
+    // The link names the environment's app, the signer's fingerprint and the
+    // realm, falling back to the device kind without an attested one
     let origin = match env {
         Environment::Release => "https://app.dark.bio",
         Environment::Staging => "https://app.darkbio.xyz",
@@ -38,6 +44,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             darkbio_connect::DeviceKind::Hardware => Realm::Hardware,
             darkbio_connect::DeviceKind::Emulator => Realm::Emulator,
         });
+
+    // Terminals show the link and each stage live, other outputs plain events
     let mut previous = None;
     let result = connection
         .client
@@ -48,7 +56,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                 deadline,
                 fingerprint,
             } => {
-                // Colo is routing supplied by the cloud, never a URL or a host name.
+                // Colo is routing supplied by the cloud, never a URL or a host
+                // name, so anything but letters and digits is percent-encoded
                 let colo: String = colo
                     .bytes()
                     .map(|byte| {
@@ -102,12 +111,16 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                 "preparing encrypted storage",
             ),
         });
+
+    // Complete the last stage only when pairing succeeded
     if result.is_ok()
         && let Some(name) = previous
     {
         context.output.stage(name, true);
     }
     result?;
+
+    // Report the serial of an attested Ark, or null for any other
     let serial = match &connection.identity {
         darkbio_connect::Identity::Attested { device, .. } => Some(&device.serial),
         _ => None,
@@ -117,7 +130,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         .document(&json!({"serial": serial, "paired": true}))
 }
 
-/// Completes the previous human stage or emits the corresponding plain progress event.
+/// Starts a human stage after completing the previous one, or emits the
+/// corresponding plain progress event outside a terminal.
 fn stage(
     context: &Context,
     previous: &mut Option<&'static str>,

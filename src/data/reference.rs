@@ -4,7 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Download planning, transport recovery and cache replay.
+//! Reference data downloads, with their planning, transport recovery and cache
+//! replay.
 //!
 //! Each attempt starts a new Ark upload and replays the retained bytes from disk.
 //! The HTTP range request opens only when replay reaches the missing suffix.
@@ -29,8 +30,11 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Validates the whole reference plan before mutation, then installs in dependency order.
-/// Stops at the first failure and reports completed, failed and unattempted slots.
+/// Validates the whole reference plan before mutation, then installs in
+/// dependency order.
+///
+/// Stops at the first failure and reports completed, failed and unattempted
+/// slots. A dry run only plans.
 pub(super) fn fetch(
     context: &Context,
     connection: &Connection,
@@ -40,6 +44,7 @@ pub(super) fn fetch(
     directory: Option<&Path>,
     no_cache: bool,
 ) -> Result<(), Error> {
+    // Order the plan and validate every offer it downloads before any change
     let directory = directory
         .map(Path::to_path_buf)
         .unwrap_or_else(cache::directory);
@@ -47,6 +52,9 @@ pub(super) fn fetch(
     for slot in ordered.iter().filter(|slot| !filled(slot)) {
         offer(slot)?;
     }
+
+    // Start each row as skipped, planned or not attempted, and keep them as
+    // the partial result
     let mut rows:Vec<Value>=ordered.iter().map(|slot| {
         let offer=download(slot);
         json!({"slot":slot_name(slot.kind),"id":slot.kind,"url":offer.map(|o|o.0),"size_bytes":offer.map(|o|o.1),"sha256":offer.map(|o|o.2),
@@ -54,6 +62,8 @@ pub(super) fn fetch(
             "outcome":if filled(slot) {"skipped"} else if dry_run {"planned"} else {"not-attempted"},"error":null})
     }).collect();
     context.interrupt.partial(json!({"fetched":rows}));
+
+    // Install in order, skipping filled slots and stopping at the first failure
     let mut failure = None;
     for (index, slot) in ordered.iter().enumerate() {
         if filled(slot) {
@@ -94,6 +104,8 @@ pub(super) fn fetch(
         }
         context.interrupt.partial(json!({"fetched":rows}));
     }
+
+    // Print every row, then return the first failure
     context.output.table(
         &json!({"fetched":rows}),
         &rows,
@@ -107,11 +119,20 @@ pub(super) fn fetch(
     failure.map_or(Ok(()), Err)
 }
 
-/// Dependencies determine order even when future slot kinds are addressed by id.
+/// Orders the reference slots after their dependencies, or picks the one slot
+/// `id` names.
+///
+/// Dependencies decide the order even for slot kinds this tool does not know.
+/// A cycle, or an empty slot's dependency that is neither filled nor planned
+/// before it, is refused.
 fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error> {
+    // A named slot is fetched alone
     if let Some(id) = id {
         return Ok(vec![select(slots, id)?]);
     }
+
+    // Take the first slot without a pending dependency, since none means a
+    // cycle
     let mut pending: Vec<_> = slots
         .iter()
         .filter(|slot| slot.origin == darkbio_connect::schema::SlotOrigin::OriginReference as i32)
@@ -135,6 +156,8 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
                 )
             })?;
         let slot = pending.remove(index);
+
+        // An empty slot's dependencies must be filled or planned before it
         for dependency in slot.deps.iter().filter(|_| !filled(slot)) {
             if !slots.iter().any(|other| {
                 other.kind == *dependency
@@ -161,15 +184,18 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
 
 /// Validated reference offer used by both protocol upload and HTTP/cache handling.
 struct Source {
-    /// Exact length, target slot and binary digest passed to connect.
+    /// Filename, exact length, target slot and binary digest passed to connect.
     dataset: Dataset,
     /// Advertised HTTPS download URL without embedded credentials.
     url: String,
     /// Canonical lowercase SHA-256 used as a cache basename.
     hash: String,
 }
-/// Validates a nonempty HTTPS offer and its complete digest before any download or upload.
+
+/// Validates a nonempty HTTPS offer and its complete digest before any
+/// download or upload.
 fn offer(slot: &SlotStatus) -> Result<Source, Error> {
+    // The slot must advertise a download with a URL that parses
     let (url, size, hash) = download(slot).ok_or_else(|| {
         Error::new(
             5,
@@ -180,6 +206,8 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
     let uri: ureq::http::Uri = url
         .parse()
         .map_err(|_| Error::new(1, "file-rejected", "invalid reference URL"))?;
+
+    // Require HTTPS to a host, without credentials in the URL
     if uri.scheme_str() != Some("https")
         || uri.host().is_none()
         || uri
@@ -192,6 +220,8 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
             "reference download requires HTTPS without credentials",
         ));
     }
+
+    // Require a nonempty length, a complete digest and a filename
     if size == 0 {
         return Err(Error::new(
             1,
@@ -221,6 +251,7 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
 }
 
 /// Replays a complete cache or streams a download through a fresh Ark upload.
+///
 /// At most three network attempts resume retained bytes when possible. Protocol
 /// refusals are returned; only source failures or a corrupt prefix permit replay.
 /// A refused HTTP range discards the prefix before the next attempt.
@@ -232,6 +263,9 @@ fn install(
 ) -> Result<(), Error> {
     let mut directory = directory;
     let clock = connection.client.clock();
+
+    // Upload a complete cached copy first, removing one that is corrupt or
+    // unreadable
     if let Some(directory) = directory {
         let path = directory.join(&source.hash);
         if let Ok(mut file) = File::open(&path) {
@@ -268,6 +302,9 @@ fn install(
             }
         }
     }
+
+    // Download in up to three attempts, each locking the cache entry or
+    // streaming without one when it is unavailable
     let agent = http::agent(Duration::from_secs(context.options.timeout), 5);
     for attempt in 0..3 {
         let entry = match directory {
@@ -286,6 +323,9 @@ fn install(
             }
             None => None,
         };
+
+        // Upload through the reader, stamping each session start and
+        // acknowledgement for its stall check
         let mut reader = Reader::new(&agent, source, &context.output, clock.clone(), entry)?;
         let last_upload = reader.last_upload.clone();
         let mut progress = Progress::new(
@@ -309,6 +349,7 @@ fn install(
             },
         );
         context.interrupt.clear();
+
         // A verified download is reusable even if the Ark later rejects processing.
         // Cache completion describes the source, not the slot's resulting state.
         let valid = reader.read == source.dataset.size
@@ -325,6 +366,9 @@ fn install(
             // reader still owns the entry when no append worker was needed.
             reader.entry.take()
         };
+
+        // Publish a verified copy, drop a full-length corrupt one, and keep a
+        // shorter prefix for resuming
         if let Some(entry) = entry {
             if valid {
                 if let Err(error) = cache::complete(entry, &source.hash) {
@@ -339,6 +383,9 @@ fn install(
                 let _ = fs::remove_file(&path);
             }
         }
+
+        // Retry a source failure or a corrupt prefix while attempts remain, and
+        // otherwise end with the outcome
         match result {
             Ok(()) => {
                 if let Some(directory) = directory {
@@ -372,7 +419,8 @@ fn install(
     unreachable!("last attempt returns its result")
 }
 
-/// Requires a partial response covering exactly the advertised remaining byte range.
+/// Checks that a partial response covers exactly the bytes from `offset` to
+/// the end of the advertised `size`.
 fn valid_range(response: &ureq::http::Response<ureq::Body>, offset: u64, size: u64) -> bool {
     if response.status() != 206 {
         return false;
@@ -398,9 +446,12 @@ fn valid_range(response: &ureq::http::Response<ureq::Body>, offset: u64, size: u
             .is_some_and(|last| end.parse::<u64>() == Ok(last))
 }
 
-/// Replays a retained prefix, then tees network bytes into a best-effort cache.
-/// Hashes both sources together and marks network failures for download retry policy.
-/// The cache lock stays held across replay, response validation and queued writes.
+/// Source reader that replays a retained prefix, then tees network bytes into a
+/// best-effort cache.
+///
+/// It hashes both sources together and marks source failures for the download
+/// retry policy. The cache lock stays held across replay, response validation
+/// and queued writes.
 struct Reader<'a> {
     /// Connection clock that measures the upload window.
     clock: Clock,
@@ -414,7 +465,8 @@ struct Reader<'a> {
     entry: Option<cache::Entry>,
     /// Retained byte count used for the range request after replay.
     offset: u64,
-    /// Session start or latest upload acknowledgement, shared with progress callbacks.
+    /// Session start or latest upload acknowledgement, shared with progress
+    /// callbacks.
     last_upload: Rc<Cell<Option<Instant>>>,
     /// Retained prefix with an independent cursor capped at the resume offset.
     prefix: Option<io::Take<File>>,
@@ -431,9 +483,12 @@ struct Reader<'a> {
     /// Request or cache setup error preserved through connect's reader boundary.
     error: Option<Error>,
 }
+
 impl<'a> Reader<'a> {
-    /// Opens only the cached prefix. A live response must not wait through replay.
-    /// Retains the cache lock even if the reader never reaches the network.
+    /// Opens only the cached prefix, since a live response must not wait
+    /// through replay.
+    ///
+    /// It retains the cache lock even if the reader never reaches the network.
     fn new(
         agent: &'a ureq::Agent,
         source: &'a Source,
@@ -469,10 +524,14 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// Validates the response before accepting any bytes or starting the cache writer.
+    /// Requests the network source and validates the response before accepting
+    /// any bytes or starting the cache writer.
+    ///
     /// A refused range resets the cache and fails this attempt. Request failures
     /// permit retry; HTTP status failures on a full download are returned directly.
     fn open(&mut self) -> Result<(), Error> {
+        // Ask for the whole file, or for the bytes past a retained prefix under
+        // the cached validator
         let mut request = self
             .agent
             .get(&self.source.url)
@@ -487,10 +546,15 @@ impl<'a> Reader<'a> {
                 request = request.header("If-Range", validator);
             }
         }
+
+        // A failed request is a source failure, which permits another attempt
         let response = request.call().map_err(|error| {
             self.failed = true;
             http::error(error)
         })?;
+
+        // A resume needs an exact range answer, and a full download a plain
+        // success
         if self.offset > 0 && !valid_range(&response, self.offset, self.source.dataset.size) {
             // The Ark already has the prefix. Reset the cache and let connect
             // cancel this upload before the next attempt starts from zero.
@@ -511,6 +575,8 @@ impl<'a> Reader<'a> {
                 format!("reference download returned HTTP {}", response.status()),
             ));
         }
+
+        // Keep the new validator for a later resume, and start the cache writer
         if let Some(entry) = &mut self.entry {
             entry.meta.validator = response
                 .headers()
@@ -532,13 +598,18 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 }
+
 impl Read for Reader<'_> {
     /// Serves prefix bytes first, then records and caches network bytes.
-    /// After a network read, detects an upload window already lost to a source stall.
+    ///
+    /// After a network read, it detects an upload window already lost to a
+    /// source stall.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
+
+        // Replay the retained prefix first
         if let Some(prefix) = &mut self.prefix {
             let count = prefix.read(buffer)?;
             if count > 0 {
@@ -548,6 +619,8 @@ impl Read for Reader<'_> {
             }
             self.prefix = None;
         }
+
+        // Open the network source once the prefix runs out
         if self.network.is_none() {
             // A complete partial file may have survived interruption just before
             // publication. Verify it without requesting a range beyond EOF.
@@ -562,6 +635,8 @@ impl Read for Reader<'_> {
                 return Err(failure);
             }
         }
+
+        // Read network bytes, failing on a read error or an early end
         let count = match self.network.as_mut().expect("opened response").read(buffer) {
             Ok(count) => count,
             Err(error) => {
@@ -576,11 +651,16 @@ impl Read for Reader<'_> {
                 "reference download ended early",
             ));
         }
+
+        // Cache, hash and count the bytes
         if let Some(writer) = &mut self.writer {
             writer.append(&buffer[..count]);
         }
         self.hash.update(&buffer[..count]);
         self.read += count as u64;
+
+        // Fail a download that stalled past the upload window since the last
+        // acknowledgement
         if self
             .last_upload
             .get()
@@ -596,6 +676,7 @@ impl Read for Reader<'_> {
     }
 }
 
+/// Tests of reference planning, offer validation, resume and cache replay.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,11 +689,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    /// Keeps parallel fixtures in separate temporary directories.
+    /// Counter that keeps parallel fixtures in separate temporary directories.
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    /// Removes a test's cache files on drop.
+    /// Temporary cache directory, removed with its files on drop.
     struct Directory(PathBuf);
+
     impl Directory {
         /// Creates an empty cache outside the user's real cache directory.
         fn new() -> Self {
@@ -625,18 +707,21 @@ mod tests {
             Self(path)
         }
     }
+
     impl Drop for Directory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
-    /// Keeps expected cache diagnostics out of test output.
+    /// Builds a quiet output, keeping expected cache diagnostics out of the
+    /// test output.
     fn output() -> Output {
         Output::new(&crate::args::Cli::parse_from(["ark", "--quiet"]).options)
     }
 
-    /// Allows loopback HTTP while retaining production status handling.
+    /// Builds a client that allows loopback HTTP while retaining production
+    /// status handling.
     fn agent() -> ureq::Agent {
         ureq::Agent::config_builder()
             .proxy(None)
@@ -702,6 +787,8 @@ mod tests {
         })
     }
 
+    /// Builds a reference slot of kind `id` with its dependencies, filled or
+    /// empty.
     fn reference(id: i32, deps: &[i32], filled: bool) -> SlotStatus {
         SlotStatus {
             kind: id,
@@ -715,6 +802,9 @@ mod tests {
             ..Default::default()
         }
     }
+
+    /// The plan keeps filled slots in dependency order, and refuses cycles and
+    /// missing dependencies of empty slots.
     #[test]
     fn dependency_order_retains_filled_slots_and_detects_missing_inputs() {
         let slots = [
@@ -741,6 +831,8 @@ mod tests {
         assert_eq!(plan(&[reference(1, &[2], true)], None).unwrap().len(), 1);
     }
 
+    /// Offers need HTTPS without credentials, a filename and a complete digest,
+    /// which is normalized to lowercase.
     #[test]
     fn offers_require_public_https_and_a_complete_hash() {
         for url in [
@@ -777,6 +869,7 @@ mod tests {
         );
     }
 
+    /// A body that ends early is a source failure, which permits a retry.
     #[test]
     fn truncated_sources_are_transport_failures() {
         let agent = http::agent(Duration::from_secs(1), 0);
@@ -790,6 +883,8 @@ mod tests {
         assert!(reader.failed);
         assert_eq!(reader.read, 2);
     }
+
+    /// A resume accepts only a 206 covering exactly the remaining bytes.
     #[test]
     fn resume_requires_an_exact_range_response() {
         for (status, range, valid) in [
@@ -813,8 +908,12 @@ mod tests {
             );
         }
     }
+
+    /// A download read fails once the upload window has passed since the last
+    /// acknowledgement.
     #[test]
     fn download_stall_tracks_the_upload_window() {
+        // Read a two-byte body on the test clock
         let agent = http::agent(Duration::from_secs(1), 0);
         let output = output();
         let source = source("https://example.com/reference.gz".into(), &[42, 43]);
@@ -837,8 +936,11 @@ mod tests {
         assert!(reader.failed);
     }
 
+    /// A resumed download replays the cache before it opens the HTTP range
+    /// request.
     #[test]
     fn restarted_download_opens_http_only_after_cache_replay() {
+        // Download one chunk and a short tail from a loopback listener
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let bytes = [vec![42; cache::CHUNK], b"remaining bytes".to_vec()].concat();
@@ -847,6 +949,7 @@ mod tests {
             &bytes,
         );
         let directory = Directory::new();
+
         // Keep one committed chunk and discard an interrupted tail. The next
         // reader has only the files left by the previous invocation.
         interrupted(&directory.0, &source, &bytes[..cache::CHUNK + 3]);
@@ -857,6 +960,8 @@ mod tests {
         let output = output();
         let clock = TestClock::new().clock();
         let mut reader = Reader::new(&agent, &source, &output, clock, Some(entry)).unwrap();
+
+        // The prefix replays without any HTTP request
         let mut received = vec![0; cache::CHUNK];
         reader.read_exact(&mut received).unwrap();
         assert_eq!(received, bytes[..cache::CHUNK]);
@@ -865,6 +970,8 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
 
+        // The rest arrives through a range request, and the complete copy is
+        // published
         let server = serve(
             listener,
             vec![(
@@ -891,15 +998,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(directory.0.join(&source.hash)).unwrap(), bytes);
+
+        // The one request asks for the suffix under the cached validator
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains(&format!("\r\nrange: bytes={}-\r\n", cache::CHUNK)));
         assert!(requests[0].contains("\r\nif-range: \"reference-v1\"\r\n"));
     }
 
+    /// A refused resume discards the prefix, and the retry downloads from the
+    /// start.
     #[test]
     fn refused_resume_discards_the_prefix_before_retry() {
         for status in [200, 206, 416] {
+            // Keep one chunk, and script a refused resume and then the whole
+            // file
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let bytes = [vec![42; cache::CHUNK], b"remaining bytes".to_vec()].concat();
             let source = source(
@@ -922,6 +1035,8 @@ mod tests {
             let agent = agent();
             let output = output();
             let clock = TestClock::new().clock();
+
+            // The refused resume fails the first attempt after the prefix replays
             {
                 let entry = cache::Entry::open(
                     &directory.0,
@@ -938,6 +1053,9 @@ mod tests {
                 assert!(reader.failed);
                 assert!(reader.writer.is_none());
             }
+
+            // The prefix is gone, so the retry downloads everything without a
+            // range
             let entry =
                 cache::Entry::open(&directory.0, &source.hash, &source.url, source.dataset.size)
                     .unwrap();
@@ -963,6 +1081,8 @@ mod tests {
         }
     }
 
+    /// A partial file that already holds every byte completes without an HTTP
+    /// request.
     #[test]
     fn complete_partial_file_needs_no_http_request() {
         let bytes = vec![42; cache::CHUNK];

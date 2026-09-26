@@ -15,13 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-/// Coalesces unfinished lookups by host and port, without caching completed DNS.
-/// System lookups cannot be cancelled on timeout, so a retry joins the one
-/// still running instead of starting another.
+/// Resolver that coalesces unfinished lookups by host and port, without caching
+/// completed results.
+///
+/// The standard library's lookup cannot be canceled on timeout, so a retry
+/// joins the one still running instead of starting another.
 #[derive(Debug)]
 pub(super) struct Resolver {
-    clock: Clock, // clock that the waiters' deadlines are measured on
-    pending: Mutex<HashMap<(String, u16), Arc<Lookup>>>, // Only unfinished system calls
+    /// Clock that the waiters' deadlines are measured on.
+    clock: Clock,
+    /// Lookups still running by host and port, each removed once it completes.
+    pending: Mutex<HashMap<(String, u16), Arc<Lookup>>>,
 }
 
 /// One system lookup retained until every attached waiter releases it.
@@ -29,7 +33,7 @@ pub(super) struct Resolver {
 struct Lookup {
     /// Addresses or failure, published once by the resolver worker.
     result: sync::Mutex<Option<Result<Vec<SocketAddr>, Failure>>>,
-    /// Wakes all callers when the shared system lookup returns.
+    /// Signal that wakes every waiter once the shared system lookup returns.
     ready: sync::Condvar,
 }
 
@@ -42,7 +46,11 @@ impl Resolver {
         })
     }
 
-    /// A caller's deadline ends its wait, leaving the lookup available to retries.
+    /// Resolves a host and port to socket addresses, joining a lookup already
+    /// running for them.
+    ///
+    /// An IP address needs no lookup. A caller's deadline ends only its own
+    /// wait, leaving the lookup available to retries.
     pub(super) fn resolve(
         self: &Arc<Self>,
         host: &str,
@@ -62,8 +70,11 @@ impl Resolver {
         })
     }
 
-    /// Completed lookups are removed so a later attachment refreshes DNS. An
-    /// expired waiter neither cancels nor replaces a system call still running.
+    /// Waits for the lookup under `key`, starting it on a worker thread when
+    /// none is running.
+    ///
+    /// A completed lookup is forgotten, so a later attempt resolves afresh. An
+    /// expired waiter neither cancels nor replaces a lookup still running.
     fn lookup(
         self: &Arc<Self>,
         key: (String, u16),
@@ -71,6 +82,8 @@ impl Resolver {
         lookup: impl FnOnce() -> Result<Vec<SocketAddr>, Failure> + Send + 'static,
     ) -> Result<Vec<SocketAddr>, Failure> {
         self.clock.remaining(deadline).map_err(socket::io_error)?;
+
+        // Join the lookup running for this key, or start one on a worker thread
         let mut pending = self.pending.lock().expect("DNS lookups not poisoned");
         let attempt = match pending.get(&key) {
             Some(attempt) => attempt.clone(),
@@ -87,6 +100,9 @@ impl Resolver {
                         let key = key.clone();
                         move || {
                             let result = lookup();
+
+                            // Publish and forget under the map's lock, so a new
+                            // caller either joins this lookup or starts afresh
                             let mut pending =
                                 resolver.pending.lock().expect("DNS lookups not poisoned");
                             *attempt.result.lock().expect("DNS result not poisoned") = Some(result);
@@ -100,6 +116,8 @@ impl Resolver {
             }
         };
         drop(pending);
+
+        // Wait for the shared result until this caller's own deadline
         let mut result = attempt.result.lock().expect("DNS result not poisoned");
         loop {
             if let Some(result) = &*result {
@@ -115,6 +133,7 @@ impl Resolver {
     }
 }
 
+/// Lookup sharing, expiry and refresh.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,7 +142,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// Retries join a stalled lookup, and the next completed attempt refreshes it.
+    /// Retries join a stalled lookup, and an attempt after it completes starts
+    /// a fresh one.
     #[test]
     fn test_timeout_and_retry() {
         // Stall the first system lookup until released

@@ -104,6 +104,7 @@ fn slots() -> Vec<SlotStatus> {
 /// Runs one scenario in a child test process, capturing its real stdout and
 /// stderr so results and hints stay distinguishable.
 fn capture(scenario: &str, json: bool) -> (String, String) {
+    // Run this test again as a child that prints the scenario without color
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -116,6 +117,8 @@ fn capture(scenario: &str, json: bool) -> (String, String) {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+
+    // Keep only the result between the markers, past the test harness's lines
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stdout = stdout
         .split_once("<result>\n")
@@ -128,10 +131,14 @@ fn capture(scenario: &str, json: bool) -> (String, String) {
     (stdout, String::from_utf8(output.stderr).unwrap())
 }
 
-/// Full, partial and empty path maps and every slot print exact JSON, a readable
-/// view and the right hints, with availability marked once per missing subtree.
+/// Checks that path maps and slots print exact JSON, a readable view and the
+/// right hints.
+///
+/// Full, partial and empty path maps are covered, with availability marked once
+/// per missing subtree.
 #[test]
 fn inventory_output() {
+    // As the child, print one scenario between result markers
     if let Ok(scenario) = std::env::var("ARK_TEST_DATA_SCENARIO") {
         let mut options = Cli::parse_from(["ark"]).options;
         options.json = std::env::var("ARK_TEST_DATA_JSON").unwrap() == "true";
@@ -156,6 +163,9 @@ fn inventory_output() {
         writeln!(std::io::stdout(), "</result>").unwrap();
         return;
     }
+
+    // Every path map prints the same entries as JSON or a tree, hinting at the
+    // slot list when some are unavailable
     let expected = json!({"paths":[
         {
             "path":"v1/sample", "directory":true, "grantable":true, "available":true,
@@ -226,6 +236,9 @@ fn inventory_output() {
             assert!(!stdout.contains('\x1b'));
         }
     }
+
+    // The slot list prints both slots and hints at fetching the missing
+    // reference
     let expected = json!({"slots":[
         {
             "slot":"41", "id":41, "name":"Sample A",
@@ -258,6 +271,8 @@ fn inventory_output() {
         "  SLOT  STATE      ORIGIN     BUILD     VERSION     SIZE  REQUIRES\n  41    ok filled  personal   sample-a  1        2.0 KiB  none\n  42    - empty    reference  -         -            0 B  41 (filled)\n"
     );
     assert_eq!(stderr, "hint: run `ark data fetch 42`\n");
+
+    // Each slot's page shows every field, wrapping long texts under their label
     for (index, id) in [41, 42].into_iter().enumerate() {
         let scenario = format!("show{id}");
         let (stdout, stderr) = capture(&scenario, true);

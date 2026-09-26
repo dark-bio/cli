@@ -19,15 +19,18 @@ use tungstenite::{
     stream::MaybeTlsStream,
 };
 
-/// Bounds cloud frames and assembled messages to wire's transport capacity.
+/// Largest cloud frame or assembled message, the most one wire message carries.
 const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
 
 /// Cloud WebSocket retaining its TLS state when switched to readiness polling.
 pub(super) type Connection = WebSocket<MaybeTlsStream<Socket>>;
 
-/// Opens a cloud socket and requires the requested application subprotocol.
-/// DNS, TCP, TLS and upgrade share one deadline. Caller authentication stays
-/// separate from cloud proof refusals, before any application exchange begins.
+/// Opens a cloud socket that must agree on the requested subprotocol, carrying
+/// the Ark's `auth` proof in the upgrade.
+///
+/// DNS, TCP, TLS and the upgrade share one deadline. A refusal of the caller's
+/// credentials returns [`Failure::AuthRequired`], kept apart from a refused
+/// proof, before any application exchange begins.
 pub(super) fn connect(
     api: &Api,
     url: &str,
@@ -35,6 +38,7 @@ pub(super) fn connect(
     subprotocol: &str,
     deadline: Instant,
 ) -> Result<Connection, Failure> {
+    // Carry the caller's credentials and the Ark's proof on the upgrade request
     let mut request = url.into_client_request().map_err(socket_error)?;
     request
         .headers_mut()
@@ -48,6 +52,8 @@ pub(super) fn connect(
         .parse()
         .expect("base64url is a valid header"),
     );
+
+    // Take the host without IPv6 brackets, and the scheme's default port
     let host = request
         .uri()
         .host()
@@ -64,6 +70,7 @@ pub(super) fn connect(
             80
         });
 
+    // Try the resolved addresses in turn until one connects within the deadline
     let addresses = api.resolver.resolve(&host, port, deadline)?;
     let mut failure = io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -82,6 +89,8 @@ pub(super) fn connect(
     }
     let stream = connected.ok_or_else(|| io_error(failure))?;
     stream.set_nodelay(true).map_err(io_error)?;
+
+    // Upgrade with frames and messages capped at what one wire message carries
     let config = WebSocketConfig::default()
         .write_buffer_size(0)
         .max_write_buffer_size(2 * MAX_MESSAGE)
@@ -108,6 +117,8 @@ pub(super) fn connect(
         }
         HandshakeError::Failure(error) => socket_error(error),
     })?;
+
+    // The cloud must agree on the requested subprotocol
     if response
         .headers()
         .get("Sec-WebSocket-Protocol")
@@ -121,7 +132,11 @@ pub(super) fn connect(
     Ok(socket)
 }
 
-/// Blocking reads and writes share a deadline; attached relays use readiness.
+/// Stream under a cloud WebSocket, blocking under a deadline or polled for
+/// readiness.
+///
+/// Blocking reads and writes share one deadline, and an attached relay
+/// switches to readiness polling.
 #[derive(Debug)]
 pub(super) enum Socket {
     /// Handshake or pairing stream with a shared read and write bound.
@@ -130,7 +145,7 @@ pub(super) enum Socket {
         clock: Clock,
         /// Connected TCP socket, optionally wrapped by TLS above this adapter.
         stream: TcpStream,
-        /// Absolute bound checked again before each blocking I/O.
+        /// Absolute bound, turned into a fresh timeout before each blocking I/O.
         deadline: Instant,
     },
     /// Attached relay socket serviced by the worker's readiness loop.
@@ -138,7 +153,8 @@ pub(super) enum Socket {
 }
 
 impl Read for Socket {
-    /// Applies the remaining blocking deadline or returns readiness-based I/O.
+    /// Reads within the remaining deadline, or without blocking on a relay
+    /// socket.
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Blocking {
@@ -155,7 +171,8 @@ impl Read for Socket {
 }
 
 impl Write for Socket {
-    /// Applies the remaining blocking deadline or writes through the relay socket.
+    /// Writes within the remaining deadline, or without blocking on a relay
+    /// socket.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Blocking {
@@ -169,6 +186,7 @@ impl Write for Socket {
             Self::Connected(stream) => stream.write(bytes),
         }
     }
+
     /// Flushes the underlying stream under the same bound as a write.
     fn flush(&mut self) -> io::Result<()> {
         match self {
@@ -185,7 +203,8 @@ impl Write for Socket {
     }
 }
 
-/// Accesses the readiness adapter under either the cleartext test socket or TLS.
+/// Returns the adapter under a WebSocket, reaching through its TLS layer when
+/// there is one.
 pub(super) fn socket_mut(socket: &mut WebSocket<MaybeTlsStream<Socket>>) -> &mut Socket {
     match socket.get_mut() {
         MaybeTlsStream::Plain(stream) => stream,
@@ -194,7 +213,10 @@ pub(super) fn socket_mut(socket: &mut WebSocket<MaybeTlsStream<Socket>>) -> &mut
     }
 }
 
-/// Preserves timeout classification across blocking socket error conventions.
+/// Converts an I/O error, treating both timeout kinds as a wire timeout.
+///
+/// A blocking socket reports an expired timeout as `TimedOut` or `WouldBlock`,
+/// depending on the platform.
 pub(super) fn io_error(error: io::Error) -> Failure {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
@@ -204,7 +226,10 @@ pub(super) fn io_error(error: io::Error) -> Failure {
     }
 }
 
-/// Separates expired I/O and rejected proofs from other cloud socket failures.
+/// Converts a WebSocket error, keeping expired I/O and a refused proof apart
+/// from other failures.
+///
+/// An HTTP 403 answer to the upgrade counts as a refused proof.
 pub(super) fn socket_error(error: tungstenite::Error) -> Failure {
     match error {
         tungstenite::Error::Io(error) => io_error(error),
@@ -213,6 +238,7 @@ pub(super) fn socket_error(error: tungstenite::Error) -> Failure {
     }
 }
 
+/// Socket upgrades carrying caller credentials.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,11 +253,15 @@ mod tests {
     use std::sync::{Arc, atomic::Ordering};
     use std::thread;
 
+    /// A refused upgrade triggers one login, and both the retry and a later
+    /// reconnect carry the refreshed credentials.
     #[test]
-    #[allow(clippy::result_large_err)] // Tungstenite's server callback owns its HTTP response.
+    #[allow(clippy::result_large_err)] // the upgrade callback's error is a whole HTTP response
     fn socket_upgrades_and_reconnects_use_refreshed_credentials() {
         let clock = test_clock().clock();
         for subprotocol in ["Pairing", "Relaying"] {
+            // Refuse the first upgrade for its cached credentials, then accept
+            // two that carry refreshed ones
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("ws://{}/v1/{subprotocol}", listener.local_addr().unwrap());
             let server = thread::spawn(move || {
@@ -266,6 +296,8 @@ mod tests {
                     drop(socket);
                 }
             });
+
+            // Connect twice, logging in once when the first upgrade is refused
             let cloud = api(url.clone(), Realm::Hardware, &clock);
             let login = Login::default();
             cloud.auth.set(Arc::new(login.clone()));

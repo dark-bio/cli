@@ -26,14 +26,16 @@ impl Discovery {
         }
     }
 
-    /// Selects an endpoint by locator or by a unique serial, name or image basename.
-    /// Without a selector, requires exactly one device. The `hardware:` and
+    /// Selects an endpoint by locator or by a unique serial, name or image
+    /// basename.
+    ///
+    /// Without a selector, it requires exactly one device. The `hardware:` and
     /// `emulator:` prefixes are reserved for locators; a missing locator never
-    /// falls back to a device name. Display formatting does not determine selection.
-    /// The bare names `hardware` and `emulator` require one device of that kind.
-    /// Label matches are exact and case-sensitive.
+    /// falls back to a device name. Display formatting does not determine
+    /// selection. The bare names `hardware` and `emulator` require one device of
+    /// that kind. Label matches are exact and case-sensitive.
     pub fn select(&self, selector: Option<&str>) -> Result<&Device, Error> {
-        // A reported name must not shadow a locator, including an absent one.
+        // A reported name must not shadow a locator, including an absent one
         if let Some(selector) = selector
             && (selector.starts_with("hardware:") || selector.starts_with("emulator:"))
         {
@@ -43,7 +45,8 @@ impl Discovery {
                 .find(|device| device.locator().to_string() == selector)
                 .ok_or_else(|| Error::NoMatch(selector.into()));
         }
-        // Descriptive labels may be shared. Retain every match for ambiguity errors.
+
+        // Descriptive labels may be shared. Keep every match for ambiguity errors.
         let matches: Vec<_> = self
             .devices
             .iter()
@@ -71,8 +74,9 @@ impl Discovery {
     }
 }
 
-/// Lists hardware and emulators. A discovery failure for one kind does not hide
-/// devices returned by the other.
+/// Lists hardware and emulators.
+///
+/// A discovery failure for one kind does not hide devices returned by the other.
 pub fn list() -> Discovery {
     let mut found = Discovery::default();
     found.extend(hardware::list());
@@ -98,10 +102,11 @@ mod tests {
         })
     }
 
-    /// Duplicate labels require explicit locators. Reported names cannot shadow
-    /// locators, including an endpoint that has disappeared.
+    /// Duplicate labels require explicit locators, and reported names never
+    /// shadow a locator, even of an endpoint that has disappeared.
     #[test]
     fn test_selection() {
+        // Two emulators sharing an image basename need their locators
         let mut found = Discovery::default();
         found.extend(Ok(vec![device(18181, None), device(18182, None)]));
         assert_eq!(found.devices[0].to_string(), found.devices[1].to_string());
@@ -113,11 +118,16 @@ mod tests {
             found.select(Some("emulator:18182")).unwrap().locator(),
             Locator::Emulator { port: 18182 }
         );
+
+        // A name spelling another endpoint's locator does not shadow it
         found.devices[0] = device(18181, Some("emulator:18182"));
         assert_eq!(
             found.select(Some("emulator:18182")).unwrap().locator(),
             Locator::Emulator { port: 18182 }
         );
+
+        // A locator with no endpoint behind it matches no reported name, for
+        // emulators and hardware alike
         found.devices.pop();
         assert!(matches!(
             found.select(Some("emulator:18182")),

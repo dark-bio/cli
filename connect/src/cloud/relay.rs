@@ -32,42 +32,55 @@ use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-/// Relay bodies fit inside a wire message. Queues and requests also have limits.
+/// Largest encoded relay envelope, the most one wire message carries.
 const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
-/// Byte allowance for each queued direction, excluding in-flight wire messages.
+/// Byte allowance, 16 MiB, for each of the admission and output queues, not
+/// counting messages in flight on the wire.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
-/// Request count limit applied to admission, active exchanges and output queues.
+/// Request count limit, 128, for the admission queue, the open exchanges in
+/// each direction and the output queue.
 const MAX_INFLIGHT: usize = 128;
 
-/// The firmware bounds its relay requests by sixty seconds. This also bounds
-/// retained responders when a companion never answers, independently of callers.
+/// Time an Ark request or a companion request stays open on the relay, 60 s.
+///
+/// An Ark request that needs the relay attached spends part of it attaching.
+/// It also releases a responder whose companion never answers, whatever the
+/// caller's own deadline.
 pub(super) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Maximum time to flush an outgoing frame through a backlogged cloud socket.
+/// Maximum time, 5 s, that written output may wait to flush through the cloud
+/// socket.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Idle interval between a valid pong and the next liveness probe.
+/// Interval, 15 s, from attachment or a matching pong to the next liveness
+/// probe.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
-/// Maximum wait for the pong matching the current probe.
+/// Maximum wait, 10 s, for the pong matching the current probe.
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 /// Readiness token for incoming traffic and pending socket writes.
 const SOCKET: Token = Token(0);
-/// Readiness token for queued Ark requests or local closure.
+/// Readiness token for queued Ark requests, wire completions and local closure.
 const WAKE: Token = Token(1);
 
-/// An attached relay. Dropping it ends its worker and outstanding forwarding.
+/// Relay attached to one connection, ending its worker and forwarding when
+/// dropped.
 #[derive(Debug)]
 pub(super) struct Relay {
-    shared: Arc<Shared>,    // Queue and ending reason observed by the dispatcher
-    worker: Option<Worker>, // Started when dispatch can see this attachment
+    /// Admission queue and ending reason, shared by the dispatcher and the
+    /// worker.
+    shared: Arc<Shared>,
+    /// Worker resources, until [`Self::start`] moves them into the worker
+    /// thread.
+    worker: Option<Worker>,
 }
 
-/// Connected resources moved into the worker only after services publishes the relay.
+/// Connected resources that [`Relay::start`] moves into the worker thread.
 #[derive(Debug)]
 struct Worker {
     /// Sole owner of WebSocket framing and TLS state.
     socket: WebSocket<MaybeTlsStream<Socket>>,
-    /// Waits for socket readiness, admission wakeups and exchange deadlines.
+    /// Poller for socket readiness, admission wakeups and exchange deadlines.
     poll: Poll,
-    /// Issues companion requests through the original Ark session.
+    /// Requester passing companion requests to the Ark over the original
+    /// session.
     requester: Requester,
     /// Cloud liveness probes, independent of companion availability.
     heartbeat: Heartbeat,
@@ -76,25 +89,33 @@ struct Worker {
 /// Admission and shutdown handles shared by the dispatcher and relay worker.
 #[derive(Debug)]
 struct Shared {
-    state: Mutex<State>, // Admission and closure are atomic with respect to each other
-    wake: Arc<Waker>,    // signals queued Ark traffic, wire completions or local closure
-    socket: TcpStream,   // Interrupts reads even inside WebSocket message assembly
-    /// Notifies a test once the last handle to this relay is gone.
+    /// Queue and ending reason under one lock, so admission and closure never
+    /// interleave.
+    state: Mutex<State>,
+    /// Waker for queued Ark requests, wire completions and local closure.
+    wake: Arc<Waker>,
+    /// Clone of the TCP stream, shut down to interrupt the worker even inside
+    /// WebSocket message assembly.
+    socket: TcpStream,
+    /// Channel notifying a test once the last handle to this relay is gone.
     #[cfg(test)]
     dropped: Mutex<Option<mpsc::Sender<()>>>,
 }
 
-/// Reverse requests awaiting admission and the first attachment failure.
+/// Ark requests waiting for the worker, and the first reason the relay ended.
 #[derive(Debug, Default)]
 struct State {
     /// Ark requests, unanswered responders and their fixed exchange deadlines.
     queue: VecDeque<(schema::RelayArkToAppRequest, Responder, Instant)>,
-    bytes: usize,          // Opaque bytes waiting for the socket worker
-    error: Option<String>, // First reason this relay ended
+    /// Opaque request bytes waiting in the queue.
+    bytes: usize,
+    /// First reason this relay ended.
+    error: Option<String>,
 }
 
 impl Relay {
-    /// Opens an authenticated socket under the original operation's deadline.
+    /// Opens an authenticated relay socket under the operation's deadline,
+    /// ready for [`Self::start`] to hand to the worker.
     pub(super) fn connect(
         api: &super::http::Api,
         url: &str,
@@ -104,6 +125,9 @@ impl Relay {
     ) -> Result<Self, Failure> {
         let mut socket = socket::connect(api, url, auth, "Relaying", deadline)?;
         api.clock.remaining(deadline).map_err(io_error)?;
+
+        // Switch the upgraded stream to readiness polling, keeping a clone to
+        // shut it down with
         let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
             unreachable!()
         };
@@ -121,6 +145,9 @@ impl Relay {
             )
             .map_err(io_error)?;
         *socket_mut(&mut socket) = Socket::Connected(connected);
+
+        // Share the queue and shutdown handles, holding the worker's resources
+        // until it starts
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Arc::new(Waker::new(poll.registry(), WAKE).map_err(io_error)?),
@@ -139,8 +166,14 @@ impl Relay {
         })
     }
 
-    /// Starts under the services lock so a companion request arriving immediately
-    /// after upgrade cannot provoke Ark traffic before dispatch sees this relay.
+    /// Starts the worker thread that services this relay.
+    ///
+    /// The setup calls it under its lock, so dispatch finds this relay for any
+    /// Ark request that an early companion message provokes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the worker already started.
     pub(super) fn start(&mut self) -> Result<(), Failure> {
         let Worker {
             socket,
@@ -158,8 +191,10 @@ impl Relay {
         Ok(())
     }
 
-    /// Whether this attachment has no recorded failure. This is a local snapshot;
-    /// a dead peer may remain undetected until I/O or the next heartbeat expires.
+    /// Checks whether this attachment has not recorded an ending yet.
+    ///
+    /// This is a local snapshot, so a dead peer may go unnoticed until I/O
+    /// fails or the next heartbeat expires.
     pub(super) fn connected(&self) -> bool {
         self.shared
             .state
@@ -169,7 +204,10 @@ impl Relay {
             .is_none()
     }
 
-    /// Queues a reverse request without blocking the Ark's receive loop.
+    /// Queues an Ark request for the companion without blocking dispatch.
+    ///
+    /// A relay that ended, a full queue or a body without 64 bytes of room for
+    /// its envelope refuses the request at once with `UNAVAILABLE`.
     pub(super) fn forward(
         &self,
         request: schema::RelayArkToAppRequest,
@@ -191,7 +229,8 @@ impl Relay {
         }
     }
 
-    /// Refuses queued work and wakes the worker without waiting for it to join.
+    /// Ends the relay, refusing queued requests and waking the worker without
+    /// waiting for it to exit.
     pub(super) fn close(&self) {
         self.shared.end("relay closed".into());
     }
@@ -205,7 +244,10 @@ impl Drop for Relay {
 }
 
 impl Shared {
-    /// Refuses queued work and interrupts the socket, retaining the first failure.
+    /// Ends the relay with `error`, refusing queued requests and interrupting
+    /// the socket.
+    ///
+    /// Only the first reason is kept, and later calls do nothing.
     fn end(&self, error: String) {
         let mut state = self.state.lock().expect("relay queue not poisoned");
         if state.error.is_none() {
@@ -231,38 +273,46 @@ impl Drop for Shared {
     }
 }
 
-/// Recognizes an incomplete nonblocking operation that the poll loop can resume.
+/// Checks whether a WebSocket error is a nonblocking operation left for the
+/// poll loop to resume.
 fn would_block(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
 }
 
-/// An unavailable relay fails the Ark's reverse request, allowing its original
-/// operation to finish with an error. Enqueueing the reply does not wait on I/O.
+/// Refuses an Ark request with `UNAVAILABLE` and the reason, queueing the reply
+/// without waiting on I/O.
+///
+/// The reply gets [`protocol::DEFAULT_AUTOREPLY_TIMEOUT`] to go out.
 pub(super) fn fail(responder: Responder, reason: &str) {
     let error = schema::Error::reserved(schema::ReservedErrors::Unavailable, reason);
     let deadline = responder.clock().now() + protocol::DEFAULT_AUTOREPLY_TIMEOUT;
     let _ = responder.fail(error, deadline);
 }
 
-/// Current cloud envelope. Only the envelope is interpreted; all bodies stay sealed.
+/// Cloud relay envelope, whose framing is all the host reads.
+///
+/// Every body stays opaque to the host.
 #[derive(Cbor, Default)]
 #[cbor(array)]
 struct Envelope {
-    /// Envelope version; the current cloud protocol requires one.
+    /// Envelope version, which must be `1`.
     darkrpc: u64,
     /// Correlation ID present only on requests and responses.
     id: Option<u64>,
-    /// Sealed notification body, currently ignored after envelope validation.
+    /// Sealed notification body, accepted and ignored since the wire has no
+    /// input for it.
     notify: Option<Vec<u8>>,
     /// Sealed request body forwarded without interpretation.
     request: Option<Vec<u8>>,
     /// Sealed response body matched to an outstanding request.
     response: Option<Vec<u8>>,
-    /// Presence body, currently ignored because wire has no corresponding input.
+    /// Presence body, accepted and ignored since the wire has no input for it.
     presence: Option<Vec<u8>>,
 }
 
-/// Validated envelope shape. The host only originates requests and responses.
+/// Envelope validated into one of its three shapes.
+///
+/// The host originates only requests and responses.
 enum Frame {
     /// Correlation ID and opaque request bytes.
     Request(u64, Vec<u8>),
@@ -273,7 +323,8 @@ enum Frame {
 }
 
 impl Frame {
-    /// Requires the current version and exactly one payload with the proper ID shape.
+    /// Decodes an envelope, requiring version `1` and exactly one body, with an
+    /// ID only on requests and responses.
     fn decode(bytes: &[u8]) -> Result<Self, Failure> {
         let envelope: Envelope = cbor::decode(bytes)
             .map_err(|error| Failure::Relay(format!("invalid relay envelope: {error}")))?;
@@ -296,8 +347,12 @@ impl Frame {
         }
     }
 
-    /// Encodes a forwarded exchange without changing its ID or sealed payload.
-    /// Notifications cannot be originated by the host.
+    /// Encodes a request or response envelope, keeping its ID and sealed body
+    /// unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`Self::Notice`], since the host originates no notifications.
     fn encode(self) -> Vec<u8> {
         let mut envelope = Envelope {
             darkrpc: 1,
@@ -318,8 +373,11 @@ impl Frame {
     }
 }
 
-/// Checks the cloud transport independently of companion availability. Only a
-/// pong echoing our current ping proves liveness; other traffic cannot defer it.
+/// Liveness probe schedule for the cloud socket, independent of companion
+/// traffic.
+///
+/// Only a pong echoing the current ping proves liveness, and other traffic
+/// cannot defer a probe.
 #[derive(Debug)]
 struct Heartbeat {
     /// Delay before probing again after a matching pong.
@@ -335,8 +393,10 @@ struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// Schedules the first probe of a relay attaching now. The worker's socket
-    /// timers run on real time, so the schedule starts on it too.
+    /// Schedules the first probe of a relay attaching now.
+    ///
+    /// The worker's socket timers run on real time, so the schedule starts on
+    /// it too.
     #[expect(
         clippy::disallowed_methods,
         reason = "the heartbeat is one of the worker's socket timers, which run on real time from attachment"
@@ -357,7 +417,10 @@ impl Heartbeat {
         }
     }
 
-    /// Produces at most one ping until its matching pong arrives or expires.
+    /// Returns a probe payload when one is due, keeping at most one probe
+    /// outstanding.
+    ///
+    /// Fails once the outstanding probe's pong is overdue.
     fn ping(&mut self, now: Instant) -> Result<Option<[u8; 8]>, Failure> {
         if let Some((_, deadline)) = self.pending {
             if now >= deadline {
@@ -382,15 +445,17 @@ impl Heartbeat {
         }
     }
 
-    /// Next instant the worker must wake to send a probe or detect its expiry.
+    /// Returns the next instant the worker must wake, to send a probe or detect
+    /// its expiry.
     fn deadline(&self) -> Instant {
         self.pending.map_or(self.next, |(_, deadline)| deadline)
     }
 }
 
-/// Bounds output the cloud socket has not taken yet. The first write or
-/// deferred flush starts the bound, later ones keep its deadline, and only a
-/// completed flush ends it.
+/// Time bound on output the cloud socket has not taken yet.
+///
+/// The first write or deferred flush starts the bound, later ones keep its
+/// deadline, and only a completed flush ends it.
 #[derive(Debug, Default)]
 struct Backlog {
     /// Time the pending output must be flushed by, while there is some.
@@ -409,26 +474,31 @@ impl Backlog {
         self.deadline = None;
     }
 
-    /// Whether output is left to flush, which holds back the next frame.
+    /// Checks whether output is left to flush, which holds back the next frame.
     fn active(&self) -> bool {
         self.deadline.is_some()
     }
 
-    /// Whether the output left to flush missed its deadline by `now`.
+    /// Checks whether the output left to flush missed its deadline by `now`.
     fn expired(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| now >= deadline)
     }
 
-    /// Time left after `now` before the deadline, bounding the next poll.
+    /// Returns the time left after `now` before the deadline, which bounds the
+    /// next poll.
     fn remaining(&self, now: Instant) -> Option<Duration> {
         self.deadline
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 }
 
-/// Writes one frame at a time while receiving concurrently. Wire completions
-/// and queued Ark requests wake the poll; idle wakeups check liveness. The
-/// socket's own timers read real time and exchange deadlines the session's clock.
+/// Runs the relay worker, writing one frame at a time while receiving
+/// concurrently.
+///
+/// Wire completions and queued Ark requests wake the poll, and idle wakeups
+/// check liveness. The socket's own timers read real time, while exchange
+/// deadlines read the session's clock. When the relay ends, every Ark request
+/// still queued or open is refused with the ending reason.
 #[expect(
     clippy::disallowed_methods,
     reason = "the worker waits on the cloud socket through mio, so its heartbeat and write timers run on real time"
@@ -442,23 +512,29 @@ fn pump(
 ) {
     let clock = requester.clock();
     let mut events = Events::with_capacity(8);
+
     // The two directions have independent ID spaces. Only the worker changes
     // these maps, so completions never need the shared admission lock.
     let mut pending: HashMap<u64, (Responder, Instant)> = HashMap::new();
     let mut inbound: HashMap<u64, Promise<protocol::Message>> = HashMap::new();
     let (answered, answers) = mpsc::channel();
+
+    // Output waits in a bounded queue and goes out one frame at a time
     let mut output = VecDeque::new();
     let mut bytes = 0usize;
     let mut writing = Backlog::default();
+
+    // Service the relay until the first failure ends it
     let result = (|| -> Result<(), Failure> {
         loop {
+            // Stop once the relay ended, or admit one queued Ark request
             {
                 let mut state = shared.state.lock().expect("relay queue not poisoned");
                 if let Some(error) = &state.error {
                     return Err(Failure::Relay(error.clone()));
                 }
-                // Admission stops while the socket is backlogged; reading and
-                // completion handling continue independently of that backlog.
+                // Admission stops while the socket is backlogged, but reading
+                // and completion handling continue independently of that backlog
                 if output.is_empty()
                     && !writing.active()
                     && pending.len() < MAX_INFLIGHT
@@ -481,8 +557,9 @@ fn pump(
                     }
                 }
             }
-            // Expired exchanges release their responder even if no further
-            // traffic arrives. Responses without a pending responder are discarded.
+
+            // Refuse Ark requests whose exchange expired, even if no further
+            // traffic arrives
             let now = clock.now();
             let expired: Vec<_> = pending
                 .iter()
@@ -492,12 +569,14 @@ fn pump(
             for id in expired {
                 fail(pending.remove(&id).unwrap().0, "relay request timed out");
             }
+
+            // Pass the Ark's answers to companion requests on to the cloud
             while let Ok(id) = answers.try_recv() {
                 if let Some(promise) = inbound.remove(&id) {
                     let response = match promise.wait::<schema::RelayArkToAppResponse>() {
                         Ok(response) => response,
-                        // Only the Ark can seal an error for the companion. Let
-                        // this exchange expire there without ending unrelated ones.
+                        // Only the Ark can seal an answer for the companion, so
+                        // this one goes unanswered and unrelated ones continue
                         Err(
                             protocol::Error::Remote(_)
                             | protocol::Error::Timeout
@@ -513,6 +592,8 @@ fn pump(
                     enqueue(&mut output, &mut bytes, Frame::Response(id, response.res))?;
                 }
             }
+
+            // Start writing the next frame once the previous one is flushed
             if !writing.active()
                 && let Some(frame) = output.pop_front()
             {
@@ -524,8 +605,9 @@ fn pump(
                     Err(error) => return Err(socket_error(error)),
                 }
             }
+
             // Bound each read batch so a busy companion cannot starve writes,
-            // expired Ark requests or the heartbeat.
+            // expired Ark requests or the heartbeat
             let mut batch_full = false;
             for index in 0..32 {
                 match socket.read() {
@@ -536,6 +618,8 @@ fn pump(
                                     "too many or duplicate companion requests".into(),
                                 ));
                             }
+
+                            // Ask the Ark, waking the worker on its answer
                             let mut promise = requester.request(
                                 schema::RelayAppToArkRequest { id, req },
                                 clock.now() + EXCHANGE_TIMEOUT,
@@ -549,12 +633,13 @@ fn pump(
                             inbound.insert(id, promise);
                         }
                         Frame::Response(id, res) => {
+                            // Responses to closed exchanges are dropped
                             if let Some((responder, deadline)) = pending.remove(&id) {
                                 let _ = responder
                                     .reply(schema::RelayAppToArkResponse { id, res }, deadline)?;
                             }
                         }
-                        Frame::Notice => {} // The wire has no notification or presence input.
+                        Frame::Notice => {} // the wire has no notification or presence input
                     },
                     Ok(Message::Pong(bytes)) => heartbeat.pong(&bytes, Instant::now()),
                     Ok(Message::Ping(_)) => {}
@@ -567,6 +652,8 @@ fn pump(
                 }
                 batch_full = index == 31;
             }
+
+            // Probe the cloud when due, failing once a probe went unanswered
             if let Some(ping) = heartbeat.ping(Instant::now())? {
                 writing.start(Instant::now());
                 match socket.write(Message::Ping(ping.to_vec().into())) {
@@ -575,6 +662,8 @@ fn pump(
                     Err(error) => return Err(socket_error(error)),
                 }
             }
+
+            // Flush, ending the relay once output stays backlogged too long
             match socket.flush() {
                 Ok(()) => writing.flushed(),
                 Err(error) if would_block(&error) => writing.start(Instant::now()),
@@ -583,6 +672,8 @@ fn pump(
             if writing.expired(Instant::now()) {
                 return Err(Failure::Wire(protocol::Error::Timeout));
             }
+
+            // Loop again at once while work is ready, without polling
             let queued = !shared
                 .state
                 .lock()
@@ -595,6 +686,7 @@ fn pump(
             {
                 continue;
             }
+
             // Wait for readiness, a wakeup or the earliest deadline. Exchanges end
             // on the session's clock, the socket's own timers on real time.
             let (now, session) = (Instant::now(), clock.now());
@@ -611,6 +703,8 @@ fn pump(
             }
         }
     })();
+
+    // Refuse every Ark request still queued or open with the ending reason
     let error = match result {
         Err(error) => crate::Error::from(error).to_string(),
         Ok(()) => "relay ended".into(),
@@ -621,7 +715,10 @@ fn pump(
     }
 }
 
-/// Retains a bounded amount of output even when the peer stops reading.
+/// Queues an encoded frame for the socket, keeping the output bounded when the
+/// cloud stops reading.
+///
+/// A frame that does not fit fails, which ends the relay.
 fn enqueue(output: &mut VecDeque<Vec<u8>>, bytes: &mut usize, frame: Frame) -> Result<(), Failure> {
     let frame = frame.encode();
     if frame.len() > MAX_MESSAGE
@@ -651,7 +748,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tungstenite::handshake::server::{Request, Response};
 
-    /// IDs retain all sixty-four bits, including numbers beyond JSON precision.
+    /// Relay ID with its top bit set, beyond what a JSON number carries exactly.
     const ID: u64 = (1 << 63) + 7;
 
     /// Accepts the next cloud connection, bounding its I/O in case a test fails.
@@ -702,8 +799,9 @@ mod tests {
         (url, worker)
     }
 
-    /// Checks realm routing and the opaque authentication subprotocol.
-    #[allow(clippy::result_large_err)] // Tungstenite requires a full HTTP rejection response.
+    /// Accepts a relay upgrade after checking its route and the proof in its
+    /// subprotocol header.
+    #[allow(clippy::result_large_err)] // the upgrade callback's error is a whole HTTP response
     fn upgrade(stream: TcpStream) -> WebSocket<TcpStream> {
         tungstenite::accept_hdr(stream, |request: &Request, mut response: Response| {
             assert_eq!(request.uri().path(), "/v1/relaying");
@@ -719,6 +817,8 @@ mod tests {
         .unwrap()
     }
 
+    /// Reads the next binary message as a relay envelope, skipping pings and
+    /// pongs.
     fn frame(socket: &mut WebSocket<TcpStream>) -> Frame {
         loop {
             match socket.read().unwrap() {
@@ -737,7 +837,11 @@ mod tests {
         *heartbeat = Heartbeat::new(Duration::ZERO, timeout, attached);
     }
 
-    /// Keeps serving app requests while an unlock waits for its reverse response.
+    /// Spawns an Ark peer that asks the companion to authorize guarded requests,
+    /// serving other requests while an authorization waits.
+    ///
+    /// It counts relay joins and cloud syncs, approves on a `[4, 5, 6]` answer
+    /// and denies on `[0]`.
     fn peer(clock: &Clock) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let joins = Arc::new(AtomicUsize::new(0));
         let syncs = Arc::new(AtomicUsize::new(0));
@@ -839,6 +943,8 @@ mod tests {
                         | Content::SlotDelete(_)
                         | Content::FirmwareUpdatePrep(_)
                         | Content::SlotUploadStart(_)) => {
+                            // Pick the reply, whether the relay must already be
+                            // attached, and whether the companion must authorize
                             let (reply, preflight, authorize): (protocol::Message, _, _) =
                                 match request {
                                     Content::Unlock(_) => {
@@ -869,6 +975,9 @@ mod tests {
                                 responder.reply(reply, deadline).unwrap();
                                 return true;
                             }
+
+                            // Ask the companion, answering from another thread
+                            // so this peer keeps serving meanwhile
                             let id = next_id;
                             next_id += 1;
                             assert!(
@@ -907,6 +1016,7 @@ mod tests {
                             });
                         }
                         Content::RelayReq(request) => {
+                            // Refuse a `[0]` request and answer the expected one
                             if request.req == [0] {
                                 responder
                                     .fail(
@@ -947,6 +1057,8 @@ mod tests {
         let (release, pause) = mpsc::channel();
         let (staged, stages) = mpsc::channel();
         let (url, server) = cloud(1, move |_, stream| {
+            // Send a presence notice, a ping and a companion request right after
+            // the upgrade
             let mut socket = upgrade(stream);
             socket
                 .send(Message::Binary(
@@ -965,6 +1077,8 @@ mod tests {
                     Frame::Request(ID, vec![9, 8, 7]).encode().into(),
                 ))
                 .unwrap();
+
+            // Approve the unlock while the Ark's answer to the companion arrives
             let mut requests = 0;
             let mut responses = 0;
             for _ in 0..2 {
@@ -986,6 +1100,8 @@ mod tests {
                 }
             }
             assert_eq!((requests, responses), (1, 1));
+
+            // Deny the next unlock once the test is ready for it
             staged.send(()).unwrap();
             let Frame::Request(id, _) = frame(&mut socket) else {
                 panic!("expected second unlock")
@@ -997,6 +1113,8 @@ mod tests {
                 .unwrap();
             pause.recv().unwrap();
         });
+
+        // Status needs neither sync nor relay
         let clock = test_clock().clock();
         let (mut peer, joins, syncs) = peer(&clock);
         let ark = attach(&mut peer, url);
@@ -1005,6 +1123,9 @@ mod tests {
         client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
         assert_eq!(joins.load(Ordering::SeqCst), 0);
         assert_eq!(syncs.load(Ordering::SeqCst), 0);
+
+        // The first unlock attaches the relay and is approved, and the second
+        // reuses the attachment and is denied
         client.call(schema::UnlockRequest {}, deadline).unwrap();
         stages.recv().unwrap();
         assert!(
@@ -1026,6 +1147,9 @@ mod tests {
             let Frame::Request(id, _) = frame(&mut socket) else {
                 panic!("expected authorization")
             };
+
+            // While the authorization waits, send a companion request the Ark
+            // refuses and one it serves, then approve the authorization
             for request in [
                 Frame::Request(ID + 1, vec![0]),
                 Frame::Request(ID, vec![9, 8, 7]),
@@ -1056,7 +1180,10 @@ mod tests {
     /// the Ark, without relying on an earlier unlock on this connection.
     #[test]
     fn test_authorization_prerequisites() {
+        /// Guarded operation under test, run on a fresh connection.
         type Call = fn(&crate::Client) -> Result<(), Error>;
+
+        // Scheduling, repair, deletion and a whole app run each need approval
         let calls: [Call; 4] = [
             |client| {
                 client
@@ -1084,6 +1211,8 @@ mod tests {
                 Ok(())
             },
         ];
+
+        // Each runs on a fresh connection whose companion approves once
         let clock = test_clock().clock();
         for call in calls {
             let (release, pause) = mpsc::channel();
@@ -1108,12 +1237,13 @@ mod tests {
         }
     }
 
-    /// Unpaired updates and catalog uploads need no companion. Their conditional
-    /// counterparts attach when the Ark first requests authorization.
+    /// Conditional requests attach the relay only once the Ark asks for
+    /// authorization, and not when it answers them directly.
     #[test]
     fn test_conditional_authorization() {
         let clock = test_clock().clock();
         for firmware in [false, true] {
+            // Serve one attachment whose companion approves once
             let (release, pause) = mpsc::channel();
             let (url, server) = cloud(1, move |_, stream| {
                 let mut socket = upgrade(stream);
@@ -1127,6 +1257,9 @@ mod tests {
                     .unwrap();
                 pause.recv().unwrap();
             });
+
+            // A request the Ark answers directly attaches nothing, and one it
+            // authorizes attaches the relay
             let (mut peer, joins, _) = peer(&clock);
             let ark = attach(&mut peer, url);
             let client = ark.client();
@@ -1163,8 +1296,8 @@ mod tests {
         }
     }
 
-    /// Client clones share one attachment. A shorter caller expires independently
-    /// while local requests and two concurrent authorizations remain available.
+    /// Client clones share one attachment, and a shorter caller expires alone
+    /// while local requests and concurrent authorizations continue.
     #[test]
     fn test_shared_attachment() {
         // Hold the leader's relay attachment at its upgrade
@@ -1199,6 +1332,8 @@ mod tests {
             move || client.call(schema::UnlockRequest {}, deadline)
         });
         attempts.recv().unwrap();
+
+        // Status runs while the attachment is held
         client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
 
         // A short caller joining the attachment expires alone, at the earliest
@@ -1268,6 +1403,7 @@ mod tests {
     fn test_reconnect() {
         let clock = test_clock().clock();
         for refused in [false, true] {
+            // Refuse or break the first attachment, then approve over the second
             let (release, pause) = mpsc::channel();
             let (url, server) = cloud(2, move |attempt, mut stream| {
                 if attempt == 0 && refused {
@@ -1292,6 +1428,8 @@ mod tests {
                     pause.recv().unwrap();
                 }
             });
+
+            // The unlock fails with the first attachment and is not replayed
             let (mut peer, joins, syncs) = peer(&clock);
             let ark = attach(&mut peer, url);
             let client = ark.client();
@@ -1304,6 +1442,8 @@ mod tests {
                     matches!(error, Error::Remote(error) if error.code == schema::ReservedErrors::Unavailable as u64)
                 );
             }
+
+            // Local requests go on, and the next guarded request attaches again
             client.call(schema::DeviceInfoRequest {}, deadline).unwrap();
             client
                 .call(schema::SlotDeleteRequest::default(), deadline)
@@ -1315,9 +1455,11 @@ mod tests {
         }
     }
 
-    /// Dropping the owner ends authorization and the socket despite a retained client.
+    /// Dropping the owner ends authorization and the socket despite a retained
+    /// client.
     #[test]
     fn test_owner_close() {
+        // Hold an unlock's authorization at the companion until the socket ends
         let (seen, requests) = mpsc::channel();
         let (url, server) = cloud(1, move |_, stream| {
             let mut socket = upgrade(stream);
@@ -1333,6 +1475,8 @@ mod tests {
             .send(schema::UnlockRequest {}, clock.now() + TIMEOUT)
             .unwrap();
         requests.recv().unwrap();
+
+        // Drop the owner while the authorization waits
         drop(ark);
         assert!(matches!(pending.wait(), Err(Error::Closed)));
         assert!(matches!(
@@ -1342,8 +1486,8 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// Unsolicited or late pongs cannot acknowledge a different probe or restart
-    /// its deadline. A valid pong schedules a fresh probe with a different ID.
+    /// Only a timely pong echoing the current probe acknowledges it, and the
+    /// next probe carries a new ID.
     #[test]
     fn test_heartbeat() {
         // Probe first once an interval has passed since the start
@@ -1363,7 +1507,8 @@ mod tests {
         heartbeat.pong(&first, now);
         assert_eq!(heartbeat.deadline(), now + PING_INTERVAL);
 
-        // An old probe's pong or one arriving at the deadline leaves the probe to expire
+        // An old probe's pong, or one arriving at the deadline, leaves the probe
+        // to expire
         tester.advance(PING_INTERVAL);
         let second = heartbeat.ping(clock.now()).unwrap().unwrap();
         assert_ne!(first, second);
@@ -1375,9 +1520,8 @@ mod tests {
         assert!(heartbeat.ping(clock.now()).is_err());
     }
 
-    /// Output left to flush starts the backlog bound once. Later blockage keeps
-    /// the original deadline, where the bound expires, and a completed flush
-    /// clears it for the next output.
+    /// The backlog bound starts once, expires on its original deadline and
+    /// clears with a completed flush.
     #[test]
     fn test_backlog() {
         // The first blockage starts the bound
@@ -1414,6 +1558,7 @@ mod tests {
     /// starts that late probes at once.
     #[test]
     fn test_heartbeat_starts_at_attachment() {
+        // Attach a relay to a cloud that waits for the first probe
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
         let (probed, probes) = mpsc::channel();
@@ -1440,20 +1585,18 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// The socket pump accepts matching pongs, then ends an unresponsive relay
-    /// without disrupting local wire calls. A replacement can attach afterward.
-    /// Both relays probe at once. The first gives every pong an hour, and the
-    /// test waits for the server to answer three probes. The second gives its
-    /// pong no time, and the test waits for the server to see its socket end.
+    /// The worker keeps a relay whose pongs match, ends one whose probe expires,
+    /// and leaves the wire session usable for a replacement.
     #[test]
     fn test_heartbeat_disconnect() {
+        // Serve three attachments, one after another
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
         let (answered, pongs) = mpsc::channel();
         let (gone, ended) = mpsc::channel();
         let (release, pause) = mpsc::channel();
         let server = thread::spawn(move || {
-            // Answer three probes, each one sent only once the previous pong matched
+            // Answer three probes, each sent only once the previous pong matched
             let mut socket = upgrade(accept(&listener));
             for _ in 0..3 {
                 assert!(matches!(socket.read().unwrap(), Message::Ping(_)));
@@ -1471,6 +1614,8 @@ mod tests {
             let _replacement = upgrade(accept(&listener));
             pause.recv().unwrap();
         });
+
+        // Open the wire session that every relay attaches beside
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(&clock, Box::new(answering));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
@@ -1486,7 +1631,8 @@ mod tests {
         pongs.recv().unwrap();
         relay.close();
 
-        // A relay whose probe expires at once ends, leaving the wire session usable
+        // A relay whose probe expires at once ends, and the wire session stays
+        // usable
         let mut relay =
             Relay::connect(&api, &url, &[0xfb, 0xff], session.requester(), deadline).unwrap();
         probe_at_once(&mut relay, Duration::ZERO);
@@ -1519,17 +1665,20 @@ mod tests {
     fn test_close_fragmented_message() {
         let clock = test_clock().clock();
         for started in [false, true] {
+            // Serve a relay that starts a fragmented message and never ends it
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
             let (sent, fragments) = mpsc::channel();
             let server = thread::spawn(move || {
                 let mut socket = upgrade(accept(&listener));
                 let mut bytes = vec![0; 128 * 1024];
-                bytes[0] = 2; // Non-final binary frame followed by empty continuations
+                bytes[0] = 2; // non-final binary frame followed by empty continuations
                 socket.get_mut().write_all(&bytes).unwrap();
                 sent.send(()).unwrap();
                 assert!(matches!(socket.get_mut().read(&mut [0]), Ok(0) | Err(_)));
             });
+
+            // Close amid the unfinished message, before or after the worker starts
             let mut peer = Peer::spawn(&clock, Box::new(answering));
             let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
             let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
@@ -1557,11 +1706,13 @@ mod tests {
         }
     }
 
-    /// Every read of a stalled upgrade retains the caller's original deadline.
-    /// The socket's own timeout is real, so the upgrade stalls for the whole
-    /// 100 ms budget that the clock leaves it.
+    /// Every read of a stalled upgrade keeps the caller's original deadline.
+    ///
+    /// The socket's own timeout runs on real time, so the upgrade stalls for
+    /// the whole 100 ms that the clock leaves it.
     #[test]
     fn test_handshake_deadline() {
+        // Stall the upgrade once its request headers arrive
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/relaying", listener.local_addr().unwrap());
         let (release, pause) = mpsc::channel();
@@ -1570,6 +1721,8 @@ mod tests {
             headers(&mut stream);
             pause.recv().unwrap();
         });
+
+        // The attachment times out once the 100 ms pass
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(&clock, Box::new(answering));
         let verifier = crate::TrustMode::Recover(Box::new(peer.identity.clone()));
@@ -1592,11 +1745,14 @@ mod tests {
     /// Ambiguous, malformed and foreign-version envelopes never reach the Ark.
     #[test]
     fn test_envelopes() {
+        // A request envelope encodes as a CBOR array and decodes back
         let encoded = Frame::Request(ID, vec![0xfb, 0xff]).encode();
         assert_eq!(hex::encode(&encoded), "86011b8000000000000007f642fbfff6f6");
         assert!(
             matches!(Frame::decode(&encoded).unwrap(), Frame::Request(ID, bytes) if bytes == [0xfb, 0xff])
         );
+
+        // A foreign version, a missing or stray ID and two bodies are refused
         for envelope in [
             Envelope {
                 darkrpc: 2,
@@ -1625,6 +1781,8 @@ mod tests {
         ] {
             assert!(Frame::decode(&cbor::encode(envelope).unwrap()).is_err());
         }
+
+        // So are trailing bytes and garbage
         let mut trailing = encoded;
         trailing.push(0);
         assert!(Frame::decode(&trailing).is_err());

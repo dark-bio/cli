@@ -13,8 +13,11 @@ use ureq::unversioned::{
     transport::{Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport},
 };
 
-/// Creates an HTTPS download client with bounded network waits and caller-selected
-/// redirect allowance. Active bodies can outlive many inactivity windows.
+/// Creates an HTTPS-only download client that bounds each network wait by
+/// `timeout` and follows up to `redirects` redirects.
+///
+/// Active bodies can outlive many inactivity windows, and HTTP error statuses
+/// come back as responses for the caller to judge.
 pub(crate) fn agent(timeout: Duration, redirects: u32) -> ureq::Agent {
     agent_over(DefaultConnector::default(), timeout, redirects)
 }
@@ -46,8 +49,11 @@ pub(crate) fn error(error: ureq::Error) -> Error {
     }
 }
 
-/// Body readers wrap ureq's typed timeout in io::ErrorKind::Other.
-/// Normalize it before handing the reader to a protocol-only workflow.
+/// Turns a ureq timeout wrapped in a body read error into a `TimedOut` error,
+/// passing other errors through.
+///
+/// Body readers wrap ureq's typed timeout in `io::ErrorKind::Other`, so
+/// download readers normalize it before a protocol-only workflow sees it.
 pub(crate) fn normalize_read_error(error: std::io::Error) -> std::io::Error {
     if matches!(
         error
@@ -61,7 +67,7 @@ pub(crate) fn normalize_read_error(error: std::io::Error) -> std::io::Error {
     }
 }
 
-/// Classifies an HTTP body read after recovering any wrapped timeout.
+/// Classifies an HTTP body read failure after recovering any wrapped timeout.
 pub(crate) fn read_error(error: std::io::Error) -> Error {
     let error = normalize_read_error(error);
     if error.kind() == std::io::ErrorKind::TimedOut {
@@ -71,10 +77,13 @@ pub(crate) fn read_error(error: std::io::Error) -> Error {
     }
 }
 
+/// Connector adapter that bounds each transport wait by an inactivity allowance.
+///
 /// Ureq's body timeout covers the entire body. This adapter instead limits each
 /// transport wait, preserving any shorter deadline supplied by the HTTP layer.
 #[derive(Debug)]
 struct Inactivity(Duration);
+
 impl<T: Transport> Connector<T> for Inactivity {
     /// Original transport with a renewed bound on each wait.
     type Out = Idle<T>;
@@ -90,6 +99,7 @@ impl<T: Transport> Connector<T> for Inactivity {
         }))
     }
 }
+
 /// HTTP transport that clips each I/O wait to the download inactivity allowance.
 #[derive(Debug)]
 struct Idle<T> {
@@ -98,6 +108,7 @@ struct Idle<T> {
     /// Fresh allowance for each transport wait, independent of body length.
     timeout: Duration,
 }
+
 impl<T: Transport> Idle<T> {
     /// Preserves an earlier HTTP deadline, otherwise applying the inactivity limit.
     fn bound(&self, timeout: NextTimeout) -> NextTimeout {
@@ -111,29 +122,35 @@ impl<T: Transport> Idle<T> {
         }
     }
 }
+
 impl<T: Transport> Transport for Idle<T> {
     /// Uses the original transport buffers without introducing another body copy.
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.inner.buffers()
     }
+
     /// Writes buffered request bytes under the earlier transport bound.
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.inner.transmit_output(amount, self.bound(timeout))
     }
+
     /// Waits for more response bytes with a renewed inactivity allowance.
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
         self.inner.await_input(self.bound(timeout))
     }
+
     /// Defers pooled-connection liveness checks to the underlying transport.
     fn is_open(&mut self) -> bool {
         self.inner.is_open()
     }
+
     /// Preserves the transport's TLS status for HTTPS policy checks.
     fn is_tls(&self) -> bool {
         self.inner.is_tls()
     }
 }
 
+/// Tests of the inactivity bound, the HTTPS policy and the error classes.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,12 +163,13 @@ mod tests {
     use ureq::unversioned::transport::LazyBuffers;
 
     /// Transport whose input the test hands over, waited for on the test clock.
+    ///
     /// Every wait reports its deadline before it starts.
     #[derive(Debug)]
     struct Scripted {
         /// Clock the input waits run on.
         clock: Clock,
-        /// Buffers the client reads and writes through.
+        /// Input and output buffers the client reads and writes through.
         buffers: LazyBuffers,
         /// Input the test hands over.
         input: crossbeam_channel::Receiver<Vec<u8>>,
@@ -193,7 +211,8 @@ mod tests {
         }
     }
 
-    /// Opens the scripted transport for the one connection a test makes.
+    /// Connector that opens the scripted transport for the one connection a
+    /// test makes.
     #[derive(Debug)]
     struct Script(Mutex<Option<Scripted>>);
 
@@ -231,9 +250,8 @@ mod tests {
         (agent, hand, reported)
     }
 
-    /// Active downloads can take many inactivity windows, since each wait for
-    /// body input gets the whole allowance. A silent body still expires at the
-    /// end of its window, and an earlier HTTP deadline wins over the allowance.
+    /// Checks that each wait for body input gets the whole inactivity allowance,
+    /// while a silent body and an earlier HTTP deadline still end the wait.
     #[test]
     fn body_timeout_measures_each_wait() {
         // A request's earlier deadline bounds the wait for its response
@@ -288,8 +306,8 @@ mod tests {
         assert_eq!(read_error(result.unwrap_err()).class, 7);
     }
 
-    /// Body readers wrap ureq's timeout in an io::Error, which still classifies
-    /// as a timeout.
+    /// Checks that a ureq timeout wrapped in an I/O error still classifies as a
+    /// timeout, while other read failures do not.
     #[test]
     fn test_wrapped_body_timeouts_are_timeouts() {
         let wrapped = ureq::Error::Timeout(ureq::Timeout::RecvBody).into_io();
@@ -301,6 +319,7 @@ mod tests {
         );
     }
 
+    /// Checks that the download client fails a plain HTTP request.
     #[test]
     fn public_downloads_require_https() {
         assert!(

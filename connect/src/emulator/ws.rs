@@ -42,16 +42,17 @@ const MAX_MESSAGE: usize = transport::MAX_FRAME_SIZE + 2;
 const INBOUND_LIMIT: usize = 2 * MAX_MESSAGE;
 
 /// Opens a plain WebSocket endpoint and authenticates its wire session.
+///
 /// After address resolution, TCP establishment and HTTP upgrade share the
-/// handshake timeout. The encrypted wire handshake starts its own timeout.
-/// The connection measures its deadlines on the clock.
+/// handshake timeout. The encrypted wire handshake starts its own timeout. The
+/// connection measures its deadlines on the clock.
 pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     url: &str,
     verifier: &V,
     cloud: impl FnOnce(&crate::Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,
     clock: &Clock,
 ) -> Result<(Ark, V::Info), Error> {
-    // Resolve the endpoint before starting the TCP and HTTP handshake budget.
+    // Resolve the endpoint before starting the TCP and HTTP handshake budget
     let request = url.into_client_request().map_err(Error::Upgrade)?;
     let uri = request.uri();
     if uri.scheme_str() != Some("ws") {
@@ -67,7 +68,8 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     let addresses = (host, uri.port_u16().unwrap_or(80))
         .to_socket_addrs()
         .map_err(Error::Unreachable)?;
-    // Failed address attempts consume the same budget as the eventual upgrade.
+
+    // Failed address attempts consume the same budget as the eventual upgrade
     let deadline = clock.now() + transport::DEFAULT_HANDSHAKE_TIMEOUT;
     let mut last_error = io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -86,7 +88,10 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     }
     let tcp = connected.ok_or(Error::Unreachable(last_error))?;
     tcp.set_nodelay(true).map_err(Error::Unreachable)?;
-    // Bound both protocol buffers before accepting peer WebSocket traffic.
+
+    // Bound both protocol buffers before accepting peer WebSocket traffic. An
+    // expired socket timeout typically reads as WouldBlock on Unix and as
+    // TimedOut on Windows, so both end the upgrade as a timeout.
     let config = WebSocketConfig::default()
         .write_buffer_size(0)
         .max_write_buffer_size(2 * MAX_MESSAGE)
@@ -110,7 +115,8 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
         }
         HandshakeError::Failure(err) => Error::Upgrade(err),
     })?;
-    // Transfer the upgraded socket to its worker and give wire blocking adapters.
+
+    // Transfer the upgraded socket to its worker and give wire blocking adapters
     let (reader, writer, shutdown) = adapters(socket, clock).map_err(Error::Unreachable)?;
     Ark::attach(
         transport::Stream::new(reader, writer, shutdown),
@@ -120,7 +126,8 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
 }
 
 /// Socket used during the blocking HTTP upgrade and subsequent nonblocking I/O.
-/// Replacing its adapter retains bytes already buffered by the WebSocket.
+///
+/// Replacing its adapter keeps the bytes already buffered by the WebSocket.
 enum Socket {
     /// TCP stream whose individual I/O calls share the upgrade deadline.
     Handshake {
@@ -190,7 +197,8 @@ fn socket_error(err: tungstenite::Error) -> io::Error {
     }
 }
 
-/// Whether the WebSocket needs a readiness event before it can make progress.
+/// Checks whether the WebSocket needs a readiness event before it can make
+/// progress.
 fn would_block(err: &tungstenite::Error) -> bool {
     matches!(err, tungstenite::Error::Io(err) if err.kind() == io::ErrorKind::WouldBlock)
 }
@@ -198,20 +206,30 @@ fn would_block(err: &tungstenite::Error) -> bool {
 /// Binary input waiting for the reader, followed by the worker's ending result.
 #[derive(Default)]
 struct Incoming {
-    chunks: VecDeque<Bytes>,  // Messages retained until the reader consumes them
-    bytes: usize,             // Payload bytes still charged against the input limit
-    ended: bool,              // Whether the worker has stopped producing input
-    error: Option<io::Error>, // Ending failure, returned after buffered input
+    /// Binary messages kept until the reader consumes them.
+    chunks: VecDeque<Bytes>,
+    /// Payload bytes still charged against the input limit.
+    bytes: usize,
+    /// Flag set once the worker stops producing input.
+    ended: bool,
+    /// Failure that ended the worker, returned after the buffered input.
+    error: Option<io::Error>,
 }
 
 /// Input and closure state shared by the worker and its blocking adapters.
 struct Shared {
-    clock: Clock,                    // clock that wire's deadlines are measured on
-    closed: AtomicBool,              // Local shutdown signal checked by every participant
-    incoming: sync::Mutex<Incoming>, // Buffered input and the worker's ending result
-    available: sync::Condvar,        // Wakes the reader for input, failure or closure
-    wake: Waker,                     // Wakes the worker when an adapter changes its work
-    /// Notifies a test each time the flush of a writer's frame waits for the socket.
+    /// Clock that wire's deadlines are measured on.
+    clock: Clock,
+    /// Local shutdown signal that every participant checks.
+    closed: AtomicBool,
+    /// Buffered input and the worker's ending result.
+    incoming: sync::Mutex<Incoming>,
+    /// Condition that wakes the reader for input, failure or closure.
+    available: sync::Condvar,
+    /// Waker of the worker, for when an adapter changes its work.
+    wake: Waker,
+    /// Channel notifying a test each time the flush of a writer's frame waits
+    /// for the socket.
     #[cfg(test)]
     blocked: std::sync::Mutex<Option<mpsc::Sender<()>>>,
 }
@@ -219,7 +237,7 @@ struct Shared {
 impl Shared {
     /// Marks local closure and wakes both the reader and the socket worker.
     fn close(&self) {
-        // Pair the condition change with the reader's lock to prevent a lost wake.
+        // Pair the condition change with the reader's lock to prevent a lost wake
         let _incoming = self.incoming.lock().expect("WebSocket input not poisoned");
         self.closed.store(true, Ordering::Release);
         self.available.notify_all();
@@ -234,14 +252,18 @@ impl Shared {
         self.available.notify_all();
     }
 
-    /// Reserves room for a complete message before the worker reads another one.
+    /// Checks that a complete message still fits before the worker reads
+    /// another one.
+    ///
     /// The chunk limit also bounds overhead from many small binary messages.
     fn can_read(&self) -> bool {
         let incoming = self.incoming.lock().expect("WebSocket input not poisoned");
         incoming.bytes <= INBOUND_LIMIT - MAX_MESSAGE && incoming.chunks.len() < 1024
     }
 
-    /// Queues a binary message and wakes the reader. Empty messages carry no bytes.
+    /// Queues a binary message and wakes the reader.
+    ///
+    /// An empty message is dropped, since it carries no bytes.
     fn push(&self, bytes: Bytes) {
         if bytes.is_empty() {
             return;
@@ -263,19 +285,23 @@ impl Shared {
 
 /// One flush submitted by the writer, acknowledged when the worker finishes it.
 struct Outgoing {
-    bytes: Vec<u8>,    // Complete frame accumulated since the previous flush
-    deadline: Instant, // Original write deadline, including the queue wait
-    /// Receives the local write result without blocking the socket worker.
+    /// Complete frame accumulated since the previous flush.
+    bytes: Vec<u8>,
+    /// Original write deadline, which includes the wait in the queue.
+    deadline: Instant,
+    /// Sender of the local write result, which never blocks the socket worker.
     done: crossbeam_channel::Sender<io::Result<()>>,
 }
 
 /// Starts the socket worker and returns adapters with their shutdown operation.
+///
 /// The returned shutdown wakes blocking I/O and closes the underlying socket.
 /// The adapters measure wire's deadlines on the clock.
 fn adapters(
     mut socket: WebSocket<Socket>,
     clock: &Clock,
 ) -> io::Result<(Reader, Writer, impl FnOnce() + Send + use<>)> {
+    // Switch the upgraded stream to nonblocking I/O registered with a poll
     let Socket::Handshake { stream, .. } = socket.get_ref() else {
         unreachable!("socket upgraded once")
     };
@@ -290,8 +316,10 @@ fn adapters(
         SOCKET,
         Interest::READABLE | Interest::WRITABLE,
     )?;
-    // Reads and writes must use mio's socket, which rearms readiness on Windows.
+    // Reads and writes must use mio's socket, which rearms readiness on Windows
     *socket.get_mut() = Socket::Connected(connected);
+
+    // Run the socket worker, handing its adapters to wire
     let shared = Arc::new(Shared {
         clock: clock.clone(),
         closed: AtomicBool::new(false),
@@ -324,9 +352,11 @@ fn adapters(
     ))
 }
 
-/// Bounds output the socket has not taken yet, the worker's own control
-/// replies included. A deferred flush starts the bound, later ones keep its
-/// deadline, and only a completed flush ends it.
+/// Bound on output the socket has not taken yet, the worker's own control
+/// replies included.
+///
+/// A deferred flush starts the bound, later ones keep its deadline, and only a
+/// completed flush ends it.
 #[derive(Debug, Default)]
 struct Backlog {
     /// Time the pending output must be flushed by, while there is some.
@@ -346,12 +376,13 @@ impl Backlog {
         self.deadline = None;
     }
 
-    /// Whether the output left to flush missed its deadline by `now`.
+    /// Checks whether the output left to flush missed its deadline by `now`.
     fn expired(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| now >= deadline)
     }
 
-    /// Time left after `now` before the deadline, bounding the next poll.
+    /// Returns the time left after `now` before the deadline, bounding the
+    /// next poll.
     fn remaining(&self, now: Instant) -> Option<Duration> {
         self.deadline
             .map(|deadline| deadline.saturating_duration_since(now))
@@ -359,9 +390,10 @@ impl Backlog {
 }
 
 /// Drives the WebSocket while preserving input progress during blocked output.
-/// One adapter writer submits flushes serially and waits for each acknowledgement.
-/// Frame deadlines are wire's and measured on the connection's clock; control
-/// replies are bounded on real time.
+///
+/// One adapter writer submits flushes serially and waits for each
+/// acknowledgement. Frame deadlines are wire's and measured on the connection's
+/// clock; control replies are bounded on real time.
 #[expect(
     clippy::disallowed_methods,
     reason = "the worker waits on the socket through mio, so the bound on its own control replies runs on real time"
@@ -379,6 +411,8 @@ fn pump(
     let mut peer_closed = false;
     let result = (|| -> io::Result<()> {
         loop {
+            // Stop on local closure, and fail once a frame or the backlog runs
+            // out of time
             if shared.closed.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -388,6 +422,7 @@ fn pump(
             if backlog.expired(Instant::now()) {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
+
             // Admit at most one flush. Its bytes stay in the WebSocket until
             // output completes, while the original deadline continues to run.
             if active.is_none() && !peer_closed {
@@ -412,7 +447,9 @@ fn pump(
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
             }
-            // Limit each batch so continuous ingress cannot starve sends or deadlines.
+
+            // Limit each batch so continuous ingress cannot starve sends or
+            // deadlines
             let mut batch_full = false;
             for index in 0..32 {
                 if peer_closed || !shared.can_read() {
@@ -431,6 +468,7 @@ fn pump(
                 }
                 batch_full = index == 31;
             }
+
             // Flush data and automatic Pong/Close replies through the same owner.
             // An acknowledgement covers everything queued before this flush.
             match socket.flush() {
@@ -456,6 +494,7 @@ fn pump(
             if batch_full {
                 continue;
             }
+
             // Either socket readiness or an adapter wake may enable more work.
             // Deadlines must also wake an otherwise idle or blocked connection.
             let timeout = active
@@ -471,7 +510,9 @@ fn pump(
             }
         }
     })();
-    // Settle the outstanding flush before waking the reader with the ending result.
+
+    // Settle the outstanding flush before waking the reader with the ending
+    // result
     if let Some(frame) = active {
         let error = result
             .as_ref()
@@ -487,12 +528,16 @@ fn pump(
 
 /// Blocking reader over buffered binary input from the socket worker.
 struct Reader {
-    shared: Arc<Shared>,       // Input queue and closure notifications
-    deadline: Option<Instant>, // Deadline bounding the next wait for input
+    /// Input queue and closure notifications shared with the worker.
+    shared: Arc<Shared>,
+    /// Deadline bounding the next wait for input.
+    deadline: Option<Instant>,
 }
 
 impl Read for Reader {
-    /// Drains buffered binary bytes before reporting closure or the worker error.
+    /// Drains buffered binary bytes before reporting closure or the worker
+    /// error.
+    ///
     /// Consuming input wakes the worker to resume reads after backpressure.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
@@ -555,10 +600,14 @@ impl transport::Read for Reader {
 
 /// Blocking writer whose flush waits for the socket worker's completion result.
 struct Writer {
-    shared: Arc<Shared>,              // Closure signal and worker wakeup
-    outgoing: mpsc::Sender<Outgoing>, // Frames waiting for the socket worker
-    pending: Vec<u8>,                 // Bytes accumulated since the last flush
-    deadline: Option<Instant>,        // One budget for writes and their flush
+    /// Closure signal and worker wakeup shared with the worker.
+    shared: Arc<Shared>,
+    /// Queue of frames waiting for the socket worker.
+    outgoing: mpsc::Sender<Outgoing>,
+    /// Bytes accumulated since the last flush.
+    pending: Vec<u8>,
+    /// Deadline shared by the writes of a frame and their flush.
+    deadline: Option<Instant>,
 }
 
 impl Write for Writer {
@@ -575,7 +624,9 @@ impl Write for Writer {
     }
 
     /// Submits accumulated bytes and waits for local socket completion under the
-    /// original write deadline. Success does not acknowledge receipt by the Ark.
+    /// original write deadline.
+    ///
+    /// Success does not acknowledge receipt by the Ark.
     fn flush(&mut self) -> io::Result<()> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(closed());
@@ -588,6 +639,8 @@ impl Write for Writer {
         if self.pending.is_empty() {
             return Ok(());
         }
+
+        // Hand the frame to the worker and wait for its local write result
         let (done, result) = crossbeam_channel::bounded(1);
         self.outgoing
             .send(Outgoing {
@@ -631,10 +684,13 @@ mod tests {
     use std::thread;
     use tungstenite::protocol::Role;
 
-    /// Exercises the actual adapters without a wire session consuming their bytes.
+    /// Connects a client socket to a local WebSocket server, for exercising the
+    /// adapters without a wire session consuming their bytes.
+    ///
     /// The upgrade's socket timeouts are measured from the clock, which the
     /// tests never advance through them.
     fn socket_pair(clock: &Clock) -> (WebSocket<Socket>, WebSocket<TcpStream>) {
+        // Serve one WebSocket upgrade on a local listener
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -643,6 +699,8 @@ mod tests {
             tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
             tungstenite::accept(tcp).unwrap()
         });
+
+        // Upgrade the client over the socket type the adapters take over
         let tcp = TcpStream::connect(addr).unwrap();
         let (client, _) = tungstenite::client(
             format!("ws://{addr}/v1/usb"),
@@ -659,6 +717,7 @@ mod tests {
     /// Ping and Close receive protocol replies while the application is idle.
     #[test]
     fn test_control_frames() {
+        // A ping gets its pong while the application reads nothing
         let clock = test_clock().clock();
         let (socket, mut server) = socket_pair(&clock);
         let (mut reader, _writer, shutdown) = adapters(socket, &clock).unwrap();
@@ -669,6 +728,8 @@ mod tests {
             server.read().unwrap(),
             Message::Pong(Bytes::from_static(b"probe"))
         );
+
+        // A close gets its reply and ends the reader's stream
         server.close(None).unwrap();
         assert!(matches!(server.read().unwrap(), Message::Close(_)));
         assert_eq!(reader.read(&mut [0]).unwrap(), 0);
@@ -714,6 +775,8 @@ mod tests {
     /// Consuming buffered input releases capacity for the remaining messages.
     #[test]
     fn test_input_buffering() {
+        // The peer sends four of the largest messages, twice what the input
+        // limit holds
         let clock = test_clock().clock();
         let (socket, mut server) = socket_pair(&clock);
         let (mut reader, _writer, shutdown) = adapters(socket, &clock).unwrap();
@@ -724,6 +787,8 @@ mod tests {
             }
             server
         });
+
+        // Reading each message frees room for the rest, never passing the limit
         let mut message = vec![0; MAX_MESSAGE];
         for _ in 0..4 {
             reader.read_exact(&mut message).unwrap();
@@ -734,7 +799,8 @@ mod tests {
         shutdown();
     }
 
-    /// Blocked output retains its deadline while incoming traffic still reaches the reader.
+    /// Blocked output keeps its deadline while incoming traffic still reaches
+    /// the reader.
     #[test]
     fn test_output_backpressure() {
         // Flood the peer with output it never drains, under one write deadline,
@@ -779,9 +845,8 @@ mod tests {
         shutdown();
     }
 
-    /// A blocked flush starts the output bound once. Later blocked flushes keep
-    /// the original deadline, where the bound expires, and a completed flush
-    /// clears it for the next blockage.
+    /// A blocked flush starts the output bound once, later ones keep its
+    /// deadline, and a completed flush clears it for the next blockage.
     #[test]
     fn test_backlog() {
         // The first blocked flush starts the bound
@@ -814,11 +879,14 @@ mod tests {
         assert_eq!(backlog.remaining(clock.now()), Some(limit));
     }
 
-    // Serves one WebSocket client on the listener the way an emulator does,
-    // carrying its binary messages into the peer's stream and the stream's
-    // bytes back out as messages, until either side ends. Each direction has
-    // its own thread and socket handle and blocks on its own input.
+    /// Bridges one WebSocket client on the listener to the peer's stream,
+    /// standing in for an emulator.
+    ///
+    /// Binary messages carry the bytes both ways until either side ends. Each
+    /// direction has its own thread and socket handle and blocks on its own
+    /// input.
     fn bridge(listener: TcpListener, stream: Duplex) {
+        // Split the peer's stream and accept the client's upgrade
         let (mut reader, mut writer) = stream.into_halves();
         let (tcp, _) = listener.accept().unwrap();
         let mut socket = tungstenite::accept(tcp).unwrap();
@@ -862,6 +930,8 @@ mod tests {
                 Ok(_) => {}
             }
         }
+
+        // Close the peer's input, then check that the client answered the probe
         drop(writer);
         sending.join().unwrap();
         assert!(
@@ -870,10 +940,11 @@ mod tests {
         );
     }
 
-    // Tests that a session over an emulator's socket reaches the peer behind
-    // it, the requests answered and the close ending the socket.
+    /// A session over an emulator's socket reaches the peer behind it, and
+    /// closing the session ends the socket.
     #[test]
     fn test_socket_session() {
+        // Bridge a local WebSocket listener to an answering peer
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(&clock, Box::new(answering));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -881,6 +952,7 @@ mod tests {
         let stream = peer.stream();
         let served = thread::spawn(move || bridge(listener, stream));
 
+        // A request crosses the socket, and closing the session ends the bridge
         let (ark, _) = connect(
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),
@@ -899,11 +971,11 @@ mod tests {
         served.join().unwrap();
     }
 
-    // Tests that the emulator going away ends the session with the reason,
-    // the reading object reporting the end of the stream once the socket
-    // behind it is gone.
+    /// The emulator going away ends the session as a disconnect once the socket
+    /// behind it is gone.
     #[test]
     fn test_socket_lost() {
+        // Bridge a local WebSocket listener to a peer that hangs up
         let clock = test_clock().clock();
         let mut peer = Peer::spawn(&clock, hangup());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -911,6 +983,7 @@ mod tests {
         let stream = peer.stream();
         let served = thread::spawn(move || bridge(listener, stream));
 
+        // The request fails as a disconnect, and the bridge ends
         let (ark, _) = connect(
             &url,
             &crate::TrustMode::Recover(Box::new(peer.identity.clone())),

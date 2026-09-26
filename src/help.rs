@@ -4,8 +4,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Help is generated from the commands this build actually serves. A page has
-//! one shape on a terminal and in a pipe; only color and glyphs differ.
+//! Help pages, topics and the manual, generated from the commands this build
+//! serves.
+//!
+//! A page has one shape on a terminal and in a pipe; only color and glyphs
+//! differ.
 
 use crate::{
     args::Cli,
@@ -23,13 +26,16 @@ const GLOBAL: [&str; 10] = [
 /// Help topics in the order the manual prints them.
 const TOPICS: [&str; 6] = ["agents", "states", "output", "devices", "datasets", "apps"];
 
-/// Help is written for reading even when the invocation selects JSON, so the
-/// theme never follows that flag; a pipe still loses color and glyphs.
+/// Resolves the stdout theme for help, which is written for reading even when
+/// the invocation selects JSON.
+///
+/// The theme never follows that flag, but a pipe still loses color and glyphs.
 pub(crate) fn theme() -> Theme {
     Theme::new(false, false)
 }
 
-/// Builds the executable command tree with shared styling and command-specific contracts.
+/// Builds the executable command tree with shared styling and command-specific
+/// contracts.
 pub(crate) fn command(theme: &Theme) -> clap::Command {
     let mut command = Cli::command();
     decorate(&mut command, "", theme);
@@ -38,10 +44,13 @@ pub(crate) fn command(theme: &Theme) -> clap::Command {
     command
 }
 
-/// Clap normally expands long help onto two lines per option. Render its short
-/// layout once, wrapped to the width, then let the help action select the
-/// short or long footer. The shared options drop off every page but the root.
+/// Lays out every page in clap's short help layout, wrapped to the width, and
+/// hides the shared options on every page but the root.
+///
+/// Clap normally expands long help onto two lines per option. The short layout
+/// is rendered once, and the help action then selects the short or long footer.
 fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
+    // Hide the shared options below the root
     if !root {
         for name in GLOBAL {
             *command = command
@@ -49,6 +58,9 @@ fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
                 .mut_arg(name, |argument| argument.hide(true));
         }
     }
+
+    // Render the short layout without footers, and use it as the page's
+    // template in front of the footer the help action selects
     let mut display = command.clone().after_help(None).after_long_help(None);
     let scan = display
         .render_help()
@@ -61,14 +73,20 @@ fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
     *command = command
         .clone()
         .help_template(format!("{}{{after-help}}", scan.trim_end()));
+
+    // Subcommands get the same layout, without the shared options
     for child in command.get_subcommands_mut() {
         compact(child, theme, false);
     }
 }
 
-/// Adds prerequisites, approval guidance, output fields and examples to each command.
+/// Adds prerequisites, approval guidance, output fields and examples to each
+/// command.
+///
 /// The command path selects its contract; clap still owns syntax and argument help.
 fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
+    // Style the page, and give each subcommand back the help flag that the
+    // root disables for its whole tree
     *command = command
         .clone()
         .styles(theme.clap())
@@ -87,6 +105,8 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
                 .long_help("Print help (see a summary with '-h')"),
         );
     }
+
+    // The command path, without the root's name, selects the contract
     let path = if parent.is_empty() {
         command.get_name().to_string()
     } else {
@@ -235,6 +255,8 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "ark --help\nark help agents",
         ),
     };
+
+    // List the exit classes each command can end with
     let exits = match key {
         "devices" => "0 done; 1 local; 2 usage; 3 device",
         "status" => {
@@ -255,6 +277,9 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         }
         _ => "0 done; 1 local; 2 usage",
     };
+
+    // The root gets the overview, a group points to its children, and a leaf
+    // gets its contract
     let help = if parent.is_empty() {
         "Output is formatted for reading; --json keeps complete, exact values.
 AI agents: read `ark help agents` first.
@@ -266,7 +291,7 @@ Topics: agents, states, output, devices, datasets, apps."
         )
     } else {
         // Clap keeps an option hidden from the short page out of the rendered
-        // scan too, so the long page lists it by hand ahead of the contract.
+        // scan too, so the long page lists it by hand ahead of the contract
         let advanced = if matches!(key, "status" | "enroll") {
             "Advanced:
       --pubkey <HEX>  Pin an xDSA public key instead of verifying the attestation
@@ -290,6 +315,9 @@ Topics: agents, states, output, devices, datasets, apps."
             )
         )
     };
+
+    // Wrap the text and attach it as the long footer, and on the root as the
+    // short one too
     let help = help
         .lines()
         .map(|line| style::wrap(&theme.inline(line), theme.width, 0))
@@ -300,16 +328,21 @@ Topics: agents, states, output, devices, datasets, apps."
         decorated = decorated.after_help(format!("{help}\n"));
     }
     *command = decorated;
+
+    // Subcommands get their own contracts under this path
     for child in command.get_subcommands_mut() {
         decorate(child, &path, theme);
     }
 }
 
 /// Prints a command page, an embedded topic or the full manual without discovery.
+///
 /// Help remains readable text even when the invocation selects JSON.
 pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
     let theme = theme();
     let mut root = command(&theme);
+
+    // The manual joins every command page and topic, divided by a muted line
     if all {
         let mut pages = Vec::new();
         collect_help(&mut root, &mut pages);
@@ -323,12 +356,16 @@ pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
         );
         return Ok(());
     }
+
+    // A single name may be a topic
     if path.len() == 1
         && let Some(topic) = topic(&path[0])
     {
         println!("{}", markdown(&theme, topic));
         return Ok(());
     }
+
+    // Anything else walks the command tree to the page it names
     let mut command = &mut root;
     for name in path {
         command = command.find_subcommand_mut(name).ok_or_else(|| {
@@ -343,9 +380,11 @@ pub(crate) fn run(path: &[String], all: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// Lays out the contract: labels with a colon padded to one column, values
-/// wrapped under themselves, then the examples as bare commands, since a pasted
-/// prompt breaks in a shell.
+/// Lays out the contract with its labels padded to one column and its values
+/// wrapped under themselves.
+///
+/// The examples follow as bare commands, since a pasted prompt breaks in a
+/// shell.
 fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
     let column = fields
         .iter()
@@ -367,6 +406,8 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
             )
         })
         .collect::<Vec<_>>();
+
+    // The examples follow under their own heading, styled as commands
     lines.push(format!("\n{}", theme.paint(Role::Heading, "Examples:")));
     lines.extend(examples.lines().map(|line| {
         style::wrap(
@@ -378,19 +419,24 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
     lines.join("\n")
 }
 
-/// Renders the topic dialect: headings, bullets with their continuation lines,
-/// and code that is either fenced or indented by four spaces or more. Indented
-/// code drops the block's own indent so long commands stay on one line.
+/// Renders a help topic's Markdown dialect for reading.
+///
+/// The dialect has headings, bullets with their continuation lines, and code
+/// that is either fenced or indented by four spaces or more. Indented code
+/// drops the block's own indent so long commands stay on one line.
 fn markdown(theme: &Theme, text: &str) -> String {
     let mut fenced = false;
     let mut bullet = false;
     let mut block = None;
     let mut lines = Vec::new();
     for line in text.lines() {
+        // Fences toggle a code block and print nothing themselves
         if line.starts_with("```") {
             fenced = !fenced;
             continue;
         }
+
+        // Style the line by its kind, keeping the hanging indent its wrap needs
         let content = line.trim_start();
         let indent = line.len() - content.len();
         let (line, hanging) = if fenced {
@@ -454,10 +500,13 @@ fn topic(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Tests of help pages, contract footers and topic rendering.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The footer aligns its labels and styles its examples, and a topic
+    /// styles its headings, code and bullets.
     #[test]
     fn footer_uses_aligned_labels_and_styled_examples() {
         let theme = Theme::test(80, Color::Basic, true);
@@ -506,6 +555,7 @@ mod tests {
         }
     }
 
+    /// Help fits a narrow terminal and keeps its example commands whole.
     #[test]
     fn help_fits_narrow_terminals_without_losing_commands() {
         let theme = Theme::test(60, Color::True, true);
@@ -525,12 +575,16 @@ mod tests {
         assert!(rendered.contains("\x1b["));
     }
 
+    /// Shared options are listed on the root page and hidden on child pages,
+    /// which keep their help flag.
     #[test]
     fn shared_options_are_listed_on_the_root_page_only() {
         let theme = Theme::test(80, Color::Off, false);
         let mut root = command(&theme);
-        // Examples mention the flags too, so the test identifies the listing by
-        // the text clap prints beside each option.
+
+        // The root page lists the shared options. Examples mention the flags
+        // too, so the test identifies the listing by the text clap prints
+        // beside each option.
         let listed = [
             "--timeout <SECONDS>",
             "Print the complete result as JSON",
@@ -542,6 +596,8 @@ mod tests {
         for option in listed {
             assert!(page.contains(option), "{option}");
         }
+
+        // Child pages hide them, and keep their help flag
         for path in [vec!["data"], vec!["data", "upload"], vec!["doctor"]] {
             let mut command = &mut root;
             for name in &path {
@@ -555,10 +611,14 @@ mod tests {
         }
     }
 
+    /// Group pages point to their children's contracts, and leaf pages carry
+    /// their own.
     #[test]
     fn groups_point_to_child_contracts() {
         let theme = Theme::test(80, Color::Off, false);
         let mut root = command(&theme);
+
+        // Group pages point to their children without a contract of their own
         for name in ["data", "app", "firmware"] {
             let group = root.find_subcommand_mut(name).unwrap();
             let long = group.render_long_help().to_string();
@@ -567,6 +627,8 @@ mod tests {
             assert!(!long.contains("Approval:"));
             assert!(!long.contains("Exit:"));
         }
+
+        // Leaf pages carry their contracts, down to the unlock guidance
         let status = root.find_subcommand_mut("status").unwrap();
         assert!(
             status
@@ -587,6 +649,8 @@ mod tests {
         }
     }
 
+    /// Topic bullets align their continuation lines, and indented code drops
+    /// its block indent.
     #[test]
     fn markdown_aligns_bullets_and_dedents_indented_code() {
         let theme = Theme::test(80, Color::Basic, true);

@@ -10,8 +10,11 @@ use serde_json::Value;
 use std::process::{Command, Output};
 use std::sync::Mutex;
 
+/// Lock that keeps the tests' `ark` processes from running at the same time.
 static PROCESS: Mutex<()> = Mutex::new(());
 
+/// Runs the `ark` binary with `args` under the process lock, without color and
+/// with release lookups off.
 fn ark(args: &[&str]) -> Output {
     let _process = PROCESS.lock().unwrap();
     Command::new(env!("CARGO_BIN_EXE_ark"))
@@ -22,7 +25,8 @@ fn ark(args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// The private update entry point does nothing and prints nothing under CI.
+/// Checks that the private update entry point does nothing and prints nothing
+/// under CI.
 #[test]
 fn test_update_entry_point_is_silent_under_ci() {
     let output = ark(&["__update"]);
@@ -31,8 +35,10 @@ fn test_update_entry_point_is_silent_under_ci() {
     assert!(output.stderr.is_empty());
 }
 
-/// Stamps a kept update answer as asked now. The spawned ark judges the
-/// answer's age against the real wall time, so the stamp reads it too.
+/// Stamps a kept update answer as asked now.
+///
+/// The spawned ark judges the answer's age against the real wall time, so the
+/// stamp reads it too.
 #[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,
@@ -42,28 +48,32 @@ fn asked_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// A fresh isolated answer produces one stderr note while help and invalid invocations stay quiet.
+/// Checks that a fresh isolated answer produces one stderr note, while help and
+/// invalid invocations stay quiet.
 #[cfg(unix)]
 #[test]
 fn test_update_note_preserves_command_output_and_excludes_noncommands() {
-    /// Removes the subprocess home and cache even after an assertion failure.
+    /// Home and cache of the spawned processes, removed even after an assertion
+    /// failure.
     struct Directory(
-        /// Isolated root used for both HOME and XDG_CACHE_HOME.
+        /// Isolated root holding the `HOME` and `XDG_CACHE_HOME` directories.
         std::path::PathBuf,
     );
+
     impl Drop for Directory {
-        /// Cleans up files owned by this process test.
+        /// Removes the whole isolated root.
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    // macOS uses Library/Caches while other Unix targets use XDG_CACHE_HOME
+    // Keep an answer that names the next major version in an isolated cache
     let _process = PROCESS.lock().unwrap();
     let directory =
         Directory(std::env::temp_dir().join(format!("ark-update-palette-{}", std::process::id())));
     let home = directory.0.join("home");
     let xdg_cache = directory.0.join("cache");
+    // macOS uses Library/Caches while other Unix targets use XDG_CACHE_HOME
     let cache = if cfg!(target_os = "macos") {
         home.join("Library/Caches/ark")
     } else {
@@ -80,6 +90,8 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
     }))
     .unwrap();
     std::fs::write(cache.join("update.json"), &answer).unwrap();
+
+    // Invocations run in the isolated home, with CI set only when asked
     let invoke = |args: &[&str], ci: Option<&str>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ark"));
         command
@@ -147,7 +159,8 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
         assert!(!String::from_utf8_lossy(&baseline.stderr).contains("is available"));
     }
 
-    // None of these paths may announce or refresh a release, even with a known newer build
+    // None of these paths may announce or refresh a release, even with a known
+    // newer build
     for args in [
         vec!["help"],
         vec!["help", "--all"],
@@ -214,6 +227,11 @@ fn json_output(output: &Output) -> Value {
     document
 }
 
+/// Checks that an invocation exits alike with and without `--json`, and both
+/// outputs keep their format contracts.
+///
+/// Human output carries no escape sequences, and no label ends in a unit suffix
+/// such as `_bytes` or `_seconds`.
 fn conformance(args: &[&str]) {
     let mut invocation = args.to_vec();
     invocation.push("--json");
@@ -232,6 +250,8 @@ fn conformance(args: &[&str]) {
     }
 }
 
+/// Checks that every command's help page and output follow the shared
+/// conventions.
 #[test]
 fn command_tree_output_conforms() {
     for (path, page) in commands() {
@@ -244,11 +264,15 @@ fn command_tree_output_conforms() {
         }
         assert!(!page.contains("--format"), "{path:?}");
         assert!(page.contains("-h, --help"), "{path:?}");
+
+        // Every command rejects --format as a usage error, reported in JSON
         let mut rejected = args.clone();
         rejected.extend(["--json", "--format", "json"]);
         let output = ark(&rejected);
         assert_eq!(output.status.code(), Some(2), "{path:?}");
         assert_eq!(json_output(&output)["error"]["code"], "usage");
+
+        // The root and every command that requires nothing run in both formats
         if path.is_empty() {
             conformance(&["--version"]);
         } else if page.contains("Requires: nothing") {
@@ -273,7 +297,7 @@ fn command_tree_output_conforms() {
                 }
                 _ => {
                     let mut args = args;
-                    // Never open an attached Ark during conformance tests.
+                    // Never open an attached Ark during conformance tests
                     args.extend(["--device", "hardware:palette-no-device", "--no-input", "-v"]);
                     conformance(&args);
                 }
@@ -282,6 +306,8 @@ fn command_tree_output_conforms() {
     }
 }
 
+/// Checks that short help differs from long help exactly when it points at
+/// `--help` for more.
 #[test]
 fn help_differs_exactly_where_it_promises_more() {
     for (path, long) in commands() {
@@ -296,6 +322,8 @@ fn help_differs_exactly_where_it_promises_more() {
             "{path:?}: {short}"
         );
     }
+
+    // Every spelling of the manual prints it, and --all alone is a usage error
     for args in [["--help", "--all"], ["--all", "--help"], ["-h", "--all"]] {
         let output = ark(&args);
         assert!(output.status.success());
@@ -304,10 +332,12 @@ fn help_differs_exactly_where_it_promises_more() {
     assert_eq!(ark(&["--all"]).status.code(), Some(2));
 }
 
+/// Checks that usage errors print the documented text prefix on stderr and
+/// nothing on stdout.
 #[test]
 fn documented_usage_errors_keep_the_text_prefix() {
     // Topics render in a pipe as on a terminal, so code spans lose their
-    // backtick markers there and keep only their text.
+    // backtick markers there and keep only their text
     let help = String::from_utf8(ark(&["help", "output"]).stdout).unwrap();
     assert!(help.contains("Exit 2, usage"));
     for args in [
@@ -326,6 +356,8 @@ fn documented_usage_errors_keep_the_text_prefix() {
         assert!(stderr.starts_with("error[usage]: "), "{args:?}: {stderr}");
         assert!(!stderr.contains('\x1b'));
     }
+
+    // A missing device is the documented no-device error
     let output = ark(&["status", "--device", "hardware:palette-no-device"]);
     assert_eq!(output.status.code(), Some(3));
     assert!(help.contains("no-device: no Ark found"));
@@ -337,6 +369,8 @@ fn documented_usage_errors_keep_the_text_prefix() {
     );
 }
 
+/// Checks that usage errors under `--json` print a JSON error on stdout and an
+/// error event first on stderr.
 #[test]
 fn usage_errors_are_json_in_both_streams() {
     for args in [
@@ -362,6 +396,8 @@ fn usage_errors_are_json_in_both_streams() {
     }
 }
 
+/// Checks that `--version --json` prints one document with the versions and
+/// the firmware minimums, and nothing on stderr.
 #[test]
 fn version_is_a_single_structured_result() {
     let output = ark(&["--version", "--json"]);
@@ -377,6 +413,7 @@ fn version_is_a_single_structured_result() {
     assert!(output.stderr.is_empty());
 }
 
+/// Checks that piped output keeps the human layout without escape sequences.
 #[test]
 fn default_pipes_have_layout_without_terminal_escapes() {
     let output = ark(&["--version"]);
@@ -389,6 +426,7 @@ fn default_pipes_have_layout_without_terminal_escapes() {
     );
 }
 
+/// Checks that color variables cannot force escape sequences into a pipe.
 #[test]
 fn pipes_cannot_force_color() {
     let _process = PROCESS.lock().unwrap();
@@ -407,6 +445,8 @@ fn pipes_cannot_force_color() {
     assert!(!output.stderr.contains(&0x1b));
 }
 
+/// Checks that help prints the same page wherever `--json` appears, and
+/// unsupported flags fail as usage errors.
 #[test]
 fn json_selection_applies_before_help_and_usage_errors() {
     let help = ark(&["data", "fetch", "--help", "--json"]);
@@ -415,6 +455,8 @@ fn json_selection_applies_before_help_and_usage_errors() {
         ark(&["--json", "data", "fetch", "--help"]).stdout
     );
     assert_eq!(help.stdout, ark(&["data", "fetch", "--help"]).stdout);
+
+    // Output format flags and repeated verbosity are not part of the palette
     for flag in [
         "--format",
         "--format=json",
@@ -431,12 +473,18 @@ fn json_selection_applies_before_help_and_usage_errors() {
     }
 }
 
+/// Checks that the help pages carry their contract fields and advertise only
+/// the supported commands.
 #[test]
 fn help_matches_the_supported_palette() {
+    // The root page stays within 42 lines
     let output = ark(&["--help"]);
     assert!(output.status.success());
     let root = String::from_utf8(output.stdout).unwrap();
     assert!(root.lines().count() <= 42, "{root}");
+
+    // Each long page carries every contract field and matches its help topic,
+    // and its short page leaves the contract out
     for path in [
         "status",
         "data paths",
@@ -461,7 +509,7 @@ fn help_matches_the_supported_palette() {
             assert!(long.contains(field), "{path}: {long}");
         }
         // The contract block keeps one shape in a pipe: colon labels, wrapped
-        // values, and examples as bare commands with no prompt.
+        // values, and examples as bare commands with no prompt
         for line in long.lines() {
             assert!(line.chars().count() <= 80, "{path}: {line}");
             assert!(!line.trim_start().starts_with("$ "), "{path}: {line}");
@@ -477,6 +525,9 @@ fn help_matches_the_supported_palette() {
                 .contains("Requires:")
         );
     }
+
+    // The manual advertises no unsupported command, and only long help shows
+    // the advanced options
     let manual = String::from_utf8(ark(&["help", "--all"]).stdout).unwrap();
     for absent in ["ark app check", "ark lock"] {
         assert!(!manual.contains(absent), "{absent} advertised prematurely");
@@ -493,11 +544,14 @@ fn help_matches_the_supported_palette() {
     );
 }
 
-/// The manual names the example apps and the emulator, the two other corners
-/// of the loop a reader arrives in, and the root page lists the shared options.
+/// Checks that the manual names the example apps and the emulator, and the
+/// root page lists the shared options.
+///
+/// The example apps and the emulator are the two other corners of the loop a
+/// reader arrives in.
 #[test]
 fn manual_carries_the_cross_references() {
-    // Wrapped, so a phrase is looked for across line breaks.
+    // Wrapped, so a phrase is looked for across line breaks
     let manual = String::from_utf8(ark(&["help", "--all"]).stdout).unwrap();
     let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
     for link in [
@@ -507,14 +561,19 @@ fn manual_carries_the_cross_references() {
     ] {
         assert!(manual.contains(link), "{link}");
     }
+
+    // The root page lists the shared options
     let root = String::from_utf8(ark(&["--help"]).stdout).unwrap();
     assert!(root.contains("--timeout <SECONDS>"));
     assert!(root.contains("--json"));
 }
 
-/// Every error code the source can emit, read from the source itself, so the
-/// output topic is checked against what the tool does and not a second list.
+/// Collects every error code the source can emit, reading the source itself.
+///
+/// The output topic is then checked against what the tool does, not against a
+/// second list.
 fn emitted_codes() -> std::collections::BTreeSet<String> {
+    /// Adds the codes found in every Rust file under `dir` to `codes`.
     fn visit(dir: &std::path::Path, codes: &mut std::collections::BTreeSet<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -525,6 +584,7 @@ fn emitted_codes() -> std::collections::BTreeSet<String> {
             if path.extension().is_none_or(|extension| extension != "rs") {
                 continue;
             }
+            // Constructors name the code as the string after the exit class
             let text = std::fs::read_to_string(&path).unwrap();
             for prefix in ["Error::new(", "Self::new("] {
                 for (index, _) in text.match_indices(prefix) {
@@ -541,7 +601,7 @@ fn emitted_codes() -> std::collections::BTreeSet<String> {
                     }
                 }
             }
-            // The Ark's reserved verdicts map to codes in match arms.
+            // The Ark's reserved verdicts map to codes in match arms
             if path.file_name().is_some_and(|name| name == "error.rs") {
                 for (index, _) in text.match_indices("=> \"") {
                     let rest = &text[index + 4..];
@@ -561,6 +621,7 @@ fn emitted_codes() -> std::collections::BTreeSet<String> {
     codes
 }
 
+/// Checks that the output topic documents every error code the source emits.
 #[test]
 fn every_error_code_is_documented() {
     let topic = std::fs::read_to_string(
@@ -575,6 +636,8 @@ fn every_error_code_is_documented() {
     }
 }
 
+/// Checks that completions generate for every supported shell under the `ark`
+/// name.
 #[test]
 fn completions_are_generated_for_the_binary_name() {
     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {

@@ -4,14 +4,18 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Human layouts of result fields. Machine renderings never pass through here.
+//! Human layouts of result fields.
+//!
+//! Machine renderings never pass through here.
 
 use crate::style::{self, Role, Theme};
 use serde_json::Value;
 
 /// Styles a field, retaining explicit absent values.
+///
 /// Arbitrary strings receive no semantic status color merely because of their text.
 pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
+    // Absent values and empty lists stay visible
     if value.is_null() {
         return theme.paint(
             Role::Muted,
@@ -21,6 +25,8 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
     if value.as_array().is_some_and(Vec::is_empty) {
         return theme.paint(Role::Muted, "none");
     }
+
+    // Sizes and durations read in their units, and timestamps in local time
     if key.ends_with("_bytes")
         && let Some(bytes) = value.as_u64()
     {
@@ -45,6 +51,8 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
             format!("{seconds} s")
         };
     }
+
+    // Other values read as text, styled by what their key means
     let text = super::scalar(value);
     match key {
         "trust" | "state" | "outcome" | "result" => {
@@ -93,6 +101,7 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
 }
 
 /// Aligns label/value rows, stacking them when labels consume the available width.
+///
 /// An empty pair separates groups; an empty label introduces an unlabeled row.
 pub(crate) fn block(theme: &Theme, rows: &[(String, String)]) -> String {
     let labels = rows
@@ -134,8 +143,10 @@ pub(crate) fn document(theme: &Theme, value: &Value) -> String {
     block(theme, &rows)
 }
 
-/// Keeps nesting in labels without exposing machine paths or unit suffixes.
+/// Flattens a value into rows, joining nested keys into readable labels
+/// without machine paths or unit suffixes.
 fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<(String, String)>) {
+    // Name the field for reading, dropping the unit suffix its value shows
     let name = if key == "requires" {
         "dependencies"
     } else {
@@ -148,6 +159,9 @@ fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<
     let label = format!("{prefix} {}", name.replace('_', " "))
         .trim()
         .to_string();
+
+    // Objects and lists of structures recurse, numbering list items from one,
+    // and a leaf becomes one row with a capitalized label
     match value {
         Value::Object(object) if !object.is_empty() => {
             for (key, value) in object {
@@ -175,6 +189,7 @@ fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<
 }
 
 /// Fits a table by shrinking one free-text column, then falls back to blocks.
+///
 /// Selectors, hashes and other actionable fields are never ellipsized by the table.
 pub(super) fn table(
     theme: &Theme,
@@ -182,6 +197,7 @@ pub(super) fn table(
     columns: &[(&str, &str)],
     groups: &[String],
 ) -> String {
+    // Style every cell and measure each column against its header
     let cells: Vec<Vec<_>> = rows
         .iter()
         .map(|row| {
@@ -203,6 +219,8 @@ pub(super) fn table(
                 .max(label.len())
         })
         .collect();
+
+    // Shrink the one free-text column to fit, never below its header or 8 cells
     let total =
         |widths: &[usize]| 2 + widths.iter().sum::<usize>() + columns.len().saturating_sub(1) * 2;
     let flexible = columns
@@ -213,6 +231,8 @@ pub(super) fn table(
             .saturating_sub(total(&widths).saturating_sub(theme.width))
             .max(columns[index].0.len().max(8));
     }
+
+    // A table that still overflows falls back to one block per row
     if total(&widths) > theme.width {
         return cells
             .iter()
@@ -229,6 +249,8 @@ pub(super) fn table(
             .collect::<Vec<_>>()
             .join("\n\n");
     }
+
+    // Lay out a line, right-aligning sizes, durations and numeric columns
     let line = |cells: &[String], header: bool| {
         let mut result = String::from("  ");
         for (i, cell) in cells.iter().enumerate() {
@@ -258,6 +280,8 @@ pub(super) fn table(
         }
         result
     };
+
+    // Print the header, then each row under a label whenever its group changes
     let mut lines = vec![line(
         &columns
             .iter()
@@ -305,6 +329,8 @@ pub(super) fn checklist(theme: &Theme, rows: &[Value]) -> String {
                 detail.to_string()
             };
             let name = theme.mark(role, name);
+            // Pad marked names to one column, which the two-letter ASCII mark
+            // widens
             let width = labels + if theme.unicode { 2 } else { 3 };
             let line = format!(
                 "  {}{}  {}",
@@ -331,12 +357,15 @@ pub(super) fn checklist(theme: &Theme, rows: &[Value]) -> String {
         .join("\n")
 }
 
+/// Tests of the human layouts of values, documents, tables and checklists.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::style::Color;
     use serde_json::json;
 
+    /// Nested fields become labels, absent values stay visible, and free text
+    /// gets no status color.
     #[test]
     fn block_retains_nested_fields_and_absent_values() {
         let theme = Theme::test(80, Color::Basic, true);
@@ -351,6 +380,8 @@ mod tests {
         assert_eq!(value(&theme, "serial", &Value::Null), "unverified");
     }
 
+    /// Sizes and durations show in their units, under labels without unit
+    /// suffixes or machine paths.
     #[test]
     fn transformed_values_use_reading_labels() {
         for width in [32, 80, 160] {
@@ -373,6 +404,7 @@ mod tests {
         }
     }
 
+    /// A table right-aligns sizes and marks states.
     #[test]
     fn table_aligns_sizes_and_marks_states() {
         let theme = Theme::test(80, Color::Basic, true);
@@ -392,6 +424,7 @@ mod tests {
         );
     }
 
+    /// Tables show sizes in the same units as blocks.
     #[test]
     fn tables_and_blocks_agree_on_byte_units() {
         let theme = Theme::test(80, Color::Off, false);
@@ -410,6 +443,7 @@ mod tests {
         }
     }
 
+    /// A narrow table fits the width and keeps actionable values whole.
     #[test]
     fn narrow_tables_keep_actionable_values() {
         let theme = Theme::test(32, Color::True, true);
@@ -439,6 +473,7 @@ mod tests {
         assert!(!plain.contains('\u{2026}'));
     }
 
+    /// A table truncates only its free-text column to fit.
     #[test]
     fn table_truncates_only_free_text() {
         let theme = Theme::test(40, Color::Off, true);

@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! Discovery of physical Arks attached to the host.
+//!
 //! Connect through [`Device::connect`] to authenticate a discovered Ark.
 
 mod usb;
@@ -14,7 +15,7 @@ pub(crate) use usb::{connect, name};
 use crate::{Device, Error};
 use nusb::MaybeFuture;
 
-/// Vendor and product id pairs Arks enumerate with.
+/// Vendor and product ID pairs Arks enumerate with.
 const USB_IDS: &[(u16, u16)] = &[
     (0x2e8a, 0x10f1), // Ark I
 ];

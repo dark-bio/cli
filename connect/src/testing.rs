@@ -33,6 +33,7 @@ pub fn test_clock() -> TestClock {
 }
 
 /// Blocks until the earliest wait or timer on the clock is due at `deadline`.
+///
 /// The advance that reaches the deadline then wakes it, whenever the test makes
 /// that advance.
 pub fn wait_deadline(tester: &TestClock, deadline: Instant) {
@@ -41,9 +42,11 @@ pub fn wait_deadline(tester: &TestClock, deadline: Instant) {
     }
 }
 
-/// Hardware attestation of an identity, signed by the given key at the clock's
-/// wall time. Signed by the identity itself, it is the placeholder of an Ark
-/// that was never onboarded.
+/// Issues a hardware attestation of an identity, signed by the given key at the
+/// clock's wall time.
+///
+/// Signed by the identity itself, it is the placeholder of an Ark that was
+/// never onboarded.
 pub fn self_attestation(
     signer: &xdsa::SecretKey,
     identity: xdsa::PublicKey,
@@ -75,13 +78,15 @@ pub fn self_attestation(
     Attestation::new(cwt).unwrap()
 }
 
-/// Handles one peer request, with access to the session for reverse requests.
+/// Handler of one peer request, with access to the session for reverse
+/// requests.
+///
 /// Returning false ends the peer's session.
 pub type Script = Box<dyn FnMut(&Session, Request, Responder) -> bool + Send>;
 
-/// Script answering device info requests with a firmware version, unlock
-/// requests with a request of the peer's own ahead of the reply, and anything
-/// else with the protocol's UNSUPPORTED error.
+/// Answers device info requests with a firmware version, unlock requests with a
+/// request of the peer's own ahead of the reply, and anything else with the
+/// protocol's `UNSUPPORTED` error.
 pub fn answering(session: &Session, request: Request, responder: Responder) -> bool {
     let deadline = session.clock().now() + Duration::from_secs(10);
     let queued = match request {
@@ -109,8 +114,8 @@ pub fn answering(session: &Session, request: Request, responder: Responder) -> b
     queued.is_ok()
 }
 
-/// Script never answering, holding on to the responders so the wire does not
-/// answer for them either.
+/// Returns a script that never answers, holding on to the responders so the
+/// wire does not answer for them either.
 pub fn silent() -> Script {
     let mut held = Vec::new();
     Box::new(move |_, _, responder| {
@@ -119,8 +124,8 @@ pub fn silent() -> Script {
     })
 }
 
-/// Script hanging up on the first request, holding on to its responder so
-/// nothing but the end of the session reaches the client.
+/// Returns a script that hangs up on the first request, holding on to its
+/// responder so only the end of the session reaches the client.
 pub fn hangup() -> Script {
     let mut held = Vec::new();
     Box::new(move |_, _, responder| {
@@ -129,22 +134,30 @@ pub fn hangup() -> Script {
     })
 }
 
-/// Scripted Ark peer over an in-memory stream. Runs until its script finishes
-/// or the host closes, and joins its serving thread on drop.
+/// Scripted Ark peer over an in-memory stream.
+///
+/// It runs until its script finishes or the host closes, and joins its serving
+/// thread on drop.
 pub struct Peer {
-    pub identity: xdsa::PublicKey, // Identity key the peer signs its handshake with
-    stream: Option<Duplex>,        // Client's end of the stream, until taken
-    thread: Option<JoinHandle<()>>, // Serving thread, joined on drop
+    /// Identity key the peer signs its handshake with.
+    pub identity: xdsa::PublicKey,
+    /// Host end of the stream, until a test takes it.
+    stream: Option<Duplex>,
+    /// Serving thread, joined on drop.
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Peer {
-    /// Starts a peer serving the client per the script. Both ends of its stream
-    /// measure their deadlines on the clock.
+    /// Starts a peer serving the client per the script.
+    ///
+    /// Both ends of its stream measure their deadlines on the clock.
     pub fn spawn(clock: &Clock, mut script: Script) -> Self {
+        // Sign the handshake with a fresh identity attesting itself
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer, identity.clone(), clock);
 
+        // Serve one session, passing each request to the script
         let (host, ark) = memory::duplex(CAPACITY, clock);
         let thread = thread::spawn(move || {
             let mut server = Server::new(ark, signer, attestation);
@@ -167,12 +180,21 @@ impl Peer {
         }
     }
 
-    /// Takes the host stream for attachment or forwarding through another transport.
+    /// Takes the host stream for attachment or forwarding through another
+    /// transport.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stream was already taken.
     pub fn stream(&mut self) -> Duplex {
         self.stream.take().expect("stream already taken")
     }
 
     /// Attaches to the peer using its pinned identity key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stream was already taken.
     pub fn attach(&mut self) -> Result<(Ark, Identity), Error> {
         let stream = self.stream();
         Ark::attach(
@@ -186,7 +208,8 @@ impl Peer {
 impl Drop for Peer {
     /// Releases an unused host stream and joins the peer after its session ends.
     fn drop(&mut self) {
-        // An untaken host stream must close before joining the peer's receive loop.
+        // An untaken host stream must close before joining the peer's
+        // receive loop
         drop(self.stream.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

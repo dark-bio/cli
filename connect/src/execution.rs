@@ -12,12 +12,16 @@ use darkbio_wire::protocol::{Message, Promise, Requester};
 use std::io::{self, Read};
 use std::time::Duration;
 
-const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024; // Leave room for sealing and framing
+/// Largest upload chunk, 32 KiB short of a 2 MiB frame to leave room for
+/// sealing and framing.
+const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024;
 /// Delay between status requests while the Ark retains a pending task.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Execution stages reported on the caller's thread. A task ID identifies
-/// both the upload and its eventual execution, including cancellation.
+/// Execution stages reported on the caller's thread.
+///
+/// A task ID identifies both the upload and its eventual execution, including
+/// cancellation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionProgress {
     /// Allocating an app upload on the Ark.
@@ -36,16 +40,20 @@ pub enum ExecutionProgress {
     },
     /// Requesting companion approval to run the uploaded app.
     Authorizing,
-    /// The app is running. Elapsed time starts at the scheduling acknowledgement.
+    /// The app is running, its elapsed time counted from the scheduling
+    /// acknowledgement.
     Running {
         /// Host time since scheduling succeeded, including status polling waits.
         elapsed: Duration,
     },
 }
 
-/// Streams at most two outstanding chunks, waits for authorization and retrieves
-/// the result once. Scheduling establishes the relay through the caller's client.
-/// Deadlines and the running time are measured on the clock of the requester's session.
+/// Uploads and runs an app, streaming at most two outstanding chunks, waiting
+/// for authorization and retrieving the result once.
+///
+/// Scheduling establishes the relay through the caller's client. A failed task
+/// is cancelled within the remaining deadline, at most 1 s. Deadlines and the
+/// running time are measured on the clock of the requester's session.
 pub(crate) fn execute(
     requester: &Requester,
     size: u64,
@@ -59,6 +67,8 @@ pub(crate) fn execute(
     if size == 0 {
         return Err(Error::Execution("app is empty".into()));
     }
+
+    // Allocate the task, whose ID addresses both the upload and the run
     progress(ExecutionProgress::Preparing);
     let taskid = requester
         .request(
@@ -67,12 +77,16 @@ pub(crate) fn execute(
         )?
         .wait::<schema::ExecutionUploadStartResponse>()?
         .taskid;
+
+    // Run the task's steps as one outcome, so any failure cancels it
     let result = (|| {
         progress(ExecutionProgress::Started { taskid });
         progress(ExecutionProgress::Uploading {
             uploaded: 0,
             total: size,
         });
+
+        // Stream the app, checking the source ends at its declared size
         let mut sent = 0;
         let mut uploaded = 0;
         let mut pending: Option<(Promise<Message>, u64)> = None;
@@ -86,8 +100,9 @@ pub(crate) fn execute(
             if sent == size {
                 finish_read(reader, clock, timing)?;
             }
-            // Submit the next chunk before waiting for the previous one, keeping
-            // at most two outstanding while device writes overlap transport I/O.
+            // Submit the next chunk before waiting for the previous one,
+            // keeping at most two outstanding while device writes overlap
+            // transport I/O
             let next = requester.request(
                 schema::ExecutionUploadChunkRequest { taskid, chunk },
                 timing.io(clock),
@@ -110,8 +125,11 @@ pub(crate) fn execute(
                 total: size,
             });
         }
+
+        // Schedule the run, which waits for the owner's approval
         progress(ExecutionProgress::Authorizing);
         schedule(taskid)?;
+
         // Retrieving a completed status consumes the result on the Ark. This
         // workflow is the sole poller and never retries a completed retrieval.
         let started = clock.now();
@@ -130,6 +148,8 @@ pub(crate) fn execute(
             timing.pause(clock, POLL_INTERVAL)?;
         }
     })();
+
+    // Cancel a failed task within the remaining deadline, at most 1 s
     if result.is_err() {
         let cleanup = timing.io(clock).min(clock.now() + Duration::from_secs(1));
         let _ = requester
@@ -139,8 +159,10 @@ pub(crate) fn execute(
     result
 }
 
-/// Check EOF before the final chunk so a growing or misdeclared source never
-/// reaches scheduling. Interrupted reads do not indicate the end of a file.
+/// Checks EOF before the final chunk, so a growing or misdeclared source never
+/// reaches scheduling.
+///
+/// Interrupted reads do not count as the end of the file.
 fn finish_read(reader: &mut impl Read, clock: &Clock, timing: Timing) -> Result<(), Error> {
     loop {
         timing.check(clock)?;
@@ -164,6 +186,7 @@ fn read_error(error: io::Error) -> Error {
     }
 }
 
+/// App execution regressions against a scripted Ark.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,15 +198,21 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
+    /// Budget for test I/O that is not exercising expiration.
     const TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Wire exchange recorded by the scripted peer.
     #[derive(Default)]
     struct Observed {
+        /// Stages the peer served, in arrival order.
         stages: Vec<&'static str>,
+        /// Declared app length the upload started with.
         size: u64,
+        /// App bytes the upload delivered.
         bytes: Vec<u8>,
     }
 
+    /// Builds an execution result with binary output, successful or not.
     fn result(success: bool) -> schema::ExecutionResultResponse {
         schema::ExecutionResultResponse {
             app_name: "test app".into(),
@@ -194,6 +223,10 @@ mod tests {
         }
     }
 
+    /// Spawns a peer recording the wire exchange, optionally refusing a stage.
+    ///
+    /// A refusing peer refuses the cancel too. Status polls take their answers
+    /// from `reports`.
     fn peer(
         clock: &Clock,
         fail: Option<&'static str>,
@@ -256,11 +289,13 @@ mod tests {
         (peer, observed)
     }
 
+    /// Connects a raw wire session to the peer, pinning its identity key.
     fn attach(peer: &mut Peer) -> Session {
         let trust = TrustMode::Recover(Box::new(peer.identity.clone()));
         protocol::connect(peer.stream(), &trust).unwrap().0
     }
 
+    /// Runs an app under a fresh budget, scheduling it with a raw request.
     fn run(
         requester: &Requester,
         size: u64,
@@ -276,8 +311,8 @@ mod tests {
         })
     }
 
-    /// The final acknowledgement precedes scheduling. Polling stops as soon as
-    /// the result is retrieved, retaining binary output even when the app failed.
+    /// Scheduling follows the final acknowledgement, and polling stops at the
+    /// result, keeping binary output even of a failed app.
     #[test]
     fn test_execution() {
         let mut tester = test_clock();
@@ -313,12 +348,16 @@ mod tests {
                 }
             });
 
-            // End the pause between the two status polls once the runner sleeps in it
+            // End the pause between the two status polls once the runner
+            // sleeps in it
             let poll = clock.now() + POLL_INTERVAL;
             wait_deadline(&tester, poll);
             tester.advance_to(poll);
             let (actual, progress) = running.join().unwrap().unwrap();
             assert_eq!(actual, expected);
+
+            // Every byte arrived, polling stopped at the result, and approval
+            // followed the final acknowledgement
             let observed = observed.lock().unwrap();
             assert_eq!(observed.bytes, bytes);
             assert_eq!(
@@ -345,10 +384,12 @@ mod tests {
         }
     }
 
-    /// A remote failure keeps its code and message even when cleanup fails too.
-    /// A refused start has no task ID and must not attempt cancellation.
+    /// A refused stage keeps its code and message even when cleanup fails too,
+    /// and a refused start attempts no cancellation.
     #[test]
     fn test_refusals() {
+        // Each refused stage fails the run without a retry, cancelling any
+        // task it allocated
         let clock = test_clock().clock();
         for fail in ["start", "chunk", "schedule", "status"] {
             let (mut peer, observed) = peer(
@@ -401,8 +442,8 @@ mod tests {
         }
     }
 
-    /// Declared lengths are enforced before scheduling, including sources that
-    /// change after their first chunk. Read failures cancel the allocated task.
+    /// A source shorter or longer than declared fails before scheduling and
+    /// cancels the allocated task.
     #[test]
     fn test_source_length() {
         let clock = test_clock().clock();
@@ -427,10 +468,12 @@ mod tests {
         }
     }
 
-    /// Two requests can be in flight, and acknowledgements can arrive reversed.
-    /// The last chunk remains outstanding until explicitly released by the test.
+    /// Two chunks can be in flight with their acknowledgements reversed, and
+    /// approval waits for the last one.
     #[test]
     fn test_upload_window() {
+        // The peer answers the second chunk before the first, and holds the
+        // last one until the test releases it
         let clock = test_clock().clock();
         let (notice, notices) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -488,6 +531,8 @@ mod tests {
                 true
             }),
         );
+
+        // Run a three chunk app, reporting its progress to the test
         let session = attach(&mut peer);
         let requester = session.requester();
         let (updates, progress) = mpsc::channel();
@@ -502,6 +547,8 @@ mod tests {
                 },
             )
         });
+
+        // Approval waits for the last chunk's acknowledgement
         notices.recv().unwrap();
         assert!(
             !progress
@@ -512,10 +559,11 @@ mod tests {
         assert!(worker.join().unwrap().unwrap().success);
     }
 
-    /// Cancellation can be sent while status is outstanding. Neither request
-    /// requires an application receive loop or a second connection.
+    /// A cancel goes out while a status poll is outstanding, with no receive
+    /// loop or second connection.
     #[test]
     fn test_cancellation() {
+        // The peer holds the status poll until the cancel, then answers both
         let clock = test_clock().clock();
         let (notice, notices) = mpsc::channel();
         let mut held = None;
@@ -564,6 +612,8 @@ mod tests {
                 true
             }),
         );
+
+        // Cancel from another handle while the runner waits on its status poll
         let session = attach(&mut peer);
         let requester = session.requester();
         let worker = thread::spawn(move || run(&requester, 1, &mut [42].as_slice(), |_| {}));
@@ -580,12 +630,16 @@ mod tests {
         assert!(!worker.join().unwrap().unwrap().success);
     }
 
-    /// Readers may fragment data or interrupt EOF checks. An expired deadline
-    /// never allocates a task and a reader timeout remains a timeout error.
+    /// Fragmented and interrupted reads still run the app, while an expired
+    /// deadline allocates no task and a reader timeout stays a timeout.
     #[test]
     fn test_reads_and_deadlines() {
+        /// Source serving one byte per read, interrupting the first read past
+        /// its end.
         struct Fragmented {
+            /// Bytes left to serve.
             bytes: &'static [u8],
+            /// Flag set once the read past the end was interrupted.
             interrupted: bool,
         }
         impl Read for Fragmented {
@@ -597,6 +651,8 @@ mod tests {
                 self.bytes.read(&mut buffer[..1])
             }
         }
+
+        // Fragmented and interrupted reads still run the app
         let clock = test_clock().clock();
         let (mut peer, _) = peer(
             &clock,
@@ -618,6 +674,7 @@ mod tests {
         );
         assert!(reader.interrupted);
 
+        // An expired deadline allocates no task
         let result = execute(
             &session.requester(),
             1,
@@ -628,6 +685,8 @@ mod tests {
         );
         assert!(matches!(result, Err(Error::Timeout)));
 
+        // A reader timeout stays a timeout
+        /// Source whose every read times out.
         struct TimedOut;
         impl Read for TimedOut {
             fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {

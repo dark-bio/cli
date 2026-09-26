@@ -21,18 +21,26 @@ use package::Package;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// Verification window covering old-session closure and discovery after installation.
+/// Verification window covering old-session closure and discovery after
+/// installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
 /// First firmware version speaking the wire protocol this CLI uses.
 pub(crate) const MINIMUM_VERSION: &str = "0.11.5";
 
-/// Bump when current-release changes require developers to rebuild their image.
+/// Earliest publish time of a develop build this CLI accepts, in Unix seconds.
+///
+/// It moves forward whenever a change on the current release needs developers
+/// to rebuild their image.
 pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_461_235; // 2026-09-15 08:33:55 UTC
 
-/// Requires the protocol batch and, for mutable develop builds, its publish cutoff.
+/// Checks that the firmware is at least [`MINIMUM_VERSION`], and that a
+/// mutable develop build was published no earlier than
+/// [`MINIMUM_DEVELOP_PUBLISH`].
+///
 /// This is CLI compatibility guidance based on reported firmware metadata.
 pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(), Error> {
+    // A version below the minimum, or one that does not parse, needs an update
     let minimum = package::Version::parse(&format!("{MINIMUM_VERSION}-develop"))
         .expect("compiled firmware minimum is valid");
     let Some(version) = package::Version::parse(&info.firmware_version)
@@ -48,6 +56,8 @@ pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(
             ),
         ));
     };
+
+    // A develop build also needs a publish time past the cutoff
     if version.is_develop() && info.firmware_publish < MINIMUM_DEVELOP_PUBLISH {
         return Err(Error::new(
             5,
@@ -59,9 +69,12 @@ pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(
 }
 
 /// Lists candidates or plans and installs a selected firmware archive.
+///
 /// The CLI owns package retrieval, consent and reboot verification; connect owns the
 /// authorized update sequence. Partial results distinguish installation from return.
 pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Error> {
+    // Connect past the compatibility gate, which an update exists to cross, and
+    // fetch the published packages
     let connection = context.connect_recovery(None)?;
     let clock = connection.client.clock();
     let mut packages = Packages::new(context, clock.clone(), connection.env)?;
@@ -69,6 +82,9 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     if let args::Firmware::List = command {
         return listing(context, &connection, &firmwares);
     }
+
+    // Plan the update, and print the plan alone when nothing is newer or on a
+    // dry run
     let args::Firmware::Update {
         version,
         dry_run,
@@ -102,6 +118,9 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     if dry_run {
         return context.output.document(&value);
     }
+
+    // Announce the update, which then needs --yes or a confirmation at the
+    // prompt
     context.output.event(
         "note",
         format!(
@@ -127,11 +146,15 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         )
         .hint("add --yes to confirm installation and reboot"));
     }
+
+    // With --unlock, a locked or unreported Ark unlocks first, so the phone
+    // approves the update
     if context.options.unlock && matches!(approval, Some(Approval::Button) | None) {
         context.unlock(&connection)?;
         approval = Some(Approval::Phone);
         value["approval"] = json!(approval);
     }
+
     // The public archive is opened lazily, after the Ark accepts preparation.
     // Connect owns authorization, transfer, verification and installation.
     let mut reader = Download {
@@ -170,6 +193,9 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             UpdateProgress::Installing => context.output.event("progress", "installing firmware"),
         },
     );
+
+    // A failed update prints the plan, with hints for a stale proof or the
+    // emulator
     if let Err(error) = result {
         context.output.document(&value)?;
         let mut error: Error = error.into();
@@ -185,9 +211,15 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         }
         return Err(error);
     }
+
+    // Record the installation, with the running build unknown until the Ark
+    // returns
     value["installed"] = json!(true);
     value["running"] = Value::Null;
     context.interrupt.partial(value.clone());
+
+    // Wait for the Ark to return and verify its build, unless --no-wait skips
+    // that
     if !no_wait {
         context
             .output
@@ -212,8 +244,11 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     context.output.document(&value)
 }
 
-/// Installation acknowledges before scheduling reboot. Observe the old session
-/// ending first, including when reinstalling the same build. The reboot window
+/// Waits for the Ark to reboot and return running `target`, recording what it
+/// finds in `value`.
+///
+/// The Ark answers the install request before it reboots, so the old session
+/// has to end first, even when the same build is reinstalled. The reboot window
 /// and the pauses between attempts run on the old connection's clock.
 fn verify_reboot(
     context: &Context,
@@ -221,6 +256,7 @@ fn verify_reboot(
     target: &str,
     value: &mut Value,
 ) -> Result<(), Error> {
+    // Poll the old session every 250 ms until it ends, within the reboot window
     let clock = connection.client.clock();
     let deadline = clock.now() + REBOOT_WAIT;
     loop {
@@ -236,6 +272,9 @@ fn verify_reboot(
             return Err(reboot_timeout());
         }
     }
+
+    // Rediscover the Ark every 500 ms while a handshake still fits in the
+    // window
     connection.ark.close();
     let device = &connection.device;
     let key = connection.identity.key();
@@ -276,10 +315,13 @@ fn verify_reboot(
         }
         clock.sleep(Duration::from_millis(500));
     }
+
+    // Report the timeout only once the whole window has passed
     clock.sleep_until(deadline);
     Err(reboot_timeout())
 }
-/// Reports that installation was not verified within the reboot window.
+
+/// Builds the error for an Ark that did not return within the reboot window.
 fn reboot_timeout() -> Error {
     Error::new(7, "timeout", "the Ark did not return within 120 seconds")
 }
@@ -288,16 +330,21 @@ fn reboot_timeout() -> Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Approval {
-    /// An unpaired Ark needs no phone or button approval.
+    /// No phone or button approval, as for an unpaired Ark.
     None,
-    /// A paired, unlocked Ark asks its companion for approval.
+    /// Approval on the owner's phone in Ark Companion, as a paired, unlocked
+    /// Ark asks for.
     Phone,
-    /// A paired, locked Ark asks for physical button approval.
+    /// Approval by a press of the Ark's button, as a paired, locked Ark asks
+    /// for.
     Button,
 }
 
+/// Predicts the approval an update needs from the Ark's pairing and lock
+/// state, leaving it unknown on firmware this CLI does not support.
+///
 /// Older firmware omits these flags. An absent flag cannot mean "unpaired" on
-/// the recovery path, so leave approval unknown and let the Ark handle it.
+/// the recovery path, so the approval stays unknown and the Ark handles it.
 fn approval(info: &schema::DeviceInfoResponse) -> Option<Approval> {
     check_compatibility(info).ok()?;
     Some(if !info.paired {
@@ -308,13 +355,16 @@ fn approval(info: &schema::DeviceInfoResponse) -> Option<Approval> {
         Approval::Button
     })
 }
+
 /// Finds an exact requested build or the first candidate in a newest-first listing.
+///
 /// Explicit selection permits reinstallation or downgrade requests; the Ark decides.
 fn select<'a>(
     firmwares: &'a [Package],
     requested: Option<&str>,
     installed: &str,
 ) -> Result<Option<&'a Package>, Error> {
+    // A requested build must be a valid version the listing publishes
     if let Some(version) = requested {
         package::Version::parse(version)?;
         return firmwares
@@ -329,6 +379,8 @@ fn select<'a>(
                 )
             });
     }
+
+    // Otherwise the newest candidate wins, since the listing is newest first
     for firmware in firmwares {
         if package::candidate(firmware, installed)? {
             return Ok(Some(firmware));
@@ -336,8 +388,11 @@ fn select<'a>(
     }
     Ok(None)
 }
-/// Shows candidates and the installed build, even when that build is no longer published.
+
+/// Shows the candidates and the installed build, adding the installed one when
+/// the listing lacks it.
 fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) -> Result<(), Error> {
+    // Keep the candidates and the installed build from the listing
     let installed = &connection.info.firmware_version;
     let mut rows = Vec::new();
     for firmware in firmwares {
@@ -354,6 +409,8 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
             }));
         }
     }
+
+    // An installed build missing from the listing still gets a row, first
     if !rows.iter().any(|row| row["installed"] == true) {
         rows.insert(
             0,
@@ -361,6 +418,9 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
             "summary":null,"installed":true,"candidate":false}),
         );
     }
+
+    // The JSON document names the update and takes the rows before the table
+    // adds its flags
     let update = select(firmwares, None, installed)?.map(|firmware| firmware.version.clone());
     let document = json!({"installed":installed,"update":update,"firmwares":rows});
     for row in &mut rows {
@@ -375,6 +435,8 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
             .join(", ")
         );
     }
+
+    // Group the table rows by semantic version, without the build suffix
     let groups: Vec<_> = rows
         .iter()
         .map(|row| {
@@ -412,8 +474,10 @@ pub(crate) struct Packages {
     /// Cached Access application token for a protected package host.
     token: Option<String>,
 }
+
 impl Packages {
-    /// Selects the package host and tries cached credentials without prompting for login.
+    /// Selects the package host and tries cached credentials without prompting
+    /// for login.
     pub fn new(context: &Context, clock: Clock, env: Option<Environment>) -> Result<Self, Error> {
         let origin = match env.ok_or_else(|| {
             Error::new(4, "environment-unknown", "cloud environment unknown")
@@ -436,6 +500,7 @@ impl Packages {
         };
         Ok(result)
     }
+
     /// Fetches a size-bounded listing and validates every artifact before selection.
     pub fn list(&mut self, context: &Context) -> Result<Vec<Package>, Error> {
         let mut response = self.get(context, "imgs/arkos.pkgs")?;
@@ -455,13 +520,17 @@ impl Packages {
             })?
             .firmwares()
     }
+
     /// Fetches one path and retries once after a recognized Access login challenge.
+    ///
     /// An unrelated redirect never changes the destination or receives credentials.
     fn get(
         &mut self,
         context: &Context,
         path: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, Error> {
+        // Send any token as a sensitive header, and log in once after a
+        // challenge before retrying
         let fetch = |token: Option<&str>| {
             let mut request = self.agent.get(format!("{}/{path}", self.origin));
             if let Some(token) = token {
@@ -479,6 +548,9 @@ impl Packages {
         } else {
             response
         };
+
+        // A second challenge fails with the manual login command, and any other
+        // status but success is a cloud failure
         if access::required(self.origin, response.status(), response.headers()) {
             return Err(Error::new(
                 4,
@@ -513,8 +585,10 @@ struct Download<'a> {
     /// HTTP body retained after the first read starts the download.
     response: Option<ureq::http::Response<ureq::Body>>,
 }
+
 impl std::io::Read for Download<'_> {
-    /// Opens once and streams bytes, preserving CLI login errors through connect's reader API.
+    /// Opens the download on the first read and streams it, carrying CLI
+    /// errors such as a login refusal through connect's reader API.
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.response.is_none() {
             self.response = Some(
@@ -533,10 +607,13 @@ impl std::io::Read for Download<'_> {
     }
 }
 
+/// Tests of the firmware compatibility gate and the approval prediction.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Builds device info reporting firmware `version`, published at `publish`
+    /// in Unix seconds.
     fn info(version: &str, publish: u64) -> schema::DeviceInfoResponse {
         schema::DeviceInfoResponse {
             firmware_version: version.into(),
@@ -545,6 +622,8 @@ mod tests {
         }
     }
 
+    /// Builds from the minimum version up pass the gate, and older or malformed
+    /// versions fail it.
     #[test]
     fn compatibility_requires_the_protocol_batch() {
         for version in [
@@ -572,6 +651,8 @@ mod tests {
         }
     }
 
+    /// Develop builds need the publish cutoff, and tagged builds pass without
+    /// it.
     #[test]
     fn develop_builds_need_the_cutoff_but_tagged_builds_do_not() {
         for version in ["0.11.5-develop", "0.12.0-develop"] {
@@ -593,6 +674,8 @@ mod tests {
         }
     }
 
+    /// The predicted approval follows the pairing and lock state, but only on
+    /// supported firmware.
     #[test]
     fn approval_uses_device_state_only_on_supported_firmware() {
         for (paired, unlocked, expected) in [

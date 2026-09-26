@@ -5,16 +5,18 @@
 // license that can be found in the LICENSE file.
 
 //! Arks over USB, the wire's byte stream on the bulk endpoints of the vendor
-//! interface a plugged in Ark enumerates with. The host claims the interface
-//! exclusively, so an Ark held by another program, a browser tab included,
-//! cannot be opened until that lets go.
+//! interface a plugged-in Ark enumerates with.
+//!
+//! The host claims the interface exclusively, so an Ark held by another
+//! program, a browser tab included, cannot be opened until that program lets
+//! go.
 //!
 //! Each direction queues a ring of host transfers to keep the bus occupied.
 //! A zero length packet closes a frame that ended on a packet boundary. Flushes
 //! reap finished transfers without draining the ring, so consecutive frames
-//! can overlap on the bus.
-//! Every wait is bounded by the deadline the wire installed, measured on the
-//! connection's clock, and ends early once the connection is closed.
+//! can overlap on the bus. Every wait ends at the deadline the wire installed,
+//! if any, measured on the connection's clock, or early once the connection is
+//! closed.
 
 use crate::ark::Ark;
 use crate::{Error, wire};
@@ -31,25 +33,29 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 use wire::transport::{self, Verifier};
 
-/// Class, subclass and protocol of the vendor interface carrying the wire. It
-/// distinguishes the interface from the mass storage a development Ark exposes
-/// too, which is bulk in both directions as well.
+/// Class, subclass and protocol of the vendor interface carrying the wire.
+///
+/// It distinguishes the wire's interface from any other one with bulk
+/// endpoints in both directions.
 const VENDOR_INTERFACE: (u8, u8, u8) = (0xff, 1, 2);
 
-/// Separator between the parts of the product string an Ark enumerates
-/// with, its carrier, its revision and the name it was given, the last there
+/// Separator between the parts of the product string an Ark enumerates with.
+///
+/// The parts are its model, its revision and the name it was given, the last
 /// only when a name was given.
 const PRODUCT_SEPARATOR: &str = " \u{00b7} ";
 
-/// Bytes per host transfer in either direction. A multiple of every supported
-/// bulk endpoint's packet size, keeping partial packets at frame boundaries.
+/// Bytes per host transfer in either direction.
+///
+/// It is a multiple of every supported bulk endpoint's packet size, keeping
+/// partial packets at frame boundaries.
 const TRANSFER_SIZE: usize = 64 * 1024;
 
 /// Host transfers kept in flight per direction to overlap USB and protocol work.
 const TRANSFERS: usize = 16;
 
-/// Name the Ark was given, carried in its product string after the carrier
-/// and the revision.
+/// Returns the name the Ark was given, taken from its product string after the
+/// model and the revision.
 pub(crate) fn name(product: &str) -> Option<&str> {
     product
         .splitn(3, PRODUCT_SEPARATOR)
@@ -58,14 +64,16 @@ pub(crate) fn name(product: &str) -> Option<&str> {
 }
 
 /// Opens the Ark and runs the wire handshake over it, the verifier deciding
-/// whether to trust the attestation it presents. The connection measures its
-/// deadlines on the clock.
+/// whether to trust the attestation it presents.
+///
+/// The connection measures its deadlines on the clock.
 pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     info: &nusb::DeviceInfo,
     verifier: &V,
     cloud: impl FnOnce(&crate::Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,
     clock: &Clock,
 ) -> Result<(Ark, V::Info), Error> {
+    // Open the device and read its active configuration
     let device = info.open().wait().map_err(Error::Usb)?;
     let config = device
         .active_configuration()
@@ -102,9 +110,9 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     }
     let (number, alternate, ep_in, ep_out) = found.ok_or(Error::Unsupported)?;
 
-    // Claim the interface and open the endpoints, a claim refused for the
-    // device being held meaning another program has it. The endpoints keep
-    // the interface claimed and the device open for as long as either lives.
+    // Claim the interface and open the endpoints. A claim refused as busy
+    // means another program holds the device. The endpoints keep the
+    // interface claimed and the device open for as long as either lives.
     let iface = device
         .claim_interface(number)
         .wait()
@@ -140,14 +148,15 @@ pub(crate) fn connect<V: Verifier<Info = crate::Identity>>(
     Ark::attach(stream, verifier, cloud)
 }
 
-/// Queue of transfers on one endpoint, what a direction of the adapter
-/// drives. The tests drive the rings through it without a device.
+/// Queue of transfers on one endpoint, which a direction of the adapter drives.
+///
+/// The tests drive the rings through it without a device.
 trait Transfers {
-    /// Packet size of the endpoint, deciding when a frame needs a zero length
-    /// packet behind it.
+    /// Returns the endpoint's packet size, which decides when a frame needs a
+    /// zero length packet behind it.
     fn packet_size(&self) -> usize;
 
-    /// Transfers queued and not yet taken back.
+    /// Counts the transfers queued and not yet taken back.
     fn in_flight(&self) -> usize;
 
     /// Queues a transfer behind the ones in flight.
@@ -164,7 +173,6 @@ impl<D: EndpointDirection> Transfers for nusb::Endpoint<Bulk, D> {
         self.max_packet_size()
     }
 
-    /// Counts submitted transfers whose completions have not been reaped.
     fn in_flight(&self) -> usize {
         self.pending()
     }
@@ -174,18 +182,20 @@ impl<D: EndpointDirection> Transfers for nusb::Endpoint<Bulk, D> {
         self.submit(buffer);
     }
 
-    /// Reaps the next system completion or registers the direction's waker.
     fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
         self.poll_next_complete(cx)
     }
 }
 
-/// Wakes a direction waiting on its endpoint, a transfer finishing or the
-/// connection closing being what there is to wake for.
+/// Wake signal for a direction waiting on its endpoint, raised by a finishing
+/// transfer or the closing connection.
 struct Notifier {
-    clock: Clock,             // clock that the wire's deadlines are measured on
-    woken: sync::Mutex<bool>, // Whether a wake arrived since the wait last looked
-    wake: sync::Condvar,      // Signalled on every wake
+    /// Clock that the wire's deadlines are measured on.
+    clock: Clock,
+    /// Flag set by a wake that arrived since the wait last looked.
+    woken: sync::Mutex<bool>,
+    /// Condition signaled on every wake.
+    wake: sync::Condvar,
 }
 
 impl Notifier {
@@ -223,9 +233,10 @@ impl Wake for Notifier {
 }
 
 /// Waits for the next transfer of the queue to finish, giving up without one
-/// once the deadline passes or the connection is closed. Without a deadline
-/// only a finished transfer or the close end the wait. A deadline already
-/// passed makes the wait a look at what has finished.
+/// once the deadline passes or the connection is closed.
+///
+/// Without a deadline only a finished transfer or the close end the wait. A
+/// deadline already passed makes the wait a look at what has finished.
 fn finished<T: Transfers>(
     queue: &mut T,
     notifier: &Arc<Notifier>,
@@ -235,9 +246,12 @@ fn finished<T: Transfers>(
     let waker = Waker::from(notifier.clone());
     let mut cx = Context::from_waker(&waker);
     loop {
+        // Take a finished transfer, the poll registering the waker otherwise
         if let Poll::Ready(completion) = queue.poll_finished(&mut cx) {
             return Some(completion);
         }
+
+        // Wait for a wake, giving up at the close or the deadline
         let mut woken = notifier.woken.lock().expect("USB wake state not poisoned");
         while !*woken {
             if closed.load(Ordering::Acquire) || notifier.expired(deadline) {
@@ -270,29 +284,38 @@ fn transfer_error(err: TransferError) -> io::Error {
     }
 }
 
-/// The error of output refused once the connection was closed.
+/// Returns the error for output refused once the connection is closed.
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "device closed")
 }
 
-/// Reader over the bulk IN endpoint, every transfer of the ring queued ahead
-/// so the device never waits for a buffer, each served to the wire once it
-/// finishes and queued again once served out. An empty transfer is a zero
-/// length packet the device closed a frame with, not the end of the stream.
-/// A wait ends at the deadline the wire installed, or with the stream once
-/// the connection is closed.
+/// Reader over the bulk IN endpoint, serving finished transfers to the wire.
+///
+/// Every transfer of the ring is queued ahead, so the device has buffers to
+/// fill while the wire reads. Each is served once it finishes and queued again
+/// once served out. An empty transfer is a zero length packet the device closed
+/// a frame with, not the end of the stream. A wait ends at the deadline the
+/// wire installed, if any, or with the end of the stream once the connection
+/// is closed.
 struct Reader<T: Transfers> {
-    queue: T,                  // Transfers in flight on the endpoint
-    notifier: Arc<Notifier>,   // Wakes the wait on a finished transfer or the close
-    closed: Arc<AtomicBool>,   // Close signal
-    served: Option<Buffer>,    // Finished transfer being served to the wire
-    offset: usize,             // Bytes of it served so far
-    deadline: Option<Instant>, // Deadline the wire installed for its reads
+    /// Transfers in flight on the endpoint.
+    queue: T,
+    /// Wake signal for a finished transfer or the close.
+    notifier: Arc<Notifier>,
+    /// Close signal shared with the writer and the shutdown.
+    closed: Arc<AtomicBool>,
+    /// Finished transfer being served to the wire.
+    served: Option<Buffer>,
+    /// Bytes of the served transfer handed out so far.
+    offset: usize,
+    /// Deadline the wire installed for its reads.
+    deadline: Option<Instant>,
 }
 
 impl<T: Transfers> Reader<T> {
     /// Queues every transfer of the ring on the endpoint.
     fn new(mut queue: T, notifier: Arc<Notifier>, closed: Arc<AtomicBool>) -> Self {
+        // Size each transfer in whole packets, as inbound transfers require
         let packet = queue.packet_size();
         let size = TRANSFER_SIZE.div_ceil(packet) * packet;
         for _ in 0..TRANSFERS {
@@ -310,8 +333,9 @@ impl<T: Transfers> Reader<T> {
 }
 
 impl<T: Transfers> Read for Reader<T> {
-    /// Serves completed bytes before waiting for another transfer. Empty USB
-    /// packets delimit frames; only closure ends the stream.
+    /// Serves completed bytes before waiting for another transfer.
+    ///
+    /// Empty USB packets delimit frames; only closure ends the stream.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -331,12 +355,16 @@ impl<T: Transfers> Read for Reader<T> {
                 self.queue.queue(buffer);
                 self.offset = 0;
             }
+
+            // Stop at the close, or fail at the deadline the wire installed
             if self.closed.load(Ordering::Acquire) {
                 return Ok(0);
             }
             if self.notifier.expired(self.deadline) {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
+
+            // Take the next finished transfer, where an empty one closes a frame
             let Some(completion) =
                 finished(&mut self.queue, &self.notifier, &self.closed, self.deadline)
             else {
@@ -372,21 +400,29 @@ impl<T: Transfers> transport::Read for Reader<T> {
     }
 }
 
-/// Writer over the bulk OUT endpoint, each write queued as transfers of the
-/// chunk size behind the ones in flight, waiting for room only once the ring
-/// is full. A flush closes the frame with a zero length packet if the last
-/// write ended on a packet boundary, as the device's read would otherwise
-/// wait for the next frame to complete it, then takes back the transfers
-/// already finished for their outcome without draining the ring. The
-/// deadline the wire installed bounds every wait, the connection closing
-/// refuses further output.
+/// Writer over the bulk OUT endpoint, queueing each write as transfers of at
+/// most [`TRANSFER_SIZE`] behind the ones in flight.
+///
+/// A write waits for room only once the ring is full. A flush closes a frame
+/// ending on a packet boundary with a zero length packet, since the device's
+/// read would otherwise wait for the next frame to complete it. It then takes
+/// back the transfers already finished for their outcome, without draining
+/// the ring. The deadline the wire installed bounds every wait, and closing
+/// the connection refuses further output.
 struct Writer<T: Transfers> {
-    queue: T,                  // Transfers in flight on the endpoint
-    notifier: Arc<Notifier>,   // Wakes the wait on a finished transfer or the close
-    closed: Arc<AtomicBool>,   // Close signal
-    spare: Vec<Buffer>,        // Buffers of finished transfers, reused by the next
-    wrote: usize,              // Length of the last write, deciding the zero length packet at flush
-    deadline: Option<Instant>, // Deadline the wire installed for its writes
+    /// Transfers in flight on the endpoint.
+    queue: T,
+    /// Wake signal for a finished transfer or the close.
+    notifier: Arc<Notifier>,
+    /// Close signal shared with the reader and the shutdown.
+    closed: Arc<AtomicBool>,
+    /// Spare buffers of finished transfers, reused by the next writes.
+    spare: Vec<Buffer>,
+    /// Length of the last write, which decides whether a flush owes a zero
+    /// length packet.
+    wrote: usize,
+    /// Deadline the wire installed for its writes.
+    deadline: Option<Instant>,
 }
 
 impl<T: Transfers> Writer<T> {
@@ -402,9 +438,11 @@ impl<T: Transfers> Writer<T> {
         }
     }
 
-    /// Keeps the buffer of a finished transfer for the next, its failure
-    /// surfacing. The zero length packets travel in buffers with no room
-    /// for anything, not worth keeping.
+    /// Keeps a finished transfer's buffer for reuse, returning the transfer's
+    /// failure.
+    ///
+    /// Zero length packets travel in buffers with no room, so those are not
+    /// kept.
     fn finished(&mut self, completion: Completion) -> io::Result<()> {
         if completion.buffer.capacity() >= TRANSFER_SIZE {
             self.spare.push(completion.buffer);
@@ -438,8 +476,8 @@ impl<T: Transfers> Writer<T> {
         Ok(())
     }
 
-    /// Takes back the transfers already finished, their failures surfacing,
-    /// without waiting for the rest.
+    /// Takes back the transfers already finished without waiting for the rest,
+    /// returning the first failure among them.
     fn reap(&mut self) -> io::Result<()> {
         while self.queue.in_flight() > 0 {
             let now = Some(self.notifier.clock.now());
@@ -454,17 +492,21 @@ impl<T: Transfers> Writer<T> {
 }
 
 impl<T: Transfers> Write for Writer<T> {
-    /// Queues bytes in order, reporting partial acceptance if a later wait fails.
+    /// Queues bytes in order, reporting partial acceptance if a later wait
+    /// fails.
+    ///
     /// Acceptance means submission to USB; a later reap may report its failure.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Refuse output once closed or past the deadline
         if self.closed.load(Ordering::Acquire) {
             return Err(closed());
         }
         if self.notifier.expired(self.deadline) {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
-        // Chunks already queued stay queued in order, so a wait for room
-        // failing reports what was taken, the rest failing on the next call
+
+        // Chunks already queued stay queued in order, so a failed wait for
+        // room reports what was taken, and the rest fails on the next call
         let mut accepted = 0;
         for chunk in buf.chunks(TRANSFER_SIZE) {
             match self.send(chunk) {
@@ -478,22 +520,28 @@ impl<T: Transfers> Write for Writer<T> {
     }
 
     /// Terminates an aligned frame and surfaces completed transfer errors.
-    /// Transfers still in flight remain queued so consecutive frames can overlap.
+    ///
+    /// Transfers still in flight remain queued so consecutive frames can
+    /// overlap.
     fn flush(&mut self) -> io::Result<()> {
+        // Refuse output once closed or past the deadline
         if self.closed.load(Ordering::Acquire) {
             return Err(closed());
         }
         if self.notifier.expired(self.deadline) {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
-        // A frame ending on a packet boundary leaves the device's read open,
-        // only a short packet completes it, so close the frame with an empty
-        // one. Whether one is owed depends on the last write alone, a short
-        // one having completed the read whatever came before it.
+
+        // A frame ending on a packet boundary leaves the device's read open
+        // until a short packet completes it, so close the frame with an empty
+        // one. Whether one is owed depends on the last write alone, since a
+        // short one completed the read whatever came before it.
         if self.wrote > 0 && self.wrote.is_multiple_of(self.queue.packet_size()) {
             self.room()?;
             self.queue.queue(Buffer::new(0));
         }
+
+        // Take back what finished, leaving the rest in flight
         self.wrote = 0;
         self.reap()
     }
@@ -512,6 +560,7 @@ impl<T: Transfers> transport::Write for Writer<T> {
     }
 }
 
+/// USB adapter regressions over a fake endpoint, and product name parsing.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,11 +578,15 @@ mod tests {
     /// thread, waking the waiting direction the way the system does.
     #[derive(Default)]
     struct Ring {
-        queued: VecDeque<Buffer>,       // Transfers queued, oldest first
-        finished: VecDeque<Completion>, // Transfers finished and not yet taken back
-        waker: Option<Waker>,           // Waiter to wake on the next finish
+        /// Transfers queued, oldest first.
+        queued: VecDeque<Buffer>,
+        /// Transfers finished and not yet taken back.
+        finished: VecDeque<Completion>,
+        /// Waker of the direction waiting on the next finish.
+        waker: Option<Waker>,
     }
 
+    /// Fake endpoint shared between a direction and the test driving it.
     type Fake = Arc<Mutex<Ring>>;
 
     impl Transfers for Fake {
@@ -562,8 +615,8 @@ mod tests {
         }
     }
 
-    // Finishes the oldest transfer queued with the status, an inbound one
-    // filled with the bytes, waking the waiting direction.
+    /// Finishes the oldest queued transfer with the status, filling an empty
+    /// inbound buffer with `bytes` bytes, and wakes the waiting direction.
     fn finish(fake: &Fake, bytes: usize, status: Result<(), TransferError>) {
         let waker = {
             let mut ring = fake.lock().unwrap();
@@ -584,9 +637,11 @@ mod tests {
         }
     }
 
-    // Waits until a direction looked at the ring and then parked on the
-    // deadline, or without one. The direction is the only thread that waits on
-    // the clock, and the test clears the ring's waker before it starts.
+    /// Waits until a direction has looked at the ring and parked on the
+    /// deadline, or without one.
+    ///
+    /// The direction is the only thread that waits on the clock, and the test
+    /// clears the ring's waker before it starts.
     fn parked(fake: &Fake, tester: &TestClock, deadline: Option<Instant>) {
         while fake.lock().unwrap().waker.is_none() {
             thread::yield_now();
@@ -600,7 +655,7 @@ mod tests {
         }
     }
 
-    // Lengths of the transfers queued, oldest first.
+    /// Returns the lengths of the queued transfers, oldest first.
     fn queued(fake: &Fake) -> Vec<usize> {
         fake.lock()
             .unwrap()
@@ -610,6 +665,8 @@ mod tests {
             .collect()
     }
 
+    /// Creates a reader over a fake endpoint, returned with the endpoint and
+    /// the close flag.
     fn reader(clock: &Clock) -> (Reader<Fake>, Fake, Arc<AtomicBool>) {
         let fake = Fake::default();
         let closed = Arc::new(AtomicBool::new(false));
@@ -617,6 +674,8 @@ mod tests {
         (reader, fake, closed)
     }
 
+    /// Creates a writer over a fake endpoint, returned with the endpoint and
+    /// the close flag.
     fn writer(clock: &Clock) -> (Writer<Fake>, Fake, Arc<AtomicBool>) {
         let fake = Fake::default();
         let closed = Arc::new(AtomicBool::new(false));
@@ -624,20 +683,22 @@ mod tests {
         (writer, fake, closed)
     }
 
-    // Tests that the ring is queued ahead, that finished transfers are
-    // served as they arrive and queued again once served out, and that an
-    // empty one is skipped rather than ending the stream.
+    /// A read serves finished transfers as they arrive, queues them again once
+    /// served out and skips empty ones.
     #[test]
     fn test_read_serves_transfers() {
+        // The whole ring is queued ahead
         let (mut reader, fake, _closed) = reader(&test_clock().clock());
         assert_eq!(fake.in_flight(), TRANSFERS);
 
+        // A finished transfer serves across reads
         finish(&fake, 3, Ok(()));
         let mut buf = [0u8; 2];
         assert_eq!(reader.read(&mut buf).unwrap(), 2);
         assert_eq!(buf, [0xab, 0xab]);
         assert_eq!(reader.read(&mut buf).unwrap(), 1);
 
+        // An empty transfer is skipped, and the served-out ones queue again
         finish(&fake, 0, Ok(()));
         finish(&fake, 4, Ok(()));
         let mut buf = [0u8; 8];
@@ -645,11 +706,11 @@ mod tests {
         assert_eq!(fake.in_flight(), TRANSFERS - 1);
     }
 
-    // Tests that a wait ends with the deadline the wire installed, that a
-    // transfer finishing meanwhile ends it with data, and that the close
-    // ends it with the stream.
+    /// A read's wait ends at the wire's deadline, with a transfer finishing
+    /// meanwhile, or with the end of the stream at the close.
     #[test]
     fn test_read_waits() {
+        // Read from a fake ring, keeping its notifier to wake the close
         let mut tester = test_clock();
         let clock = tester.clock();
         let (mut reader, fake, closed) = reader(&clock);
@@ -690,8 +751,8 @@ mod tests {
         assert_eq!(reading.join().unwrap().unwrap(), 0);
     }
 
-    // Tests that a failed transfer fails the read, the device going away
-    // reported as the connection lost.
+    /// A failed transfer fails the read, a vanished device reported as a lost
+    /// connection.
     #[test]
     fn test_read_failure() {
         let (mut reader, fake, _closed) = reader(&test_clock().clock());
@@ -702,12 +763,11 @@ mod tests {
         );
     }
 
-    // Tests that a write is queued as transfers of the chunk size, that a
-    // full ring waits for a transfer to finish within the deadline, that what
-    // was taken before the wait ran out is reported as written, and that the
-    // close refuses output.
+    /// A write queues transfers of at most the transfer size, waits for room
+    /// within the deadline, reports what it took, and fails once closed.
     #[test]
     fn test_write_chunks() {
+        // A write splits into transfers, and further writes fill the ring
         let mut tester = test_clock();
         let clock = tester.clock();
         let (mut writer, fake, closed) = writer(&clock);
@@ -739,8 +799,8 @@ mod tests {
         let (mut writer, result) = writing.join().unwrap();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
 
-        // Make one completion available so only the second chunk waits
-        // for its deadline.
+        // Make one completion available, so only the second chunk waits for
+        // its deadline
         let two = vec![7u8; 2 * TRANSFER_SIZE];
         finish(&fake, 0, Ok(()));
         let deadline = clock.now() + Duration::from_millis(100);
@@ -755,6 +815,7 @@ mod tests {
         let (mut writer, result) = writing.join().unwrap();
         assert_eq!(result.unwrap(), TRANSFER_SIZE);
 
+        // The close refuses output
         closed.store(true, Ordering::Release);
         assert_eq!(
             writer.write(&chunk).unwrap_err().kind(),
@@ -766,24 +827,27 @@ mod tests {
         );
     }
 
-    // Tests that a flush closes a frame ending on a packet boundary with a
-    // zero length packet and leaves a short one alone, that nothing is owed
-    // for nothing written, and that a failed transfer surfaces at the next
-    // flush without the flush draining the ring.
+    /// A flush closes an aligned frame with a zero length packet, owes none for
+    /// a short frame, and surfaces a failure without draining the ring.
     #[test]
     fn test_flush() {
+        // Write through a fake ring
         let (mut writer, fake, _closed) = writer(&test_clock().clock());
 
+        // An aligned frame gets one zero length packet, however often it flushes
         assert_eq!(writer.write(&[1u8; 2 * PACKET]).unwrap(), 2 * PACKET);
         writer.flush().unwrap();
         assert_eq!(queued(&fake), [2 * PACKET, 0]);
         writer.flush().unwrap();
         assert_eq!(queued(&fake), [2 * PACKET, 0]);
 
+        // A short frame needs no zero length packet
         assert_eq!(writer.write(&[1u8; PACKET + 1]).unwrap(), PACKET + 1);
         writer.flush().unwrap();
         assert_eq!(queued(&fake), [2 * PACKET, 0, PACKET + 1]);
 
+        // A failed transfer surfaces at the next flush, which leaves the rest
+        // in flight
         finish(&fake, 0, Ok(()));
         finish(&fake, 0, Err(TransferError::Fault));
         assert!(writer.flush().is_err());
@@ -791,8 +855,8 @@ mod tests {
         assert_eq!(writer.spare.len(), 1);
     }
 
-    // Tests that the name is taken from the product string only when a name
-    // was given, the carrier and the revision never mistaken for one.
+    /// A name is taken from the product string only when one was given, never
+    /// mistaking the model or the revision for one.
     #[test]
     fn test_name() {
         assert_eq!(name("Ark I \u{00b7} v1.2"), None);

@@ -36,19 +36,28 @@ use error::Error;
 use serde_json::{Value, json};
 use std::process::ExitCode;
 
-/// Parses the invocation, installs output and interruption, then reports one outcome.
-/// Help and usage failures honor stream formatting even before typed parsing succeeds.
+/// Parses the invocation, installs output and interruption handling, then
+/// reports one outcome.
+///
+/// Help and usage failures honor stream formatting even before typed parsing
+/// succeeds.
 fn main() -> ExitCode {
+    // A hidden sole argument runs the detached release lookup instead
     let arguments: Vec<_> = std::env::args_os().collect();
     if arguments.len() == 2 && arguments[1] == update::ENTRY_POINT {
         update::run();
         return ExitCode::SUCCESS;
     }
+
+    // Find --json by hand, so a usage failure can still answer in JSON
     let json = arguments
         .iter()
         .skip(1)
         .take_while(|arg| *arg != "--")
         .any(|arg| arg == "--json");
+
+    // Parse with the themed command. A clap display that exits cleanly prints
+    // as it is, and any other failure is a usage error.
     let mut command = help::command(&help::theme());
     let matches = match command.try_get_matches_from_mut(&arguments) {
         Ok(matches) => matches,
@@ -83,6 +92,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Install output, logging and interruption handling before any work
     let output = output::Output::new(&cli.options);
     logging::init(output.clone(), cli.options.verbose, cli.options.log);
     let interrupt = match interrupt::Interrupt::install(output.clone()) {
@@ -92,14 +103,18 @@ fn main() -> ExitCode {
             return ExitCode::from(error.class);
         }
     };
+
+    // A failed validation becomes the result, reported like any command failure
     let validation = cli.validate();
     let context = Context {
         options: cli.options,
         output,
         interrupt,
     };
-    // Valid commands print the release note, except help, completions, --version, a bare run and doctor.
-    // The note comes before any connection, so it reads the real clock.
+
+    // Valid commands print the newer release note, except help, completions,
+    // --version, a bare run and doctor. The note comes before any connection,
+    // so it reads the real clock.
     if validation.is_ok()
         && !cli.help
         && !cli.version
@@ -113,6 +128,8 @@ fn main() -> ExitCode {
             chrono::DateTime::from(Clock::real().system_time()),
         );
     }
+
+    // Run the command, or print the top-level help or the versions when asked
     let result = if let Err(error) = validation {
         Err(error)
     } else if cli.help {
@@ -122,6 +139,7 @@ fn main() -> ExitCode {
     } else {
         run(&context, cli.command)
     };
+
     // Wait for interruption cleanup already in progress. Stop the live line
     // before printing an error, preserving a result already emitted by a command.
     context.interrupt.finished();
@@ -137,7 +155,9 @@ fn main() -> ExitCode {
         }
     }
 }
-/// Dispatches one command; an absent command prints top-level help without discovery.
+
+/// Dispatches one command; an absent command prints top-level help without
+/// discovery.
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
         None => {
@@ -166,6 +186,7 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         }
     }
 }
+
 /// Reports compiled crate versions and the firmware compatibility baseline.
 pub(crate) fn versions() -> Value {
     json!({

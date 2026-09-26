@@ -4,7 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! App results and CLI cancellation handles.
+//! App commands, which run an app on the Ark and report its result, or cancel
+//! a task.
 
 use crate::{
     args,
@@ -18,9 +19,12 @@ use darkbio_connect::{ExecutionProgress, schema};
 use serde_json::{Value, json};
 
 /// Cancels an explicit task or uploads and runs a local app after unlock.
-/// The connector owns protocol sequencing; the CLI owns progress, partial results
-/// and byte-preserving report output. An app failure retains its returned result.
+///
+/// The connection library owns protocol sequencing, and the CLI owns progress,
+/// partial results and byte-preserving report output. An app failure retains
+/// its returned result.
 pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
+    // A cancel request goes straight to the Ark and reports the task it named
     let args::App::Run { file: path } = command else {
         let args::App::Cancel { task } = command else {
             unreachable!()
@@ -34,15 +38,23 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
             .output
             .document(&json!({"task":task.to_string(),"cancelled":true}));
     };
+
+    // Open the app before connecting, then require an unlocked Ark
     let (mut file, size) = open_file(&path)?;
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, false)?;
+
+    // The result starts unknown and fills in as the run goes. Running progress
+    // repeats at most every second on a terminal, and every 5 s elsewhere.
     let mut value = json!({"task":null,"app":{"name":null,"version":null},"success":null,"stdout":null,"stderr":null,"duration_seconds":null});
     let clock = connection.client.clock();
     let mut started = None;
     let mut transfer = Transfer::new(context.output.terminal(), clock.clone());
     let report_interval = if context.output.terminal() { 1 } else { 5 };
     let mut reported = None;
+
+    // Upload and run the app, registering the task for interruption as soon as
+    // the Ark names it
     let result =
         connection
             .client
@@ -76,6 +88,8 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                     }
                 }
             });
+
+    // A failed run still prints the partial JSON result once a task started
     context.interrupt.clear();
     let result = match result {
         Ok(result) => result,
@@ -86,12 +100,16 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
             return Err(error.into());
         }
     };
+
+    // Complete the result, keeping output that is not UTF-8 as base64
     value["app"] = json!({"name":result.app_name,"version":result.app_version});
     value["success"] = json!(result.success);
     let duration = clock.elapsed(started.expect("successful execution reported running"));
     value["duration_seconds"] = json!(duration.as_secs());
     bytes(&mut value, "stdout", &result.stdout);
     bytes(&mut value, "stderr", &result.stderr);
+
+    // Print the report as it came, then fail when the app reported failure
     if context.output.json() {
         context.output.document(&value)?;
     } else {
@@ -113,7 +131,8 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     }
 }
 
-/// Stores valid UTF-8 verbatim; other bytes replace the text key with a base64 sibling.
+/// Stores valid UTF-8 verbatim; other bytes replace the text key with a base64
+/// sibling.
 fn bytes(value: &mut Value, name: &str, bytes: &[u8]) {
     match std::str::from_utf8(bytes) {
         Ok(text) => value[name] = json!(text),
@@ -133,9 +152,13 @@ fn bytes(value: &mut Value, name: &str, bytes: &[u8]) {
     }
 }
 
+/// Tests of the app result encoding.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks that output that is not UTF-8 becomes base64 in the same key
+    /// position, while UTF-8 output stays text.
     #[test]
     fn app_output_is_never_lossily_decoded() {
         let mut result = json!({"task":u64::MAX.to_string(),"stdout":null,"stderr":null});

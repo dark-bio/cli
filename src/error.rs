@@ -4,13 +4,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Stable caller actions around opaque application refusals.
+//! CLI errors with stable exit classes and machine codes, around opaque
+//! application refusals.
 
 use darkbio_connect::{Error as ConnectError, schema, wire};
 use serde_json::{Value, json};
 
 /// CLI failure with a stable exit class and machine code, plus actionable hints.
-/// Application error numbers and messages remain opaque and are retained verbatim.
+///
+/// Application error numbers and messages remain opaque and are retained
+/// verbatim.
 #[derive(Debug)]
 pub(crate) struct Error {
     /// Process exit class, shared by errors requiring the same caller action.
@@ -36,13 +39,16 @@ impl Error {
             remote: None,
         }
     }
+
     /// Appends a caller action in the order it should be presented.
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hints.push(hint.into());
         self
     }
-    /// Encodes the result error; hints travel as stderr events instead. The
-    /// Ark's number is a decimal string, as every 64-bit value is in JSON.
+
+    /// Encodes the error for the JSON result, leaving hints to stderr events.
+    ///
+    /// The Ark's number is a decimal string, as every 64-bit value is in JSON.
     pub fn json(&self) -> Value {
         let mut value = json!({"code": self.code, "message": self.message});
         if let Some(remote) = &self.remote {
@@ -58,11 +64,15 @@ impl std::fmt::Display for Error {
         f.write_str(&self.message)
     }
 }
+
 impl std::error::Error for Error {}
 
 impl From<ConnectError> for Error {
-    /// Maps connector failures to caller actions without interpreting app codes.
-    /// Download adapters can carry an existing CLI error through a reader failure.
+    /// Maps connection library failures to caller actions without interpreting
+    /// app codes.
+    ///
+    /// Download adapters can carry an existing CLI error through a reader
+    /// failure, which comes back unchanged.
     fn from(error: ConnectError) -> Self {
         use ConnectError::*;
         match error {
@@ -181,12 +191,16 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Tests of the mapping from connection library failures to CLI errors.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Checks that handshake and pairing failures keep their class, code and
+    /// message.
     #[test]
     fn handshake_and_pairing_errors_retain_caller_actions() {
+        // A refused handshake reports the reason the handshake gave
         let err = Error::from(ConnectError::Handshake(
             wire::transport::Error::HandshakeFailed("attestation signed by an unknown key".into())
                 .into(),
@@ -194,6 +208,9 @@ mod tests {
         assert_eq!((err.class, err.code), (3, "handshake-failed"));
         assert_eq!(err.message, "attestation signed by an unknown key");
         assert!(err.hints.is_empty());
+
+        // An expired pairing is an approval timeout, and a failed one keeps its
+        // message
         let err = Error::from(ConnectError::PairingExpired);
         assert_eq!((err.class, err.code), (6, "approval-timeout"));
         let err = Error::from(ConnectError::Pairing("companion disconnected".into()));
@@ -201,8 +218,10 @@ mod tests {
         assert_eq!(err.message, "companion disconnected");
     }
 
-    /// An application code can share low bits with a reserved code without
-    /// being interpreted by the host. Its message and full number survive.
+    /// Checks that application codes stay opaque, even when their low bits
+    /// match a reserved code.
+    ///
+    /// The message and the full number survive into the JSON result.
     #[test]
     fn application_errors_are_opaque() {
         for code in [
@@ -220,6 +239,8 @@ mod tests {
         }
     }
 
+    /// Checks that a CLI error carried through a firmware read comes back with
+    /// its hint, and a read timeout keeps the timeout class.
     #[test]
     fn download_error_retains_required_caller_action() {
         let source = Error::new(4, "login-required", "sign in to the package host")
@@ -227,6 +248,9 @@ mod tests {
         let error: Error = ConnectError::FirmwareRead(std::io::Error::other(source)).into();
         assert_eq!(error.code, "login-required");
         assert_eq!(error.hints.len(), 1);
+
+        // A read timeout without a CLI error inside is a timeout with its own
+        // message
         let error: Error = ConnectError::FirmwareRead(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "stalled",
@@ -235,6 +259,9 @@ mod tests {
         assert_eq!(error.class, 7);
         assert_eq!(error.message, "stalled");
     }
+
+    /// Checks that a denied and an unconfirmed approval map to distinct codes
+    /// of the approval class.
     #[test]
     fn reserved_approval_outcomes_are_distinct() {
         for (code, name) in [

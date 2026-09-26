@@ -4,7 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! A reading view or a JSON result, with diagnostics confined to stderr.
+//! Output layer that prints one result as a reading view or JSON, with
+//! diagnostics confined to stderr.
 
 pub(crate) mod human;
 
@@ -22,10 +23,13 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Clonable output handle for one invocation. Result emission is claimed once;
-/// events and live stderr lines share terminal state across clones.
+/// Clonable output handle for one invocation.
+///
+/// The first result claims stdout, and later ones are ignored. Events and live
+/// stderr lines share terminal state across clones.
 #[derive(Clone)]
 pub(crate) struct Output(Arc<State>);
+
 /// Immutable stream policy and synchronization shared by output handles.
 struct State {
     /// Whether stdout uses a JSON document and stderr uses JSON events.
@@ -34,7 +38,8 @@ struct State {
     out: Theme,
     /// Capabilities of stderr, including live progress support.
     err: Theme,
-    /// Suppresses optional events while retaining approvals, errors and hints.
+    /// Whether optional events are hidden, keeping approvals, errors, hints
+    /// and logs.
     quiet: bool,
     /// Whether step narration is enabled.
     verbose: bool,
@@ -42,27 +47,32 @@ struct State {
     printed: AtomicBool,
     /// Whether a non-release route was announced during this command.
     environment_noted: AtomicBool,
-    /// Serializes result claims and writes; acquired before the terminal lock.
+    /// Lock that serializes result claims and writes, taken before the ticker
+    /// and terminal locks.
     result: Mutex<()>,
     /// Clock of the latest connection, which times every wait display.
     clock: Mutex<Option<Clock>>,
-    /// Worker redrawing the active wait. Its lock orders every change of the
-    /// wait display with the worker's replacement, and comes before the
-    /// terminal lock.
+    /// Worker redrawing the active wait.
+    ///
+    /// Its lock orders every change of the wait display with the worker's
+    /// replacement, and comes before the terminal lock.
     ticker: Mutex<Option<Ticker>>,
-    /// Serializes stderr line changes and spacing around human result blocks.
+    /// Terminal layout, whose lock serializes stderr line changes and spacing
+    /// around human result blocks.
+    ///
     /// The redraw worker shares it, but never the rest of the output.
     terminal: Arc<Mutex<Terminal>>,
 }
 
 /// Owner of a worker that redraws a wait display once a second on a clock.
+///
 /// Dropping it stops the worker and waits for it to exit. The worker holds
 /// only what it draws with, never its owner, so the owner is never dropped on
 /// the worker's own thread.
 struct Ticker {
-    /// Disconnects when dropped, which wakes the worker to exit.
+    /// Sender of the stop channel, whose drop wakes the worker to exit.
     stop: Option<crossbeam_channel::Sender<()>>,
-    /// Joined on drop, so no redraw outlives the display.
+    /// Worker thread, joined on drop so no redraw outlives the display.
     worker: Option<JoinHandle<()>>,
 }
 
@@ -143,20 +153,22 @@ impl Output {
     pub fn connection(&self, clock: Clock) {
         *self.0.clock.lock().expect("output not poisoned") = Some(clock);
     }
-    /// Whether the caller requested JSON for both output streams.
+    /// Reports whether the caller requested JSON for both output streams.
     pub fn json(&self) -> bool {
         self.0.json
     }
-    /// Whether stderr supports live progress.
+    /// Reports whether stderr supports live progress.
     pub fn terminal(&self) -> bool {
         self.0.err.interactive
     }
-    /// Whether a result was claimed, so failure reporting must not emit another.
+    /// Reports whether a result was claimed, so failure reporting must not
+    /// emit another.
     pub fn printed(&self) -> bool {
         self.0.printed.load(Ordering::SeqCst)
     }
 
-    /// Reconnects share one environment note for the command.
+    /// Notes a non-release environment once per command, however often it
+    /// reconnects.
     pub fn environment(&self, env: Environment) {
         if let Some(message) = self.environment_note(env) {
             self.event("note", message);
@@ -180,6 +192,7 @@ impl Output {
     }
 
     /// Emits the sole result, invoking the custom renderer only for human stdout.
+    ///
     /// Later result attempts are ignored, including after an earlier write failed.
     pub fn document_with(
         &self,
@@ -208,7 +221,8 @@ impl Output {
         self.grouped_table(document, rows, columns, &[])
     }
 
-    /// Adds group labels parallel to rows; JSON keeps all fields.
+    /// Renders rows as a table under group headings, given one group per row;
+    /// JSON keeps the complete document.
     pub fn grouped_table(
         &self,
         document: &Value,
@@ -225,7 +239,9 @@ impl Output {
     }
 
     /// Ends live stderr activity and writes a complete stdout result block.
-    /// The caller holds the result lock; terminal state is acquired second.
+    ///
+    /// The caller holds the result lock, which comes before the ticker and
+    /// terminal locks.
     fn write_result(&self, text: &str) -> Result<(), Error> {
         let mut terminal = self.end_wait();
         close_line(&mut terminal, &mut io::stderr().lock());
@@ -239,18 +255,26 @@ impl Output {
         Ok(())
     }
 
-    /// App reports and dataset READMEs are payloads that bypass every layout rule.
+    /// Emits an app's report as the sole result, copying its bytes unchanged.
+    ///
+    /// The report goes to stdout without any layout. A nonempty app stderr
+    /// follows on stderr, after a note with its size.
     pub fn app(&self, stdout: &[u8], stderr: &[u8]) -> Result<(), Error> {
+        // Claim the sole result, ignoring every later attempt
         let _result = self.0.result.lock().expect("output not poisoned");
         if self.0.printed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+
+        // End live terminal activity and copy the report to stdout
         self.finish();
         {
             let mut output = io::stdout().lock();
             output.write_all(stdout)?;
             output.flush()?;
         }
+
+        // Copy a nonempty app stderr after a note with its size
         if !stderr.is_empty() {
             self.event("note", format!("app stderr, {} bytes", stderr.len()));
             let mut output = io::stderr().lock();
@@ -261,18 +285,25 @@ impl Output {
     }
 
     /// Writes a best-effort stderr event under quiet and verbosity policy.
-    /// Single-line approvals start a presentation timer on interactive terminals.
+    ///
+    /// A single-line approval starts a wait display on an interactive terminal,
+    /// unless quiet hides it.
     pub fn event(&self, kind: &str, message: impl AsRef<str>) {
+        // Quiet hides the optional events, and steps need verbose
         if self.0.quiet && matches!(kind, "progress" | "note" | "warning" | "step") {
             return;
         }
         if kind == "step" && !self.0.verbose {
             return;
         }
-        let message = message.as_ref();
+
         // JSON escapes on its own; the reading streams get a printable copy,
-        // since a device name or verdict must not drive the terminal.
+        // since a device name or verdict must not drive the terminal
+        let message = message.as_ref();
         let shown = style::printable(message);
+
+        // Progress on a terminal takes the live line of its stage, which the
+        // text before the first colon names
         if kind == "progress" && self.terminal() {
             let theme = &self.0.err;
             let line = format!(
@@ -283,6 +314,9 @@ impl Output {
             self.progress_line(shown.split(':').next().unwrap_or(&shown), &line);
             return;
         }
+
+        // Notes, warnings, steps and logs keep a wait display running, and
+        // other events end it before their line
         {
             let mut terminal = if matches!(kind, "note" | "warning" | "step" | "log") {
                 self.0.terminal.lock().expect("output not poisoned")
@@ -302,12 +336,15 @@ impl Output {
             terminal.err_printed = true;
             let _ = stderr.flush();
         }
+
+        // A single-line approval starts a wait display for its answer
         if kind == "approve" && !message.contains('\n') {
             self.wait("waiting", None);
         }
     }
 
-    /// Selects a live human observation or the established machine progress line.
+    /// Shows an update as a live terminal line, or elsewhere as a progress
+    /// event with its stable text.
     pub fn progress(&self, update: &crate::progress::Update) {
         if self.terminal() {
             self.progress_line(&update.stage, &update.render(&self.0.err));
@@ -317,11 +354,14 @@ impl Output {
     }
 
     /// Replaces the same live stage in place, preserving a completed previous stage.
+    ///
     /// Redirected human output appends lines without terminal control sequences.
     fn progress_line(&self, key: &str, line: &str) {
         if self.0.quiet {
             return;
         }
+
+        // Erase the same stage's line for a redraw, or close an earlier one
         let mut terminal = self.end_wait();
         let mut stderr = io::stderr().lock();
         if terminal
@@ -334,6 +374,9 @@ impl Output {
         } else {
             close_line(&mut terminal, &mut stderr);
         }
+
+        // Fit the line to the width, leaving it open on a terminal for the next
+        // update
         separate_result(&mut terminal, &mut stderr);
         let line = self
             .0
@@ -349,7 +392,8 @@ impl Output {
         let _ = stderr.flush();
     }
 
-    /// Optional human detail has no counterpart in the machine event stream.
+    /// Emits an event only on a terminal, for human detail that has no
+    /// counterpart in the machine event stream.
     pub fn human_event(&self, kind: &str, message: impl AsRef<str>) {
         if self.terminal() {
             self.event(kind, message);
@@ -402,11 +446,18 @@ impl Output {
         }
     }
 
-    /// Presents a scan URL and a QR code when terminal width and Unicode permit.
-    /// The caller uses this renderer only outside JSON, where the URL is structured.
+    /// Presents a pairing URL to scan, with a QR code when Unicode and the
+    /// terminal width permit.
+    ///
+    /// It announces the approval first and then counts down to `deadline`. The
+    /// caller uses it only on a terminal; elsewhere the URL goes out in an
+    /// approval event.
     pub fn pairing(&self, url: &str, deadline: Instant) {
+        // Announce the approval and close any live line
         self.event("approve", "scan in Ark Companion");
         self.finish();
+
+        // Draw the QR code when Unicode is on and every line fits, then the URL
         {
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
             let mut stderr = io::stderr().lock();
@@ -442,11 +493,16 @@ impl Output {
             );
             terminal.err_printed = true;
         }
+
+        // Count down to the scan deadline
         self.wait("scan", Some(deadline));
     }
 
-    /// The timer only draws while a wait is active. It never bounds the call.
-    /// It runs on the latest connection's clock and stays hidden before one.
+    /// Shows a wait display counting the elapsed time, or down to `until`.
+    ///
+    /// The display is presentation only and never bounds the call. It needs an
+    /// interactive stderr outside quiet mode, runs on the latest connection's
+    /// clock and stays hidden before a connection exists.
     pub fn wait(&self, label: &str, until: Option<Instant>) {
         if !self.0.err.interactive || self.0.quiet {
             return;
@@ -455,18 +511,21 @@ impl Output {
     }
 
     /// Replaces any earlier wait display with one drawn to `screen`, which the
-    /// worker then redraws every second. The replacement happens under the
-    /// ticker lock, so a concurrent change of the display lands before or after
-    /// it as a whole.
+    /// worker then redraws every second.
+    ///
+    /// The replacement happens under the ticker lock, so a concurrent change of
+    /// the display lands before or after it as a whole.
     fn show_wait<W: Write>(
         &self,
         label: &str,
         until: Option<Instant>,
         screen: impl Fn() -> W + Send + 'static,
     ) {
+        // Without a connection's clock, no wait display shows
         let Some(clock) = self.0.clock.lock().expect("output not poisoned").clone() else {
             return;
         };
+
         // Stop the earlier worker before touching the terminal, which it draws on
         let mut ticker = self.0.ticker.lock().expect("output not poisoned");
         drop(ticker.take());
@@ -482,6 +541,7 @@ impl Output {
             });
             tick(&self.0.err, &mut terminal, &mut screen(), now);
         }
+
         // Install the worker before another change can take the ticker lock
         let theme = self.0.err.clone();
         let terminal = self.0.terminal.clone();
@@ -517,6 +577,8 @@ impl Output {
 
     /// Reports a failure and its hints on stderr without claiming a stdout result.
     pub fn error(&self, error: &Error) {
+        // End live activity, then write the error as a JSON event or a
+        // printable line
         self.finish();
         if self.json() {
             self.event_value(json!({"event":"error", "error":error.json()}));
@@ -544,19 +606,22 @@ impl Output {
             }
             terminal.err_printed = true;
         }
+
+        // Hints follow as events of their own
         for hint in &error.hints {
             self.event("hint", hint);
         }
     }
 
     /// Writes one preassembled JSON event after ending live terminal activity.
-    /// The caller is responsible for selecting this path only in JSON mode.
+    ///
+    /// The caller uses it only in JSON mode.
     pub fn event_value(&self, value: Value) {
         self.finish();
         let _ = writeln!(io::stderr().lock(), "{value}");
     }
 
-    /// Stops the active timer and closes its live line; safe to call repeatedly.
+    /// Stops the wait display and closes the live line; safe to call repeatedly.
     pub fn finish(&self) {
         let mut terminal = self.end_wait();
         let mut stderr = io::stderr().lock();
@@ -565,8 +630,10 @@ impl Output {
     }
 
     /// Ends the wait display and returns the terminal for the caller's next
-    /// write. The worker is stopped under the ticker lock and joined before
-    /// the terminal lock is taken, since each redraw takes that lock too.
+    /// write.
+    ///
+    /// The worker is stopped under the ticker lock and joined before the
+    /// terminal lock is taken, since each redraw takes that lock too.
     fn end_wait(&self) -> MutexGuard<'_, Terminal> {
         let mut ticker = self.0.ticker.lock().expect("output not poisoned");
         drop(ticker.take());
@@ -620,6 +687,8 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
     let Some(wait) = &terminal.waiting else {
         return;
     };
+
+    // Count down to the bound, or up from the start
     let time = match wait.until {
         Some(until) => format!("{} s left", until.saturating_duration_since(now).as_secs()),
         None => format!(
@@ -635,6 +704,9 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
             theme.glyph("\u{00b7}", "-")
         ),
     );
+
+    // Replace the previous frame with a temporary line that the next write
+    // erases
     close_line(terminal, output);
     let _ = write!(
         output,
@@ -646,7 +718,9 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
 }
 
 /// Formats scalar values and lists without terminal styling or field-specific units.
-/// Text is made printable here, since every reading layout passes through it.
+///
+/// Text is made printable here, since the document and table layouts pass
+/// through it.
 pub(crate) fn scalar(value: &Value) -> String {
     match value {
         Value::Null => "-".into(),
@@ -658,6 +732,7 @@ pub(crate) fn scalar(value: &Value) -> String {
     }
 }
 
+/// Tests of wait displays, event lines and the environment note.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,7 +743,8 @@ mod tests {
     use std::sync::{TryLockError, mpsc};
     use std::thread;
 
-    /// Captures the frames that wait displays draw in place of stderr.
+    /// In-memory screen holding the frames that wait displays draw in place of
+    /// stderr.
     #[derive(Clone, Default)]
     struct Screen(Arc<Mutex<Vec<u8>>>);
 
@@ -720,9 +796,8 @@ mod tests {
         }
     }
 
-    /// A wait arriving while another replaces the display goes after it, so its
-    /// display is the one that its sole worker redraws. Dropping the output then
-    /// stops that worker while it waits for the next redraw.
+    /// A wait arriving while another replaces the display lands after it, and
+    /// its sole worker stops when the output drops.
     #[test]
     fn test_concurrent_waits_keep_one_worker() {
         // Hold the terminal, so the first wait stops inside its replacement
@@ -819,6 +894,7 @@ mod tests {
         assert_eq!(tester.next_deadline(), None);
     }
 
+    /// Event lines keep their kind prefix, style inline commands and mark steps.
     #[test]
     fn events_keep_prefixes_and_style_inline_commands() {
         let theme = Theme::test(80, Color::Basic, true);
@@ -836,8 +912,11 @@ mod tests {
         );
     }
 
+    /// A wait line is erased, while a finished progress line stays, ended by one
+    /// newline.
     #[test]
     fn waiting_line_is_erased_but_completed_progress_stays() {
+        // The first frame counts up from the start of the wait
         let theme = Theme::test(80, Color::Off, true);
         let started = TestClock::new().clock().now();
         let mut terminal = Terminal {
@@ -860,6 +939,8 @@ mod tests {
             "         waiting \u{00b7} 2 s elapsed"
         );
         output.clear();
+
+        // A countdown frame erases the previous frame first
         terminal.waiting.as_mut().unwrap().until = Some(started + Duration::from_secs(20));
         tick(
             &theme,
@@ -872,6 +953,8 @@ mod tests {
             format!("{}         waiting \u{00b7} 15 s left", style::CLEAR_LINE)
         );
         output.clear();
+
+        // Closing erases the wait line, and a tick without a wait draws nothing
         terminal.waiting = None;
         close_line(&mut terminal, &mut output);
         tick(
@@ -882,12 +965,17 @@ mod tests {
         );
         assert_eq!(output, style::CLEAR_LINE.as_bytes());
         output.clear();
+
+        // A finished progress line ends with one newline, however often it
+        // closes
         terminal.live = Some(("uploading".into(), false));
         close_line(&mut terminal, &mut output);
         close_line(&mut terminal, &mut output);
         assert_eq!(output, b"\n");
     }
 
+    /// A non-release environment is noted once per output, and never under
+    /// quiet.
     #[test]
     fn nonrelease_environment_is_noted_once_unless_quiet() {
         for env in [Environment::Develop, Environment::Staging] {

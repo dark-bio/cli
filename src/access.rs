@@ -20,13 +20,18 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// Prompt policy copied into a connection without retaining its session owner.
 pub(crate) struct Login {
-    clock: Clock,                  // connection's clock, which its deadlines are measured on
-    output: crate::output::Output, // Invocation's shared diagnostic stream
-    interactive: bool,             // Whether browser login is permitted
+    /// Clock of the connection, which measures the deadlines it passes in.
+    clock: Clock,
+    /// Shared diagnostic stream of the invocation.
+    output: crate::output::Output,
+    /// Whether a browser login may start.
+    interactive: bool,
 }
 
 impl Login {
-    /// Captures CLI policy without looking up credentials or contacting a host.
+    /// Captures the invocation's prompt policy for a connection, without
+    /// looking up credentials or contacting a host.
+    ///
     /// The connection's clock measures the deadlines it passes in.
     pub fn new(context: &Context, clock: Clock) -> Self {
         Self {
@@ -56,12 +61,16 @@ impl darkbio_connect::CloudAuth for Login {
         .unwrap_or_default()
     }
 
-    /// Recognizes Access separately from the cloud's device proof refusal.
+    /// Recognizes a Cloudflare Access refusal, as [`required`] defines it.
     fn rejected(&self, origin: &str, status: StatusCode, headers: &HeaderMap) -> bool {
         required(origin, status, headers)
     }
 
-    /// Leaves browser interaction out of noninteractive commands and the connector.
+    /// Runs a browser login for an internal API host, only when the invocation
+    /// allows prompts.
+    ///
+    /// The login window is 600 s on the connection's clock, cut short by an
+    /// earlier caller deadline.
     fn login(&self, origin: &str, deadline: Option<Instant>) -> Result<HeaderMap, String> {
         if !matches!(
             origin,
@@ -87,7 +96,9 @@ fn headers(token: &str) -> Result<HeaderMap, String> {
 }
 
 impl Login {
-    /// Starts one browser login under the supplied human or absolute window.
+    /// Runs one browser login through cloudflared, which must end by `deadline`.
+    ///
+    /// A noninteractive invocation fails at once, without starting the helper.
     fn authenticate(&self, origin: &str, deadline: Instant) -> Result<String, String> {
         if !self.interactive {
             return Err(format!("access to {origin} requires login"));
@@ -106,7 +117,9 @@ impl Login {
 }
 
 /// Asks cloudflared for a cached application token, treating failure as no
-/// credentials. The lookup gets one command budget on the connection's clock.
+/// credentials.
+///
+/// The lookup gets one command budget on the connection's clock.
 pub(crate) fn cached(context: &Context, clock: &Clock, origin: &str) -> Option<String> {
     token(
         Command::new("cloudflared").args(["access", "token", "--app", origin]),
@@ -116,9 +129,11 @@ pub(crate) fn cached(context: &Context, clock: &Clock, origin: &str) -> Option<S
     .ok()
 }
 
-/// Starts browser login only when stdin prompts are permitted, under a separate
-/// human login window on the connection's clock. Noninteractive callers receive
-/// the manual login command.
+/// Runs a browser login for `origin` when prompts are permitted, within a 600 s
+/// window on the connection's clock.
+///
+/// Any failure, a noninteractive invocation included, returns a
+/// `login-required` error that hints at the manual login command.
 pub(crate) fn authenticate(
     context: &Context,
     clock: &Clock,
@@ -132,8 +147,12 @@ pub(crate) fn authenticate(
         })
 }
 
-/// Recognizes this tenant's login redirects and HTML refusals on internal hosts.
-/// Cloud proof refusals remain plain responses and never start browser login.
+/// Checks whether a response from an internal host is a Cloudflare Access
+/// refusal.
+///
+/// A refusal is a redirect to this tenant's login page for the host, or a 401
+/// or 403 status with an HTML body. Cloud proof refusals remain plain
+/// responses and never start a browser login.
 pub(crate) fn required(origin: &str, status: StatusCode, headers: &HeaderMap) -> bool {
     if !matches!(
         origin,
@@ -177,11 +196,14 @@ fn challenge(origin: &str, redirect: &str) -> bool {
         )
 }
 
-/// Captures credentials without forwarding helper output to the terminal.
+/// Runs a helper command and returns the application token it prints, never
+/// forwarding its output to the terminal.
+///
 /// Expiration kills and reaps the helper, including while its output is blocked.
 /// The helper's exit and output arrive as events, which the deadline bounds on
-/// the clock.
+/// the clock. Output that is not a well-formed token fails without being echoed.
 fn token(command: &mut Command, clock: &Clock, deadline: Instant) -> Result<String, ConnectError> {
+    // Start the helper with only its stdout connected, unless the time is up
     remaining(clock, deadline)?;
     let mut child = Child(
         command
@@ -200,6 +222,8 @@ fn token(command: &mut Command, clock: &Clock, deadline: Instant) -> Result<Stri
                 }
             })?,
     );
+
+    // Read the output on a thread of its own, stopping one byte past 64 KiB
     let stdout = child.0.stdout.take().expect("piped helper stdout");
     let (send, output) = crossbeam_channel::unbounded();
     thread::Builder::new()
@@ -228,6 +252,9 @@ fn token(command: &mut Command, clock: &Clock, deadline: Instant) -> Result<Stri
     drop(abandon);
     let _ = watcher.join();
     let output = result?;
+
+    // Accept at most 64 KiB, holding three nonempty dot-separated parts of
+    // URL-safe base64
     let token = String::from_utf8_lossy(&output);
     let token = token.trim();
     if output.len() > 64 * 1024
@@ -246,8 +273,9 @@ fn token(command: &mut Command, clock: &Clock, deadline: Instant) -> Result<Stri
     Ok(token.to_owned())
 }
 
-/// Waits until the deadline for the helper's exit and then for its output. A
-/// failed helper is reported by its exit status, never by its output.
+/// Waits until the deadline for the helper's exit and then for its output.
+///
+/// A failed helper is reported by its exit status, never by its output.
 fn settle(
     clock: &Clock,
     deadline: Instant,
@@ -283,9 +311,10 @@ fn settle(
         .map_err(|error| ConnectError::Cloud(format!("could not read cloudflared token: {error}")))
 }
 
-/// Polls the helper until it exits and reports the exit. A waiter that gives
-/// up disconnects `abandoned`, which ends the polls at once. Dropping the
-/// helper kills and reaps it either way.
+/// Polls the helper until it exits and reports the exit.
+///
+/// A waiter that gives up disconnects `abandoned`, which ends the polls at
+/// once. Dropping the helper kills and reaps it either way.
 #[expect(
     clippy::disallowed_methods,
     reason = "try_wait observes the helper's exit, and real time only paces its polls"
@@ -313,8 +342,10 @@ fn watch(
     }
 }
 
-/// Requires a positive remaining helper budget on the clock before spawning or
-/// receiving.
+/// Returns the time left before `deadline` on the clock, failing with a timeout
+/// when none is left.
+///
+/// Helper runs check it before spawning or receiving.
 fn remaining(clock: &Clock, deadline: Instant) -> Result<Duration, ConnectError> {
     deadline
         .checked_duration_since(clock.now())
@@ -326,21 +357,27 @@ fn remaining(clock: &Clock, deadline: Instant) -> Result<Duration, ConnectError>
 struct Child(std::process::Child);
 
 impl Drop for Child {
-    /// Reaps the helper even when output collection, validation or the deadline failed.
+    /// Kills and reaps the helper, even when output collection, validation or
+    /// the deadline failed.
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
+/// Tests of the Access refusal checks and the cloudflared helper runs.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::wait_deadline;
     use darkbio_clock::TestClock;
 
+    /// Checks that login redirects and HTML refusals on internal hosts count
+    /// as Access refusals, while JSON refusals and other hosts do not.
     #[test]
     fn access_refusals_do_not_include_device_proof_errors() {
+        // On each internal host, a login redirect and an HTML refusal count, but
+        // a bare or JSON refusal does not
         for origin in [
             "https://api.darkbio.dev",
             "https://api.darkbio.xyz",
@@ -368,6 +405,8 @@ mod tests {
                 headers.clear();
             }
         }
+
+        // Public, lookalike and plain HTTP hosts never count, even with HTML
         let headers = HeaderMap::from_iter([(
             "content-type".parse().unwrap(),
             "text/html".parse().unwrap(),
@@ -382,10 +421,15 @@ mod tests {
         }
     }
 
+    /// Checks that a noninteractive login fails with the manual login command
+    /// as its hint, and a public host gets no headers.
     #[test]
     fn noninteractive_login_returns_an_action_without_starting_a_helper() {
         use clap::Parser;
         use darkbio_connect::CloudAuth;
+
+        // A noninteractive login refuses, and the refusal maps to a
+        // login-required error with the manual command
         let options = crate::args::Cli::parse_from(["ark", "--no-input"]).options;
         let clock = TestClock::new().clock();
         let login = Login {
@@ -403,6 +447,8 @@ mod tests {
             error.hints,
             ["run `cloudflared access login --app https://api.darkbio.dev`"]
         );
+
+        // A public host gets no headers, so no helper starts for it
         assert!(
             login
                 .headers("https://api.dark.bio", clock.now())
@@ -410,6 +456,8 @@ mod tests {
         );
     }
 
+    /// Checks that only the tenant's login page for the exact host counts as a
+    /// challenge.
     #[test]
     fn challenge_is_scoped_to_our_tenant_and_package_host() {
         assert!(challenge(
@@ -425,11 +473,15 @@ mod tests {
             assert!(!challenge("https://pkg.darkbio.dev", redirect));
         }
     }
-    /// Helper failures and malformed stdout are reported without including the
-    /// token. The tests use a local child instead of opening a browser.
+
+    /// Checks that a helper's token comes back, while helper failures and
+    /// malformed output never echo it.
+    ///
+    /// A local shell stands in for cloudflared, so no browser opens.
     #[cfg(unix)]
     #[test]
     fn test_token() {
+        // A well-formed token comes back without its line ending
         let clock = TestClock::new().clock();
         let deadline = clock.now() + Duration::from_secs(5);
         assert_eq!(
@@ -441,6 +493,8 @@ mod tests {
             .unwrap(),
             "e30.e30.signature"
         );
+
+        // Empty, malformed, failed and oversized output fails without the token
         for script in [
             "exit 0",
             "printf 'private-token'",
@@ -451,6 +505,8 @@ mod tests {
                 token(Command::new("sh").args(["-c", script]), &clock, deadline).unwrap_err();
             assert!(!error.to_string().contains("private-token"));
         }
+
+        // A missing helper asks for cloudflared to be installed
         let error = token(
             &mut Command::new("/nonexistent/ark-test-cloudflared"),
             &clock,
@@ -460,8 +516,8 @@ mod tests {
         assert!(error.to_string().contains("install it"));
     }
 
-    /// An expired deadline never starts a helper; a running helper is killed
-    /// promptly instead of surviving until its own login timeout.
+    /// Checks that an expired deadline starts no helper, and a reached deadline
+    /// ends a running one instead of waiting out its own login timeout.
     #[cfg(unix)]
     #[test]
     fn test_deadline() {
@@ -477,7 +533,8 @@ mod tests {
             Err(ConnectError::Timeout)
         ));
 
-        // A helper announces its start through a named pipe, then would run for an hour
+        // A helper announces its start through a named pipe, and would then
+        // run for an hour
         let pipe = std::env::temp_dir().join(format!("ark-access-test-{}", std::process::id()));
         assert!(
             Command::new("mkfifo")
@@ -504,21 +561,20 @@ mod tests {
         ));
     }
 
-    /// Exit status of a helper that ended with `code`.
+    /// Builds the exit status of a helper that ended with `code`.
     #[cfg(unix)]
     fn exited(code: i32) -> ExitStatus {
         std::os::unix::process::ExitStatusExt::from_raw(code << 8)
     }
 
-    /// Exit status of a helper that ended with `code`.
+    /// Builds the exit status of a helper that ended with `code`.
     #[cfg(windows)]
     fn exited(code: i32) -> ExitStatus {
         std::os::windows::process::ExitStatusExt::from_raw(code as u32)
     }
 
-    /// The helper's exit and then its output settle the wait. A failed or
-    /// unobservable exit fails it without the output, and the deadline ends
-    /// the wait for either event.
+    /// Checks that the helper's exit and then its output settle the wait, while
+    /// a failed exit or the deadline ends it.
     #[test]
     fn test_settle() {
         // Settles one helper's events on a thread, under a deadline a second
