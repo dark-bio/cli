@@ -24,9 +24,10 @@ mod socket;
 pub use auth::CloudAuth;
 pub use firmware::{Firmware, UpdateProgress};
 pub use http::Registration;
+pub use relay::RelayNotice;
 
 use crate::schema::{
-    GenuinityProofRequest, RelayArkToAppRequest, RelayJoinRequest, RelayJoinResponse,
+    GenuinityProofRequest, RelayJoinRequest, RelayJoinResponse, RelayOutboundRequest,
 };
 use crate::{Error, Identity, Timing};
 use darkbio_clock::{Clock, sync};
@@ -74,6 +75,8 @@ pub(crate) struct Services {
     state: Mutex<State>,
     /// Lock admitting one firmware update at a time across client clones.
     updating: Mutex<()>,
+    /// Application's observer of the relay's notices.
+    notices: Arc<relay::Observer>,
 }
 
 /// Setup attempts, results and ending reason of one connection.
@@ -87,10 +90,9 @@ struct State {
     error: Option<protocol::Error>,
     /// Cloud sync attempt in flight, which concurrent callers join.
     syncing: Option<Arc<Attempt>>,
-    /// Relay attached to this connection, once a request needs it.
-    relay: Option<relay::Relay>,
-    /// Relay attachment in flight, which concurrent callers join.
-    joining: Option<Arc<Attempt>>,
+    /// Relay of this connection, created by the Ark's first frame or an
+    /// explicit join.
+    relay: Option<Arc<relay::Relay>>,
 }
 
 /// One attempt's outcome, retained by its waiters even after a retry starts.
@@ -123,7 +125,7 @@ enum Failure {
     },
     /// A cloud request or socket failed, or its response could not be used.
     Cloud(String),
-    /// The relay ended, or an exchange on it broke the protocol or its limits.
+    /// A relay attachment or frame delivery failed.
     Relay(String),
     /// A wire request failed or an operation timed out, keeping the Ark's
     /// refusal or the disconnect reason.
@@ -168,6 +170,11 @@ impl Services {
         }
     }
 
+    /// Installs the application's relay observer, without starting the relay.
+    pub(crate) fn set_relay_observer(&self, observer: Arc<dyn Fn(RelayNotice) + Send + Sync>) {
+        self.notices.set(observer);
+    }
+
     /// Converts a request error, replacing a bare closure with the session's
     /// recorded ending reason.
     ///
@@ -196,6 +203,7 @@ impl Services {
             cloud: http::Api::new(identity, cloud, clock),
             state: Mutex::new(State::default()),
             updating: Mutex::new(()),
+            notices: Arc::new(relay::Observer::default()),
         }
     }
 
@@ -227,19 +235,40 @@ impl Services {
             .map_err(Into::into)
     }
 
-    /// Attaches the relay after cloud sync, reusing a healthy attachment.
+    /// Joins the relay after cloud sync, reusing an open socket.
     ///
-    /// A failed relay is replaced on the next call, without replaying any
-    /// operation.
+    /// Concurrent callers share one attempt, each waiting under its own
+    /// deadline. The relay then stays joined until the session ends.
     pub(crate) fn relay(
-        &self,
+        self: &Arc<Self>,
         requester: &Requester,
         timing: impl Into<Timing>,
     ) -> Result<(), Error> {
-        let timing = timing.into();
+        let timing = Timing::until(timing.into().io(&self.clock));
         self.sync(requester, timing)?;
-        self.ensure(requester, Step::Relay, timing)
+        self.relay_worker(requester)?
+            .attach(timing.io(&self.clock))
             .map_err(Into::into)
+    }
+
+    /// Returns this connection's relay, creating it on first use without any
+    /// network I/O.
+    fn relay_worker(self: &Arc<Self>, requester: &Requester) -> Result<Arc<relay::Relay>, Failure> {
+        let mut state = self.state.lock().expect("cloud setup not poisoned");
+        if let Some(error) = &state.error {
+            return Err(error.clone().into());
+        }
+        if self.cloud.is_none() {
+            return Err(Failure::MissingEnvironment);
+        }
+        if state.relay.is_none() {
+            state.relay = Some(Arc::new(relay::Relay::new(
+                Arc::downgrade(self),
+                requester.clone(),
+                self.notices.clone(),
+            )?));
+        }
+        Ok(state.relay.as_ref().unwrap().clone())
     }
 
     /// Establishes one prerequisite, one attempt at a time, while unrelated
@@ -264,9 +293,6 @@ impl Services {
                 {
                     return Ok(());
                 }
-                Step::Relay if state.relay.as_ref().is_some_and(relay::Relay::connected) => {
-                    return Ok(());
-                }
                 _ => {}
             }
 
@@ -277,10 +303,7 @@ impl Services {
             if matches!(step, Step::Refresh) {
                 state.synced = None;
             }
-            let pending = match step {
-                Step::Sync | Step::Refresh => &mut state.syncing,
-                Step::Relay => &mut state.joining,
-            };
+            let pending = &mut state.syncing;
             match pending {
                 Some(attempt) => (attempt.clone(), false),
                 None => {
@@ -305,57 +328,44 @@ impl Services {
 
         // Run setup without the state lock, then publish only if the session
         // remains open. Closure wins over a late successful network response.
-        let result = match step {
-            Step::Sync | Step::Refresh => self
-                .synchronize(requester, timing, matches!(step, Step::Refresh))
-                .map(|refreshed| {
-                    attempt.refreshed.store(refreshed, Ordering::Release);
-                    None
-                }),
-            Step::Relay => self.join(requester, timing).map(Some),
-        };
+        let result = self
+            .synchronize(requester, timing, matches!(step, Step::Refresh))
+            .map(|refreshed| attempt.refreshed.store(refreshed, Ordering::Release));
         let mut state = self.state.lock().expect("cloud setup not poisoned");
         let result = if let Some(error) = &state.error {
             Err(Failure::Wire(error.clone()))
         } else {
-            result.and_then(|relay| {
-                match step {
-                    Step::Sync | Step::Refresh => {
-                        state.synced = Some((self.clock.now(), true));
-                    }
-                    Step::Relay => {
-                        let mut relay = relay.expect("relay setup returned an attachment");
-                        relay.start()?;
-                        state.relay = Some(relay);
-                        tracing::info!(target: "darkbio_connect::setup", "relay attached");
-                    }
-                }
-                Ok(())
-            })
+            result.map(|()| state.synced = Some((self.clock.now(), true)))
         };
 
         // Clear the attempt for the next caller and release its waiters
-        match step {
-            Step::Sync | Step::Refresh => state.syncing = None,
-            Step::Relay => state.joining = None,
-        }
+        state.syncing = None;
         attempt.finish(result.clone());
         result
     }
 
-    /// Authenticates relay attachment with a fresh authorization from the Ark.
-    fn join(&self, requester: &Requester, timing: Timing) -> Result<relay::Relay, Failure> {
+    /// Opens a relay socket with a fresh join token from the Ark.
+    ///
+    /// `connected` receives the TCP stream before the upgrade starts, so the
+    /// relay can shut it down to interrupt a stalled upgrade.
+    fn join(
+        &self,
+        requester: &Requester,
+        timing: Timing,
+        connected: &dyn Fn(&std::net::TcpStream) -> Result<(), Failure>,
+    ) -> Result<socket::Connection, Failure> {
         let cloud = self.cloud.as_ref().expect("cloud route available");
         self.authenticate(requester, timing, || {
             let joined = requester
                 .request(RelayJoinRequest {}, timing.io(&self.clock))?
                 .wait::<RelayJoinResponse>()?;
-            relay::Relay::connect(
+            socket::connect(
                 cloud,
                 &cloud.relay_url(),
                 &joined.auth,
-                requester.clone(),
+                "Relaying",
                 timing.io(&self.clock),
+                Some(connected),
             )
         })
     }
@@ -382,36 +392,29 @@ impl Services {
         result
     }
 
-    /// Forwards an Ark request to the companion, attaching the relay on demand.
+    /// Hands a frame of the Ark to the relay, without blocking the dispatcher.
     ///
-    /// Replies to wire requests keep arriving while dispatch waits for the
-    /// attachment, and a failed attachment refuses the request with
-    /// `UNAVAILABLE`. Without a cloud route, the request comes back for the
+    /// The relay refuses the frame with `UNAVAILABLE` when it cannot write it
+    /// in time. Without a cloud route, the request comes back for the
     /// application's own receive queue.
     pub(crate) fn forward(
-        &self,
+        self: &Arc<Self>,
         requester: &Requester,
-        request: RelayArkToAppRequest,
+        request: RelayOutboundRequest,
         responder: Responder,
-    ) -> Option<(RelayArkToAppRequest, Responder)> {
+    ) -> Option<(RelayOutboundRequest, Responder)> {
         if self.cloud.is_none() {
             return Some((request, responder));
         }
 
-        // Attach within the exchange's own time, refusing the request on failure
-        let deadline = self.clock.now() + relay::EXCHANGE_TIMEOUT;
-        if let Err(error) = self.relay(requester, deadline) {
-            relay::fail(responder, &error.to_string());
-            return None;
-        }
-
-        // Hand the request to the relay, unless it ended meanwhile
-        let state = self.state.lock().expect("cloud setup not poisoned");
-        match &state.relay {
-            Some(relay) => {
-                relay.forward(request, responder, deadline);
+        // Leave the join and the socket writes to the relay's own worker
+        match self.relay_worker(requester) {
+            Ok(relay) => relay.forward(request, responder),
+            Err(error) => {
+                let cause = Error::from(error).to_string();
+                self.notices.report(RelayNotice::Failed(cause.clone()));
+                relay::fail(responder, &cause);
             }
-            None => relay::fail(responder, "relay closed"),
         }
         None
     }
@@ -523,21 +526,18 @@ impl Services {
             return;
         }
         state.error = Some(error.clone());
-        for attempt in [state.syncing.take(), state.joining.take()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(attempt) = state.syncing.take() {
             attempt.finish(Err(Failure::Wire(error.clone())));
         }
-        if let Some(relay) = state.relay.take() {
+        let relay = state.relay.take();
+        drop(state);
+        if let Some(relay) = relay {
             relay.close();
         }
     }
 }
 
 /// Setup step that callers join or start.
-///
-/// Relay callers establish cloud sync first.
 #[derive(Clone, Copy)]
 enum Step {
     /// Cloud sync, reusing fresh device state when it can.
@@ -545,8 +545,6 @@ enum Step {
     /// Cloud sync that exchanges keys and time even when the device reports
     /// usable setup.
     Refresh,
-    /// Relay attachment with its own worker, reusing a healthy one.
-    Relay,
 }
 
 impl Attempt {
@@ -690,6 +688,7 @@ pub(crate) mod tests {
             cloud: Some(super::http::tests::api(url, Realm::Hardware, &clock)),
             state: Mutex::new(State::default()),
             updating: Mutex::new(()),
+            notices: Arc::new(relay::Observer::default()),
         });
         Ark::start(session, services).unwrap()
     }

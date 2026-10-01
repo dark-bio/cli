@@ -85,22 +85,26 @@ impl From<ConnectError> for Error {
                 {
                     Some(schema::ReservedErrors::Unauthorized) => "approval-denied",
                     Some(schema::ReservedErrors::Unconfirmed) => "approval-timeout",
+                    Some(schema::ReservedErrors::Undelivered) => "approval-undelivered",
                     Some(schema::ReservedErrors::Unsupported) => "unsupported",
                     Some(schema::ReservedErrors::Unknown) => "unknown",
                     Some(schema::ReservedErrors::Unavailable) => "unavailable",
                     Some(schema::ReservedErrors::Unanswered) => "unanswered",
                     _ => "ark",
                 };
-                let class = if matches!(code, "approval-denied" | "approval-timeout") {
-                    6
-                } else {
-                    5
+                let class = match code {
+                    "approval-denied" | "approval-timeout" => 6,
+                    "approval-undelivered" => 4,
+                    _ => 5,
                 };
                 let mut error = Self::new(class, code, remote.msg.clone());
                 if code == "unknown" {
                     error
                         .hints
                         .push("update the Ark firmware and this tool".into());
+                }
+                if code == "approval-undelivered" {
+                    error.hints.push("run `ark doctor` to check the relay".into());
                 }
                 error.remote = Some(remote);
                 error
@@ -260,21 +264,33 @@ mod tests {
         assert_eq!(error.message, "stalled");
     }
 
-    /// Checks that a denied and an unconfirmed approval map to distinct codes
-    /// of the approval class.
+    /// Checks that approval outcomes retain their remote cause and exit class.
     #[test]
     fn reserved_approval_outcomes_are_distinct() {
-        for (code, name) in [
-            (schema::ReservedErrors::Unauthorized, "approval-denied"),
-            (schema::ReservedErrors::Unconfirmed, "approval-timeout"),
-        ] {
+        for (i, (code, name, class)) in [
+            (schema::ReservedErrors::Unauthorized, "approval-denied", 6), // refused decision
+            (schema::ReservedErrors::Unconfirmed, "approval-timeout", 6), // expired approval
+            (
+                schema::ReservedErrors::Undelivered,
+                "approval-undelivered",
+                4,
+            ), // failed delivery
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let error = Error::from(ConnectError::Remote(schema::Error::reserved(
                 code,
                 "owner's verdict",
             )));
-            assert_eq!(error.class, 6);
-            assert_eq!(error.code, name);
-            assert_eq!(error.message, "owner's verdict");
+            assert_eq!(error.class, class, "{i}");
+            assert_eq!(error.code, name, "{i}");
+            assert_eq!(error.message, "owner's verdict", "{i}");
+            assert_eq!(
+                error.remote.unwrap(),
+                schema::Error::reserved(code, "owner's verdict"),
+                "{i}"
+            );
         }
     }
 }

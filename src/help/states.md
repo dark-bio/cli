@@ -7,10 +7,12 @@ environment controls routing and never changes the handshake's trust result.
 
 Status works offline, including while unpaired or locked. It reads pairing,
 lock and cloud sync state without synchronizing. Commands that need cloud
-requests reuse the Ark's identity and clock when fresh, synchronize when needed,
-and attach the companion relay only when required. A CLI command owns its
-connection until it exits. genuine and doctor explicitly refresh cloud sync.
-Doctor reports checks and suggests fixes; it does not apply repairs.
+requests reuse the Ark's identity and clock when fresh, and synchronize when
+needed. A command joins the companion relay only once the Ark asks the owner for
+an approval, and stays joined until it exits. A CLI command owns its connection
+until it exits. genuine and doctor explicitly refresh cloud sync, and doctor
+joins the relay to check it. Doctor reports checks and suggests fixes; it does
+not apply repairs.
 
 ## Status and firmware fields
 

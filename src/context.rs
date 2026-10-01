@@ -156,6 +156,20 @@ impl Context {
             ark.set_cloud_auth(crate::access::Login::new(self, client.clock()));
         }
 
+        // Report relay problems as warnings, since the Ark's answer to an
+        // undelivered approval carries no cause from this host
+        let output = self.output.clone();
+        ark.set_relay_observer(move |notice| {
+            let message = match notice {
+                darkbio_connect::RelayNotice::Refused(error) => format!(
+                    "the Ark refused a frame from Ark Companion: {} (code 0x{:x})",
+                    error.msg, error.code
+                ),
+                darkbio_connect::RelayNotice::Failed(cause) => cause,
+            };
+            output.event("warning", message);
+        });
+
         // Register the session for interruption before its first request
         self.interrupt.connection(client.clone(), ark.closer());
         let info = client.call(schema::DeviceInfoRequest {}, timing)?;
@@ -207,9 +221,8 @@ impl Context {
             .hint("run `ark unlock`, or add --unlock to unlock first"))
     }
 
-    /// Attaches the relay before announcing approval and requesting unlock.
+    /// Announces the approval and requests the unlock.
     pub fn unlock(&self, connection: &Connection) -> Result<(), Error> {
-        connection.client.attach_relay(self.timing())?;
         self.output
             .event("approve", "unlock (Ark Companion on your phone)");
         connection

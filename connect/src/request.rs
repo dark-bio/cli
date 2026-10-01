@@ -21,8 +21,6 @@ pub enum Setup {
     None,
     /// Cloud keys and a synchronized clock.
     Cloud,
-    /// Cloud synchronization followed by companion relay attachment.
-    Relay,
 }
 
 /// Request body paired with the response type that [`crate::Client::call`]
@@ -84,7 +82,7 @@ pairs! { Setup::Cloud, None;
     PairingSetAppStorageRequest => PairingSetAppStorageResponse,
     PairingAckArkStorageRequest => PairingAckArkStorageResponse,
     RelayJoinRequest => RelayJoinResponse,
-    RelayAppToArkRequest => RelayArkToAppResponse,
+    RelayInboundRequest => RelayInboundResponse,
     ExecutionUploadStartRequest => ExecutionUploadStartResponse,
     ExecutionUploadChunkRequest => ExecutionUploadChunkResponse,
     ExecutionStatusRequest => ExecutionStatusResponse,
@@ -97,14 +95,11 @@ pairs! { Setup::Cloud, None;
     SlotUploadProcessRequest => SlotUploadProcessResponse,
 }
 
-// These requests only need a relay if the Ark asks for companion authorization.
-// The reverse-request dispatcher attaches it then, while retaining this window.
+// These requests can wait on the owner's approval. They sync with the cloud
+// first, since the Ark joins the relay only after a sync.
 pairs! { Setup::Cloud, Some(APPROVAL_WINDOW);
     FirmwareUpdatePrepRequest => FirmwareUpdatePrepResponse,
     SlotUploadStartRequest => SlotUploadStartResponse,
-}
-
-pairs! { Setup::Relay, Some(APPROVAL_WINDOW);
     UnlockRequest => UnlockResponse,
     ExecutionScheduleRequest => ExecutionScheduleResponse,
     SlotRepairRequest => SlotRepairResponse,

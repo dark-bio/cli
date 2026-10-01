@@ -444,9 +444,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto"
-version = "0.19.1"
+version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "030dcbb25b2b423e3ffddbf27b834815353a86aad76e828d852be3581a8e0b15"
+checksum = "c2582a69fd804d95f6ece2740db3ea2f9f9a9e29e1ef1f3f9be5ca7ab6747fe0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -470,9 +470,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto-cbor-derive"
-version = "0.19.1"
+version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4a03fa7df24e0afd285b98163b0b24ecde7ce87f2672e55bf70b12a7afec3c0"
+checksum = "ad24955999fe057b7caff7f9d4e085f67ca39efd79a6eb7d9a8e54ebf52a1488"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -481,9 +481,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-trust"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d3d06e8971c65286e956a3b8eadcde851e7f60ec4a854d04ce84b9db14725e"
+checksum = "2b2e39ff598220ffd978244d6d1a93dd0103c4819e25c491253670cb974e738f"
 dependencies = [
  "darkbio-crypto",
  "hex",
@@ -492,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-wire"
-version = "0.12.1"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2e800feb76d26a00929f5b550d2523788a25c85213ab128a55ee32258985111"
+checksum = "9b16f69d67f1bd1dbfe64e93d7db809133cdb345f80a28acbef8c0c2f0280f26"
 dependencies = [
  "darkbio-clock",
  "darkbio-cobs",

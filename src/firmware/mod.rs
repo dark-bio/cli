@@ -26,13 +26,13 @@ use std::time::Duration;
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
 /// First firmware version speaking the wire protocol this CLI uses.
-pub(crate) const MINIMUM_VERSION: &str = "0.11.5";
+pub(crate) const MINIMUM_VERSION: &str = "0.11.7";
 
 /// Earliest publish time of a develop build this CLI accepts, in Unix seconds.
 ///
 /// It moves forward whenever a change on the current release needs developers
 /// to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_789_461_235; // 2026-09-15 08:33:55 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_790_857_383; // 2026-10-01 12:23:03 UTC
 
 /// Checks that the firmware is at least [`MINIMUM_VERSION`], and that a
 /// mutable develop build was published no earlier than
@@ -627,8 +627,8 @@ mod tests {
     #[test]
     fn compatibility_requires_the_protocol_batch() {
         for version in [
-            "0.11.5-develop",
-            "0.11.5-abcdef0",
+            "0.11.7-develop",
+            "0.11.7-abcdef0",
             "0.12.0-develop",
             "1.0.0-0000000",
         ] {
@@ -638,11 +638,11 @@ mod tests {
             );
         }
         for version in [
-            "0.11.4-develop",
-            "0.11.4-abcdef0",
+            "0.11.6-develop",
+            "0.11.6-abcdef0",
             "0.10.99-abcdef0",
             "unknown",
-            "0.11.5",
+            "0.11.7",
         ] {
             let error =
                 check_compatibility(&info(version, MINIMUM_DEVELOP_PUBLISH + 1)).unwrap_err();
@@ -655,7 +655,7 @@ mod tests {
     /// it.
     #[test]
     fn develop_builds_need_the_cutoff_but_tagged_builds_do_not() {
-        for version in ["0.11.5-develop", "0.12.0-develop"] {
+        for version in ["0.11.7-develop", "0.12.0-develop"] {
             for publish in [0, MINIMUM_DEVELOP_PUBLISH - 1] {
                 let error = check_compatibility(&info(version, publish)).unwrap_err();
                 assert_eq!(error.code, "firmware-outdated");
@@ -669,7 +669,7 @@ mod tests {
                 assert!(check_compatibility(&info(version, publish)).is_ok());
             }
         }
-        for version in ["0.11.5-abcdef0", "0.12.0-abcdef0"] {
+        for version in ["0.11.7-abcdef0", "0.12.0-abcdef0"] {
             assert!(check_compatibility(&info(version, 0)).is_ok());
         }
     }
@@ -683,14 +683,37 @@ mod tests {
             (true, false, Approval::Button),
             (true, true, Approval::Phone),
         ] {
-            let mut device = info("0.11.5-develop", MINIMUM_DEVELOP_PUBLISH);
+            let mut device = info("0.11.7-develop", MINIMUM_DEVELOP_PUBLISH);
             device.paired = paired;
             device.unlocked = unlocked;
             assert_eq!(approval(&device), Some(expected));
             device.firmware_publish -= 1;
             assert_eq!(approval(&device), None);
-            device.firmware_version = "0.11.4-abcdef0".into();
+            device.firmware_version = "0.11.6-abcdef0".into();
             assert_eq!(approval(&device), None);
+        }
+    }
+
+    /// Checks the cutoff against the publish times of real develop images, the
+    /// last build it refuses and the first it accepts.
+    #[test]
+    fn published_develop_images_straddle_the_cutoff() {
+        for (i, (publish, accepted)) in [
+            (1_790_807_253, false), // last refused, amd64 emulator
+            (1_790_807_260, false), // last refused, arm64 boot
+            (1_790_807_668, false), // last refused, arm64 emulator
+            (1_790_857_383, true),  // first accepted, amd64 emulator
+            (1_790_857_395, true),  // first accepted, arm64 boot
+            (1_790_857_856, true),  // first accepted, arm64 emulator
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                check_compatibility(&info("0.11.7-develop", publish)).is_ok(),
+                accepted,
+                "{i}"
+            );
         }
     }
 }

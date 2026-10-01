@@ -25,18 +25,24 @@ const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
 /// Cloud WebSocket retaining its TLS state when switched to readiness polling.
 pub(super) type Connection = WebSocket<MaybeTlsStream<Socket>>;
 
+/// Callback that sees the TCP stream before the upgrade, such as to keep a
+/// handle that shuts it down.
+type OnConnect<'a> = &'a dyn Fn(&TcpStream) -> Result<(), Failure>;
+
 /// Opens a cloud socket that must agree on the requested subprotocol, carrying
 /// the Ark's `auth` proof in the upgrade.
 ///
 /// DNS, TCP, TLS and the upgrade share one deadline. A refusal of the caller's
 /// credentials returns [`Failure::AuthRequired`], kept apart from a refused
-/// proof, before any application exchange begins.
+/// proof, before any application exchange begins. `on_connect` runs once TCP
+/// connects, and its error abandons the socket before the upgrade.
 pub(super) fn connect(
     api: &Api,
     url: &str,
     auth: &[u8],
     subprotocol: &str,
     deadline: Instant,
+    on_connect: Option<OnConnect<'_>>,
 ) -> Result<Connection, Failure> {
     // Carry the caller's credentials and the Ark's proof on the upgrade request
     let mut request = url.into_client_request().map_err(socket_error)?;
@@ -89,6 +95,9 @@ pub(super) fn connect(
     }
     let stream = connected.ok_or_else(|| io_error(failure))?;
     stream.set_nodelay(true).map_err(io_error)?;
+    if let Some(on_connect) = on_connect {
+        on_connect(&stream)?;
+    }
 
     // Upgrade with frames and messages capped at what one wire message carries
     let config = WebSocketConfig::default()
@@ -149,7 +158,13 @@ pub(super) enum Socket {
         deadline: Instant,
     },
     /// Attached relay socket serviced by the worker's readiness loop.
-    Connected(mio::net::TcpStream),
+    Connected {
+        /// Nonblocking stream registered with the relay's poller.
+        stream: mio::net::TcpStream,
+        /// Bytes a test still lets through before writes return `WouldBlock`.
+        #[cfg(test)]
+        write_limit: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    },
 }
 
 impl Read for Socket {
@@ -165,7 +180,7 @@ impl Read for Socket {
                 stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.read(bytes)
             }
-            Self::Connected(stream) => stream.read(bytes),
+            Self::Connected { stream, .. } => stream.read(bytes),
         }
     }
 }
@@ -183,7 +198,24 @@ impl Write for Socket {
                 stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.write(bytes)
             }
-            Self::Connected(stream) => stream.write(bytes),
+            Self::Connected {
+                stream,
+                #[cfg(test)]
+                write_limit,
+            } => {
+                #[cfg(test)]
+                if let Some(limit) = write_limit {
+                    use std::sync::atomic::Ordering;
+                    let allowed = limit.load(Ordering::Acquire).min(bytes.len());
+                    if allowed == 0 {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    let written = stream.write(&bytes[..allowed])?;
+                    limit.fetch_sub(written, Ordering::Release);
+                    return Ok(written);
+                }
+                stream.write(bytes)
+            }
         }
     }
 
@@ -198,7 +230,7 @@ impl Write for Socket {
                 stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
                 stream.flush()
             }
-            Self::Connected(stream) => stream.flush(),
+            Self::Connected { stream, .. } => stream.flush(),
         }
     }
 }
@@ -305,7 +337,14 @@ mod tests {
             for _ in 0..2 {
                 let socket = cloud
                     .with_auth(timing, || {
-                        connect(&cloud, &url, &[0xfb, 0xff], subprotocol, timing.io(&clock))
+                        connect(
+                            &cloud,
+                            &url,
+                            &[0xfb, 0xff],
+                            subprotocol,
+                            timing.io(&clock),
+                            None,
+                        )
                     })
                     .unwrap();
                 drop(socket);

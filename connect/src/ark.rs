@@ -47,6 +47,19 @@ impl Ark {
         self.services.set_cloud_auth(Arc::new(auth));
     }
 
+    /// Installs the observer of the relay's notices, the frames the Ark refused
+    /// and the relay failures that kept the Ark's frames from going out.
+    ///
+    /// Install it before using the clients. It runs on the relay's and the
+    /// dispatcher's threads, outside connection locks, and must return promptly
+    /// without panicking.
+    pub fn set_relay_observer(
+        &mut self,
+        observer: impl Fn(crate::RelayNotice) + Send + Sync + 'static,
+    ) {
+        self.services.set_relay_observer(Arc::new(observer));
+    }
+
     /// Authenticates the peer under wire's handshake timeout, then selects cloud
     /// routing for the session.
     ///
@@ -249,8 +262,7 @@ impl Client {
     /// Establishes the request's prerequisites, then queues it without waiting
     /// for output or a response.
     ///
-    /// The first cloud-dependent send may wait for sync and relay attachment,
-    /// according to the request's prerequisites. Unlike [`Self::call`], a
+    /// The first cloud-dependent send may wait for sync. Unlike [`Self::call`], a
     /// refusal is returned without retrying lost setup. Waiting on the promise
     /// does not refresh the deadline; dropping it does not cancel the request.
     /// Wire's output queue has no capacity limit, so the caller bounds the
@@ -278,7 +290,6 @@ impl Client {
         match R::SETUP {
             Setup::None => {}
             Setup::Cloud => self.services.sync(&self.requester, timing)?,
-            Setup::Relay => self.services.relay(&self.requester, timing)?,
         }
 
         // Bound the response by its protocol window or the inactivity allowance
@@ -523,7 +534,7 @@ impl<T: TryFrom<Message, Error = protocol::Error>> Pending<T> {
 mod tests {
     use super::*;
     use crate::schema::{
-        DeviceInfoRequest, OnboardingRequest, RelayAppToArkResponse, RelayArkToAppRequest,
+        DeviceInfoRequest, OnboardingRequest, RelayOutboundRequest, RelayOutboundResponse,
         UnlockRequest, UnlockResponse,
     };
     use crate::testing::{Peer, answering, hangup, silent, test_clock, wait_deadline};
@@ -658,9 +669,9 @@ mod tests {
                 let deadline = session.clock().now() + TIMEOUT;
                 let error = session
                     .requester()
-                    .request(RelayArkToAppRequest::default(), deadline)
+                    .request(RelayOutboundRequest::default(), deadline)
                     .unwrap()
-                    .wait::<RelayAppToArkResponse>()
+                    .wait::<RelayOutboundResponse>()
                     .unwrap_err();
                 assert!(matches!(
                     error, protocol::Error::Remote(error)
@@ -686,7 +697,10 @@ mod tests {
         let client = ark.client();
         let pending = client.send(ManualUnlock, clock.now() + TIMEOUT).unwrap();
         let (request, responder) = ark.recv().unwrap();
-        assert!(matches!(request, schema::ark_to_host::Content::RelayReq(_)));
+        assert!(matches!(
+            request,
+            schema::ark_to_host::Content::RelayOutbound(_)
+        ));
         responder
             .fail(Denied, clock.now() + TIMEOUT)
             .unwrap()
@@ -963,7 +977,7 @@ mod tests {
         );
     }
 
-    /// An unlock can wait for the host to return an opaque companion response.
+    /// Without a cloud route, the application receives and acknowledges relay frames.
     #[test]
     fn test_reverse_requests() {
         // The peer answers an unlock after the host answers its relay request
@@ -972,22 +986,18 @@ mod tests {
             &clock,
             Box::new(|session, _, responder| {
                 let deadline = session.clock().now() + TIMEOUT;
-                // Unlock cannot complete until the application returns the opaque
-                // companion response through this reverse request
-                let approval = session
+                // Unlock waits until the application acknowledges the frame
+                session
                     .requester()
                     .request(
-                        RelayArkToAppRequest {
-                            id: 42,
-                            req: vec![1, 2, 3],
+                        RelayOutboundRequest {
+                            frame: vec![1, 2, 3],
                         },
                         deadline,
                     )
                     .unwrap()
-                    .wait::<RelayAppToArkResponse>()
+                    .wait::<RelayOutboundResponse>()
                     .unwrap();
-                assert_eq!(approval.id, 42);
-                assert_eq!(approval.res, [4, 5, 6]);
                 responder
                     .reply(UnlockResponse::default(), deadline)
                     .unwrap()
@@ -1003,18 +1013,12 @@ mod tests {
         let deadline = clock.now() + TIMEOUT;
         let operation = thread::spawn(move || client.call(ManualUnlock, deadline));
         let (request, responder) = ark.recv().unwrap();
-        let schema::ark_to_host::Content::RelayReq(request) = request else {
+        let schema::ark_to_host::Content::RelayOutbound(request) = request else {
             panic!("expected relay request")
         };
-        assert_eq!(request.req, [1, 2, 3]);
+        assert_eq!(request.frame, [1, 2, 3]);
         responder
-            .reply(
-                RelayAppToArkResponse {
-                    id: request.id,
-                    res: vec![4, 5, 6],
-                },
-                clock.now() + TIMEOUT,
-            )
+            .reply(RelayOutboundResponse {}, clock.now() + TIMEOUT)
             .unwrap()
             .wait()
             .unwrap();
