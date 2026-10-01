@@ -30,9 +30,9 @@ test = true
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.60", features = ["derive"] }
 darkbio-clock = { version = "0.3", features = ["crossbeam"] }
-darkbio-crypto = { version = "0.19.1", features = ["cbor", "xdsa"] }
-darkbio-trust = { version = "0.6.0", features = ["release", "staging", "develop"] }
-darkbio-wire = "0.12.1"
+darkbio-crypto = { version = "0.19.3", features = ["cbor", "xdsa", "rand"] }
+darkbio-trust = { version = "0.6.1", features = ["release", "staging", "develop"] }
+darkbio-wire = "0.13.1"
 hex = "0.4.3"
 console = "0.15.11"
 base64 = "0.23.1"

@@ -89,6 +89,7 @@ impl Services {
                 &auth.auth,
                 "Pairing",
                 timing.io(clock),
+                None,
             )?;
             Ok((socket, auth.fprint))
         })?;
@@ -145,7 +146,7 @@ fn exchange(
         .wait::<schema::PairingSetAppIdentityResponse>()?;
 
     // Exchange storage keys between the companion and the Ark
-    let app_key = channel.receive(timing.approval(clock))?;
+    let app_key = channel.receive(timing.window(clock, crate::timing::PAIRING_EXCHANGE_WINDOW))?;
     progress(PairingProgress::Storage);
     let storage = requester
         .request(
@@ -154,7 +155,7 @@ fn exchange(
         )?
         .wait::<schema::PairingSetAppStorageResponse>()?;
     channel.send(storage.ark_keys, timing.io(clock))?;
-    let app_ack = channel.receive(timing.approval(clock))?;
+    let app_ack = channel.receive(timing.window(clock, crate::timing::PAIRING_EXCHANGE_WINDOW))?;
     requester
         .request(
             schema::PairingAckArkStorageRequest { app_ack },
@@ -362,6 +363,7 @@ mod tests {
                 &[],
                 "Pairing",
                 deadline,
+                None,
             )
             .unwrap();
             let err = receive(&mut socket, deadline).unwrap_err();
@@ -616,6 +618,7 @@ mod tests {
             let verifier = TrustMode::Recover(Box::new(peer.identity.clone()));
             let (session, _) = protocol::connect(peer.stream(), &verifier).unwrap();
             let services = Arc::new(Services {
+                notices: Arc::new(super::super::relay::Observer::default()),
                 clock: clock.clone(),
                 cloud: Some(http::tests::api(url, Realm::Hardware, &clock)),
                 state: Mutex::new(State {

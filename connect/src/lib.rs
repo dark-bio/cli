@@ -38,10 +38,11 @@
 //!
 //! Requests establish their cloud prerequisites lazily. Cloud synchronization
 //! reuses the Ark's reported sync marker and clock when fresh. A refused cloud
-//! proof triggers one refresh and authentication retry. Relay attachment follows
-//! only when required and is reused while healthy. [`Client::sync`] explicitly
-//! refreshes the signed clock and cloud keys; [`Client::attach_relay`] exposes
-//! attachment for diagnostics. Status and enrollment work before either step.
+//! proof triggers one refresh and authentication retry. The relay joins once
+//! the Ark sends its first frame for Ark Companion, and stays joined until the
+//! session ends. [`Client::sync`] explicitly refreshes the signed clock and
+//! cloud keys; [`Client::attach_relay`] joins the relay for diagnostics. Status
+//! and enrollment work before either step.
 //!
 //! [`Device::connect_with_env`] selects cloud routing after authentication on
 //! the same connection. Self-signed and recovery peers need a caller-selected
@@ -76,7 +77,9 @@
 //! [`Client::pair`] forwards the cloud pairing exchange. Its progress callback
 //! supplies the rendezvous for presentation to the owner. Pairing and relay
 //! payloads stay opaque; the Ark and companion authenticate their content.
-//! Connect interprets only rendezvous routing and relay envelope fields.
+//! Connect interprets only rendezvous routing. [`Ark::set_relay_observer`]
+//! reports the frames the Ark refused, and the relay failures that kept the
+//! Ark's frames from going out.
 //!
 //! [`Client::send`] establishes prerequisites and returns a typed [`Pending`]
 //! without waiting for the response. Waiting later retains the original deadline;
@@ -106,7 +109,9 @@ mod timing;
 mod testing;
 
 pub use ark::{Ark, Client, Closer, Pending};
-pub use cloud::{CloudAuth, Firmware, PairingProgress, Registration, UpdateProgress, cloud_synced};
+pub use cloud::{
+    CloudAuth, Firmware, PairingProgress, Registration, RelayNotice, UpdateProgress, cloud_synced,
+};
 /// Clocks that connections measure their deadlines on, as [`Client::clock`] returns.
 pub use darkbio_clock as clock;
 pub use darkbio_wire as wire;
@@ -172,7 +177,7 @@ pub enum Error {
     #[error("firmware update failed: {0}")]
     Firmware(String),
 
-    /// A relay connection or forwarded exchange failed.
+    /// The relay could not join, or its socket failed.
     #[error("relay operation failed: {0}")]
     Relay(String),
 

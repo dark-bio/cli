@@ -129,11 +129,14 @@ pub(crate) fn dispatch(mut session: Session, services: Arc<Services>, incoming: 
 
         // Relay requests go to cloud services, which return any lacking a
         // cloud route
-        if let schema::ark_to_host::Content::RelayReq(request) = request {
+        if let schema::ark_to_host::Content::RelayOutbound(request) = request {
             if let Some((request, responder)) =
                 services.forward(&session.requester(), request, responder)
             {
-                incoming.push(schema::ark_to_host::Content::RelayReq(request), responder);
+                incoming.push(
+                    schema::ark_to_host::Content::RelayOutbound(request),
+                    responder,
+                );
             }
         } else {
             incoming.push(request, responder);

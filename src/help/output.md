@@ -122,6 +122,8 @@ Exit 3, device access:
 
 Exit 4, cloud:
 - `cloud-unreachable`: an HTTP, package host or relay request failed
+- `approval-undelivered`: the approval never reached the phone; the warning
+  before it names the cause, and `ark doctor` checks the relay
 - `environment-unknown`: no cloud environment; select one with --env
 - `login-required`: the cloud or package host wants a browser login; the hint
   has the cloudflared command
@@ -145,7 +147,8 @@ Exit 5, Ark state or refusal:
   `unknown` means the firmware and this tool disagree, update both
 
 Exit 6, approval:
-- `approval-denied`: the owner declined on the phone or the button
+- `approval-denied`: the owner declined, or Ark Companion sent an answer the Ark
+  could not accept; the message says which
 - `approval-timeout`: nobody answered in time; a pairing hints `ark pair`
 
 Exit 7, `timeout`: a machine wait exceeded --timeout, or the Ark did not

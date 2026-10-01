@@ -10,10 +10,15 @@ use darkbio_clock::Clock;
 use std::io;
 use std::time::{Duration, Instant};
 
-/// Device approval window with time for relay forwarding and the final reply.
-pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(40);
+/// Wait of 10 min on a request the Ark holds for the owner's approval.
+///
+/// It outlasts every approval window the Ark opens, so the Ark's own answer
+/// always comes first, even after it lengthens a window.
+pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(600);
 /// Pairing approval window with time for the cloud and device exchanges.
 pub(crate) const PAIRING_WINDOW: Duration = Duration::from_secs(70);
+/// Wait of 40 s on each storage key message from the phone while pairing.
+pub(crate) const PAIRING_EXCHANGE_WINDOW: Duration = Duration::from_secs(40);
 
 /// Bound on an operation, as an absolute deadline, an inactivity limit, or both.
 ///
@@ -66,9 +71,8 @@ impl Timing {
 
     /// Returns the deadline for a request that may wait on an approval.
     ///
-    /// The approval window replaces the inactivity allowance and includes a
-    /// small allowance for forwarding and replies. A timing with only an
-    /// absolute deadline keeps that exact bound.
+    /// The 10 min approval wait replaces the inactivity allowance. A timing
+    /// with only an absolute deadline keeps that exact bound.
     pub(crate) fn approval(self, clock: &Clock) -> Instant {
         self.window(clock, APPROVAL_WINDOW)
     }
@@ -185,6 +189,9 @@ mod tests {
         let clock = test_clock().clock();
         let timing = Timing::inactivity(Duration::from_millis(10));
         assert_eq!(timing.io(&clock), clock.now() + Duration::from_millis(10));
-        assert!(timing.approval(&clock) > clock.now() + Duration::from_secs(39));
+        assert_eq!(
+            timing.approval(&clock),
+            clock.now() + Duration::from_secs(600)
+        );
     }
 }

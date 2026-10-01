@@ -7,11 +7,12 @@ Authenticated connections to Dark Bio Arks from Rust. Discovery returns hardware
 and local emulators through one `Device` API. `Ark` owns a session; clonable
 `Client` handles issue typed requests without keeping it open.
 
-Cloud synchronization and companion relay attachment happen when a request needs
-them. Pairing, dataset upload, firmware installation and app execution are
-protocol workflows with progress callbacks. Each operation accepts an absolute
-deadline, an inactivity allowance, or both through `Timing`; no timeout is stored
-on the client.
+Cloud synchronization happens when a request needs it. The relay to Ark
+Companion joins once the Ark sends its first frame for the phone, and stays
+joined until the session ends. Pairing, dataset upload, firmware installation
+and app execution are protocol workflows with progress callbacks. Each
+operation accepts an absolute deadline, an inactivity allowance, or both
+through `Timing`; no timeout is stored on the client.
 
 Device-info responses supply the sync marker and clock for lazy setup. A cloud
 proof rejected with HTTP 403 triggers one forced sync and authentication retry
