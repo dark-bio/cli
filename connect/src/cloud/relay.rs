@@ -1434,7 +1434,9 @@ mod tests {
             let mut sent = fixture.outbound(vec![0xff, 0, i as u8, 0x80]);
             let (acked, acks) = mpsc::channel();
             sent.notify(move || {
-                acked.send(()).unwrap();
+                // A wire worker runs this, possibly after the iteration dropped
+                // `acks`, and a panic there aborts the test binary
+                let _ = acked.send(());
             });
             let (request, responder) = fixture.requests.recv().unwrap();
             assert!(matches!(request, Content::RelayJoin(_)), "{i}");
