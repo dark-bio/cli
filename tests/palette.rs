@@ -345,7 +345,6 @@ fn documented_usage_errors_keep_the_text_prefix() {
         vec!["--timeout", "0", "status"],
         vec!["--timeout", "18446744073709551615", "status"],
         vec!["data", "show", "0"],
-        vec!["app", "cancel", "invalid"],
         vec!["--version", "status"],
         vec!["help", "no-such-topic"],
     ] {
@@ -377,7 +376,6 @@ fn usage_errors_are_json_in_both_streams() {
         vec!["data", "fetch", "--all", "reference-genome", "--json"],
         vec!["--json", "data", "upload", "x", "--dry-run", "--unlock"],
         vec!["--json", "--timeout", "0", "status"],
-        vec!["--json", "app", "cancel", "18446744073709551616"],
         vec!["--json", "--version", "status"],
         vec!["--json", "help", "missing"],
     ] {

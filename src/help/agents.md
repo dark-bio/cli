@@ -33,8 +33,8 @@ on their phone, in Ark Companion. You cannot approve for them.
   reply or network chunk wait, not approval or total runtime. It must be
   positive and cannot be disabled. A repeated processing percentage counts
   as a reply. Use your shell's timeout utility for a workflow ceiling.
-  Ctrl-C and SIGTERM attempt cancellation; the task id from app run also
-  works with app cancel.
+  Ctrl-C and SIGTERM attempt cancellation, and an app run ends with its
+  process.
 - --unlock authorizes unlocking first, --yes confirms firmware installation,
   and --dry-run plans supported changes without applying them. -v adds step
   narration; --log debug or --log trace enables diagnostics independently.

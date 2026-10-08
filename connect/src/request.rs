@@ -86,6 +86,8 @@ pairs! { Setup::Cloud, None;
     ExecutionUploadStartRequest => ExecutionUploadStartResponse,
     ExecutionUploadChunkRequest => ExecutionUploadChunkResponse,
     ExecutionStatusRequest => ExecutionStatusResponse,
+    ExecutionResultRequest => ExecutionResultResponse,
+    ExecutionOutputRequest => ExecutionOutputResponse,
     ExecutionCancelRequest => ExecutionCancelResponse,
     SlotListRequest => SlotListResponse,
     DatasetPathsRequest => DatasetPathsResponse,

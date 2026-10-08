@@ -174,7 +174,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
             "a paired, unlocked Ark (--unlock only if status reports locked)",
             "none; --unlock needs your phone",
             "seconds",
-            "path tree with directories, grants, availability and examples; JSON paths: path, directory, grantable, available, description, format, examples",
+            "path tree with directories, grants, availability and examples; JSON paths: path, directory, grantable, available, description, format, examples, public, wording",
             "ark data paths\nark data paths --json",
         ),
         "data upload" => (
@@ -207,17 +207,10 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         ),
         "app run" => (
             "a local WASM file and a paired, unlocked Ark (--unlock only if status reports locked)",
-            "on your phone before running",
-            "unbounded run; --timeout bounds replies, not the whole app",
-            "exact report bytes; JSON: task, app, success, stdout or stdout_base64, stderr or stderr_base64, duration_seconds",
+            "on your phone, to run the app and to release its report",
+            "unbounded run, then the owner's review; --timeout bounds replies, not the whole app",
+            "exact report bytes once released; JSON: task, app (name, version, develop), success, paths, media, stdout or stdout_base64, stderr or stderr_base64, duration_seconds",
             "ark app run app.wasm > report.md\nark app run app.wasm --json",
-        ),
-        "app cancel" => (
-            "one Ark and a task id from app run",
-            "none",
-            "seconds",
-            "task, cancelled",
-            "ark app cancel 42\nark app cancel 18446744073709551615 --json",
         ),
         "firmware list" => (
             "one Ark and its package host",
@@ -265,7 +258,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         "enroll" => {
             "0 installed with --cwt; 1 local or enrollment-required; 2 usage; 3 device; 5 Ark; 7 timeout"
         }
-        "genuine" | "app cancel" | "firmware list" | "doctor" => {
+        "genuine" | "firmware list" | "doctor" => {
             "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 7 timeout"
         }
         "pair" | "unlock" | "data list" | "data show" | "data paths" | "data upload"

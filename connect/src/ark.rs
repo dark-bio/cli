@@ -9,8 +9,8 @@
 use crate::cloud::Services;
 use crate::incoming::{self, Incoming};
 use crate::{
-    Dataset, Error, ExecutionProgress, Firmware, Identity, Registration, Request, Setup, Timing,
-    UpdateProgress, UploadProgress, dataset, execution,
+    Dataset, Error, ExecutionOutcome, ExecutionProgress, Firmware, Identity, Registration, Request,
+    Setup, Timing, UpdateProgress, UploadProgress, dataset, execution,
 };
 use darkbio_clock::Clock;
 use darkbio_wire::protocol::{self, Message, Promise, Requester, Responder, Session, schema};
@@ -449,31 +449,30 @@ impl Client {
         dataset::upload(&self.requester, dataset, reader, timing, progress)
     }
 
-    /// Uploads an app, obtains companion approval and waits for its result.
+    /// Uploads an app, obtains companion approval and reads its released result.
     ///
     /// The source must contain exactly `size` bytes. The Ark validates the app
-    /// and its dataset requirements. An unsuccessful app still returns its
-    /// result; inspect its `success` flag. Output is kept as the Ark returns it,
-    /// and a failed app's streams come back only when its manifest sets
-    /// `develop`.
+    /// and its dataset requirements. A released unsuccessful app still returns
+    /// its result; inspect its `success` flag. A withheld report returns a remote
+    /// error. Standard error is kept for develop builds.
     ///
-    /// Setup, upload, approval and execution share the deadline. Reads and
-    /// progress callbacks run on this thread and must return promptly. The
+    /// Setup, upload, approvals and execution share any absolute deadline. Reads
+    /// and progress callbacks run on this thread and must return promptly. The
     /// deadline cannot interrupt a blocking reader. Failed operations attempt
     /// cancellation within the remaining time, at most 1 s, and are never
     /// retried.
     ///
     /// [`ExecutionProgress::Started`] supplies the task ID for cancellation with
     /// [`schema::ExecutionCancelRequest`] through another client clone. Closing
-    /// the connection sends no cancellation. Retrieving a completed result
-    /// consumes it, so only one caller should poll a task's status.
+    /// the connection ends the task. Each output stream is consumed once, so
+    /// only one caller should retrieve a task's output.
     pub fn execute(
         &self,
         size: u64,
         reader: &mut impl io::Read,
         timing: impl Into<Timing>,
         progress: impl FnMut(ExecutionProgress),
-    ) -> Result<schema::ExecutionResultResponse, Error> {
+    ) -> Result<ExecutionOutcome, Error> {
         let timing = timing.into();
         self.services.sync(&self.requester, timing)?;
         execution::execute(&self.requester, size, reader, timing, progress, |taskid| {

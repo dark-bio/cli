@@ -62,11 +62,11 @@
 //! processing. [`Client::update_firmware`] streams a [`Firmware`], obtains
 //! cloud access keys, verifies and installs it; success acknowledges
 //! installation, not the later reboot. [`Client::execute`] uploads an app,
-//! obtains approval and retrieves its result. A failed app returns
-//! `success: false` and whatever output the Ark includes, which is none unless
-//! the app's manifest sets `develop`. Firmware preparation may require
-//! approval, so a rejected proof refreshes cloud keys and returns an error for
-//! the caller to retry explicitly.
+//! obtains approval and retrieves its released result and output. A released
+//! failed app returns `success: false`; a withheld report returns a remote
+//! error. Standard error is kept for develop builds. Firmware preparation may
+//! require approval, so a rejected proof refreshes cloud keys and returns an
+//! error for the caller to retry explicitly.
 //!
 //! Downloads, package catalogs, version selection, caches, prompts, signal
 //! handling and reboot waits belong to callers. Connect accepts readers, checks
@@ -121,7 +121,7 @@ pub use darkbio_wire::trust;
 pub use dataset::{Dataset, UploadProgress};
 pub use device::{Device, DeviceKind, Locator};
 pub use discovery::{Discovery, list};
-pub use execution::ExecutionProgress;
+pub use execution::{ExecutionOutcome, ExecutionProgress};
 pub use identity::{Identity, TrustMode};
 pub use request::{Request, Setup};
 pub use timing::Timing;

@@ -101,7 +101,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
                 )?;
             }
             value["state"] = json!("empty");
-            value["changed"] = json!(filled(slot) || slot.state == SlotState::StateDamaged as i32);
+            value["changed"] = json!(filled(slot) || slot.state == SlotState::Damaged as i32);
             context.output.document(&value)
         }
         args::Data::Fetch {
@@ -150,7 +150,7 @@ fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), E
     // Hint at repairing damage, fetching missing references and filling
     // missing dependencies
     for slot in slots {
-        if slot.state == SlotState::StateDamaged as i32 {
+        if slot.state == SlotState::Damaged as i32 {
             output.event(
                 "hint",
                 format!("run `ark data repair {}`", slot_name(slot.kind)),
@@ -417,9 +417,9 @@ impl<'a> Progress<'a> {
 fn upload_approval(slot: i32) -> bool {
     !matches!(
         schema::SlotKind::try_from(slot),
-        Ok(schema::SlotKind::SlotReferenceGenome
-            | schema::SlotKind::SlotGeneAnnotations
-            | schema::SlotKind::SlotVariantCatalog)
+        Ok(schema::SlotKind::ReferenceGenome
+            | schema::SlotKind::GeneAnnotations
+            | schema::SlotKind::VariantCatalog)
     )
 }
 
@@ -429,7 +429,7 @@ fn confidence(value: i32) -> String {
         .map(|value| {
             value
                 .as_str_name()
-                .trim_start_matches("CONFIDENCE_")
+                .trim_start_matches("SLOT_CONFIDENCE_")
                 .to_ascii_lowercase()
         })
         .unwrap_or_else(|_| value.to_string())
@@ -448,7 +448,7 @@ pub(crate) fn select(slots: &[SlotStatus], id: i32) -> Result<&SlotStatus, Error
 
 /// Checks whether the Ark explicitly reports usable, filled data in this slot.
 pub(crate) fn filled(slot: &SlotStatus) -> bool {
-    slot.state == SlotState::StateFilled as i32
+    slot.state == SlotState::Filled as i32
 }
 
 /// Names known slot states while retaining future state numbers.
@@ -457,7 +457,7 @@ pub(crate) fn state(slot: &SlotStatus) -> String {
         .map(|state| {
             state
                 .as_str_name()
-                .trim_start_matches("STATE_")
+                .trim_start_matches("SLOT_STATE_")
                 .to_ascii_lowercase()
         })
         .unwrap_or_else(|_| slot.state.to_string())
@@ -512,7 +512,7 @@ pub(crate) fn metadata(slot: &SlotStatus) -> Value {
         .map(|origin| {
             origin
                 .as_str_name()
-                .trim_start_matches("ORIGIN_")
+                .trim_start_matches("SLOT_ORIGIN_")
                 .to_ascii_lowercase()
         })
         .unwrap_or_else(|_| slot.origin.to_string());
@@ -540,10 +540,10 @@ mod tests {
     #[test]
     fn reference_uploads_do_not_request_approval() {
         use schema::SlotKind::*;
-        for kind in [SlotReferenceGenome, SlotGeneAnnotations, SlotVariantCatalog] {
+        for kind in [ReferenceGenome, GeneAnnotations, VariantCatalog] {
             assert!(!upload_approval(kind as i32));
         }
-        assert!(upload_approval(SlotSnpIndelCalls as i32));
+        assert!(upload_approval(SnpIndelCalls as i32));
     }
 
     /// Checks that a slot kind this CLI does not know keeps its texts and
@@ -556,7 +556,7 @@ mod tests {
             name: "Future dataset".into(),
             desc: "A public dataset for apps.".into(),
             format: "An unchanged file from the reference catalog.".into(),
-            state: SlotState::StateFilled as i32,
+            state: SlotState::Filled as i32,
             bytes: 123,
             build: "GRCh39".into(),
             version: "158".into(),
@@ -576,7 +576,7 @@ mod tests {
         // The human view marks whether the known dependency is filled
         let dependency = SlotStatus {
             kind: 1,
-            state: SlotState::StateFilled as i32,
+            state: SlotState::Filled as i32,
             ..Default::default()
         };
         assert_eq!(
@@ -592,7 +592,7 @@ mod tests {
         let error = select(&[], 5).unwrap_err();
         assert_eq!((error.class, error.code), (1, "invalid-slot"));
         assert!(!filled(&SlotStatus {
-            state: SlotState::StateDamaged as i32,
+            state: SlotState::Damaged as i32,
             ..slot
         }));
     }

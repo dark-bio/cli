@@ -138,7 +138,7 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
     // cycle
     let mut pending: Vec<_> = slots
         .iter()
-        .filter(|slot| slot.origin == darkbio_connect::schema::SlotOrigin::OriginReference as i32)
+        .filter(|slot| slot.origin == darkbio_connect::schema::SlotOrigin::Reference as i32)
         .collect();
     let mut ordered = Vec::new();
     while !pending.is_empty() {
@@ -799,12 +799,12 @@ mod tests {
     fn reference(id: i32, deps: &[i32], filled: bool) -> SlotStatus {
         SlotStatus {
             kind: id,
-            origin: SlotOrigin::OriginReference as i32,
+            origin: SlotOrigin::Reference as i32,
             deps: deps.into(),
             state: if filled {
-                SlotState::StateFilled
+                SlotState::Filled
             } else {
-                SlotState::StateEmpty
+                SlotState::Empty
             } as i32,
             ..Default::default()
         }

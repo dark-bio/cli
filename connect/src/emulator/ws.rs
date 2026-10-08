@@ -766,7 +766,7 @@ mod tests {
             reader.read(&mut [0])
         });
         reading.recv().unwrap();
-        tester.wait_blocked(1);
+        tester.wait_parked(1);
         assert_eq!(tester.next_deadline(), None);
         shutdown();
         assert_eq!(read.join().unwrap().unwrap(), 0);

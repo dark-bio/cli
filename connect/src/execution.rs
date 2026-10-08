@@ -12,7 +12,7 @@ use darkbio_wire::protocol::{Message, Promise, Requester};
 use std::io::{self, Read};
 use std::time::Duration;
 
-/// Largest upload chunk, 32 KiB short of a 2 MiB frame to leave room for
+/// Largest transfer chunk, 32 KiB short of a 2 MiB frame to leave room for
 /// sealing and framing.
 const CHUNK_SIZE: usize = 2 * 1024 * 1024 - 32 * 1024;
 /// Delay between status requests while the Ark retains a pending task.
@@ -46,10 +46,27 @@ pub enum ExecutionProgress {
         /// Host time since scheduling succeeded, including status polling waits.
         elapsed: Duration,
     },
+    /// The Ark is awaiting the owner's review of the report.
+    ///
+    /// Reported once, when the first awaiting status arrives.
+    Reviewing,
+}
+
+/// Released result, complete output streams and time spent running the app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionOutcome {
+    /// Result metadata the owner saw when releasing the report.
+    pub result: schema::ExecutionResultResponse,
+    /// Released standard output bytes.
+    pub stdout: Vec<u8>,
+    /// Released standard error bytes, kept for develop builds.
+    pub stderr: Vec<u8>,
+    /// Time from scheduling acknowledgment to the first observed end of the run.
+    pub duration: Duration,
 }
 
 /// Uploads and runs an app, streaming at most two outstanding chunks, waiting
-/// for authorization and retrieving the result once.
+/// for authorization and report review, then reading the released output.
 ///
 /// Scheduling runs through the caller's client, which waits on the owner's
 /// approval. After a failure it requests the task's cancellation within the
@@ -62,7 +79,7 @@ pub(crate) fn execute(
     timing: impl Into<Timing>,
     mut progress: impl FnMut(ExecutionProgress),
     schedule: impl FnOnce(u64) -> Result<(), Error>,
-) -> Result<schema::ExecutionResultResponse, Error> {
+) -> Result<ExecutionOutcome, Error> {
     let clock = &requester.clock();
     let timing = timing.into();
     if size == 0 {
@@ -131,23 +148,60 @@ pub(crate) fn execute(
         progress(ExecutionProgress::Authorizing);
         schedule(taskid)?;
 
-        // Retrieving a completed status consumes the result on the Ark. This
-        // workflow is the sole poller and never retries a completed retrieval.
+        // Poll through the run and review, recording when the run first ends
         let started = clock.now();
+        let mut duration = None;
         loop {
-            progress(ExecutionProgress::Running {
-                elapsed: clock.elapsed(started),
-            });
             let status = requester
                 .request(schema::ExecutionStatusRequest { taskid }, timing.io(clock))?
                 .wait::<schema::ExecutionStatusResponse>()?;
-            match (status.pending, status.result) {
-                (false, Some(result)) => return Ok(result),
-                (true, None) => {}
+            match schema::ExecutionState::try_from(status.state) {
+                Ok(schema::ExecutionState::Running) => {
+                    if duration.is_none() {
+                        progress(ExecutionProgress::Running {
+                            elapsed: clock.elapsed(started),
+                        });
+                    }
+                }
+                Ok(schema::ExecutionState::Awaiting) => {
+                    if duration.is_none() {
+                        duration = Some(clock.elapsed(started));
+                        progress(ExecutionProgress::Reviewing);
+                    }
+                }
+                Ok(schema::ExecutionState::Resolved) => {
+                    duration.get_or_insert_with(|| clock.elapsed(started));
+                    break;
+                }
                 _ => return Err(Error::Execution("invalid execution status".into())),
             }
             timing.pause(clock, POLL_INTERVAL)?;
         }
+
+        // Fetch the released result, then read each output stream in order
+        let result = requester
+            .request(schema::ExecutionResultRequest { taskid }, timing.io(clock))?
+            .wait::<schema::ExecutionResultResponse>()?;
+        let stdout = read_output(
+            requester,
+            taskid,
+            schema::ExecutionStream::Stdout,
+            result.stdout_bytes,
+            timing,
+        )?;
+        let stderr = read_output(
+            requester,
+            taskid,
+            schema::ExecutionStream::Stderr,
+            result.stderr_bytes,
+            timing,
+        )?;
+        Ok(ExecutionOutcome {
+            result,
+            stdout,
+            stderr,
+            duration: duration.expect("resolved execution ended"),
+        })
     })();
 
     // Request a failed task's cancellation within the remaining deadline, at
@@ -159,6 +213,38 @@ pub(crate) fn execute(
             .and_then(|pending| pending.wait::<schema::ExecutionCancelResponse>());
     }
     result
+}
+
+/// Reads one released stream to its advertised length, rejecting invalid chunks.
+fn read_output(
+    requester: &Requester,
+    taskid: u64,
+    stream: schema::ExecutionStream,
+    size: u64,
+    timing: Timing,
+) -> Result<Vec<u8>, Error> {
+    let clock = requester.clock();
+    let mut output = Vec::new();
+    let mut offset = 0;
+    while offset < size {
+        let response = requester
+            .request(
+                schema::ExecutionOutputRequest {
+                    taskid,
+                    stream: stream as i32,
+                    offset,
+                    size: CHUNK_SIZE as u64,
+                },
+                timing.io(&clock),
+            )?
+            .wait::<schema::ExecutionOutputResponse>()?;
+        if response.chunk.len() as u64 != (size - offset).min(CHUNK_SIZE as u64) {
+            return Err(Error::Execution("invalid execution output chunk".into()));
+        }
+        offset += response.chunk.len() as u64;
+        output.extend(response.chunk);
+    }
+    Ok(output)
 }
 
 /// Checks EOF before the final chunk, so a growing or misdeclared source never
@@ -212,16 +298,35 @@ mod tests {
         size: u64,
         /// App bytes the upload delivered.
         bytes: Vec<u8>,
+        /// Output reads, with their requested streams, sizes and offsets.
+        reads: Vec<schema::ExecutionOutputRequest>,
     }
 
-    /// Builds an execution result with binary output, successful or not.
+    /// Builds released result metadata with empty streams, successful or not.
     fn result(success: bool) -> schema::ExecutionResultResponse {
         schema::ExecutionResultResponse {
-            app_name: "test app".into(),
-            app_version: "1.2.3".into(),
+            name: "sample app".into(),
+            version: "1.2.3".into(),
+            develop: true,
             success,
+            paths: vec!["v1/sample".into()],
+            media: "text/plain".into(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        }
+    }
+
+    /// Builds a released outcome with binary output on both streams.
+    fn outcome(success: bool) -> ExecutionOutcome {
+        ExecutionOutcome {
+            result: schema::ExecutionResultResponse {
+                stdout_bytes: 3,
+                stderr_bytes: 2,
+                ..result(success)
+            },
             stdout: vec![0, 255, 42],
             stderr: vec![254, 0],
+            duration: Duration::ZERO,
         }
     }
 
@@ -231,8 +336,9 @@ mod tests {
     /// from `reports`.
     fn peer(
         clock: &Clock,
-        fail: Option<&'static str>,
-        reports: Vec<schema::ExecutionStatusResponse>,
+        fail: Option<(&'static str, schema::Error)>,
+        reports: Vec<i32>,
+        output: ExecutionOutcome,
     ) -> (Peer, Arc<Mutex<Observed>>) {
         let observed = Arc::new(Mutex::new(Observed::default()));
         let shared = observed.clone();
@@ -264,8 +370,32 @@ mod tests {
                         assert_eq!(request.taskid, 7);
                         (
                             "status",
-                            reports.pop_front().expect("unexpected status poll").into(),
+                            schema::ExecutionStatusResponse {
+                                state: reports.pop_front().expect("unexpected status poll"),
+                            }
+                            .into(),
                         )
+                    }
+                    Content::ExecResult(request) => {
+                        assert_eq!(request.taskid, 7);
+                        ("result", output.result.clone().into())
+                    }
+                    Content::ExecOutput(request) => {
+                        assert_eq!(request.taskid, 7);
+                        let bytes = match schema::ExecutionStream::try_from(request.stream) {
+                            Ok(schema::ExecutionStream::Stdout) => &output.stdout,
+                            Ok(schema::ExecutionStream::Stderr) => &output.stderr,
+                            _ => panic!("invalid output stream"),
+                        };
+                        let chunk = bytes
+                            .get(request.offset as usize..)
+                            .unwrap_or_default()
+                            .iter()
+                            .copied()
+                            .take(request.size as usize)
+                            .collect();
+                        observed.reads.push(request);
+                        ("output", schema::ExecutionOutputResponse { chunk }.into())
                     }
                     Content::ExecCancel(request) => {
                         assert_eq!(request.taskid, 7);
@@ -275,13 +405,15 @@ mod tests {
                 };
                 observed.stages.push(stage);
                 let deadline = session.clock().now() + TIMEOUT;
-                if fail == Some(stage) || stage == "cancel" && fail.is_some() {
-                    responder
-                        .fail(
-                            schema::Error::new(0x778, format!("refused {stage}")),
-                            deadline,
-                        )
-                        .unwrap();
+                if let Some((failed, error)) = &fail
+                    && (*failed == stage || stage == "cancel")
+                {
+                    let error = if stage == "cancel" {
+                        schema::Error::new(0x779, "cleanup refused")
+                    } else {
+                        error.clone()
+                    };
+                    responder.fail(error, deadline).unwrap();
                 } else {
                     responder.reply(response, deadline).unwrap();
                 }
@@ -303,7 +435,7 @@ mod tests {
         size: u64,
         reader: &mut impl Read,
         progress: impl FnMut(ExecutionProgress),
-    ) -> Result<schema::ExecutionResultResponse, Error> {
+    ) -> Result<ExecutionOutcome, Error> {
         let deadline = requester.clock().now() + TIMEOUT;
         execute(requester, size, reader, deadline, progress, |taskid| {
             requester
@@ -313,28 +445,28 @@ mod tests {
         })
     }
 
-    /// Scheduling follows the final acknowledgment, and polling stops at the
-    /// result, keeping binary output even of a failed app.
+    /// Resolution ends polling, output reads follow the release, and the run's
+    /// duration excludes the review even for a failed app.
     #[test]
     fn test_execution() {
         let mut tester = test_clock();
         let clock = tester.clock();
         for (size, success) in [(17, false), (3 * CHUNK_SIZE + 29, true)] {
-            // Run the app, the first status reporting it still pending
-            let expected = result(success);
+            // Serve a run and repeated review polls before releasing both streams
+            let mut expected = outcome(success);
+            expected.stdout = (0..2 * CHUNK_SIZE + 29).map(|i| (i % 251) as u8).collect();
+            expected.result.stdout_bytes = expected.stdout.len() as u64;
+            expected.duration = Duration::from_millis(500);
             let (mut peer, observed) = peer(
                 &clock,
                 None,
                 vec![
-                    schema::ExecutionStatusResponse {
-                        pending: true,
-                        result: None,
-                    },
-                    schema::ExecutionStatusResponse {
-                        pending: false,
-                        result: Some(expected.clone()),
-                    },
+                    schema::ExecutionState::Running as i32,
+                    schema::ExecutionState::Awaiting as i32,
+                    schema::ExecutionState::Awaiting as i32,
+                    schema::ExecutionState::Resolved as i32,
                 ],
+                expected.clone(),
             );
             let session = attach(&mut peer);
             let bytes: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -350,11 +482,13 @@ mod tests {
                 }
             });
 
-            // End the pause between the two status polls once the runner
-            // sleeps in it
-            let poll = clock.now() + POLL_INTERVAL;
-            wait_deadline(&tester, poll);
-            tester.advance_to(poll);
+            // Advance each polling pause, spending a full second in review
+            let started = clock.now();
+            for millis in [500, 1000, 1500] {
+                let poll = started + Duration::from_millis(millis);
+                wait_deadline(&tester, poll);
+                tester.advance_to(poll);
+            }
             let (actual, progress) = running.join().unwrap().unwrap();
             assert_eq!(actual, expected);
 
@@ -368,9 +502,26 @@ mod tests {
                     .iter()
                     .filter(|stage| **stage == "status")
                     .count(),
-                2
+                4
             );
             assert!(!observed.stages.contains(&"cancel"));
+            assert_eq!(
+                &observed.stages[observed.stages.len() - 6..],
+                ["status", "result", "output", "output", "output", "output"]
+            );
+            assert_eq!(
+                observed
+                    .reads
+                    .iter()
+                    .map(|read| (read.stream, read.offset, read.size))
+                    .collect::<Vec<_>>(),
+                [
+                    (1, 0, 2_064_384),
+                    (1, 2_064_384, 2_064_384),
+                    (1, 4_128_768, 2_064_384),
+                    (2, 0, 2_064_384),
+                ]
+            );
             let authorizing = progress
                 .iter()
                 .position(|stage| *stage == ExecutionProgress::Authorizing)
@@ -383,6 +534,15 @@ mod tests {
                 }
             );
             assert_eq!(progress[1], ExecutionProgress::Started { taskid: 7 });
+            assert_eq!(
+                &progress[authorizing + 1..],
+                [
+                    ExecutionProgress::Running {
+                        elapsed: Duration::ZERO,
+                    },
+                    ExecutionProgress::Reviewing,
+                ]
+            );
         }
     }
 
@@ -393,14 +553,12 @@ mod tests {
         // Each refused stage fails the run without a retry, requesting
         // cancellation of any task it allocated
         let clock = test_clock().clock();
-        for fail in ["start", "chunk", "schedule", "status"] {
+        for fail in ["start", "chunk", "schedule", "status", "result", "output"] {
             let (mut peer, observed) = peer(
                 &clock,
-                Some(fail),
-                vec![schema::ExecutionStatusResponse {
-                    pending: false,
-                    result: Some(result(true)),
-                }],
+                Some((fail, schema::Error::new(0x778, format!("refused {fail}")))),
+                vec![schema::ExecutionState::Resolved as i32],
+                outcome(true),
             );
             let session = attach(&mut peer);
             let result = run(&session.requester(), 1, &mut [42].as_slice(), |_| {});
@@ -423,24 +581,223 @@ mod tests {
         }
     }
 
-    /// A missing result or contradictory pending flag must not become success.
+    /// Unspecified and unknown states fail and cancel the task.
     #[test]
     fn test_invalid_status() {
         let clock = test_clock().clock();
-        for report in [
-            schema::ExecutionStatusResponse::default(),
-            schema::ExecutionStatusResponse {
-                pending: true,
-                result: Some(result(true)),
-            },
-        ] {
-            let (mut peer, observed) = peer(&clock, None, vec![report]);
+        for report in [schema::ExecutionState::Unspecified as i32, 99] {
+            let (mut peer, observed) = peer(&clock, None, vec![report], outcome(true));
             let session = attach(&mut peer);
             assert!(matches!(
                 run(&session.requester(), 1, &mut [42].as_slice(), |_| {}),
-                Err(Error::Execution(_))
+                Err(Error::Execution(message)) if message == "invalid execution status"
             ));
             assert_eq!(observed.lock().unwrap().stages.last(), Some(&"cancel"));
+        }
+    }
+
+    /// A resolved observation ends the run without prompting for an unseen review.
+    #[test]
+    fn test_resolved_without_awaiting() {
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (mut peer, observed) = peer(
+            &clock,
+            None,
+            vec![
+                schema::ExecutionState::Running as i32,
+                schema::ExecutionState::Resolved as i32,
+            ],
+            outcome(true),
+        );
+        let session = attach(&mut peer);
+        let worker = thread::spawn({
+            let requester = session.requester();
+            move || {
+                let mut progress = Vec::new();
+                let outcome = run(&requester, 1, &mut [42].as_slice(), |stage| {
+                    progress.push(stage)
+                })
+                .unwrap();
+                (outcome, progress)
+            }
+        });
+
+        // Finish the run at the second poll, without a separate review wait
+        let poll = clock.now() + Duration::from_millis(500);
+        wait_deadline(&tester, poll);
+        tester.advance_to(poll);
+        let (outcome, progress) = worker.join().unwrap();
+        assert_eq!(outcome.duration, Duration::from_millis(500));
+        assert!(!progress.contains(&ExecutionProgress::Reviewing));
+        assert_eq!(
+            observed.lock().unwrap().stages,
+            [
+                "start", "chunk", "schedule", "status", "status", "result", "output", "output"
+            ]
+        );
+    }
+
+    /// Timely status replies keep a review alive beyond the inactivity allowance.
+    #[test]
+    fn test_review_outlasts_inactivity() {
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let mut states = vec![schema::ExecutionState::Awaiting as i32; 24];
+        states.push(schema::ExecutionState::Resolved as i32);
+        let (mut peer, _) = peer(&clock, None, states, outcome(true));
+        let session = attach(&mut peer);
+        let worker = thread::spawn({
+            let requester = session.requester();
+            move || {
+                let timing = Timing::inactivity(Duration::from_millis(100));
+                let mut progress = Vec::new();
+                let outcome = execute(
+                    &requester,
+                    1,
+                    &mut [42].as_slice(),
+                    timing,
+                    |stage| progress.push(stage),
+                    |taskid| {
+                        requester
+                            .request(
+                                schema::ExecutionScheduleRequest { taskid },
+                                timing.io(&requester.clock()),
+                            )?
+                            .wait::<schema::ExecutionScheduleResponse>()?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                (outcome, progress)
+            }
+        });
+
+        // Each reply renews the I/O allowance while review has no total bound
+        let started = clock.now();
+        for index in 1..=24 {
+            let poll = started + Duration::from_millis(index * 500);
+            wait_deadline(&tester, poll);
+            tester.advance_to(poll);
+        }
+        let (outcome, progress) = worker.join().unwrap();
+        assert_eq!(outcome.duration, Duration::ZERO);
+        assert_eq!(
+            &progress[progress.len() - 2..],
+            [ExecutionProgress::Authorizing, ExecutionProgress::Reviewing]
+        );
+    }
+
+    /// Every withheld report keeps its reserved code and message.
+    #[test]
+    fn test_withheld_reports() {
+        let clock = test_clock().clock();
+        for (code, message) in [
+            (
+                schema::ReservedErrors::Unauthorized,
+                "sample report declined",
+            ),
+            (schema::ReservedErrors::Unconfirmed, "sample review expired"),
+            (
+                schema::ReservedErrors::Undelivered,
+                "sample review not delivered",
+            ),
+        ] {
+            let expected = schema::Error::reserved(code, message);
+            let (mut peer, observed) = peer(
+                &clock,
+                Some(("result", expected.clone())),
+                vec![schema::ExecutionState::Resolved as i32],
+                outcome(true),
+            );
+            let session = attach(&mut peer);
+            assert!(matches!(
+                run(&session.requester(), 1, &mut [42].as_slice(), |_| {}),
+                Err(Error::Remote(error)) if error == expected
+            ));
+            assert_eq!(
+                observed.lock().unwrap().stages,
+                ["start", "chunk", "schedule", "status", "result", "cancel"]
+            );
+        }
+    }
+
+    /// Empty, short and overrunning chunks fail and cancel either output stream.
+    #[test]
+    fn test_invalid_output_chunks() {
+        let clock = test_clock().clock();
+        for stream in [
+            schema::ExecutionStream::Stdout,
+            schema::ExecutionStream::Stderr,
+        ] {
+            for length in [0, 2, 4] {
+                let mut output = outcome(true);
+                if stream == schema::ExecutionStream::Stdout {
+                    output.stdout = vec![42; length];
+                } else {
+                    output.result.stderr_bytes = 3;
+                    output.stderr = vec![42; length];
+                }
+                let (mut peer, observed) = peer(
+                    &clock,
+                    None,
+                    vec![schema::ExecutionState::Resolved as i32],
+                    output,
+                );
+                let session = attach(&mut peer);
+                assert!(matches!(
+                    run(&session.requester(), 1, &mut [42].as_slice(), |_| {}),
+                    Err(Error::Execution(_))
+                ));
+                let observed = observed.lock().unwrap();
+                assert_eq!(observed.stages.last(), Some(&"cancel"));
+                assert_eq!(observed.reads.last().unwrap().stream, stream as i32);
+            }
+        }
+    }
+
+    /// Empty streams issue no output read, including when only one is empty.
+    #[test]
+    fn test_empty_streams() {
+        let clock = test_clock().clock();
+        for (stdout, stderr, streams) in [
+            (false, false, vec![]),
+            (false, true, vec![2]),
+            (true, false, vec![1]),
+        ] {
+            let mut expected = outcome(true);
+            if !stdout {
+                expected.stdout.clear();
+                expected.result.stdout_bytes = 0;
+            }
+            if !stderr {
+                expected.stderr.clear();
+                expected.result.stderr_bytes = 0;
+            }
+            let (mut peer, observed) = peer(
+                &clock,
+                None,
+                vec![schema::ExecutionState::Resolved as i32],
+                expected.clone(),
+            );
+            let session = attach(&mut peer);
+            let mut progress = Vec::new();
+            let actual = run(&session.requester(), 1, &mut [42].as_slice(), |stage| {
+                progress.push(stage)
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert!(!progress.contains(&ExecutionProgress::Reviewing));
+            let observed = observed.lock().unwrap();
+            assert_eq!(
+                observed
+                    .reads
+                    .iter()
+                    .map(|read| read.stream)
+                    .collect::<Vec<_>>(),
+                streams
+            );
+            assert!(!observed.stages.contains(&"cancel"));
         }
     }
 
@@ -451,7 +808,7 @@ mod tests {
         let clock = test_clock().clock();
         for size in [17, CHUNK_SIZE + 17] {
             for extra in [-1_i64, 1] {
-                let (mut peer, observed) = peer(&clock, None, vec![]);
+                let (mut peer, observed) = peer(&clock, None, vec![], outcome(true));
                 let session = attach(&mut peer);
                 let bytes = vec![42; (size as i64 + extra) as usize];
                 assert!(
@@ -521,12 +878,14 @@ mod tests {
                         responder
                             .reply(
                                 schema::ExecutionStatusResponse {
-                                    pending: false,
-                                    result: Some(result(true)),
+                                    state: schema::ExecutionState::Resolved as i32,
                                 },
                                 deadline,
                             )
                             .unwrap();
+                    }
+                    Content::ExecResult(_) => {
+                        responder.reply(result(true), deadline).unwrap();
                     }
                     _ => panic!("unexpected request"),
                 }
@@ -558,7 +917,7 @@ mod tests {
                 .any(|stage| stage == ExecutionProgress::Authorizing)
         );
         release.send(()).unwrap();
-        assert!(worker.join().unwrap().unwrap().success);
+        assert!(worker.join().unwrap().unwrap().result.success);
     }
 
     /// A cancel goes out while a status poll is outstanding, with no receive
@@ -602,12 +961,14 @@ mod tests {
                             .unwrap()
                             .reply(
                                 schema::ExecutionStatusResponse {
-                                    pending: false,
-                                    result: Some(result(false)),
+                                    state: schema::ExecutionState::Resolved as i32,
                                 },
                                 deadline,
                             )
                             .unwrap();
+                    }
+                    Content::ExecResult(_) => {
+                        responder.reply(result(false), deadline).unwrap();
                     }
                     _ => panic!("unexpected request"),
                 }
@@ -629,7 +990,7 @@ mod tests {
             .unwrap()
             .wait::<schema::ExecutionCancelResponse>()
             .unwrap();
-        assert!(!worker.join().unwrap().unwrap().success);
+        assert!(!worker.join().unwrap().unwrap().result.success);
     }
 
     /// Fragmented and interrupted reads still run the app, while an expired
@@ -661,10 +1022,8 @@ mod tests {
         let (mut peer, _) = peer(
             &clock,
             None,
-            vec![schema::ExecutionStatusResponse {
-                pending: false,
-                result: Some(result(true)),
-            }],
+            vec![schema::ExecutionState::Resolved as i32],
+            outcome(true),
         );
         let session = attach(&mut peer);
         let mut reader = Fragmented {
@@ -674,6 +1033,7 @@ mod tests {
         assert!(
             run(&session.requester(), 3, &mut reader, |_| {})
                 .unwrap()
+                .result
                 .success
         );
         assert!(reader.interrupted);

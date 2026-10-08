@@ -35,8 +35,8 @@ color; neither can force it on in a pipe.
 App reports pass through to stdout as exact bytes by default. App stderr is
 announced and written verbatim to stderr. With --json, app streams become stdout
 and stderr strings, or stdout_base64 and stderr_base64 when their bytes are not
-UTF-8. Failed apps return output only with `develop = true`; the CLI preserves
-whatever the Ark returns.
+UTF-8. App output arrives only once the owner releases it, and a failed app's
+output only with `develop = true`; the CLI preserves whatever the Ark returns.
 
 A command that did partial work keeps that result, reports failure on stderr
 and exits nonzero. It never replaces an emitted result with an error document.
@@ -147,15 +147,15 @@ Exit 5, Ark state or refusal:
   `unknown` means the firmware and this tool disagree, update both
 
 Exit 6, approval:
-- `approval-denied`: the owner declined, or Ark Companion sent an answer the Ark
-  could not accept; the message says which
+- `approval-denied`: the owner declined or kept an app's report, or Ark
+  Companion sent an answer the Ark could not accept; the message says which
 - `approval-timeout`: nobody answered in time; a pairing hints `ark pair`
 
 Exit 7, `timeout`: a machine wait exceeded --timeout, or the Ark did not
 return from a reboot within 120 seconds.
 
-Exit 8, `app-failed`: the app reported failure. Any output returned by the
-Ark is still printed.
+Exit 8, `app-failed`: the app failed and the owner released that result. Any
+output returned by the Ark is still printed.
 
 Exit 130 `interrupted` and 143 `terminated`: Ctrl-C or SIGTERM, after a
 best-effort cancel of the active task or upload.

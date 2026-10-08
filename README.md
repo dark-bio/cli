@@ -88,7 +88,7 @@ Uploads of your own data are approved on the phone; public reference downloads a
 
 ## Apps
 
-An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval, runs it on the Ark and writes the report's exact bytes to stdout. Redirect stdout to save it, or use `--json` to include the run's metadata. Ctrl-C cancels a run; `ark app cancel <task>` cleans up one whose terminal went away. `ark data paths` describes the data tree; `ark help apps` has the manifest, grant rules and sandbox limits. The [examples](https://github.com/dark-bio/examples) repository has worked apps in Rust, Go, C and Python, with fixtures that run them on your computer.
+An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval and runs it on the Ark. The owner then reviews the report on their phone, and once they release it, the command writes its exact bytes to stdout. Redirect stdout to save it, or use `--json` to include the run's metadata. Ctrl-C cancels a run, and so does closing the terminal that started it. `ark data paths` describes the data tree; `ark help apps` has the manifest, grant rules and sandbox limits. The [examples](https://github.com/dark-bio/examples) repository has worked apps in Rust, Go, C and Python, with fixtures that run them on your computer.
 
 ## Firmware
 
