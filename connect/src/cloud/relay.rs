@@ -155,8 +155,9 @@ struct State {
     bytes: usize,
     /// Whether the queue's first frame is partly written to the socket.
     writing: bool,
-    /// Handle that shuts the current socket down, set once its TCP connects.
-    socket: Option<TcpStream>,
+    /// Original TCP handle used for shutdown, retained through the upgrade and
+    /// the readiness loop.
+    socket: Option<Arc<TcpStream>>,
     /// Whether the current socket finished its upgrade.
     connected: bool,
     /// Whether a join succeeded, which keeps the relay joined for the session.
@@ -389,8 +390,10 @@ impl State {
         Some(RelayNotice::Failed(cause.into()))
     }
 
-    /// Shuts the socket down, which also interrupts a stalled upgrade or a
-    /// partly written frame.
+    /// Shuts the socket down on a best-effort basis.
+    ///
+    /// On Windows, a blocked upgrade read can still wait for its I/O timeout
+    /// or for the peer to close. Join waiters and frames are released separately.
     fn shutdown(&self) {
         if let Some(socket) = &self.socket {
             let _ = socket.shutdown(Shutdown::Both);
@@ -431,11 +434,10 @@ impl Shared {
         self.signal();
     }
 
-    /// Keeps a handle that shuts a joining socket down, before its upgrade
-    /// starts.
+    /// Retains the joining socket's original handle before its upgrade starts.
     ///
     /// A closed relay or a passed join deadline abandons the socket instead.
-    fn socket(&self, socket: &TcpStream) -> Result<(), Failure> {
+    fn socket(&self, socket: &Arc<TcpStream>) -> Result<(), Failure> {
         let mut state = self.state.lock().expect("relay state not poisoned");
         if state.closed {
             return Err(protocol::Error::Closed.into());
@@ -447,7 +449,8 @@ impl Shared {
         {
             return Err(protocol::Error::Timeout.into());
         }
-        state.socket = Some(socket.try_clone().map_err(io_error)?);
+        // A duplicated handle can reject shutdown with WSAENOTCONN on Windows
+        state.socket = Some(socket.clone());
         Ok(())
     }
 
@@ -686,7 +689,8 @@ fn ready(mut socket: Connection, poll: &Poll, shared: &Shared) -> Result<Connect
         return Err(protocol::Error::Closed.into());
     }
 
-    // Make the stream nonblocking under its TLS state and register it
+    // Register a nonblocking duplicate for I/O, retaining the original handle
+    // in shared state for shutdown
     let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
         unreachable!()
     };
@@ -1196,8 +1200,12 @@ mod tests {
         }
 
         /// Answers the next join with the token expected by the loopback server.
+        #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
         fn join(&self) {
-            let (request, responder) = self.requests.recv().unwrap();
+            let (request, responder) = self
+                .requests
+                .recv_timeout(TIMEOUT)
+                .expect("relay did not request a join");
             assert!(matches!(request, Content::RelayJoin(_)));
             responder
                 .reply(
@@ -1220,6 +1228,17 @@ mod tests {
                 .unwrap()
                 .shared
                 .clone()
+        }
+    }
+
+    /// Waits until `ready` holds, failing a broken test after three `TIMEOUT`s
+    /// of real time. The session's test clock stays where it is.
+    #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
+    fn eventually(mut ready: impl FnMut() -> bool, reason: &str) {
+        let deadline = Instant::now() + TIMEOUT * 3;
+        while !ready() {
+            assert!(Instant::now() < deadline, "{reason}");
+            thread::yield_now();
         }
     }
 
@@ -1326,13 +1345,28 @@ mod tests {
     /// Checks that the host refused a frame with `UNAVAILABLE`, returning the
     /// cause.
     fn refused(promise: Promise<protocol::Message>) -> String {
-        let protocol::Error::Remote(error) =
-            promise.wait::<schema::RelayOutboundResponse>().unwrap_err()
+        let protocol::Error::Remote(error) = settled(promise)
+            .wait::<schema::RelayOutboundResponse>()
+            .unwrap_err()
         else {
             panic!("expected frame refusal")
         };
         assert_eq!(error.code, schema::ReservedErrors::Unavailable as u64);
         error.msg
+    }
+
+    /// Waits until the host answers or refuses a frame, failing a broken test
+    /// after `TIMEOUT` of real time.
+    #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
+    fn settled(mut promise: Promise<protocol::Message>) -> Promise<protocol::Message> {
+        let (done, ready) = mpsc::channel();
+        promise.notify(move || {
+            let _ = done.send(());
+        });
+        ready
+            .recv_timeout(TIMEOUT)
+            .expect("relay did not settle a frame");
+        promise
     }
 
     /// Waits until the queue holds `count` frames.
@@ -1618,17 +1652,27 @@ mod tests {
     /// A frame whose hold runs out during a stalled upgrade is refused, and never
     /// sent later.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounds broken test coordination only"
+    )]
     fn test_hold_deadline() {
         let mut tester = test_clock();
         let clock = tester.clock();
         let (listener, url) = cloud();
         let (stalled, stalls) = mpsc::channel();
+        let (closed, closes) = mpsc::channel();
         let (done, finish) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             headers(&mut stream);
             stalled.send(()).unwrap();
             assert_stream_closed(stream.read(&mut [0]));
+
+            // Close this end too, since on Windows the relay's blocked read
+            // returns only once the peer closes or its own timeout passes
+            drop(stream);
+            closed.send(()).unwrap();
             sync(&listener);
             let mut socket = upgrade(accept(&listener));
             assert_eq!(frame(&mut socket), [2]);
@@ -1637,7 +1681,9 @@ mod tests {
         let fixture = Fixture::new(&clock, url);
         let sent = fixture.outbound(vec![1]);
         fixture.join();
-        stalls.recv().unwrap();
+        stalls
+            .recv_timeout(TIMEOUT)
+            .expect("server did not receive the upgrade");
 
         // Let the frame's hold run out on the test clock, cutting the upgrade short
         let shared = fixture.shared();
@@ -1645,16 +1691,26 @@ mod tests {
         let (resume, resumed) = crossbeam_channel::bounded(0);
         *shared.rearming.lock().unwrap() = Some((rearming, resumed));
         shared.signal();
-        paused.recv().unwrap();
+        paused
+            .recv_timeout(TIMEOUT)
+            .expect("relay timer did not pause");
         tester.advance(Duration::from_secs(10));
-        resume.send(()).unwrap();
+        resume
+            .send_timeout((), TIMEOUT)
+            .expect("relay timer did not resume");
         assert!(refused(sent).contains("10 s"));
-        while !shared.state.lock().unwrap().unsynced {
-            thread::yield_now();
-        }
+        closes
+            .recv_timeout(TIMEOUT)
+            .expect("server did not finish the stalled stream");
+        eventually(
+            || shared.state.try_lock().is_ok_and(|state| state.unsynced),
+            "relay did not finish the expired upgrade",
+        );
         let sent = fixture.outbound(vec![2]);
         fixture.join();
-        sent.wait::<schema::RelayOutboundResponse>().unwrap();
+        settled(sent)
+            .wait::<schema::RelayOutboundResponse>()
+            .unwrap();
         done.send(()).unwrap();
         fixture.ark.close();
         server.join().unwrap();
@@ -2161,7 +2217,72 @@ mod tests {
         }
     }
 
-    /// Ending a relay refuses queued frames and interrupts an unfinished upgrade.
+    /// Shutdown retains the original TCP handle through the upgrade and
+    /// readiness registration, then closes the peer's stream.
+    #[test]
+    fn test_shutdown_retains_original_handle() {
+        // Complete a real upgrade, leaving the peer waiting for closure
+        let clock = test_clock().clock();
+        let (listener, url) = cloud();
+        let server = thread::spawn(move || {
+            let mut socket = upgrade(accept(&listener));
+            assert_socket_closed(socket.read());
+        });
+        let api = http::tests::api(url, Realm::Hardware, &clock);
+        let deadline = clock.now() + TIMEOUT;
+        let poll = Poll::new().unwrap();
+        let (changed, _changes) = crossbeam_channel::bounded(1);
+        let shared = Shared {
+            clock,
+            state: Mutex::new(State {
+                joining: Some(deadline),
+                ..Default::default()
+            }),
+            wake: Arc::new(Waker::new(poll.registry(), WAKE).unwrap()),
+            changed,
+            notices: Arc::new(Observer::default()),
+            rearming: Mutex::new(None),
+        };
+        let mut socket = super::super::socket::connect(
+            &api,
+            &api.relay_url(),
+            &[0xfb, 0xff],
+            "Relaying",
+            deadline,
+            Some(&|socket| shared.socket(socket)),
+        )
+        .unwrap();
+
+        // Require the same handle, even on platforms where a duplicate shuts
+        // down successfully, so this regression does not depend on a race
+        let original = {
+            let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
+                unreachable!()
+            };
+            let state = shared.state.lock().unwrap();
+            assert!(Arc::ptr_eq(stream, state.socket.as_ref().unwrap()));
+            Arc::downgrade(stream)
+        };
+
+        // Keep the original shutdown handle when I/O moves to the poller
+        let socket = ready(socket, &poll, &shared).unwrap();
+        {
+            let state = shared.state.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                &original.upgrade().unwrap(),
+                state.socket.as_ref().unwrap()
+            ));
+        }
+        shared.close();
+        server.join().unwrap();
+
+        // Release the original handle once the failed attempt is torn down
+        ended(&shared, protocol::Error::Closed.into(), false);
+        assert!(original.upgrade().is_none());
+        drop(socket);
+    }
+
+    /// Ending a relay refuses queued frames and closes a stalled upgrade's peer.
     #[test]
     fn test_close_during_join() {
         let clock = test_clock().clock();

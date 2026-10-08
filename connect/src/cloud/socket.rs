@@ -13,6 +13,7 @@ use darkbio_clock::Clock;
 use darkbio_wire::protocol;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Instant;
 use tungstenite::{
     WebSocket, client::IntoClientRequest, handshake::HandshakeError, protocol::WebSocketConfig,
@@ -25,9 +26,9 @@ const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
 /// Cloud WebSocket retaining its TLS state when switched to readiness polling.
 pub(super) type Connection = WebSocket<MaybeTlsStream<Socket>>;
 
-/// Callback that sees the TCP stream before the upgrade, such as to keep a
-/// handle that shuts it down.
-type OnConnect<'a> = &'a dyn Fn(&TcpStream) -> Result<(), Failure>;
+/// Callback that can retain the original TCP handle before the upgrade, so
+/// shutdown uses the same handle as the blocking I/O.
+type OnConnect<'a> = &'a dyn Fn(&Arc<TcpStream>) -> Result<(), Failure>;
 
 /// Opens a cloud socket that must agree on the requested subprotocol, carrying
 /// the Ark's `auth` proof in the upgrade.
@@ -93,7 +94,7 @@ pub(super) fn connect(
             Err(error) => failure = error,
         }
     }
-    let stream = connected.ok_or_else(|| io_error(failure))?;
+    let stream = Arc::new(connected.ok_or_else(|| io_error(failure))?);
     stream.set_nodelay(true).map_err(io_error)?;
     if let Some(on_connect) = on_connect {
         on_connect(&stream)?;
@@ -152,8 +153,9 @@ pub(super) enum Socket {
     Blocking {
         /// Clock of the connection, which the deadline is measured on.
         clock: Clock,
-        /// Connected TCP socket, optionally wrapped by TLS above this adapter.
-        stream: TcpStream,
+        /// Original TCP handle, shared with the relay for shutdown and
+        /// optionally wrapped by TLS above this adapter.
+        stream: Arc<TcpStream>,
         /// Absolute bound, turned into a fresh timeout before each blocking I/O.
         deadline: Instant,
     },
@@ -178,7 +180,7 @@ impl Read for Socket {
                 deadline,
             } => {
                 stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
-                stream.read(bytes)
+                stream.as_ref().read(bytes)
             }
             Self::Connected { stream, .. } => stream.read(bytes),
         }
@@ -196,7 +198,7 @@ impl Write for Socket {
                 deadline,
             } => {
                 stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
-                stream.write(bytes)
+                stream.as_ref().write(bytes)
             }
             Self::Connected {
                 stream,
@@ -228,7 +230,7 @@ impl Write for Socket {
                 deadline,
             } => {
                 stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
-                stream.flush()
+                stream.as_ref().flush()
             }
             Self::Connected { stream, .. } => stream.flush(),
         }
