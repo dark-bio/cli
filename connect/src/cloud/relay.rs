@@ -1196,8 +1196,12 @@ mod tests {
         }
 
         /// Answers the next join with the token expected by the loopback server.
+        #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
         fn join(&self) {
-            let (request, responder) = self.requests.recv().unwrap();
+            let (request, responder) = self
+                .requests
+                .recv_timeout(TIMEOUT)
+                .expect("relay did not request a join");
             assert!(matches!(request, Content::RelayJoin(_)));
             responder
                 .reply(
@@ -1220,6 +1224,17 @@ mod tests {
                 .unwrap()
                 .shared
                 .clone()
+        }
+    }
+
+    /// Waits until `ready` holds, failing a broken test after three `TIMEOUT`s
+    /// of real time. The session's test clock stays where it is.
+    #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
+    fn eventually(mut ready: impl FnMut() -> bool, reason: &str) {
+        let deadline = Instant::now() + TIMEOUT * 3;
+        while !ready() {
+            assert!(Instant::now() < deadline, "{reason}");
+            thread::yield_now();
         }
     }
 
@@ -1326,13 +1341,28 @@ mod tests {
     /// Checks that the host refused a frame with `UNAVAILABLE`, returning the
     /// cause.
     fn refused(promise: Promise<protocol::Message>) -> String {
-        let protocol::Error::Remote(error) =
-            promise.wait::<schema::RelayOutboundResponse>().unwrap_err()
+        let protocol::Error::Remote(error) = settled(promise)
+            .wait::<schema::RelayOutboundResponse>()
+            .unwrap_err()
         else {
             panic!("expected frame refusal")
         };
         assert_eq!(error.code, schema::ReservedErrors::Unavailable as u64);
         error.msg
+    }
+
+    /// Waits until the host answers or refuses a frame, failing a broken test
+    /// after `TIMEOUT` of real time.
+    #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
+    fn settled(mut promise: Promise<protocol::Message>) -> Promise<protocol::Message> {
+        let (done, ready) = mpsc::channel();
+        promise.notify(move || {
+            let _ = done.send(());
+        });
+        ready
+            .recv_timeout(TIMEOUT)
+            .expect("relay did not settle a frame");
+        promise
     }
 
     /// Waits until the queue holds `count` frames.
@@ -1618,17 +1648,27 @@ mod tests {
     /// A frame whose hold runs out during a stalled upgrade is refused, and never
     /// sent later.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounds broken test coordination only"
+    )]
     fn test_hold_deadline() {
         let mut tester = test_clock();
         let clock = tester.clock();
         let (listener, url) = cloud();
         let (stalled, stalls) = mpsc::channel();
+        let (closed, closes) = mpsc::channel();
         let (done, finish) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             headers(&mut stream);
             stalled.send(()).unwrap();
             assert_stream_closed(stream.read(&mut [0]));
+
+            // Close this end too, since on Windows the relay's blocked read
+            // returns only once the peer closes or its own timeout passes
+            drop(stream);
+            closed.send(()).unwrap();
             sync(&listener);
             let mut socket = upgrade(accept(&listener));
             assert_eq!(frame(&mut socket), [2]);
@@ -1637,7 +1677,9 @@ mod tests {
         let fixture = Fixture::new(&clock, url);
         let sent = fixture.outbound(vec![1]);
         fixture.join();
-        stalls.recv().unwrap();
+        stalls
+            .recv_timeout(TIMEOUT)
+            .expect("server did not receive the upgrade");
 
         // Let the frame's hold run out on the test clock, cutting the upgrade short
         let shared = fixture.shared();
@@ -1645,16 +1687,26 @@ mod tests {
         let (resume, resumed) = crossbeam_channel::bounded(0);
         *shared.rearming.lock().unwrap() = Some((rearming, resumed));
         shared.signal();
-        paused.recv().unwrap();
+        paused
+            .recv_timeout(TIMEOUT)
+            .expect("relay timer did not pause");
         tester.advance(Duration::from_secs(10));
-        resume.send(()).unwrap();
+        resume
+            .send_timeout((), TIMEOUT)
+            .expect("relay timer did not resume");
         assert!(refused(sent).contains("10 s"));
-        while !shared.state.lock().unwrap().unsynced {
-            thread::yield_now();
-        }
+        closes
+            .recv_timeout(TIMEOUT)
+            .expect("server did not finish the stalled stream");
+        eventually(
+            || shared.state.try_lock().is_ok_and(|state| state.unsynced),
+            "relay did not finish the expired upgrade",
+        );
         let sent = fixture.outbound(vec![2]);
         fixture.join();
-        sent.wait::<schema::RelayOutboundResponse>().unwrap();
+        settled(sent)
+            .wait::<schema::RelayOutboundResponse>()
+            .unwrap();
         done.send(()).unwrap();
         fixture.ark.close();
         server.join().unwrap();
