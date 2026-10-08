@@ -346,13 +346,13 @@ impl Services {
 
     /// Opens a relay socket with a fresh join token from the Ark.
     ///
-    /// `connected` receives the TCP stream before the upgrade starts, so the
-    /// relay can shut it down to interrupt a stalled upgrade.
+    /// `connected` receives the original TCP handle before the upgrade starts,
+    /// so the relay can shut it down if the upgrade stalls.
     fn join(
         &self,
         requester: &Requester,
         timing: Timing,
-        connected: &dyn Fn(&std::net::TcpStream) -> Result<(), Failure>,
+        connected: &dyn Fn(&Arc<std::net::TcpStream>) -> Result<(), Failure>,
     ) -> Result<socket::Connection, Failure> {
         let cloud = self.cloud.as_ref().expect("cloud route available");
         self.authenticate(requester, timing, || {
