@@ -20,6 +20,8 @@ fn paths() -> Vec<schema::DatasetPath> {
             grantable: true,
             available: true,
             desc: "A sample collection.".into(),
+            public: true,
+            wording: "Sample collection".into(),
             ..Default::default()
         },
         schema::DatasetPath {
@@ -35,6 +37,7 @@ fn paths() -> Vec<schema::DatasetPath> {
             directory: true,
             grantable: true,
             desc: "A sample group.".into(),
+            wording: "Your sample group".into(),
             ..Default::default()
         },
         schema::DatasetPath {
@@ -72,8 +75,8 @@ fn slots() -> Vec<SlotStatus> {
             format: "Plain text with one label and one value on each line. Separate the label \
                 and value with a space, then end the line with a newline."
                 .into(),
-            state: SlotState::StateFilled as i32,
-            origin: schema::SlotOrigin::OriginPersonal as i32,
+            state: SlotState::Filled as i32,
+            origin: schema::SlotOrigin::Personal as i32,
             bytes: 2048,
             build: "sample-a".into(),
             version: "1".into(),
@@ -88,8 +91,8 @@ fn slots() -> Vec<SlotStatus> {
             format: "Plain text with one value on each line. Keep the lines in label order \
                 and finish every line with a newline, including the last line."
                 .into(),
-            state: SlotState::StateEmpty as i32,
-            origin: schema::SlotOrigin::OriginReference as i32,
+            state: SlotState::Empty as i32,
+            origin: schema::SlotOrigin::Reference as i32,
             deps: vec![41],
             download: Some(schema::SlotDownload {
                 url: "https://example.test/sample".into(),
@@ -170,26 +173,32 @@ fn inventory_output() {
         {
             "path":"v1/sample", "directory":true, "grantable":true, "available":true,
             "description":"A sample collection.", "format":"", "examples":[],
+            "public":true, "wording":"Sample collection",
         },
         {
             "path":"v1/sample/label", "directory":false, "grantable":false, "available":true,
             "description":"A sample label.", "format":"Plain text.", "examples":["first","second"],
+            "public":false, "wording":"",
         },
         {
             "path":"v1/sample/group", "directory":true, "grantable":true, "available":false,
             "description":"A sample group.", "format":"", "examples":[],
+            "public":false, "wording":"Your sample group",
         },
         {
             "path":"v1/sample/group/<item>", "directory":true, "grantable":false, "available":false,
             "description":"A sample item.", "format":"", "examples":["one"],
+            "public":false, "wording":"",
         },
         {
             "path":"v1/sample/group/<item>/value", "directory":false, "grantable":false, "available":false,
             "description":"A sample value.", "format":"Decimal text.", "examples":["7","9"],
+            "public":false, "wording":"",
         },
         {
             "path":"v1/other", "directory":true, "grantable":false, "available":false,
             "description":"Another sample collection.", "format":"", "examples":[],
+            "public":false, "wording":"",
         },
     ]});
     for json in [false, true] {

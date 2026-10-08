@@ -1333,6 +1333,8 @@ pub(crate) mod tests {
                 desc: "A sample item.".into(),
                 format: "Plain text.".into(),
                 examples: vec!["first".into(), "second".into()],
+                public: true,
+                wording: "Sample item {item}".into(),
             }],
         };
         let clock = test_clock().clock();

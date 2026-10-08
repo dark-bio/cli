@@ -35,6 +35,8 @@ fn metadata(path: &DatasetPath) -> Value {
         "description": path.desc,
         "format": path.format,
         "examples": path.examples,
+        "public": path.public,
+        "wording": path.wording,
     })
 }
 

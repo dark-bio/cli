@@ -656,7 +656,7 @@ mod tests {
         match deadline {
             Some(deadline) => wait_deadline(tester, deadline),
             None => {
-                tester.wait_blocked(1);
+                tester.wait_parked(1);
                 assert_eq!(tester.next_deadline(), None);
             }
         }

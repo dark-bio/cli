@@ -138,7 +138,7 @@ pub(crate) enum Command {
     /// Read and change the datasets on the Ark
     #[command(subcommand)]
     Data(Data),
-    /// Run an app on the Ark, or cancel one
+    /// Run an app on the Ark
     #[command(subcommand)]
     App(App),
     /// List and install Ark firmware
@@ -245,18 +245,13 @@ pub(crate) struct Change {
     pub dry_run: bool,
 }
 
-// App execution and explicit cancellation by the task ID returned by the Ark
+// App execution on the Ark
 #[derive(Subcommand)]
 pub(crate) enum App {
     /// Run an app, approved on your phone; print its report
     Run {
         /// Local WebAssembly app
         file: PathBuf,
-    },
-    /// Cancel a running app or unfinished upload
-    Cancel {
-        /// Task id printed by `ark app run`
-        task: u64,
     },
 }
 
@@ -301,7 +296,7 @@ pub(crate) fn parse_slot(value: &str) -> Result<i32, String> {
     {
         return Ok(id);
     }
-    let name = format!("SLOT_{}", value.replace('-', "_").to_ascii_uppercase());
+    let name = format!("SLOT_KIND_{}", value.replace('-', "_").to_ascii_uppercase());
     darkbio_connect::schema::SlotKind::from_str_name(&name)
         .filter(|kind| *kind as i32 > 0 && slot_name(*kind as i32) == value)
         .map(i32::from)
@@ -313,7 +308,7 @@ pub(crate) fn slot_name(id: i32) -> String {
     darkbio_connect::schema::SlotKind::try_from(id)
         .map(|kind| {
             kind.as_str_name()
-                .trim_start_matches("SLOT_")
+                .trim_start_matches("SLOT_KIND_")
                 .to_ascii_lowercase()
                 .replace('_', "-")
         })
@@ -371,8 +366,14 @@ mod tests {
     /// positive id parses, known or not.
     #[test]
     fn slots_are_exact_and_future_ids_remain_addressable() {
-        for id in 1..=4 {
-            assert_eq!(parse_slot(&slot_name(id)), Ok(id));
+        for (id, name) in [
+            (1, "reference-genome"),
+            (2, "gene-annotations"),
+            (3, "snp-indel-calls"),
+            (4, "variant-catalog"),
+        ] {
+            assert_eq!(slot_name(id), name);
+            assert_eq!(parse_slot(name), Ok(id));
             assert_eq!(parse_slot(&id.to_string()), Ok(id));
         }
         assert_eq!(parse_slot("2147483647"), Ok(i32::MAX));
@@ -436,8 +437,5 @@ mod tests {
                 "{args:?}"
             );
         }
-
-        // The largest 64-bit task id still parses
-        assert!(Cli::try_parse_from(["ark", "app", "cancel", "18446744073709551615"]).is_ok());
     }
 }

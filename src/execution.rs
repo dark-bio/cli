@@ -4,52 +4,37 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! App commands, which run an app on the Ark and report its result, or cancel
-//! a task.
+//! The app command, which runs an app on the Ark and reports its result.
 
 use crate::{
     args,
     context::{Context, open_file},
     error::Error,
     interrupt::Target,
+    output::Output,
     progress::Transfer,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
-use darkbio_connect::{ExecutionProgress, schema};
+use darkbio_connect::{ExecutionOutcome, ExecutionProgress};
 use serde_json::{Value, json};
 
-/// Cancels an explicit task or uploads and runs a local app after unlock.
+/// Uploads and runs a local app after unlock.
 ///
 /// The connection library owns protocol sequencing, and the CLI owns progress,
 /// partial results and byte-preserving report output. An app failure retains
 /// its returned result.
 pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
-    // A cancel request goes straight to the Ark and reports the task it named
-    let args::App::Run { file: path } = command else {
-        let args::App::Cancel { task } = command else {
-            unreachable!()
-        };
-        let connection = context.connect(None)?;
-        connection.client.call(
-            schema::ExecutionCancelRequest { taskid: task },
-            context.timing(),
-        )?;
-        return context
-            .output
-            .document(&json!({"task":task.to_string(),"cancelled":true}));
-    };
-
     // Open the app before connecting, then require an unlocked Ark
+    let args::App::Run { file: path } = command;
     let (mut file, size) = open_file(&path)?;
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, false)?;
 
     // The result starts unknown and fills in as the run goes. Running progress
     // repeats at most every second on a terminal, and every 5 s elsewhere.
-    let mut value = json!({"task":null,"app":{"name":null,"version":null},"success":null,"stdout":null,"stderr":null,"duration_seconds":null});
+    let mut value = partial();
     let clock = connection.client.clock();
-    let mut started = None;
-    let mut transfer = Transfer::new(context.output.terminal(), clock.clone());
+    let mut transfer = Transfer::new(context.output.terminal(), clock);
     let report_interval = if context.output.terminal() { 1 } else { 5 };
     let mut reported = None;
 
@@ -78,7 +63,6 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                     format!("run {} (Ark Companion on your phone)", path.display()),
                 ),
                 ExecutionProgress::Running { elapsed } => {
-                    started.get_or_insert_with(|| clock.now() - elapsed);
                     let seconds = elapsed.as_secs();
                     if reported.is_none_or(|last| seconds >= last + report_interval) {
                         context
@@ -87,6 +71,13 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                         reported = Some(seconds);
                     }
                 }
+                ExecutionProgress::Reviewing => context.output.event(
+                    "approve",
+                    format!(
+                        "review the report of {} (Ark Companion on your phone)",
+                        path.display()
+                    ),
+                ),
             });
 
     // A failed run still prints the partial JSON result once a task started
@@ -100,28 +91,39 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
             return Err(error.into());
         }
     };
+    print(&context.output, value, result)
+}
 
+/// Builds the result document before the task or its released report is known.
+fn partial() -> Value {
+    json!({"task":null,"app":{"name":null,"version":null,"develop":null},"success":null,"paths":null,"media":null,"stdout":null,"stderr":null,"duration_seconds":null})
+}
+
+/// Prints a released report and its duration, retaining an unsuccessful result.
+fn print(output: &Output, mut value: Value, outcome: ExecutionOutcome) -> Result<(), Error> {
     // Complete the result, keeping output that is not UTF-8 as base64
-    value["app"] = json!({"name":result.app_name,"version":result.app_version});
+    let result = &outcome.result;
+    value["app"] = json!({"name":result.name,"version":result.version,"develop":result.develop});
     value["success"] = json!(result.success);
-    let duration = clock.elapsed(started.expect("successful execution reported running"));
-    value["duration_seconds"] = json!(duration.as_secs());
-    bytes(&mut value, "stdout", &result.stdout);
-    bytes(&mut value, "stderr", &result.stderr);
+    value["paths"] = json!(result.paths);
+    value["media"] = json!(result.media);
+    value["duration_seconds"] = json!(outcome.duration.as_secs());
+    bytes(&mut value, "stdout", &outcome.stdout);
+    bytes(&mut value, "stderr", &outcome.stderr);
 
     // Print the report as it came, then fail when the app reported failure
-    if context.output.json() {
-        context.output.document(&value)?;
+    if output.json() {
+        output.document(&value)?;
     } else {
-        context.output.app(&result.stdout, &result.stderr)?;
+        output.app(&outcome.stdout, &outcome.stderr)?;
     }
-    context.output.event(
+    output.event(
         "note",
         format!(
             "{} {} finished in {} s",
-            result.app_name,
-            result.app_version,
-            duration.as_secs()
+            result.name,
+            result.version,
+            outcome.duration.as_secs()
         ),
     );
     if result.success {
@@ -156,6 +158,109 @@ fn bytes(value: &mut Value, name: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use darkbio_connect::schema;
+    use std::io::Write;
+    use std::time::Duration;
+
+    /// Released and partial reports preserve the JSON contract and failure class.
+    #[test]
+    fn test_report_output() {
+        // Child scenarios print through the command's output layer
+        if let Ok(scenario) = std::env::var("ARK_TEST_REPORT_SCENARIO") {
+            let options = args::Cli::parse_from(["ark", "--json"]).options;
+            let output = Output::new(&options);
+            let mut value = partial();
+            value["task"] = json!("7");
+            writeln!(std::io::stdout(), "<result>").unwrap();
+            if scenario == "partial" {
+                output.document(&value).unwrap();
+            } else {
+                let outcome = ExecutionOutcome {
+                    result: schema::ExecutionResultResponse {
+                        name: "sample app".into(),
+                        version: "1.2.3".into(),
+                        develop: true,
+                        success: scenario == "success",
+                        paths: vec!["v1/sample".into()],
+                        media: "text/plain".into(),
+                        stdout_bytes: 3,
+                        stderr_bytes: 6,
+                    },
+                    stdout: vec![0, 255, 128],
+                    stderr: b"hello\n".to_vec(),
+                    duration: Duration::from_secs(7),
+                };
+                let result = print(&output, value, outcome);
+                if scenario == "failure" {
+                    let error = result.unwrap_err();
+                    assert_eq!((error.class, error.code), (8, "app-failed"));
+                    output.error(&error);
+                } else {
+                    result.unwrap();
+                }
+            }
+            writeln!(std::io::stdout(), "</result>").unwrap();
+            return;
+        }
+
+        // Capture complete documents and events without a device or real clock
+        for scenario in ["partial", "success", "failure"] {
+            let captured = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "execution::tests::test_report_output",
+                    "--nocapture",
+                ])
+                .env("ARK_TEST_REPORT_SCENARIO", scenario)
+                .output()
+                .unwrap();
+            assert!(captured.status.success(), "{captured:?}");
+            let stdout = String::from_utf8(captured.stdout).unwrap();
+            let document = stdout
+                .split_once("<result>\n")
+                .unwrap()
+                .1
+                .split_once("</result>\n")
+                .unwrap()
+                .0;
+            let actual: Value = serde_json::from_str(document).unwrap();
+            if scenario == "partial" {
+                assert_eq!(
+                    actual,
+                    json!({
+                        "task":"7", "app":{"name":null,"version":null,"develop":null},
+                        "success":null, "paths":null, "media":null, "stdout":null,
+                        "stderr":null, "duration_seconds":null,
+                    })
+                );
+                assert!(captured.stderr.is_empty());
+                continue;
+            }
+            assert_eq!(
+                actual,
+                json!({
+                    "task":"7", "app":{"name":"sample app","version":"1.2.3","develop":true},
+                    "success":scenario == "success", "paths":["v1/sample"], "media":"text/plain",
+                    "stdout_base64":"AP+A", "stderr":"hello\n", "duration_seconds":7,
+                })
+            );
+            let stderr = String::from_utf8(captured.stderr).unwrap();
+            let events: Vec<Value> = stderr
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                events[0],
+                json!({"event":"note","message":"sample app 1.2.3 finished in 7 s"})
+            );
+            assert_eq!(events.len(), if scenario == "failure" { 2 } else { 1 });
+            if scenario == "failure" {
+                assert_eq!(events[1]["event"], "error");
+                assert_eq!(events[1]["error"]["code"], "app-failed");
+            }
+        }
+    }
 
     /// Checks that output that is not UTF-8 becomes base64 in the same key
     /// position, while UTF-8 output stays text.
