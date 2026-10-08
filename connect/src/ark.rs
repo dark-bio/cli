@@ -780,6 +780,9 @@ mod tests {
                 assert!(reply.content.is_none());
                 replies.insert(reply.id, reply.err.unwrap().code);
             }
+
+            // Keep the stream open until the host observes its reply completion
+            assert!(matches!(server.recv(), Err(transport::Error::Terminated)));
             replies
         });
 
@@ -981,9 +984,10 @@ mod tests {
     fn test_reverse_requests() {
         // The peer answers an unlock after the host answers its relay request
         let clock = test_clock().clock();
+        let (written, completion) = mpsc::channel();
         let mut peer = Peer::spawn(
             &clock,
-            Box::new(|session, _, responder| {
+            Box::new(move |session, _, responder| {
                 let deadline = session.clock().now() + TIMEOUT;
                 // Unlock waits until the application acknowledges the frame
                 session
@@ -1002,6 +1006,7 @@ mod tests {
                     .unwrap()
                     .wait()
                     .unwrap();
+                written.send(()).unwrap();
                 true
             }),
         );
@@ -1022,6 +1027,9 @@ mod tests {
             .wait()
             .unwrap();
         operation.join().unwrap().unwrap();
+
+        // Keep Ark alive until the peer observes its unlock reply completion
+        completion.recv().unwrap();
     }
 
     /// Request handles can move between threads before choosing where to
