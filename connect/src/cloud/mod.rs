@@ -696,7 +696,9 @@ pub(crate) mod tests {
     /// Spawns an Ark peer that issues proofs and lists slots only after sync,
     /// counting its sync starts and proofs.
     ///
-    /// With `refuse_first` set, it refuses its first sync start.
+    /// With `refuse_first` set, it refuses its first sync start. Replies are
+    /// queued without waiting for their writes, which a test ending the session
+    /// right after reading a reply can fail. The host's calls check them.
     fn peer(clock: &Clock, refuse_first: bool) -> (Peer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let starts = Arc::new(AtomicUsize::new(0));
         let proofs = Arc::new(AtomicUsize::new(0));
@@ -718,14 +720,10 @@ pub(crate) mod tests {
                                         crate::schema::Error::new(0x111, "identity rejected"),
                                         deadline,
                                     )
-                                    .unwrap()
-                                    .wait()
                                     .unwrap();
                             } else {
                                 responder
                                     .reply(CloudSyncStartResponse { challenge: vec![3] }, deadline)
-                                    .unwrap()
-                                    .wait()
                                     .unwrap();
                             }
                         }
@@ -735,8 +733,6 @@ pub(crate) mod tests {
                             synced = true;
                             responder
                                 .reply(CloudSyncFinishResponse { accepted: 123 }, deadline)
-                                .unwrap()
-                                .wait()
                                 .unwrap();
                         }
                         Content::GenuinityProof(_) => {
@@ -749,16 +745,12 @@ pub(crate) mod tests {
                                     },
                                     deadline,
                                 )
-                                .unwrap()
-                                .wait()
                                 .unwrap();
                         }
                         Content::SlotList(_) => {
                             assert!(synced, "slots requested before cloud sync");
                             responder
                                 .reply(crate::schema::SlotListResponse::default(), deadline)
-                                .unwrap()
-                                .wait()
                                 .unwrap();
                         }
                         request => return answering(session, request, responder),
