@@ -181,6 +181,13 @@ pub(super) fn candidate(firmware: &Package, installed: &str) -> Result<bool, Err
         || (proposed.numbers == current.numbers && !current.stable))
 }
 
+/// Cuts a summary to its headline, the text before its first blank line.
+pub(super) fn headline(summary: &str) -> &str {
+    summary
+        .split_once("\n\n")
+        .map_or(summary, |(headline, _)| headline)
+}
+
 /// Tests of listing validation and update candidate selection.
 #[cfg(test)]
 mod tests {

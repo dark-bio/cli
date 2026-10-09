@@ -128,7 +128,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             connection.info.firmware_version,
             target.version,
             target.size as f64 / 1048576.0,
-            target.summary
+            package::headline(&target.summary)
         ),
     );
     if !context.options.yes
@@ -420,7 +420,7 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
     }
 
     // The JSON document names the update and takes the rows before the table
-    // adds its flags
+    // adds its flags and cuts each summary to its headline
     let update = select(firmwares, None, installed)?.map(|firmware| firmware.version.clone());
     let document = json!({"installed":installed,"update":update,"firmwares":rows});
     for row in &mut rows {
@@ -434,6 +434,9 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
             .collect::<Vec<_>>()
             .join(", ")
         );
+        if let Value::String(summary) = &mut row["summary"] {
+            summary.truncate(package::headline(summary).len());
+        }
     }
 
     // Group the table rows by semantic version, without the build suffix
