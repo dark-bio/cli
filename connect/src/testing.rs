@@ -15,14 +15,24 @@ use darkbio_trust::device::HardwareClaims;
 use darkbio_wire::memory::{self, Duplex};
 use darkbio_wire::protocol::schema::host_to_ark::Content as Request;
 use darkbio_wire::protocol::schema::{self, DeviceInfoResponse, UnlockResponse};
-use darkbio_wire::protocol::{Responder, Server, Session};
+use darkbio_wire::protocol::{self, Responder, Server, Session};
 use darkbio_wire::transport::Attestation;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Bytes buffered per direction of a peer's stream, enough for the handshake
 /// and a few messages to flow without the other side reading.
 const CAPACITY: usize = 256 * 1024;
+
+/// Write budget of each frame on a peer's stream, beyond any test's clock
+/// movement.
+///
+/// wire ends the session when a frame finishes writing past its budget. A test
+/// moving its clock while a frame is still being written would otherwise end
+/// it, even though the other side already read the frame. Message deadlines
+/// still expire as usual, and dropping a peer checks its test stayed within.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Creates a stopped clock a day ahead of real time, so a stray read of the
 /// real clock stands out from the test's time.
@@ -143,6 +153,12 @@ pub struct Peer {
     pub identity: xdsa::PublicKey,
     /// Host end of the stream, until a test takes it.
     stream: Option<Duplex>,
+    /// Outcome of the peer's handshake, sent once it finishes.
+    connected: mpsc::Receiver<Result<(), protocol::Error>>,
+    /// Clock of the stream, whose movement drop checks against the budget.
+    clock: Clock,
+    /// Time of spawning, before any frame took its budget.
+    started: Instant,
     /// Serving thread, joined on drop.
     thread: Option<JoinHandle<()>>,
 }
@@ -150,18 +166,30 @@ pub struct Peer {
 impl Peer {
     /// Starts a peer serving the client per the script.
     ///
-    /// Both ends of its stream measure their deadlines on the clock.
+    /// Both ends of its stream measure their deadlines on the clock. Frames get
+    /// a write budget beyond any test's clock movement, but the handshake keeps
+    /// wire's shorter deadline. A test moving the clock before exchanging any
+    /// message with the peer must call [`Self::wait_connected`] first.
     pub fn spawn(clock: &Clock, mut script: Script) -> Self {
         // Sign the handshake with a fresh identity attesting itself
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer, identity.clone(), clock);
 
-        // Serve one session, passing each request to the script
+        // Give every frame a write budget the test's clock never reaches
+        let started = clock.now();
         let (host, ark) = memory::duplex(CAPACITY, clock);
+        let host = host.set_write_timeout(WRITE_TIMEOUT);
+        let ark = ark.set_write_timeout(WRITE_TIMEOUT);
+
+        // Serve one session, reporting how its handshake ended and passing each
+        // request to the script
+        let (ready, connected) = mpsc::channel();
         let thread = thread::spawn(move || {
             let mut server = Server::new(ark, signer, attestation);
-            let Ok(mut session) = server.accept() else {
+            let accepted = server.accept();
+            let _ = ready.send(accepted.as_ref().map(|_| ()).map_err(Clone::clone));
+            let Ok(mut session) = accepted else {
                 return;
             };
             while let Ok((message, responder)) = session.recv() {
@@ -176,8 +204,29 @@ impl Peer {
         Self {
             identity,
             stream: Some(host),
+            connected,
+            clock: clock.clone(),
+            started,
             thread: Some(thread),
         }
+    }
+
+    /// Waits until the peer finishes its handshake.
+    ///
+    /// The host's connect can return before the peer's hello is fully written,
+    /// and that write keeps wire's handshake deadline. Call it at most once per
+    /// peer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handshake failed, or did not finish within 15 s of real
+    /// time.
+    #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
+    pub fn wait_connected(&self) {
+        self.connected
+            .recv_timeout(Duration::from_secs(15))
+            .expect("peer handshake did not finish")
+            .expect("peer handshake failed");
     }
 
     /// Takes the host stream for attachment or forwarding through another
@@ -207,12 +256,25 @@ impl Peer {
 
 impl Drop for Peer {
     /// Releases an unused host stream and joins the peer after its session ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the test moved the clock by the frame budget or more, unless
+    /// the thread is already panicking.
     fn drop(&mut self) {
         // An untaken host stream must close before joining the peer's
         // receive loop
         drop(self.stream.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+
+        // Fail a test that outgrew the frame budget, unless it already failed
+        if !thread::panicking() {
+            assert!(
+                self.clock.now().duration_since(self.started) < WRITE_TIMEOUT,
+                "test advanced through the peer's frame write budget"
+            );
         }
     }
 }

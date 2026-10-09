@@ -526,6 +526,10 @@ mod tests {
             ));
             wait_deadline(&tester, scan);
 
+            // Let the peer finish its handshake, since no message confirmed it
+            // before time moves
+            peer.wait_connected();
+
             // Passing the machine allowance leaves the scan waiting
             tester.advance(Duration::from_secs(2));
             assert_eq!(tester.next_deadline(), Some(scan));
