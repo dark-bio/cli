@@ -12,21 +12,21 @@ computer, are at https://github.com/dark-bio/examples.
 
 ## Running and collecting results
 
-`ark app run FILE` uploads the app, asks the owner to approve the run and waits
-for it to end. The owner then reviews the report in Ark Companion, and releases
-it to this command or keeps it. A failed run goes to review as well, so even a
-failure arrives only with a release. The task ID is printed as soon as
-allocated. Ctrl-C or SIGTERM attempts to cancel the run.
+`ark app run FILE` uploads the app, asks the owner to approve the task and
+waits for the app to end. The owner then reviews the report in Ark Companion,
+and releases it to this command or keeps it. An app that fails goes to review
+as well, so even a failure arrives only with a release. The task ID is printed
+as soon as allocated. Ctrl-C or SIGTERM attempts to cancel the task.
 
 Results arrive whole, once released. `ark app run FILE > report.md` preserves
 the exact report bytes. --json includes task, app with name, version and
 develop, success, paths, media, stdout, stderr and duration_seconds; non-UTF-8
 streams use base64 fields as described in `ark help output`. duration_seconds
-counts the run, not the owner's review. A report the owner keeps, or leaves
-unanswered, fails the command with an approval error.
+counts how long the app ran, not the owner's review. A report the owner keeps,
+or leaves unanswered, fails the command with an approval error.
 
-Only the connection that ran the app receives its report. Ending that
-connection cancels a run still going and drops its report. There is no
+Only the connection that started the task receives its report. Ending that
+connection cancels a task still running and drops its report. There is no
 detached mode or later retrieval, so background the whole command to keep its
 connection and companion relay alive.
 
@@ -52,12 +52,12 @@ controls. The version is a Semantic Versioning 2.0.0 version of at most 32
 characters, such as 0.4.0 or 1.0.0-beta.1, without build metadata or a leading
 v. `[reads]` may be left out of an app that reads nothing. A `[listing]` table
 holds what Ark Hub shows, and the Ark skips it. The Ark refuses any other table
-or key, and a module with a WebAssembly start section, since a run begins at
+or key, and a module with a WebAssembly start section, since an app begins at
 `_start`.
 
-By default the owner reviews only a successful run's stdout. `develop = true`
-under `[app]` adds stderr, and stdout after a failure, to the review; leave it
-out of shipped apps.
+By default the owner reviews only stdout, and only when the app succeeds.
+`develop = true` under `[app]` adds stderr, and stdout after a failure, to the
+review; leave it out of shipped apps.
 
 ## Data grants
 
@@ -84,9 +84,9 @@ manifest paths beneath it.
 ## Sandbox
 
 The manifest pass has 32 MiB of memory, a 250 ms limit and 64 KiB for its
-output, and its stderr is discarded. The run pass has 128 MiB of memory and
+output, and its stderr is discarded. The report pass has 128 MiB of memory and
 1 MiB per output stream; its duration is unbounded but cancellable. A report is
-UTF-8 text without control characters other than line feed and tab, and a run
+UTF-8 text without control characters other than line feed and tab, and an app
 whose output breaks that fails. Neither pass has a network or writable storage.
 Stdin is closed, random bytes are zero and clocks are counters, so apps must
 not depend on wall-clock time or randomness.
