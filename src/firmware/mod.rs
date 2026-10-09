@@ -26,16 +26,16 @@ use std::time::Duration;
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
 /// First firmware version speaking the wire protocol this CLI uses.
-pub(crate) const MINIMUM_VERSION: &str = "0.11.7";
+pub(crate) const MINIMUM_VERSION: &str = "0.12.0";
 
 /// Earliest publish time of a develop build this CLI accepts, in Unix seconds.
 ///
 /// It moves forward whenever a change on the current release needs developers
 /// to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_790_857_383; // 2026-10-01 12:23:03 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_791_557_809; // 2026-10-09 14:56:49 UTC
 
 /// Checks that the firmware is at least [`MINIMUM_VERSION`], and that a
-/// mutable develop build was published no earlier than
+/// mutable develop build has a publish time at or after
 /// [`MINIMUM_DEVELOP_PUBLISH`].
 ///
 /// This is CLI compatibility guidance based on reported firmware metadata.
@@ -57,7 +57,7 @@ pub(crate) fn check_compatibility(info: &schema::DeviceInfoResponse) -> Result<(
         ));
     };
 
-    // A develop build also needs a publish time past the cutoff
+    // A develop build also needs a publish time at or after the cutoff
     if version.is_develop() && info.firmware_publish < MINIMUM_DEVELOP_PUBLISH {
         return Err(Error::new(
             5,
@@ -627,9 +627,9 @@ mod tests {
     #[test]
     fn compatibility_requires_the_protocol_batch() {
         for version in [
-            "0.11.7-develop",
-            "0.11.7-abcdef0",
             "0.12.0-develop",
+            "0.12.0-abcdef0",
+            "0.13.0-develop",
             "1.0.0-0000000",
         ] {
             assert!(
@@ -638,11 +638,11 @@ mod tests {
             );
         }
         for version in [
-            "0.11.6-develop",
-            "0.11.6-abcdef0",
+            "0.11.7-develop",
+            "0.11.7-abcdef0",
             "0.10.99-abcdef0",
             "unknown",
-            "0.11.7",
+            "0.12.0",
         ] {
             let error =
                 check_compatibility(&info(version, MINIMUM_DEVELOP_PUBLISH + 1)).unwrap_err();
@@ -655,7 +655,7 @@ mod tests {
     /// it.
     #[test]
     fn develop_builds_need_the_cutoff_but_tagged_builds_do_not() {
-        for version in ["0.11.7-develop", "0.12.0-develop"] {
+        for version in ["0.12.0-develop", "0.13.0-develop"] {
             for publish in [0, MINIMUM_DEVELOP_PUBLISH - 1] {
                 let error = check_compatibility(&info(version, publish)).unwrap_err();
                 assert_eq!(error.code, "firmware-outdated");
@@ -669,7 +669,7 @@ mod tests {
                 assert!(check_compatibility(&info(version, publish)).is_ok());
             }
         }
-        for version in ["0.11.7-abcdef0", "0.12.0-abcdef0"] {
+        for version in ["0.12.0-abcdef0", "0.13.0-abcdef0"] {
             assert!(check_compatibility(&info(version, 0)).is_ok());
         }
     }
@@ -683,13 +683,13 @@ mod tests {
             (true, false, Approval::Button),
             (true, true, Approval::Phone),
         ] {
-            let mut device = info("0.11.7-develop", MINIMUM_DEVELOP_PUBLISH);
+            let mut device = info("0.12.0-develop", MINIMUM_DEVELOP_PUBLISH);
             device.paired = paired;
             device.unlocked = unlocked;
             assert_eq!(approval(&device), Some(expected));
             device.firmware_publish -= 1;
             assert_eq!(approval(&device), None);
-            device.firmware_version = "0.11.6-abcdef0".into();
+            device.firmware_version = "0.11.7-abcdef0".into();
             assert_eq!(approval(&device), None);
         }
     }
@@ -699,18 +699,18 @@ mod tests {
     #[test]
     fn published_develop_images_straddle_the_cutoff() {
         for (i, (publish, accepted)) in [
-            (1_790_807_253, false), // last refused, amd64 emulator
-            (1_790_807_260, false), // last refused, arm64 boot
-            (1_790_807_668, false), // last refused, arm64 emulator
-            (1_790_857_383, true),  // first accepted, amd64 emulator
-            (1_790_857_395, true),  // first accepted, arm64 boot
-            (1_790_857_856, true),  // first accepted, arm64 emulator
+            (1_791_555_376, false), // last refused, amd64 emulator
+            (1_791_555_413, false), // last refused, arm64 boot
+            (1_791_555_847, false), // last refused, arm64 emulator
+            (1_791_557_809, true),  // first accepted, amd64 emulator
+            (1_791_557_813, true),  // first accepted, arm64 boot
+            (1_791_558_225, true),  // first accepted, arm64 emulator
         ]
         .into_iter()
         .enumerate()
         {
             assert_eq!(
-                check_compatibility(&info("0.11.7-develop", publish)).is_ok(),
+                check_compatibility(&info("0.12.0-develop", publish)).is_ok(),
                 accepted,
                 "{i}"
             );
