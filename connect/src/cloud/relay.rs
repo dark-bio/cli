@@ -399,6 +399,39 @@ impl State {
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
+
+    /// Takes the frames whose hold ran out, each with its refusal cause, and
+    /// cuts short a join or a partly written frame whose deadline passed.
+    ///
+    /// The caller reports the notice and sends the refusals after releasing
+    /// the lock.
+    fn expire(&mut self, now: Instant) -> (Option<RelayNotice>, Vec<(Responder, String)>) {
+        let mut notice = None;
+        let mut refused = Vec::new();
+        while self
+            .queue
+            .front()
+            .is_some_and(|frame| frame.deadline <= now)
+        {
+            if self.writing {
+                self.shutdown();
+                self.interrupted = true;
+                self.writing = false;
+            }
+            let cause = self.cause.clone();
+            notice = notice.or_else(|| self.notice(&cause));
+            let frame = self.pop().unwrap();
+            refused.push((frame.responder, cause));
+        }
+        if self.joining.is_some_and(|deadline| deadline <= now) {
+            self.interrupted = true;
+            self.shutdown();
+            if let Some((attempt, _)) = self.waiter.take() {
+                attempt.finish(Err(protocol::Error::Timeout.into()));
+            }
+        }
+        (notice, refused)
+    }
 }
 
 impl Shared {
@@ -458,31 +491,7 @@ impl Shared {
     /// partly written frame whose deadline passed.
     fn expire(&self) {
         let mut state = self.state.lock().expect("relay state not poisoned");
-        let now = self.clock.now();
-        let mut notice = None;
-        let mut refused = Vec::new();
-        while state
-            .queue
-            .front()
-            .is_some_and(|frame| frame.deadline <= now)
-        {
-            if state.writing {
-                state.shutdown();
-                state.interrupted = true;
-                state.writing = false;
-            }
-            let cause = state.cause.clone();
-            notice = notice.or_else(|| state.notice(&cause));
-            let frame = state.pop().unwrap();
-            refused.push((frame.responder, cause));
-        }
-        if state.joining.is_some_and(|deadline| deadline <= now) {
-            state.interrupted = true;
-            state.shutdown();
-            if let Some((attempt, _)) = state.waiter.take() {
-                attempt.finish(Err(protocol::Error::Timeout.into()));
-            }
-        }
+        let (notice, refused) = state.expire(self.clock.now());
         drop(state);
         self.report(notice);
         for (responder, cause) in refused {
@@ -717,7 +726,8 @@ fn ready(mut socket: Connection, poll: &Poll, shared: &Shared) -> Result<Connect
 /// relay is wanted.
 ///
 /// A failed join refuses the frames waiting on it, while a failed socket
-/// leaves its queued frames to the next one.
+/// leaves its queued frames to the next one. Frames whose hold already ran out
+/// are refused as unsent either way.
 fn ended(shared: &Shared, error: Failure, joining: bool) {
     let cause = crate::Error::from(error.clone()).to_string();
     let cause = if joining {
@@ -726,8 +736,13 @@ fn ended(shared: &Shared, error: Failure, joining: bool) {
         cause
     };
 
-    // Drop the socket, and make the next attempt refresh cloud sync first
+    // Refuse the frames whose hold ran out with their own cause, before the
+    // failure replaces it, even if the timer thread has not seen them yet
     let mut state = shared.state.lock().expect("relay state not poisoned");
+    let now = shared.clock.now();
+    let (mut notice, mut refused) = state.expire(now);
+
+    // Drop the socket, and make the next attempt refresh cloud sync first
     state.shutdown();
     state.socket = None;
     state.connected = false;
@@ -745,19 +760,16 @@ fn ended(shared: &Shared, error: Failure, joining: bool) {
     }
 
     // A failed join refuses the frames waiting on it, reporting the cause once
-    let mut notice = None;
-    let mut refused = Vec::new();
     if joining && !state.queue.is_empty() {
-        notice = state.notice(&cause);
+        notice = notice.or_else(|| state.notice(&cause));
         while let Some(frame) = state.pop() {
-            refused.push(frame.responder);
+            refused.push((frame.responder, cause.clone()));
         }
     }
 
     // A relay that joined before reconnects after jittered, doubling delays,
     // until its retry window closes
     if state.wanted {
-        let now = shared.clock.now();
         let since = *state.failing.get_or_insert(now);
         if now < since + RETRY_WINDOW {
             let random = darkbio_crypto::rand::generate(2);
@@ -775,7 +787,7 @@ fn ended(shared: &Shared, error: Failure, joining: bool) {
     }
     drop(state);
     shared.report(notice);
-    for responder in refused {
+    for (responder, cause) in refused {
         fail(responder, &cause);
     }
     shared.signal();
@@ -1698,7 +1710,7 @@ mod tests {
         resume
             .send_timeout((), TIMEOUT)
             .expect("relay timer did not resume");
-        assert!(refused(sent).contains("10 s"));
+        assert_eq!(refused(sent), UNSENT);
         closes
             .recv_timeout(TIMEOUT)
             .expect("server did not finish the stalled stream");
@@ -1887,6 +1899,50 @@ mod tests {
         assert!(fixture.notices.try_recv().is_err());
         fixture.ark.close();
         server.join().unwrap();
+    }
+
+    /// A join timeout that the worker sees before the timer thread refuses an
+    /// expired frame as unsent and a younger one with the join's cause, with a
+    /// single notice.
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
+    fn test_join_timeout_before_timer() {
+        // Hold back the join's reply and pause the timer thread
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (_listener, url) = cloud();
+        let fixture = Fixture::new(&clock, url);
+        let expired = fixture.outbound(vec![1]);
+        let (request, _held) = fixture.requests.recv_timeout(TIMEOUT).unwrap();
+        assert!(matches!(request, Content::RelayJoin(_)));
+        let shared = fixture.shared();
+        let (rearming, paused) = crossbeam_channel::bounded(0);
+        let (resume, resumed) = crossbeam_channel::bounded(0);
+        *shared.rearming.lock().unwrap() = Some((rearming, resumed));
+        shared.signal();
+        paused
+            .recv_timeout(TIMEOUT)
+            .expect("relay timer did not pause");
+
+        // Run out the first frame's hold, which also bounds the join, while a
+        // younger frame still has time left
+        tester.advance(Duration::from_secs(1));
+        let younger = fixture.outbound(vec![2]);
+        queued(&shared, 2);
+        tester.advance(Duration::from_secs(9));
+        let expired_cause = refused(expired);
+        let younger_cause = refused(younger);
+        let notice = fixture.notices.recv_timeout(TIMEOUT).unwrap();
+
+        // Both refusals came before the timer thread resumed, so the worker
+        // chose their causes
+        resume
+            .send_timeout((), TIMEOUT)
+            .expect("relay timer did not resume");
+        assert_eq!(expired_cause, UNSENT);
+        assert_eq!(younger_cause, "relay join failed: operation timed out");
+        assert!(matches!(notice, RelayNotice::Failed(cause) if cause == UNSENT));
+        assert!(fixture.notices.try_recv().is_err());
     }
 
     /// A refused inbound frame is reported with its remote cause and never retried.
@@ -2352,8 +2408,8 @@ mod tests {
         tester.advance(Duration::from_secs(4));
 
         // Expiry refuses both the partial frame and the frames waiting behind it
-        assert!(refused(sent).contains("10 s"));
-        assert!(refused(held).contains("10 s"));
+        assert_eq!(refused(sent), UNSENT);
+        assert_eq!(refused(held), UNSENT);
         read.send(()).unwrap();
         server.join().unwrap();
     }
