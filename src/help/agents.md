@@ -28,12 +28,12 @@ on their phone, in Ark Companion. You cannot approve for them.
       wait $!
 
   Expect seconds for status, up to a minute for an approval, up to ten minutes
-  to scan a pairing, minutes for an app run, minutes to an hour for an upload,
+  to scan a pairing, minutes for an app, minutes to an hour for an upload,
   and an hour or more for a reference catalog. --timeout bounds each machine
   reply or network chunk wait, not approval or total runtime. It must be
   positive and cannot be disabled. A repeated processing percentage counts
   as a reply. Use your shell's timeout utility for a workflow ceiling.
-  Ctrl-C and SIGTERM attempt cancellation, and an app run ends with its
+  Ctrl-C and SIGTERM attempt cancellation, and a task ends with the command's
   process.
 - --unlock authorizes unlocking first, --yes confirms firmware installation,
   and --dry-run plans supported changes without applying them. -v adds step

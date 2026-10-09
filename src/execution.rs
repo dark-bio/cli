@@ -30,7 +30,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, false)?;
 
-    // The result starts unknown and fills in as the run goes. Running progress
+    // The result starts unknown and fills in as the task goes. Running progress
     // repeats at most every second on a terminal, and every 5 s elsewhere.
     let mut value = partial();
     let clock = connection.client.clock();
@@ -80,7 +80,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                 ),
             });
 
-    // A failed run still prints the partial JSON result once a task started
+    // A failed command still prints the partial JSON result once a task started
     context.interrupt.clear();
     let result = match result {
         Ok(result) => result,

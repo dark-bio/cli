@@ -208,7 +208,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
         "app run" => (
             "a local WASM file and a paired, unlocked Ark (--unlock only if status reports locked)",
             "on your phone, to run the app and to release its report",
-            "unbounded run, then the owner's review; --timeout bounds replies, not the whole app",
+            "unbounded report pass, then the owner's review; --timeout bounds replies, not the whole app",
             "exact report bytes once released; JSON: task, app (name, version, develop), success, paths, media, stdout or stdout_base64, stderr or stderr_base64, duration_seconds",
             "ark app run app.wasm > report.md\nark app run app.wasm --json",
         ),

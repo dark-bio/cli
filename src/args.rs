@@ -85,7 +85,7 @@ pub(crate) struct Options {
     /// Print the complete result as JSON and stderr events as JSON Lines
     #[arg(long, global = true)]
     pub json: bool,
-    /// Seconds to wait for each reply or network chunk, not an approval or the whole run
+    /// Seconds to wait for each reply or network chunk, not an approval or the whole task
     #[arg(long, global = true, default_value_t = 60, value_parser = parse_timeout, value_name = "SECONDS")]
     pub timeout: u64,
     /// Unlock first when needed, approved on your phone
