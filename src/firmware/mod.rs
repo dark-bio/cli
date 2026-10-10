@@ -32,7 +32,7 @@ pub(crate) const MINIMUM_VERSION: &str = "0.12.0";
 ///
 /// It moves forward whenever a change on the current release needs developers
 /// to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_791_557_809; // 2026-10-09 14:56:49 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_791_649_628; // 2026-10-10 16:27:08 UTC
 
 /// Checks that the firmware is at least [`MINIMUM_VERSION`], and that a
 /// mutable develop build has a publish time at or after
@@ -702,19 +702,19 @@ mod tests {
     /// last build it refuses and the first it accepts.
     #[test]
     fn published_develop_images_straddle_the_cutoff() {
-        for (i, (publish, accepted)) in [
-            (1_791_555_376, false), // last refused, amd64 emulator
-            (1_791_555_413, false), // last refused, arm64 boot
-            (1_791_555_847, false), // last refused, arm64 emulator
-            (1_791_557_809, true),  // first accepted, amd64 emulator
-            (1_791_557_813, true),  // first accepted, arm64 boot
-            (1_791_558_225, true),  // first accepted, arm64 emulator
+        for (i, (version, publish, accepted)) in [
+            ("0.12.0-develop", 1_791_647_343, false), // last refused, amd64 emulator
+            ("0.12.0-develop", 1_791_647_356, false), // last refused, arm64 boot
+            ("0.12.0-develop", 1_791_647_790, false), // last refused, arm64 emulator
+            ("0.12.1-develop", 1_791_652_057, true),  // first accepted, amd64 emulator
+            ("0.12.1-develop", 1_791_652_068, true),  // first accepted, arm64 boot
+            ("0.12.1-develop", 1_791_652_480, true),  // first accepted, arm64 emulator
         ]
         .into_iter()
         .enumerate()
         {
             assert_eq!(
-                check_compatibility(&info("0.12.0-develop", publish)).is_ok(),
+                check_compatibility(&info(version, publish)).is_ok(),
                 accepted,
                 "{i}"
             );
