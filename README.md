@@ -119,7 +119,7 @@ apps in Rust, Go, C and Python, with fixtures that run them on your computer.
 ## Help
 
 `ark -h` is the overview, and `ark help --all` prints the whole manual. The
-topics cover the rest, and each one's source in [`src/help`](src/help) reads
+topics cover the rest, and each one's source in `src/help` reads
 the same on GitHub:
 
 | Topic | Contents |
