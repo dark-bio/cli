@@ -293,56 +293,124 @@ pub(crate) fn table(theme: &Theme, rows: &[Value], columns: &[(&str, &str)]) -> 
     lines.join("\n")
 }
 
-/// Aligns diagnostic outcomes, keeping skipped checks explicit and hints nearby.
-pub(super) fn checklist(theme: &Theme, rows: &[Value]) -> String {
-    let labels = rows
+/// Groups diagnostic outcomes, collapsing shared skips and counting problems.
+pub(super) fn checklist(theme: &Theme, groups: &[(&str, &[Value])]) -> String {
+    // Collapse skips with the same cause inside each group, in first-seen order
+    let shown: Vec<_> = groups
         .iter()
-        .map(|row| console::measure_text_width(row["name"].as_str().unwrap_or("")))
+        .map(|(title, rows)| {
+            let mut shown: Vec<(&Value, usize)> = Vec::new();
+            for row in *rows {
+                if row["result"] == "skip"
+                    && let Some((_, count)) = shown.iter_mut().find(|(previous, _)| {
+                        previous["result"] == "skip"
+                            && previous["detail"] == row["detail"]
+                            && previous["hint"] == row["hint"]
+                    })
+                {
+                    *count += 1;
+                } else {
+                    shown.push((row, 1));
+                }
+            }
+            let shown: Vec<_> = shown
+                .into_iter()
+                .map(|(row, count)| {
+                    let name = if count > 1 {
+                        format!("{count} checks")
+                    } else {
+                        style::printable(row["name"].as_str().unwrap_or("-"))
+                    };
+                    (name, row)
+                })
+                .collect();
+            (*title, shown)
+        })
+        .collect();
+
+    // Align details across both groups, allowing for the wider ASCII ok mark
+    let labels = shown
+        .iter()
+        .flat_map(|(_, rows)| rows)
+        .map(|(name, _)| console::measure_text_width(name))
+        .chain(groups.iter().flat_map(|(_, rows)| *rows).map(|row| {
+            console::measure_text_width(&style::printable(row["name"].as_str().unwrap_or("-")))
+        }))
         .max()
         .unwrap_or(0);
-    rows.iter()
-        .map(|row| {
-            let name = row["name"].as_str().unwrap_or("-");
-            let role = match row["result"].as_str() {
-                Some("ok") => Role::Success,
-                Some("fail") => Role::Failure,
-                Some("warn") => Role::Attention,
-                _ => Role::Muted,
-            };
-            let result = row["result"].as_str().unwrap_or("-");
-            let detail = row["detail"].as_str().unwrap_or("-");
-            let detail = if result == "skip" {
-                format!("skipped: {detail}")
-            } else {
-                detail.to_string()
-            };
-            let name = theme.mark(role, name);
-            // Pad marked names to one column, which the two-letter ASCII mark
-            // widens
-            let width = labels + if theme.unicode { 2 } else { 3 };
-            let line = format!(
-                "  {}{}  {}",
-                name,
-                " ".repeat(width.saturating_sub(console::measure_text_width(&name))),
-                theme.paint(Role::Muted, detail)
+    let width = labels + if theme.unicode { 2 } else { 3 };
+    let mut sections: Vec<_> = shown
+        .iter()
+        .map(|(title, rows)| {
+            let mut lines = vec![style::wrap(
+                &theme.paint(Role::Heading, style::printable(title)),
+                theme.width,
+                0,
+            )];
+            lines.extend(
+                rows.iter()
+                    .map(|(name, row)| checklist_row(theme, name, row, width)),
             );
-            let mut line = style::wrap(&line, theme.width, 4);
-            if let Some(hint) = row["hint"].as_str() {
-                line.push('\n');
-                line.push_str(&style::wrap(
-                    &format!(
-                        "    {} {}",
-                        theme.paint(Role::Accent, "hint:"),
-                        theme.inline(hint)
-                    ),
-                    theme.width,
-                    6,
-                ));
-            }
-            line
+            lines.join("\n")
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+
+    // Skips carry no weight in the summary, and zero counts stay out
+    let mut counts = Vec::new();
+    for (result, noun) in [("fail", "problem"), ("warn", "warning")] {
+        let count = groups
+            .iter()
+            .flat_map(|(_, rows)| *rows)
+            .filter(|row| row["result"] == result)
+            .count();
+        if count > 0 {
+            counts.push(format!(
+                "{count} {noun}{}",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    let summary = if counts.is_empty() {
+        "No problems found".into()
+    } else {
+        counts.join(", ")
+    };
+    sections.push(style::wrap(&summary, theme.width, 0));
+    sections.join("\n\n")
+}
+
+/// Aligns one check's plain detail after its muted name and any hint below it.
+fn checklist_row(theme: &Theme, name: &str, row: &Value, width: usize) -> String {
+    // The mark carries the outcome's color; the detail stays plain
+    let role = match row["result"].as_str() {
+        Some("ok") => Role::Success,
+        Some("fail") => Role::Failure,
+        Some("warn") => Role::Attention,
+        _ => Role::Muted,
+    };
+    let name = theme.mark(role, &theme.paint(Role::Muted, name));
+    let line = format!(
+        "  {}{}  {}",
+        name,
+        " ".repeat(width.saturating_sub(console::measure_text_width(&name))),
+        style::printable(row["detail"].as_str().unwrap_or("-")),
+    );
+    let mut line = style::wrap(&line, theme.width, width + 4);
+
+    // A hint belongs to its check, indented four spaces and wrapped under its text
+    if let Some(hint) = row["hint"].as_str() {
+        line.push('\n');
+        line.push_str(&style::wrap(
+            &format!(
+                "    {} {}",
+                theme.paint(Role::Accent, "hint:"),
+                theme.inline(&style::printable(hint))
+            ),
+            theme.width,
+            10,
+        ));
+    }
+    line
 }
 
 /// Tests of the human layouts of values, documents, tables and checklists.
@@ -569,19 +637,201 @@ mod tests {
         );
     }
 
-    /// Every result carries its own mark, and each hint stays under its check.
+    /// A healthy report has two named groups, aligned labels and a plain summary.
     #[test]
-    fn test_checklist_keeps_skips_explicit_and_hints_local() {
-        let theme = Theme::test(80, Color::Basic, true);
-        let rows = [
-            json!({"name":"usb","result":"ok","detail":"1 device found","hint":null}),
-            json!({"name":"relay","result":"fail","detail":"no answer","hint":"open `Ark Companion`"}),
-            json!({"name":"slots","result":"skip","detail":"Ark locked","hint":null}),
-            json!({"name":"tool","result":"warn","detail":"new release","hint":"run `brew upgrade ark-cli`"}),
+    fn test_checklist_groups_computer_and_ark() {
+        let computer = [
+            json!({"name":"ark","result":"ok","detail":"0.4.1, the newest release"}),
+            json!({"name":"hardware","result":"ok","detail":"1 Ark"}),
+            json!({"name":"emulator","result":"ok","detail":"none running"}),
+            json!({"name":"cache","result":"ok","detail":"28.5 GiB in ~/Library/Caches/ark"}),
+        ];
+        let device = [
+            json!({"name":"connection","result":"ok","detail":"authenticated"}),
+            json!({"name":"compatibility","result":"ok","detail":"firmware supports this tool"}),
+            json!({"name":"environment","result":"ok","detail":"release"}),
+            json!({"name":"firmware","result":"ok","detail":"0.12.0-abc, the newest published"}),
+            json!({"name":"sync","result":"ok","detail":"keys and clock accepted"}),
+            json!({"name":"registry","result":"ok","detail":"active"}),
+            json!({"name":"pairing","result":"ok","detail":"paired and unlocked"}),
+            json!({"name":"relay","result":"ok","detail":"attached"}),
+            json!({"name":"slots","result":"ok","detail":"4 readable"}),
+        ];
+        let rendered = checklist(
+            &Theme::test(80, Color::Off, true),
+            &[("This computer", &computer), ("Sample Ark", &device)],
+        );
+        assert_eq!(
+            rendered,
+            concat!(
+                "This computer\n",
+                "  ✓ ark            0.4.1, the newest release\n",
+                "  ✓ hardware       1 Ark\n",
+                "  ✓ emulator       none running\n",
+                "  ✓ cache          28.5 GiB in ~/Library/Caches/ark\n",
+                "\nSample Ark\n",
+                "  ✓ connection     authenticated\n",
+                "  ✓ compatibility  firmware supports this tool\n",
+                "  ✓ environment    release\n",
+                "  ✓ firmware       0.12.0-abc, the newest published\n",
+                "  ✓ sync           keys and clock accepted\n",
+                "  ✓ registry       active\n",
+                "  ✓ pairing        paired and unlocked\n",
+                "  ✓ relay          attached\n",
+                "  ✓ slots          4 readable\n",
+                "\nNo problems found",
+            )
+        );
+    }
+
+    /// A failed connection collapses eight skips while hints stay under their
+    /// checks and each outcome contributes to the summary.
+    #[test]
+    fn test_checklist_collapses_connection_skips() {
+        let computer = [
+            json!({"name":"ark","result":"warn","detail":"0.4.1, and 0.4.2 is out","hint":"run `brew upgrade ark-cli`"}),
+            json!({"name":"hardware","result":"ok","detail":"1 Ark"}),
+            json!({"name":"emulator","result":"ok","detail":"1 running"}),
+        ];
+        let mut device = vec![
+            json!({"name":"connection","result":"fail","detail":"several Arks match","hint":"select one with --device: hardware, emulator"}),
+        ];
+        device.extend(
+            [
+                "compatibility",
+                "environment",
+                "firmware",
+                "sync",
+                "registry",
+                "pairing",
+                "relay",
+                "slots",
+            ]
+            .map(
+                |name| json!({"name":name,"result":"skip","detail":"skipped without a connection"}),
+            ),
+        );
+        let groups = [
+            ("This computer", computer.as_slice()),
+            ("Ark", device.as_slice()),
         ];
         assert_eq!(
-            checklist(&theme, &rows),
-            "  \x1b[1m\u{2713}\x1b[0m usb    1 device found\n  \x1b[1m\u{2717}\x1b[0m relay  no answer\n    \x1b[1mhint:\x1b[0m open `\x1b[1mArk Companion\x1b[0m`\n  \u{00b7} slots  skipped: Ark locked\n  \x1b[1m!\x1b[0m tool   new release\n    \x1b[1mhint:\x1b[0m run `\x1b[1mbrew upgrade ark-cli\x1b[0m`"
+            checklist(&Theme::test(80, Color::Off, true), &groups),
+            concat!(
+                "This computer\n",
+                "  ! ark            0.4.1, and 0.4.2 is out\n",
+                "    hint: run `brew upgrade ark-cli`\n",
+                "  ✓ hardware       1 Ark\n",
+                "  ✓ emulator       1 running\n",
+                "\nArk\n",
+                "  ✗ connection     several Arks match\n",
+                "    hint: select one with --device: hardware, emulator\n",
+                "  · 8 checks       skipped without a connection\n",
+                "\n1 problem, 1 warning",
+            )
         );
+
+        // ASCII marks retain the same groups, counts and alignment
+        let ascii = checklist(&Theme::test(80, Color::Off, false), &groups);
+        assert!(ascii.contains("  ok hardware       1 Ark\n"));
+        assert!(ascii.contains("  x connection      several Arks match\n"));
+        assert!(ascii.contains("  - 8 checks        skipped without a connection\n"));
+    }
+
+    /// Shared causes collapse within their group even across other outcomes,
+    /// while a different cause and a skip in another group remain visible.
+    #[test]
+    fn test_checklist_keeps_distinct_skip_causes_and_groups() {
+        let computer = [json!({"name":"ark","result":"skip","detail":"needs cloud sync"})];
+        let device = [
+            json!({"name":"firmware","result":"skip","detail":"needs cloud sync"}),
+            json!({"name":"pairing","result":"ok","detail":"paired and locked"}),
+            json!({"name":"relay","result":"skip","detail":"needs cloud sync"}),
+            json!({"name":"slots","result":"skip","detail":"needs an unlocked Ark and cloud sync"}),
+        ];
+        let rendered = checklist(
+            &Theme::test(80, Color::Off, true),
+            &[("This computer", &computer), ("Ark", &device)],
+        );
+        assert!(rendered.contains("  · ark       needs cloud sync\n"));
+        assert!(rendered.contains("  · 2 checks  needs cloud sync\n"));
+        assert!(rendered.contains("  · slots     needs an unlocked Ark and cloud sync\n"));
+        assert!(rendered.ends_with("\n\nNo problems found"));
+    }
+
+    /// Summary grammar covers clean, skipped, warning, failure and mixed reports.
+    #[test]
+    fn test_checklist_summary_counts_only_failures_and_warnings() {
+        for (results, summary) in [
+            (vec!["ok"], "No problems found"),
+            (vec!["skip", "skip"], "No problems found"),
+            (vec!["fail", "skip"], "1 problem"),
+            (vec!["warn", "skip"], "1 warning"),
+            (vec!["fail", "fail"], "2 problems"),
+            (vec!["warn", "warn"], "2 warnings"),
+            (vec!["fail", "warn"], "1 problem, 1 warning"),
+            (
+                vec!["fail", "fail", "warn", "warn"],
+                "2 problems, 2 warnings",
+            ),
+        ] {
+            let rows: Vec<_> = results
+                .iter()
+                .map(|result| json!({"name":"check","result":result,"detail":"detail"}))
+                .collect();
+            let rendered = checklist(&Theme::test(80, Color::Off, true), &[("Ark", &rows)]);
+            assert!(
+                rendered.ends_with(&format!("\n\n{summary}")),
+                "{results:?}: {rendered}"
+            );
+        }
+    }
+
+    /// Names are muted labels, headings are bold and only marks carry state colors.
+    #[test]
+    fn test_checklist_styles_names_and_marks_separately() {
+        for (result, mark) in [
+            ("ok", "\x1b[1m\x1b[38;2;148;202;110m✓\x1b[0m"),
+            ("warn", "\x1b[1m\x1b[38;2;232;162;74m!\x1b[0m"),
+            ("fail", "\x1b[1m\x1b[38;2;235;96;112m✗\x1b[0m"),
+            ("skip", "\x1b[38;2;124;128;152m·\x1b[0m"),
+        ] {
+            let rows = [json!({"name":"ark","result":result,"detail":"detail"})];
+            let rendered = checklist(
+                &Theme::test(80, Color::True, true),
+                &[("This computer", &rows)],
+            );
+            assert!(rendered.starts_with(&format!(
+                "\x1b[1mThis computer\x1b[0m\n  {mark} \x1b[38;2;124;128;152mark\x1b[0m  detail\n\n"
+            )), "{result}: {rendered:?}");
+        }
+    }
+
+    /// Long details and hints wrap under their own text, and untrusted text
+    /// cannot introduce terminal controls or extra report rows.
+    #[test]
+    fn test_checklist_wraps_and_escapes_text() {
+        let rows = [json!({"name":"connection","result":"fail",
+            "detail":"a long connection failure with more words to wrap",
+            "hint":"select another device with --device"})];
+        let rendered = checklist(&Theme::test(40, Color::Off, true), &[("Ark", &rows)]);
+        assert!(
+            rendered
+                .contains("\n                failure with more words\n                to wrap\n")
+        );
+        assert!(rendered.contains("\n          --device\n"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| console::measure_text_width(line) <= 40)
+        );
+
+        let rows = [
+            json!({"name":"ark","result":"warn","detail":"bad\nvalue","hint":"bad\u{001b}[2Jhint"}),
+        ];
+        let rendered = checklist(&Theme::test(80, Color::Off, true), &[("Ark\nname", &rows)]);
+        assert!(rendered.starts_with("Ark\\nname\n  ! ark  bad\\nvalue\n"));
+        assert!(rendered.contains("    hint: bad\\u{1b}[2Jhint\n"));
+        assert!(!rendered.contains('\x1b'));
     }
 }

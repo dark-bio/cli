@@ -33,7 +33,7 @@ use clap::{FromArgMatches, Parser};
 use context::Context;
 use darkbio_clock::Clock;
 use error::Error;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::process::ExitCode;
 
 /// Published version or the Cargo version with a local build mark.
@@ -200,17 +200,6 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
             Ok(())
         }
     }
-}
-
-/// Reports compiled crate versions and the firmware compatibility baseline for doctor.
-pub(crate) fn versions() -> Value {
-    json!({
-        "tool": env!("CARGO_PKG_VERSION"),
-        "connect": darkbio_connect::VERSION,
-        "wire": darkbio_connect::wire::VERSION,
-        "minimum_firmware": firmware::MINIMUM_VERSION,
-        "minimum_develop_publish": device::timestamp(firmware::MINIMUM_DEVELOP_PUBLISH),
-    })
 }
 
 /// Tests of invocation policy before command dispatch.

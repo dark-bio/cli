@@ -556,6 +556,171 @@ fn test_version_and_status_help_match_output() {
     );
 }
 
+/// Doctor keeps every check and the build version in JSON, while the reading
+/// report groups the checks and collapses skips after a failed connection.
+#[test]
+fn test_doctor_report_keeps_checks_events_and_the_final_error() {
+    // A nonexistent selector prevents any connection, and CI disables lookups
+    let args = ["doctor", "--device", "hardware:palette-no-device", "-v"];
+    let mut invocation = args.to_vec();
+    invocation.push("--json");
+    let output = ark(&invocation);
+    let document = json_output(&output);
+    let keys: Vec<_> = document
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["version", "checks"]);
+    let version = json_output(&ark(&["--version", "--json"]));
+    assert_eq!(document["version"], version["version"]);
+
+    // The flat list keeps each check, including all eight connection skips
+    let checks = document["checks"].as_array().unwrap();
+    let names: Vec<_> = checks
+        .iter()
+        .map(|check| check["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ark",
+            "hardware",
+            "emulator",
+            "cache",
+            "connection",
+            "compatibility",
+            "environment",
+            "firmware",
+            "sync",
+            "registry",
+            "pairing",
+            "relay",
+            "slots",
+        ]
+    );
+    assert_eq!(checks[0]["result"], "skip");
+    assert!(
+        checks[0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with(version["version"].as_str().unwrap())
+    );
+    assert_eq!(checks[4]["result"], "fail");
+    assert!(checks[5..].iter().all(
+        |check| check["result"] == "skip" && check["detail"] == "skipped without a connection"
+    ));
+
+    // Verbose output reports every check before the first failure ends the command
+    let events: Vec<Value> = String::from_utf8(output.stderr)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for check in checks {
+        let keys: Vec<_> = check
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["name", "result", "detail", "hint"]);
+        let message = format!(
+            "{}: {}, {}",
+            check["name"].as_str().unwrap(),
+            check["result"].as_str().unwrap(),
+            check["detail"].as_str().unwrap()
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "step" && event["message"] == message)
+                .count(),
+            1,
+            "{check}"
+        );
+    }
+    let failure = checks
+        .iter()
+        .find(|check| check["result"] == "fail")
+        .unwrap();
+    let error = events
+        .iter()
+        .position(|event| event["event"] == "error")
+        .unwrap();
+    assert_eq!(events[error]["error"]["message"], failure["detail"]);
+    assert!(
+        events[error + 1..]
+            .iter()
+            .all(|event| event["event"] == "hint")
+    );
+    if let Some(hint) = failure["hint"].as_str() {
+        assert!(
+            events[error + 1..]
+                .iter()
+                .any(|event| event["message"] == hint)
+        );
+    }
+
+    // A pipe keeps the two headings, one collapsed row and a counted summary
+    let human = ark(&args);
+    assert_eq!(human.status.code(), output.status.code());
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(stdout.starts_with("\nThis computer\n"));
+    assert!(stdout.contains("\n\nArk\n"));
+    assert_eq!(stdout.matches("skipped without a connection").count(), 1);
+    assert!(stdout.contains("8 checks"));
+    let problems = checks
+        .iter()
+        .filter(|check| check["result"] == "fail")
+        .count();
+    let summary = format!("{problems} problem{}", if problems == 1 { "" } else { "s" });
+    assert!(stdout.ends_with(&format!("\n\n{summary}\n")), "{stdout}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    let error = stderr.rfind("error[").unwrap();
+    assert!(stderr[..error].ends_with("\n\n"));
+    assert!(stderr[error..].contains(failure["detail"].as_str().unwrap()));
+    if let Some(hint) = failure["hint"].as_str() {
+        assert!(stdout.contains(&format!("    hint: {hint}")));
+        assert!(stderr[error..].contains(&format!("hint: {hint}")));
+    }
+
+    // With no events before it, the report opens the page and the error gets
+    // the only separating newline on stderr
+    let human = ark(&args[..3]);
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .starts_with("This computer\n")
+    );
+    assert!(
+        String::from_utf8(human.stderr)
+            .unwrap()
+            .starts_with("\nerror[")
+    );
+}
+
+/// Doctor's help and the output topic describe the report and its JSON keys.
+#[test]
+fn test_doctor_help_matches_the_report() {
+    let output = ark(&["doctor", "--help"]);
+    let help = String::from_utf8(output.stdout).unwrap();
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(help.contains(
+        "JSON: version, checks, each with name, result (ok, warn, fail or skip), detail and hint"
+    ));
+    assert!(!help.contains("minimum_firmware"));
+    assert!(!help.contains("emulator-registry"));
+
+    let output = ark(&["help", "output"]);
+    let topic = String::from_utf8(output.stdout).unwrap();
+    let topic = topic.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(topic.contains("the document holds version and checks"));
+    assert!(topic.contains("the answer together in the ark check"));
+    assert!(!topic.contains("update check"));
+}
+
 /// Checks that color variables cannot force escape sequences into a pipe.
 #[test]
 fn pipes_cannot_force_color() {

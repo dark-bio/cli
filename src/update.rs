@@ -46,7 +46,7 @@ impl Channel {
         }
     }
 
-    /// Names the channel in the detail of doctor's update check.
+    /// Names the channel in the detail of doctor's `ark` check.
     pub fn description(self) -> &'static str {
         match self {
             Self::Release => "release",

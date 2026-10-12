@@ -361,18 +361,17 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "doctor",
-        paragraph: "Runs every check in order and prints the whole list. It covers this tool \
-            and its newer releases, discovery, the connection, the firmware, the cloud \
-            environment and sync, the registry, pairing, the relay, the slots and the \
-            download cache. Each check is ok, warn, fail or skip, with a hint where something \
-            needs action. It applies no fixes, though its checks sync the Ark with the cloud \
-            and look up the newest ark release.",
+        paragraph: "Runs every check in order and prints the whole report, this computer first, \
+            then the Ark. Each check is ok, warn, fail or skip, with a hint where something \
+            needs action, and a summary closes the report. It applies no fixes, though its \
+            checks sync the Ark with the cloud and look up the newest ark release, which \
+            local builds and CI skip.",
         footer: Some(ContractFooter {
             requires: "nothing; a check that cannot run is skipped",
             approval: "none",
             time: "seconds per check",
-            prints: "each check's result (ok, warn, fail or skip), name, detail and hint; JSON: \
-                tool, connect, wire, minimum_firmware, minimum_develop_publish, checks",
+            prints: "grouped checks and a summary; JSON: version, checks, each with \
+                name, result (ok, warn, fail or skip), detail and hint; every skip stays in JSON",
             exit: "0 without a failed check; otherwise the class of the first failure, \
                 1 local, 3 device, 4 cloud, 5 Ark or 7 timeout",
             examples: "ark doctor\nark doctor --json",

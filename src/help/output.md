@@ -15,6 +15,14 @@ state is decoration, and the word beside it is the value. The view may shorten, 
 while --json always has the whole value. Colors and live progress need a
 terminal, and NO_COLOR or CLICOLOR=0 turns colors off.
 
+`ark doctor` prints its checks in two groups. The first is this computer,
+and the second takes the Ark's name, or Ark when no connection could be
+made. A check's name is its JSON name, and its mark shows ok, warn, fail or
+skip. Skips with one cause share a row, and a summary counts failures as
+problems and warns as warnings. Under --json the document holds version and
+checks, every check on its own with name, result, detail and hint. A failed
+doctor ends with its error and hints, even when a check already showed them.
+
 ## JSON
 
 --json prints one result document on stdout, indented by two spaces, and
@@ -82,7 +90,9 @@ While the kept answer names a newer version, every command except help,
 completions, --version and doctor starts with a note naming both versions
 and how to upgrade. Under --json it is an ordinary note event. The note
 never changes the result or the exit code, and -q hides it. doctor looks up
-afresh and reports the answer as its update check.
+afresh and reports its version and the answer together in the ark check.
+The check is ok on the newest release, warn with upgrade advice when a newer
+one is out, and skip when the lookup fails, under CI or in a local build.
 
 ## Error codes
 

@@ -203,7 +203,7 @@ impl Output {
         if self.0.printed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.write_result(text.trim_end_matches('\n'))
+        self.write_result(text.trim_end_matches('\n'), false)
     }
 
     /// Emits the sole result, invoking the custom renderer only for human stdout.
@@ -223,7 +223,7 @@ impl Output {
         } else {
             render(&self.0.out)
         };
-        self.write_result(&text)
+        self.write_result(&text, false)
     }
 
     /// Renders rows as a table; JSON retains the complete document.
@@ -236,25 +236,35 @@ impl Output {
         self.document_with(document, |theme| human::table(theme, rows, columns))
     }
 
-    /// Renders diagnostic rows with local hints, or the equivalent machine result.
-    pub fn checklist(&self, document: &Value, rows: &[Value]) -> Result<(), Error> {
-        self.document_with(document, |theme| human::checklist(theme, rows))
+    /// Renders titled diagnostic groups and a summary, or the full machine result.
+    pub fn checklist(&self, document: &Value, groups: &[(&str, &[Value])]) -> Result<(), Error> {
+        let _result = self.0.result.lock().expect("output not poisoned");
+        if self.0.printed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let text = if self.json() {
+            serde_json::to_string_pretty(document).expect("JSON value serializes")
+        } else {
+            human::checklist(&self.0.out, groups)
+        };
+        self.write_result(&text, !self.json())
     }
 
     /// Ends live stderr activity and writes a complete stdout result block.
     ///
-    /// The caller holds the result lock, which comes before the ticker and
-    /// terminal locks.
-    fn write_result(&self, text: &str) -> Result<(), Error> {
+    /// `separate` preserves spacing around a checklist in a pipe too. The caller
+    /// holds the result lock, which comes before the ticker and terminal locks.
+    fn write_result(&self, text: &str, separate: bool) -> Result<(), Error> {
         let mut terminal = self.end_wait();
         close_line(&mut terminal, &mut io::stderr().lock());
         let mut stdout = io::stdout().lock();
-        if self.0.out.interactive && self.0.err.interactive && terminal.err_printed {
+        if terminal.err_printed && (separate || (self.0.out.interactive && self.0.err.interactive))
+        {
             writeln!(stdout)?;
         }
         writeln!(stdout, "{text}")?;
         stdout.flush()?;
-        terminal.out_block = self.0.out.interactive;
+        terminal.out_block = separate || self.0.out.interactive;
         Ok(())
     }
 
@@ -594,8 +604,8 @@ impl Output {
             let message = style::printable(&error.message);
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
             let mut stderr = io::stderr().lock();
+            separate_result(&mut terminal, &mut stderr);
             if self.terminal() {
-                separate_result(&mut terminal, &mut stderr);
                 let theme = &self.0.err;
                 let line = format!(
                     "{} {}{}",
