@@ -78,10 +78,10 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
 
 /// Aligns label/value rows, stacking them when labels consume the available width.
 ///
-/// An optional title starts at column 0, and rows indent two spaces. An empty
-/// pair separates groups; an empty label introduces an unlabeled row.
+/// A title prints at column 0 above rows indented two spaces. An empty pair
+/// separates groups, and an empty label starts an unlabeled row.
 pub(crate) fn block(theme: &Theme, title: Option<&str>, rows: &[(String, String)]) -> String {
-    // A title names the block above its rows
+    // Print the title above the rows
     let mut lines = Vec::new();
     if let Some(title) = title {
         lines.push(style::wrap(
@@ -275,7 +275,7 @@ pub(crate) fn table(theme: &Theme, rows: &[Value], columns: &[(&str, &str)]) -> 
         result
     };
 
-    // Print the header and each row at column zero
+    // Print the header and the rows from column 0
     let mut lines = vec![line(
         &columns
             .iter()
@@ -289,7 +289,10 @@ pub(crate) fn table(theme: &Theme, rows: &[Value], columns: &[(&str, &str)]) -> 
     lines.join("\n")
 }
 
-/// Groups diagnostic outcomes, collapsing shared skips and counting problems.
+/// Renders checks under their group titles, then a summary of problems and
+/// warnings.
+///
+/// The skips of one cause within a group share a row.
 pub(super) fn checklist(theme: &Theme, groups: &[(&str, &[Value])]) -> String {
     // Collapse skips with the same cause inside each group, in first-seen order
     let shown: Vec<_> = groups
@@ -324,7 +327,8 @@ pub(super) fn checklist(theme: &Theme, groups: &[(&str, &[Value])]) -> String {
         })
         .collect();
 
-    // Align details across both groups, allowing for the wider ASCII ok mark
+    // Align the details across groups, leaving room for the two-letter ASCII
+    // ok mark
     let labels = shown
         .iter()
         .flat_map(|(_, rows)| rows)
@@ -351,7 +355,7 @@ pub(super) fn checklist(theme: &Theme, groups: &[(&str, &[Value])]) -> String {
         })
         .collect();
 
-    // Skips carry no weight in the summary, and zero counts stay out
+    // Count failures as problems and warns as warnings, leaving out a zero
     let mut counts = Vec::new();
     for (result, noun) in [("fail", "problem"), ("warn", "warning")] {
         let count = groups
@@ -375,9 +379,10 @@ pub(super) fn checklist(theme: &Theme, groups: &[(&str, &[Value])]) -> String {
     sections.join("\n\n")
 }
 
-/// Aligns one check's plain detail after its muted name and any hint below it.
+/// Renders one check, its detail aligned after the name and its hint below.
 fn checklist_row(theme: &Theme, name: &str, row: &Value, width: usize) -> String {
-    // The mark carries the outcome's color; the detail stays plain
+    // Only the mark takes the outcome's color, with the name muted and the
+    // detail plain
     let role = match row["result"].as_str() {
         Some("ok") => Role::Success,
         Some("fail") => Role::Failure,
@@ -393,7 +398,8 @@ fn checklist_row(theme: &Theme, name: &str, row: &Value, width: usize) -> String
     );
     let mut line = style::wrap(&line, theme.width, width + 4);
 
-    // A hint belongs to its check, indented four spaces and wrapped under its text
+    // Put the hint under its check, indented four spaces and wrapped under its
+    // own text
     if let Some(hint) = row["hint"].as_str() {
         line.push('\n');
         line.push_str(&style::wrap(
@@ -507,7 +513,7 @@ mod tests {
         );
     }
 
-    /// Tables use column 0 for headers and rows, fitting the full width.
+    /// A table starts at column 0 and may fill the whole width.
     #[test]
     fn test_tables_start_at_column_zero() {
         let theme = Theme::test(17, Color::True, true);
@@ -521,11 +527,12 @@ mod tests {
         );
     }
 
-    /// Local dates are muted in tables, while blocks retain the clock and offset.
+    /// A table shows a timestamp as its muted local date, and a block keeps the
+    /// clock and offset.
     #[cfg(unix)]
     #[test]
     fn test_table_dates_and_block_timestamps_use_local_time() {
-        // Child processes isolate timezone settings and use a fixed instant
+        // Run each time zone in a child, so its settings stay out of other tests
         let Ok(zone) = std::env::var("ARK_TEST_DATE_ZONE") else {
             for zone in ["Etc/GMT+5", "Etc/GMT-3"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -543,7 +550,7 @@ mod tests {
             return;
         };
 
-        // A timezone west of UTC crosses into the previous calendar date
+        // West of UTC the instant falls on the previous day
         let (date, clock) = if zone == "Etc/GMT+5" {
             ("2026-10-10", "20:02:03 -05:00")
         } else {
@@ -633,7 +640,8 @@ mod tests {
         );
     }
 
-    /// A healthy report has two named groups, aligned labels and a plain summary.
+    /// A healthy report shows two titled groups with aligned names, and its
+    /// summary finds no problems.
     #[test]
     fn test_checklist_groups_computer_and_ark() {
         let computer = [
@@ -680,8 +688,8 @@ mod tests {
         );
     }
 
-    /// A failed connection collapses eight skips while hints stay under their
-    /// checks and each outcome contributes to the summary.
+    /// A failed connection collapses its eight skips into one row, keeps each
+    /// hint under its check and counts every outcome.
     #[test]
     fn test_checklist_collapses_connection_skips() {
         let computer = [
@@ -727,15 +735,15 @@ mod tests {
             )
         );
 
-        // ASCII marks retain the same groups, counts and alignment
+        // ASCII marks keep the groups, counts and alignment
         let ascii = checklist(&Theme::test(80, Color::Off, false), &groups);
         assert!(ascii.contains("  ok hardware       1 Ark\n"));
         assert!(ascii.contains("  x connection      several Arks match\n"));
         assert!(ascii.contains("  - 8 checks        skipped without a connection\n"));
     }
 
-    /// Shared causes collapse within their group even across other outcomes,
-    /// while a different cause and a skip in another group remain visible.
+    /// Skips of one cause collapse within their group across other rows, while
+    /// another cause or another group keeps its own row.
     #[test]
     fn test_checklist_keeps_distinct_skip_causes_and_groups() {
         let computer = [json!({"name":"ark","result":"skip","detail":"needs cloud sync"})];
@@ -755,7 +763,8 @@ mod tests {
         assert!(rendered.ends_with("\n\nNo problems found"));
     }
 
-    /// Summary grammar covers clean, skipped, warning, failure and mixed reports.
+    /// The summary counts problems and warnings in singular and plural, and
+    /// leaves skips out.
     #[test]
     fn test_checklist_summary_counts_only_failures_and_warnings() {
         for (results, summary) in [
@@ -783,7 +792,7 @@ mod tests {
         }
     }
 
-    /// Names are muted labels, headings are bold and only marks carry state colors.
+    /// Names are muted, titles bold, and only the marks take a state's color.
     #[test]
     fn test_checklist_styles_names_and_marks_separately() {
         for (result, mark) in [
@@ -804,7 +813,7 @@ mod tests {
     }
 
     /// Long details and hints wrap under their own text, and untrusted text
-    /// cannot introduce terminal controls or extra report rows.
+    /// adds no terminal controls or rows.
     #[test]
     fn test_checklist_wraps_and_escapes_text() {
         let rows = [json!({"name":"connection","result":"fail",

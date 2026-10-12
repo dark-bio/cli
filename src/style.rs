@@ -185,7 +185,7 @@ impl Theme {
         if self.unicode { unicode } else { ascii }
     }
 
-    /// Prefixes a styled state marker, leaving its words plain.
+    /// Prefixes the state's mark in its role's color, leaving the words plain.
     pub fn mark(&self, role: Role, text: &str) -> String {
         let icon = match role {
             Role::Success => self.glyph("\u{2713}", "ok"),
@@ -215,7 +215,8 @@ impl Theme {
         console::truncate_str(text, width, tail).into_owned()
     }
 
-    /// Styles commands inside paired backticks, keeping the backticks literal.
+    /// Styles each command between paired backticks and keeps the backticks,
+    /// while an unmatched backtick stays as typed.
     pub fn inline(&self, text: &str) -> String {
         let mut result = String::new();
         let mut remaining = text;
@@ -280,7 +281,8 @@ pub(crate) fn bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-/// Formats whole seconds in the shared compact duration notation.
+/// Formats seconds as `14s`, `1m 02s` or `1h 05m`, the one duration form of
+/// every output.
 pub(crate) fn duration(seconds: u64) -> String {
     if seconds >= 3600 {
         format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
@@ -384,7 +386,8 @@ impl Theme {
 mod tests {
     use super::*;
 
-    /// Duration boundaries use seconds, minutes and hours consistently.
+    /// Checks that durations switch to minutes at 60s and to hours at 3600s,
+    /// padding the smaller unit.
     #[test]
     fn test_duration_boundaries() {
         for (seconds, expected) in [
@@ -401,14 +404,14 @@ mod tests {
         }
     }
 
-    /// Checks that piped marks follow the locale while color and cursor control
-    /// stay off, including with a dumb terminal setting.
+    /// Checks that a pipe's marks follow the locale alone, even under a dumb
+    /// terminal, while color and redraws stay off.
     #[test]
     fn test_pipe_marks_follow_locale() {
-        /// Expected mark in a child with isolated locale settings.
+        /// Variable that passes the expected mark to the child process.
         const CHILD: &str = "ARK_TEST_PIPE_MARK";
 
-        // Child processes isolate locale changes from the other tests
+        // Run each locale in a child, so its settings stay out of other tests
         let Ok(expected) = std::env::var(CHILD) else {
             for (name, locale) in [
                 ("LC_ALL", "en_US.UTF-8"),
@@ -446,14 +449,14 @@ mod tests {
             return;
         };
 
-        // Each piped stream renders the same mark, without terminal styling
+        // Both piped streams print the same mark, without color
         for stderr in [false, true] {
             let theme = Theme::new(false, stderr);
             assert!(!theme.interactive);
             assert_eq!(theme.color, Color::Off);
             assert_eq!(theme.mark(Role::Success, "done"), expected);
 
-            // JSON disables presentation capabilities regardless of locale
+            // JSON turns glyphs, color and redraws off, whatever the locale
             let json = Theme::new(true, stderr);
             assert!(!json.interactive);
             assert!(!json.unicode);
@@ -609,7 +612,8 @@ mod tests {
         );
     }
 
-    /// Checks that only a state's glyph takes its role's color and weight.
+    /// Checks that a mark takes its role's color and weight, and its words stay
+    /// plain.
     #[test]
     fn test_marks_style_only_the_glyph() {
         let theme = Theme::test(80, Color::True, true);
@@ -676,8 +680,8 @@ mod tests {
         );
     }
 
-    /// Checks that inline code keeps paired and unmatched backticks, with and
-    /// without color.
+    /// Checks that inline commands keep their backticks with and without color,
+    /// and that an unmatched backtick stays.
     #[test]
     fn test_inline_code_keeps_backticks() {
         for (color, expected) in [

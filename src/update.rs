@@ -113,7 +113,8 @@ impl Answer {
         result
     }
 
-    /// Announces a newer kept version through the invocation's output policy.
+    /// Prints the release note when the kept version is newer than the running
+    /// one.
     fn announce(&self, output: &Output, running: &Version, hint: &str) {
         if let Some(newest) = &self.newest
             && newest.cmp_precedence(running).is_gt()
@@ -198,7 +199,7 @@ pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
 ///
 /// The copy opens no connection, so its clock is the real one.
 pub(crate) fn run() {
-    // Local builds and CI skip even a direct invocation of the copy
+    // Local builds and CI do nothing, even when the copy is started by hand
     if cfg!(ark_local) || disabled() {
         return;
     }
@@ -615,12 +616,13 @@ mod tests {
         assert!(claim(&file, Channel::Release, now).is_err());
     }
 
-    /// Published releases emit one note before the command result, as text or a
-    /// JSON event, unless quiet suppresses it or the kept version is not newer.
+    /// Checks that a published build prints one release note before the result,
+    /// as text or a JSON event, unless quiet hides it or the kept version is
+    /// not newer.
     #[test]
     fn test_published_release_note_output() {
-        // The child calls the production emitter with a published version,
-        // regardless of the build kind or CI environment of this test binary
+        // As the child, announce a kept answer to a published version, whatever
+        // build or CI this test runs under
         if let Ok(case) = std::env::var("ARK_TEST_UPDATE_CASE") {
             let mut options = crate::args::Cli::parse_from(["ark"]).options;
             options.json = std::env::var("ARK_TEST_UPDATE_JSON").unwrap() == "true";
@@ -665,8 +667,8 @@ mod tests {
             return;
         }
 
-        // Merge real stdout and stderr into one file to check ordering as well
-        // as the complete note and result, without waiting on a clock or network
+        // Capture both streams into one file, so the note's place before the
+        // result shows
         let directory = Directory::new();
         for (case, message) in [
             ("none", None),

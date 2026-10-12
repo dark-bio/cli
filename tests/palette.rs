@@ -155,7 +155,7 @@ fn test_local_build_skips_release_notes_and_lookup() {
             assert_eq!(output.stderr, baseline.stderr, "json={json}, CI={ci:?}");
         }
 
-        // Quiet preserves the same result and absence of a release note
+        // Quiet keeps the result, still without a release note
         args.push("-q");
         let quiet = invoke(&args, None);
         assert_eq!(quiet.stdout, baseline.stdout);
@@ -166,7 +166,8 @@ fn test_local_build_skips_release_notes_and_lookup() {
 
     assert_eq!(std::fs::read(cache.join("update.json")).unwrap(), answer);
 
-    // A local build also ignores the worker entry point and an empty cache
+    // A local build also does nothing when the lookup copy starts directly, and
+    // never fills an empty cache
     let output = invoke(&["__update"], None);
     assert!(output.status.success());
     assert!(output.stdout.is_empty());

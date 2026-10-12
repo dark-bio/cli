@@ -38,10 +38,10 @@ With --json each slot carries:
   filled, with url, size_bytes and sha256, otherwise null
 
 `ark data show` adds required_by, the slots that require this one, and
-cached, whether this computer's download cache holds the offered file. The
-reading view of `ark data show` marks each requirement as filled or not
-filled. The list shows slot, state, build, version and size, and hints at
-the command that fills or erases a slot.
+cached, whether this computer's download cache holds the offered file. Its
+reading view marks each requirement as filled or not filled. The reading
+view of `ark data list` shows slot, state, build, version and size, and
+hints at the command that fills or erases a slot.
 
 The Ark offers the references for the assembly family of the owner's calls,
 so GRCh38.p14 references beside GRCh38.p13 calls are normal.

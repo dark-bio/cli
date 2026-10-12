@@ -26,10 +26,10 @@ and this tool are out of step. Update both.
 environment and shows the installed build and every candidate. A candidate
 is a build with a higher version. When the installed build is a develop
 build, every build of the same version is a candidate too. The reading view
-lists builds newest first, with version, local publication date, size and
-status, either installed or update. Each candidate's headline, the first
-paragraph of its summary, prints whole below the table under its version.
-The installed build's headline does not print.
+lists the builds newest first, with version, publication date, size and
+status, installed or update. Below the table, each candidate's headline,
+the first paragraph of its summary, prints whole under its version. The
+installed build's headline stays out.
 
 With --json the document holds:
 

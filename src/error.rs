@@ -22,7 +22,7 @@ pub(crate) struct Error {
     pub code: &'static str,
     /// Primary diagnostic shown in every output format.
     pub message: String,
-    /// Follow-up actions carried with the diagnostic.
+    /// Next steps, printed under the error and carried in its JSON object.
     pub hints: Vec<String>,
     /// Original Ark refusal, including its full 64-bit code, when available.
     pub remote: Option<schema::Error>,
@@ -46,7 +46,8 @@ impl Error {
         self
     }
 
-    /// Encodes the complete error for the JSON result and stderr event.
+    /// Encodes the error, hints included, for the JSON document and the error
+    /// event.
     ///
     /// The Ark's number is a decimal string, as every 64-bit value is in JSON.
     pub fn json(&self) -> Value {
@@ -194,10 +195,11 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
 
-    /// Ambiguity hints prefer a unique kind and otherwise keep each locator.
+    /// Checks that the ambiguity hint names an Ark by its kind when it is the
+    /// only one of that kind, and by its locator otherwise.
     #[test]
     fn test_ambiguous_device_hints_use_unique_kinds() {
-        // Fixed locators cover unique kinds, repeated kinds and mixed selections
+        // Cover lone kinds, repeated kinds and mixes of both
         use darkbio_connect::Locator;
         let hardware = Locator::Hardware {
             bus: "00".into(),

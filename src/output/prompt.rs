@@ -4,33 +4,37 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Single-key confirmation input, separated from prompt rendering.
+//! Reads the one key that answers a yes or no prompt.
+//!
+//! Keys come through [`Keys`], so tests type them without a terminal.
 
 use crate::error::Error;
 use console::{Key, Term};
 use std::io;
 
-/// Key source that discards queued input before the question is shown.
+/// Source of the keys that answer a prompt.
 pub(super) trait Keys {
-    /// Discards type-ahead where the platform input API supports it.
+    /// Drops the keys typed before the prompt, where the platform allows it.
     fn discard(&mut self) -> io::Result<()>;
     /// Reads a key without echoing it or waiting for Enter.
     fn read(&mut self) -> io::Result<Key>;
 }
 
-/// Console input for an invocation that already permits prompting.
+/// The terminal's keys, for an invocation that may prompt.
 pub(super) struct Input {
-    /// Console key reader independent of the prompt's stderr destination.
+    /// Reader on the terminal, whichever stream the prompt prints on.
     terminal: Term,
 }
 
 impl Input {
-    /// Opens a key reader even when the output streams are redirected.
+    /// Opens the terminal for reading, even when stdout and stderr are
+    /// redirected.
     pub(super) fn new() -> io::Result<Self> {
         #[cfg(unix)]
         let terminal = {
             use std::os::fd::AsFd;
-            // The duplicate supplies terminal detection; this reader never writes
+            // console checks its write side for a terminal, so a duplicate of
+            // stdin stands in for it, and nothing writes to it
             let descriptor = io::stdin().as_fd().try_clone_to_owned()?;
             Term::read_write_pair(io::stdin(), std::fs::File::from(descriptor))
         };
@@ -50,13 +54,14 @@ impl Keys for Input {
         {
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
-            // Stdin remains open during the call, which takes no borrowed buffers
+            // Sound since stdin's handle stays open for the call, which takes
+            // no buffers
             if unsafe { FlushConsoleInputBuffer(io::stdin().as_raw_handle()) } == 0 {
                 return Err(io::Error::last_os_error());
             }
         }
-        // console has no Unix input-flush API, and the direct dependencies
-        // expose no termios call; Unix type-ahead remains queued
+        // On Unix the early keys stay queued, since neither console nor any
+        // other direct dependency can flush terminal input
         Ok(())
     }
 
@@ -69,16 +74,19 @@ impl Keys for Input {
     }
 }
 
-/// Reads Windows console input when both output handles are redirected.
+/// Reads a key from the Windows console input when stdout and stderr are both
+/// redirected.
 #[cfg(windows)]
 fn redirected_key() -> io::Result<Key> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Console::{INPUT_RECORD, KEY_EVENT, ReadConsoleInputW};
     loop {
-        // INPUT_RECORD consists only of integers and unions that permit zero
+        // Sound since INPUT_RECORD holds only integers and unions, for which
+        // zero is a valid value
         let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
         let mut count = 0;
-        // The input handle stays open, and the call writes one initialized record
+        // Sound since stdin's handle stays open, and the call fills at most
+        // the one record it gets
         if unsafe { ReadConsoleInputW(io::stdin().as_raw_handle(), &mut record, 1, &mut count) }
             == 0
         {
@@ -87,12 +95,12 @@ fn redirected_key() -> io::Result<Key> {
         if count == 0 || record.EventType != KEY_EVENT as u16 {
             continue;
         }
-        // EventType selects the KEY_EVENT_RECORD member of the union
+        // Sound since a key event's type marks the union as a key record
         let event = unsafe { record.Event.KeyEvent };
         if event.bKeyDown == 0 {
             continue;
         }
-        // Unicode console input initializes the UnicodeChar member
+        // Sound since the wide-character read fills the UnicodeChar member
         let character = unsafe { event.uChar.UnicodeChar };
         return Ok(match char::from_u32(u32::from(character)) {
             Some('\r') => Key::Enter,
@@ -103,9 +111,12 @@ fn redirected_key() -> io::Result<Key> {
     }
 }
 
-/// Discards queued keys, shows the question, and accepts only y, n or Enter.
+/// Shows the question once type-ahead is dropped, and returns the answer of
+/// the first key that gives one.
 ///
-/// Ctrl-C becomes the interruption error that the caller routes through cleanup.
+/// `y` and `n` answer, Enter takes `default`, and other keys are ignored.
+/// Ctrl-C returns the interruption error, which the caller routes through
+/// cleanup.
 pub(super) fn confirm(
     input: &mut impl Keys,
     default: bool,
@@ -127,20 +138,21 @@ pub(super) fn confirm(
     Ok(answer)
 }
 
-/// Tests using separate queued and newly typed keys, with no terminal or clock.
+/// Tests of the answer keys, typed without a terminal.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    /// Answers need one key, ignore other keys and discard type-ahead before display.
+    /// Checks that one key answers, other keys are ignored and type-ahead
+    /// never answers.
     #[test]
     fn test_confirmation_keys() {
-        /// Queued input and keys typed after the question appears.
+        /// Keys typed before the question and after it.
         struct Input {
-            /// Keys queued before the prompt, which must never answer it.
+            /// Keys typed before the question, which must never answer it.
             queued: VecDeque<Key>,
-            /// Keys available once the prompt is shown.
+            /// Keys typed once the question shows.
             typed: VecDeque<Key>,
         }
         impl Keys for Input {

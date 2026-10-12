@@ -360,7 +360,7 @@ fn inventory_output() {
     }
 }
 
-/// Four typical slots fit as five comparison columns and four rows at 80 columns.
+/// Four typical slots print as four rows of five columns within 80 columns.
 #[test]
 fn test_data_list_fits_four_slots_at_eighty_columns() {
     let (stdout, stderr) = capture("four-slots", false);
