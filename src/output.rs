@@ -4,7 +4,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Results, diagnostics and stage narration shared by both output streams.
+//! Writes a command's result on stdout and narrates its work on stderr.
+//!
+//! The reading output composes both streams as one page, the same in a pipe
+//! as on a terminal, minus color and redraws. The blank lines around a result
+//! go to stderr, so stdout holds the result alone. Under `--json` stdout holds
+//! one document and stderr one event per line.
 
 pub(crate) mod human;
 mod prompt;
@@ -24,24 +29,24 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Clonable output handle sharing the sole result and current narration.
+/// Handle to the invocation's two output streams, cheap to clone and share.
 #[derive(Clone)]
 pub(crate) struct Output(
-    /// Invocation state shared by result, event and interruption writers.
+    /// State shared by every clone.
     Arc<State>,
 );
 
-/// Stream policy and synchronization for one invocation.
+/// Output settings and locks of one invocation.
 struct State {
-    /// Whether the invocation uses JSON documents and events.
+    /// Whether both streams print JSON.
     json: bool,
-    /// Independently resolved stdout capabilities.
+    /// Theme of stdout, resolved apart from stderr's.
     out: Theme,
-    /// Independently resolved stderr capabilities.
+    /// Theme of stderr, resolved apart from stdout's.
     err: Theme,
-    /// Whether optional narration and diagnostics are hidden.
+    /// Whether `-q` hides progress, notes, warnings and steps.
     quiet: bool,
-    /// Whether step events are shown.
+    /// Whether `-v` shows steps.
     verbose: bool,
     /// Whether stdout has been claimed, including a failed write.
     printed: AtomicBool,
@@ -49,24 +54,24 @@ struct State {
     environment_noted: AtomicBool,
     /// Result claim and write lock, taken before the ticker and terminal locks.
     result: Mutex<()>,
-    /// Clock timing narration, replaced when a connection supplies one.
+    /// Clock that times the narration, replaced by each connection's own.
     clock: Mutex<Clock>,
     /// Redraw worker lock, always taken before the terminal lock.
     ticker: Mutex<Option<Ticker>>,
-    /// Layout and activity shared with the redraw worker.
+    /// Page state and the stage in progress, shared with the redraw worker.
     terminal: Arc<Mutex<Terminal>>,
 }
 
-/// Worker stopped and joined before its display changes owner.
+/// Thread redrawing the live line once a second, stopped and joined on drop.
 struct Ticker {
     /// Dropping this sender wakes the worker to stop.
     stop: Option<crossbeam_channel::Sender<()>>,
-    /// Join handle preventing a redraw from outliving its display.
+    /// Handle joined on drop, so no redraw outlives its line.
     worker: Option<JoinHandle<()>>,
 }
 
 impl Ticker {
-    /// Draws once per clock second until the owner drops the stop sender.
+    /// Starts redrawing once a second on `clock`, until the ticker drops.
     fn start(clock: Clock, mut draw: impl FnMut(Instant) + Send + 'static) -> Self {
         let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
         let worker = std::thread::spawn(move || {
@@ -96,50 +101,52 @@ impl Drop for Ticker {
     }
 }
 
-/// Page composition and the current stage, serialized with stderr writes.
+/// What the page holds so far and the stage in progress, locked around every
+/// stderr write.
 #[derive(Default)]
 struct Terminal {
-    /// Number of screen rows occupied by the temporary live line.
+    /// Rows the live line takes on screen, 0 without one.
     live: usize,
-    /// Active stage or approval, retained until its outcome is known.
+    /// Stage or approval in progress, kept until its outcome prints.
     active: Option<Activity>,
-    /// Whether persistent stderr content precedes a result.
+    /// Whether stderr printed lines that stay, so a result needs a blank line
+    /// before it.
     err_printed: bool,
     /// Whether the next event needs a blank line after the result.
     out_block: bool,
 }
 
-/// A live stage or approval with its timing and most recent facts.
+/// Stage or approval in progress, with its start and latest facts.
 #[derive(Clone)]
 struct Activity {
-    /// Most recent label and progress facts.
+    /// Latest label and facts.
     update: Update,
-    /// Clock time when this stage or approval began.
+    /// When it began, on the narration clock.
     started: Instant,
-    /// Timer semantics explicitly chosen by its caller.
+    /// Timer the caller asked for, if any.
     timer: Option<Wait>,
-    /// Approval action and location, absent for machine work.
-    approval: Option<(String, &'static str)>,
-    /// Last emission time, used to bound live redraws and pipe intervals.
+    /// Action and location of an approval, absent for other stages.
+    approval: Option<(String, Option<&'static str>)>,
+    /// When it last printed, which paces redraws and pipe lines.
     drawn: Option<Instant>,
 }
 
-/// Presentation-only wait semantics, independent of operation enforcement.
+/// How a wait's timer reads, which never bounds the wait itself.
 #[derive(Clone, Copy)]
 pub(crate) enum Wait {
-    /// Count up from the request, including device-owned approval windows.
+    /// Counts up from the start, as for an approval whose window the Ark holds.
     Elapsed,
-    /// Count down to a deadline set by the CLI itself.
+    /// Counts down to a deadline `ark` set itself.
     Deadline(Instant),
 }
 
-/// Temporary connection notice erased when the connection attempt returns.
-pub(crate) struct Connecting(
-    /// Output owning the notice, absent when it was suppressed.
+/// Guard of a transient terminal line, which it erases on drop.
+pub(crate) struct Notice(
+    /// Output showing the line, absent when none showed.
     Option<Output>,
 );
 
-impl Drop for Connecting {
+impl Drop for Notice {
     fn drop(&mut self) {
         if let Some(output) = &self.0 {
             let mut terminal = output.0.terminal.lock().expect("output not poisoned");
@@ -149,6 +156,39 @@ impl Drop for Connecting {
 }
 
 impl Output {
+    /// Builds an output for narration tests, with fixed themes and `clock`.
+    #[cfg(test)]
+    pub(crate) fn test(json: bool, interactive: bool, clock: Clock) -> Self {
+        use clap::Parser;
+
+        let mut options = crate::args::Cli::parse_from(["ark"]).options;
+        options.json = json;
+        let mut output = Self::new(&options);
+        let state = Arc::get_mut(&mut output.0).unwrap();
+        state.err = Theme {
+            interactive: interactive && !json,
+            ..Theme::test(240, crate::style::Color::Off, true)
+        };
+        state.out = state.err.clone();
+        *state.clock.get_mut().unwrap() = clock;
+        output
+    }
+
+    /// Draws the live line at the clock's current instant, without a worker.
+    #[cfg(test)]
+    pub(crate) fn redraw(&self) {
+        let mut terminal = self.stop_ticker();
+        draw(
+            &self.0.err,
+            &mut terminal,
+            &mut io::stderr().lock(),
+            self.clock().now(),
+            self.json(),
+            self.0.quiet,
+            true,
+        );
+    }
+
     /// Resolves both streams and starts narration on the real clock.
     pub fn new(options: &Options) -> Self {
         Self(Arc::new(State {
@@ -170,19 +210,23 @@ impl Output {
     pub fn connection(&self, clock: Clock) {
         *self.0.clock.lock().expect("output not poisoned") = clock;
     }
+
     /// Reports whether both streams use JSON.
     pub fn json(&self) -> bool {
         self.0.json
     }
+
     /// Reports whether stderr supports live updates.
     pub fn terminal(&self) -> bool {
         self.0.err.interactive
     }
+
     /// Reports whether the sole stdout result was claimed, so failure reporting
     /// must not emit another.
     pub fn printed(&self) -> bool {
         self.0.printed.load(Ordering::SeqCst)
     }
+
     /// Returns the current narration clock.
     fn clock(&self) -> Clock {
         self.0.clock.lock().expect("output not poisoned").clone()
@@ -244,7 +288,7 @@ impl Output {
         self.write_result(&text)
     }
 
-    /// Renders rows as a table while retaining the full JSON document.
+    /// Emits rows as a table, or the whole document under JSON.
     pub fn table(
         &self,
         document: &Value,
@@ -254,7 +298,8 @@ impl Output {
         self.document_with(document, |theme| human::table(theme, rows, columns))
     }
 
-    /// Renders titled check groups with their summary.
+    /// Emits titled check groups and their summary, or the document under
+    /// JSON.
     pub fn checklist(&self, document: &Value, groups: &[(&str, &[Value])]) -> Result<(), Error> {
         self.document_with(document, |theme| human::checklist(theme, groups))
     }
@@ -312,7 +357,11 @@ impl Output {
         }
         let message = message.as_ref();
         if kind == "progress" {
-            self.stage(message.split(':').next().unwrap_or(message), message);
+            self.stage(
+                message.split(':').next().unwrap_or(message),
+                message,
+                Some(message),
+            );
             return;
         }
         let mut terminal = self.0.terminal.lock().expect("output not poisoned");
@@ -325,18 +374,37 @@ impl Output {
         );
     }
 
-    /// Starts a stage, completing its predecessor before showing the live line.
-    pub fn stage(&self, stage: &str, message: &str) {
-        self.start(Update::new(stage, message), None, None);
+    /// Starts a stage, ending the one before it, and shows its live line.
+    ///
+    /// A stage without `completed` words leaves no line on success, unless
+    /// [`Self::end_stage`] names one.
+    pub fn stage(&self, stage: &str, message: &str, completed: Option<&str>) {
+        self.start(
+            Update {
+                completed: completed.map(str::to_owned),
+                transient: completed.is_none(),
+                ..Update::new(stage, message)
+            },
+            None,
+            None,
+        );
     }
 
-    /// Starts a count-up wait or a countdown to a CLI-owned deadline.
+    /// Starts a wait whose timer counts up, or down to a deadline `ark` set.
     pub fn wait(&self, stage: &str, message: &str, timer: Wait) {
         self.start(Update::new(stage, message), Some(timer), None);
     }
 
-    /// Starts an approval with caller-supplied instruction words and machine facts.
-    pub fn approve(&self, action: &str, location: &'static str, instruction: impl AsRef<str>) {
+    /// Starts an approval, showing the caller's instruction with a timer.
+    ///
+    /// `action` and `location` go into the JSON event, where an unknown
+    /// location is null. The outcome names the location when it is known.
+    pub fn approve(
+        &self,
+        action: &str,
+        location: Option<&'static str>,
+        instruction: impl AsRef<str>,
+    ) {
         self.start(
             Update::new(action, instruction.as_ref()),
             Some(Wait::Elapsed),
@@ -344,19 +412,29 @@ impl Output {
         );
     }
 
-    /// Completes the current activity and starts its successor on the shared clock.
-    fn start(&self, update: Update, timer: Option<Wait>, approval: Option<(String, &'static str)>) {
-        // Serialize completion and replacement with the worker that owns the line
+    /// Ends the stage in progress and starts `update` in its place.
+    ///
+    /// An update carrying an elapsed time started that long ago, and the stage
+    /// before it ends then.
+    fn start(
+        &self,
+        update: Update,
+        timer: Option<Wait>,
+        approval: Option<(String, Option<&'static str>)>,
+    ) {
+        // Stop the worker first, since it draws the line this replaces
         let clock = self.clock();
         let mut ticker = self.0.ticker.lock().expect("output not poisoned");
         drop(ticker.take());
         {
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
+            let elapsed = update.elapsed;
+            let started = clock.now() - elapsed.unwrap_or_default();
             end_activity(
                 &self.0.err,
                 &mut terminal,
                 &mut io::stderr().lock(),
-                clock.now(),
+                started,
                 self.json(),
                 self.0.quiet,
                 None,
@@ -365,8 +443,8 @@ impl Output {
             );
             terminal.active = Some(Activity {
                 update,
-                started: clock.now(),
-                timer,
+                started,
+                timer: elapsed.map(|_| Wait::Elapsed).or(timer),
                 approval,
                 drawn: None,
             });
@@ -380,7 +458,8 @@ impl Output {
                 true,
             );
         }
-        // The worker owns only its display, so dropping Output always stops it
+        // Redraw once a second from a worker holding only the page, so it never
+        // keeps the output alive
         let theme = self.0.err.clone();
         let terminal = self.0.terminal.clone();
         let (json, quiet) = (self.json(), self.0.quiet);
@@ -398,16 +477,16 @@ impl Output {
         }));
     }
 
-    /// Updates the live facts, finishing a stage when its percentage reaches 100.
+    /// Updates the live line, ending the stage once it reaches 100%.
     pub fn progress(&self, update: &Update) {
-        // A restarted phase replaces its abandoned frame without claiming success
+        // A restarted phase drops its old line without an outcome
         if update.restarted {
             let mut terminal = self.stop_ticker();
             close_line(&mut terminal, &mut io::stderr().lock());
             terminal.active = None;
         }
 
-        // Update one stage in place, or complete it before starting the next
+        // Redraw the same stage in place, or end it and start the next
         let same = self
             .0
             .terminal
@@ -423,7 +502,12 @@ impl Output {
             self.start(update.clone(), None, None);
         } else {
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-            terminal.active.as_mut().unwrap().update = update.clone();
+            let active = terminal.active.as_mut().unwrap();
+            if let Some(elapsed) = update.elapsed {
+                active.started = self.clock().now() - elapsed;
+                active.timer = Some(Wait::Elapsed);
+            }
+            active.update = update.clone();
             draw(
                 &self.0.err,
                 &mut terminal,
@@ -431,35 +515,32 @@ impl Output {
                 self.clock().now(),
                 self.json(),
                 self.0.quiet,
-                !self.terminal(),
+                !self.terminal() && update.elapsed.is_none(),
             );
         }
-        // A terminal bar never becomes the persistent completion record
+        // A finished stage leaves its outcome line, never its bar
         if update.failed {
             self.fail_stage();
         } else if update.facts.percent == Some(100) {
-            let message = update
-                .facts
-                .done_bytes
-                .filter(|_| update.facts.stage.as_deref() == Some("uploading"))
-                .map(|bytes| format!("Uploaded {}", style::bytes(bytes)));
-            self.end_stage(message.as_deref(), None);
+            self.end_stage(None, None);
         }
     }
 
-    /// Ends a stage with caller-supplied words and a fact, or its elapsed duration.
+    /// Ends the stage in progress with `message` and `fact`, or with its own
+    /// words and time.
     ///
-    /// Absent words retain the stage label or use the approval's location outcome.
+    /// Without `message` a stage prints its `completed` words, an approval its
+    /// outcome and an Ark phase its own name. A transient stage prints nothing.
     pub fn end_stage(&self, message: Option<&str>, fact: Option<&str>) {
         self.outcome(message, fact, false);
     }
 
-    /// Ends the active stage or approval as failed, before its diagnostic.
+    /// Ends the stage or approval in progress as failed, ahead of its error.
     pub fn fail_stage(&self) {
         self.outcome(None, None, true);
     }
 
-    /// Stops redraws and emits exactly one outcome for the active activity.
+    /// Stops the redraws and prints the one outcome of the stage in progress.
     fn outcome(&self, message: Option<&str>, fact: Option<&str>, failed: bool) {
         let mut terminal = self.stop_ticker();
         end_activity(
@@ -475,23 +556,35 @@ impl Output {
         );
     }
 
-    /// Shows an immediately flushed connection notice until its guard drops.
+    /// Shows `Connecting to <name>` on a terminal until the guard drops.
     ///
-    /// A reconnect inside a narrated wait retains that wait's live line.
-    pub fn connecting(&self, name: &str) -> Connecting {
-        let mut terminal = self.0.terminal.lock().expect("output not poisoned");
-        if !self.terminal() || self.0.quiet || terminal.active.is_some() {
-            return Connecting(None);
-        }
-        let mut stderr = io::stderr().lock();
-        connection_line(&self.0.err, &mut terminal, &mut stderr, name);
-        Connecting(Some(self.clone()))
+    /// A reconnect during a wait keeps that wait's line instead.
+    pub fn connecting(&self, name: &str) -> Notice {
+        self.notice(&format!("Connecting to {name}"))
     }
 
-    /// Presents a pairing link and QR code before its count-up instruction.
+    /// Shows `Checking <name>` on a terminal until the guard drops.
+    pub fn checking(&self, name: &str) -> Notice {
+        self.notice(&format!("Checking {name}"))
+    }
+
+    /// Shows a transient line on a terminal, unless a stage or approval holds
+    /// the line.
+    fn notice(&self, message: &str) -> Notice {
+        let mut terminal = self.0.terminal.lock().expect("output not poisoned");
+        if self.json() || !self.terminal() || self.0.quiet || terminal.active.is_some() {
+            return Notice(None);
+        }
+        let mut stderr = io::stderr().lock();
+        notice_line(&self.0.err, &mut terminal, &mut stderr, message);
+        Notice(Some(self.clone()))
+    }
+
+    /// Prints the pairing link, with its QR code where the locale and width
+    /// allow, and starts the scan's approval below it.
     pub fn pairing(&self, url: &str) {
         self.end_stage(None, None);
-        if self.terminal() {
+        if !self.json() {
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
             let mut stderr = io::stderr().lock();
             separate_result(&mut terminal, &mut stderr);
@@ -518,7 +611,7 @@ impl Output {
             }
             let _ = writeln!(
                 stderr,
-                "\n{}",
+                "\n{}\n",
                 style::wrap(
                     &format!(
                         "  {}",
@@ -529,19 +622,21 @@ impl Output {
                 )
             );
             terminal.err_printed = true;
+            let _ = stderr.flush();
         }
         self.approve(
             "pair",
-            "phone",
-            if self.terminal() {
-                "scan in Ark Companion".into()
+            Some("phone"),
+            if self.json() {
+                format!("Approve the pairing by opening {url} on your phone")
             } else {
-                format!("scan with Ark Companion: {url}")
+                "Approve the pairing by scanning this code in Ark Companion".into()
             },
         );
     }
 
-    /// Reads a yes or no key and echoes the answer as a word on the prompt line.
+    /// Asks a yes or no question, answered by one key, and prints the answer as
+    /// a word.
     pub fn confirm(&self, message: &str, default: bool) -> Result<bool, Error> {
         let mut input = prompt::Input::new()?;
         let result = prompt::confirm(
@@ -563,7 +658,7 @@ impl Output {
         result
     }
 
-    /// Prints and flushes a prompt after ending live cursor activity.
+    /// Prints the question, after ending any live line.
     fn prompt(&self, message: &str, default: bool) -> Result<(), Error> {
         self.finish();
         let mut terminal = self.0.terminal.lock().expect("output not poisoned");
@@ -586,7 +681,8 @@ impl Output {
         Ok(())
     }
 
-    /// Reports an active failure, then its diagnostic with hints inside JSON errors.
+    /// Fails the stage in progress, then prints the error and its hints, which
+    /// JSON carries inside the error object.
     pub fn error(&self, error: &Error) {
         self.fail_stage();
         if self.json() {
@@ -642,7 +738,7 @@ impl Output {
         close_line(&mut terminal, &mut io::stderr().lock());
     }
 
-    /// Joins the worker before locking its display, retaining the active outcome.
+    /// Stops the worker and locks the page, keeping the stage in progress.
     ///
     /// The worker stops under the ticker lock and is joined before the terminal
     /// lock is taken, since each redraw takes that lock too.
@@ -653,7 +749,7 @@ impl Output {
     }
 }
 
-/// Styles an event's mark or diagnostic label identically in terminals and pipes.
+/// Renders an event behind its mark or diagnostic label.
 fn event_line(theme: &Theme, kind: &str, message: &str) -> String {
     let printable = style::printable(message);
     let message = theme.inline(&printable);
@@ -686,7 +782,8 @@ fn event_line(theme: &Theme, kind: &str, message: &str) -> String {
     )
 }
 
-/// Styles the words plainly and every fact after the first separator as muted.
+/// Renders an outcome behind its mark, with the facts after the first ` · `
+/// muted.
 fn outcome_line(theme: &Theme, message: &str, failed: bool) -> String {
     let message = style::printable(message);
     let text = if let Some((words, facts)) = message.split_once(" · ") {
@@ -707,7 +804,7 @@ fn outcome_line(theme: &Theme, message: &str, failed: bool) -> String {
     )
 }
 
-/// Restores surrounding emphasis after each inline command's accent reset.
+/// Paints `text` in `role`, resuming it after each inline command's own style.
 fn inline_role(theme: &Theme, role: Role, text: &str) -> String {
     let text = theme
         .inline(text)
@@ -715,7 +812,7 @@ fn inline_role(theme: &Theme, role: Role, text: &str) -> String {
     theme.paint(role, text)
 }
 
-/// Erases a live line without leaving a bar or timer behind.
+/// Erases the live line, on every row it wraps to.
 fn close_line(terminal: &mut Terminal, output: &mut impl Write) {
     let rows = std::mem::take(&mut terminal.live);
     if rows > 0 {
@@ -727,7 +824,7 @@ fn close_line(terminal: &mut Terminal, output: &mut impl Write) {
     }
 }
 
-/// Separates the next stderr event from a result exactly once.
+/// Prints the blank line that separates a result from the next event, once.
 fn separate_result(terminal: &mut Terminal, output: &mut impl Write) {
     if std::mem::take(&mut terminal.out_block) {
         let _ = writeln!(output);
@@ -753,7 +850,8 @@ fn write_result(
     Ok(())
 }
 
-/// Writes and flushes a persistent event, preserving active narration for redraw.
+/// Prints an event that stays, keeping the stage in progress for its next
+/// redraw.
 fn emit(terminal: &mut Terminal, output: &mut impl Write, json: bool, event: Value, line: &str) {
     close_line(terminal, output);
     if json {
@@ -766,14 +864,14 @@ fn emit(terminal: &mut Terminal, output: &mut impl Write, json: bool, event: Val
     let _ = output.flush();
 }
 
-/// Writes an ephemeral connection label before any connection work starts.
-fn connection_line(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, name: &str) {
+/// Draws a transient line, such as `Connecting to <name>`.
+fn notice_line(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, message: &str) {
     close_line(terminal, output);
     separate_result(terminal, output);
     let line = format!(
-        "{} Connecting to {}",
+        "{} {}",
         theme.glyph("›", ">"),
-        theme.inline(&style::printable(name))
+        theme.inline(&style::printable(message))
     );
     let _ = write!(
         output,
@@ -784,7 +882,8 @@ fn connection_line(theme: &Theme, terminal: &mut Terminal, output: &mut impl Wri
     let _ = output.flush();
 }
 
-/// Draws the latest activity on a terminal or at the pipe's five-second interval.
+/// Draws the stage in progress, in place on a terminal, and in a pipe as a new
+/// line at most every 5s unless forced.
 fn draw(
     theme: &Theme,
     terminal: &mut Terminal,
@@ -800,7 +899,7 @@ fn draw(
     if quiet && active.approval.is_none() {
         return;
     }
-    // A pipe repeats machine waits but prints an approval instruction only once
+    // A pipe repeats a stage's line, but an approval's instruction only once
     let interval = Duration::from_secs(if theme.interactive { 1 } else { 5 });
     if active.drawn.is_some_and(|last| {
         (!theme.interactive && active.approval.is_some())
@@ -809,7 +908,7 @@ fn draw(
         return;
     }
     active.drawn = Some(now);
-    // Timers are presentation facts; they never enforce a device's window
+    // Add the timer as a fact, which shows time and never bounds the wait
     let mut update = active.update.clone();
     if let Some(timer) = active.timer {
         let fact = match timer {
@@ -826,7 +925,7 @@ fn draw(
             update.details.push(fact);
         }
     }
-    // Keep machine messages whole while the reading view fits its available width
+    // JSON keeps the message whole, while the reading line fits the width
     let message = update.message();
     let (event, line) = if let Some((action, location)) = &active.approval {
         let instruction = format!(
@@ -860,7 +959,7 @@ fn draw(
             },
         )
     };
-    // Replace the terminal frame, or append a complete pipe or JSON event
+    // Redraw the line in place on a terminal, or print it anew in a pipe or JSON
     if theme.interactive {
         close_line(terminal, output);
         separate_result(terminal, output);
@@ -887,7 +986,8 @@ fn draw(
     }
 }
 
-/// Turns the active activity into one outcome, keeping its structured facts.
+/// Ends the stage in progress with its outcome line, which JSON carries as a
+/// progress event.
 #[allow(clippy::too_many_arguments)] // The renderer takes stream policy and an explicit clock for tests.
 fn end_activity(
     theme: &Theme,
@@ -905,30 +1005,39 @@ fn end_activity(
         return;
     };
     close_line(terminal, output);
-    if quiet {
+    if quiet || (active.update.transient && message.is_none() && !failed) {
         return;
     }
     let words = message.map(str::to_owned).unwrap_or_else(|| {
         if let Some((action, location)) = &active.approval {
-            let place = if *location == "button" {
-                "with the Ark's button"
-            } else {
-                "on your phone"
+            let place = match location {
+                Some("button") => " with the Ark's button",
+                Some("phone") => " on your phone",
+                _ => "",
             };
             if failed {
-                format!("{action} approval failed {place}")
-            } else if action == "pair" && *location == "phone" {
-                "scanned in Ark Companion".into()
+                format!("Not approved{place}")
+            } else if action == "pair" && *location == Some("phone") {
+                "Scanned on your phone".into()
             } else {
-                format!("Approved {place}")
+                format!("Approved{place}")
             }
+        } else if !failed && let Some(completed) = &active.update.completed {
+            completed.clone()
         } else {
             active.update.label.clone()
         }
     });
-    let fact = fact.map(str::to_owned).unwrap_or_else(|| {
-        style::duration(now.saturating_duration_since(active.started).as_secs())
-    });
+    let fact = fact
+        .map(str::to_owned)
+        .or_else(|| {
+            (!failed)
+                .then(|| active.update.completed_fact.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| {
+            style::duration(now.saturating_duration_since(active.started).as_secs())
+        });
     let message = format!("{words} · {fact}");
     emit(
         terminal,
@@ -959,7 +1068,7 @@ mod tests {
     use crate::testing::wait_deadline;
     use darkbio_clock::TestClock;
 
-    /// Builds an activity whose start is controlled by the test.
+    /// Builds an activity that started at `started`.
     fn activity(started: Instant) -> Activity {
         Activity {
             update: Update::new("sorting", "Sorting"),
@@ -970,7 +1079,8 @@ mod tests {
         }
     }
 
-    /// Every event has the same mark or diagnostic label in a terminal and pipe.
+    /// Every event kind prints the same mark or label on a terminal and in a
+    /// pipe.
     #[test]
     fn test_event_lines() {
         for interactive in [true, false] {
@@ -1008,7 +1118,7 @@ mod tests {
         );
     }
 
-    /// Stages end with a duration, an explicit fact or a failure instead of a bar.
+    /// A stage ends with its time, a given fact or a failure, never its bar.
     #[test]
     fn test_stage_lifecycle() {
         let start = TestClock::new().clock().now();
@@ -1049,7 +1159,8 @@ mod tests {
         }
     }
 
-    /// Approvals count up on one terminal line and print once in a pipe.
+    /// An approval's timer counts up on its terminal line, and a pipe prints
+    /// the instruction once.
     #[test]
     fn test_approval_lifecycle() {
         let start = TestClock::new().clock().now();
@@ -1060,7 +1171,7 @@ mod tests {
             };
             let mut active = activity(start);
             active.update = Update::new("upload", "Approve the upload on your phone");
-            active.approval = Some(("upload".into(), "phone"));
+            active.approval = Some(("upload".into(), Some("phone")));
             active.timer = Some(Wait::Elapsed);
             let mut terminal = Terminal {
                 active: Some(active),
@@ -1107,7 +1218,7 @@ mod tests {
         }
     }
 
-    /// Failed approvals keep their elapsed outcome before the following error.
+    /// A failed approval prints its outcome and time before the error.
     #[test]
     fn test_approval_failure() {
         let start = TestClock::new().clock().now();
@@ -1118,7 +1229,7 @@ mod tests {
         let mut terminal = Terminal {
             active: Some(Activity {
                 update: Update::new("unlock", "Approve the unlock on your phone"),
-                approval: Some(("unlock".into(), "phone")),
+                approval: Some(("unlock".into(), Some("phone"))),
                 timer: Some(Wait::Elapsed),
                 ..activity(start)
             }),
@@ -1139,12 +1250,37 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            "! Approve the unlock on your phone\n✗ unlock approval failed on your phone · 14s\n"
+            "! Approve the unlock on your phone\n✗ Not approved on your phone · 14s\n"
         );
         assert!(terminal.active.is_none());
     }
 
-    /// Finished facts are muted while the stage's words remain plain.
+    /// A failed button approval names the button before the error, and one in
+    /// an unknown place names no place.
+    #[test]
+    fn test_approval_failure_locations() {
+        for captured in crate::testing::narration(
+            "output::tests::test_approval_failure_locations",
+            |output, clock| {
+                for location in [Some("button"), None] {
+                    output.approve("update", location, "Approve the update");
+                    output.finish();
+                    clock.advance(Duration::from_secs(6));
+                    output.error(&Error::new(6, "approval-timeout", "approval expired"));
+                }
+            },
+        ) {
+            captured.contains(&[
+                "Not approved with the Ark's button · 6s",
+                "approval expired",
+                "Not approved · 6s",
+                "approval expired",
+            ]);
+            captured.approvals(&[("update", Some("button")), ("update", None)]);
+        }
+    }
+
+    /// An outcome's facts are muted and its words plain.
     #[test]
     fn test_finished_line_roles() {
         let theme = Theme::test(80, Color::True, true);
@@ -1154,7 +1290,7 @@ mod tests {
         );
     }
 
-    /// Timers count up and only caller-owned deadlines count down.
+    /// Timers count up, and only a deadline `ark` sets counts down.
     #[test]
     fn test_timer_and_countdown() {
         let start = TestClock::new().clock().now();
@@ -1187,7 +1323,7 @@ mod tests {
         }
     }
 
-    /// Pipe wait updates use five-second intervals without cursor control.
+    /// A pipe prints a wait's line at most every 5s, without cursor control.
     #[test]
     fn test_pipe_interval_lines() {
         let start = TestClock::new().clock().now();
@@ -1220,7 +1356,7 @@ mod tests {
         );
     }
 
-    /// All result layouts put their separating blank lines on stderr in pipes.
+    /// In a pipe, every kind of result gets its blank lines on stderr.
     #[test]
     fn test_composition_separates_only_on_stderr() {
         let theme = Theme {
@@ -1270,16 +1406,16 @@ mod tests {
         }
     }
 
-    /// The connection notice is erased without becoming persistent page content.
+    /// The connecting line is erased and leaves nothing on the page.
     #[test]
     fn test_connecting_line_erased() {
         let mut terminal = Terminal::default();
         let mut bytes = Vec::new();
-        connection_line(
+        notice_line(
             &Theme::test(80, Color::Off, true),
             &mut terminal,
             &mut bytes,
-            "Sample Ark",
+            "Connecting to Sample Ark",
         );
         close_line(&mut terminal, &mut bytes);
         assert_eq!(
@@ -1289,7 +1425,7 @@ mod tests {
         assert!(!terminal.err_printed);
     }
 
-    /// JSON approvals and their progress outcomes retain machine facts.
+    /// Under JSON an approval and its outcome carry their fields.
     #[test]
     fn test_json_approval_and_outcome() {
         let start = TestClock::new().clock().now();
@@ -1299,7 +1435,7 @@ mod tests {
         };
         let mut terminal = Terminal {
             active: Some(Activity {
-                approval: Some(("upload".into(), "phone")),
+                approval: Some(("upload".into(), Some("phone"))),
                 timer: Some(Wait::Elapsed),
                 ..activity(start)
             }),
@@ -1342,7 +1478,7 @@ mod tests {
         }
     }
 
-    /// Long approval instructions wrap whole and erase every occupied row.
+    /// A long instruction wraps whole, and erasing it clears every row it took.
     #[test]
     fn test_approval_wraps_without_losing_instructions() {
         let start = TestClock::new().clock().now();
@@ -1350,7 +1486,7 @@ mod tests {
         let mut active = activity(start);
         active.update.label =
             "Approve with `ark-emulator button press` after checking the colors".into();
-        active.approval = Some(("pair".into(), "button"));
+        active.approval = Some(("pair".into(), Some("button")));
         active.timer = Some(Wait::Elapsed);
         let mut terminal = Terminal {
             active: Some(active),
@@ -1379,12 +1515,12 @@ mod tests {
         assert_eq!(erased.matches("\x1b[1A").count(), rows - 1);
     }
 
-    /// Public output APIs retain JSON facts, quiet policy and complete errors.
+    /// The output's methods keep JSON fields, the quiet policy and whole errors.
     #[test]
     fn test_output_event_contract() {
         use clap::Parser;
 
-        // A child process captures the actual stderr and sole stdout document
+        // Run as a child, so the test reads the real streams
         if let Ok(mode) = std::env::var("ARK_TEST_NARRATION") {
             let mut options = crate::args::Cli::parse_from(["ark", "--json", "-v"]).options;
             options.quiet = mode == "quiet";
@@ -1393,11 +1529,11 @@ mod tests {
             let tester = TestClock::new();
             output.connection(tester.clock());
             drop(output.connecting("Sample Ark"));
-            output.stage("uploading", "Uploading");
+            output.stage("uploading", "Uploading", Some("Uploaded"));
             output.event("note", "note");
             output.event("warning", "warning");
             output.event("step", "step");
-            output.approve("upload", "phone", "Approve the upload on your phone");
+            output.approve("upload", Some("phone"), "Approve the upload on your phone");
             output.event("log", "log");
             output.end_stage(None, None);
             output.event("hint", "independent hint");
@@ -1410,7 +1546,7 @@ mod tests {
             return;
         }
 
-        // Error hints belong to the identical object on both streams
+        // An error's hints sit in the same object on both streams
         for mode in ["verbose", "quiet"] {
             let captured = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -1485,7 +1621,7 @@ mod tests {
         }
     }
 
-    /// The redraw worker follows the injected clock and stops when dropped.
+    /// The redraw worker runs on the given clock and stops when dropped.
     #[test]
     fn test_ticker_uses_test_clock() {
         let mut tester = TestClock::new();

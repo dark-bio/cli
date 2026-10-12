@@ -8,12 +8,13 @@ Keep the two apart when parsing.
 
 The default output is formatted for reading, the same on a terminal and in a
 pipe. One item prints as a block of labels and values, several as a table.
-Each size carries its own unit in the value. Absent values print as -,
-empty lists as none and booleans as yes and no. Timestamps are in local
-time, a date alone in a table and the full time in a block. A mark before a
-state is decoration, and the word beside it is the value. The view may shorten, round or leave out long fields,
-while --json always has the whole value. Colors and live progress need a
-terminal, and NO_COLOR or CLICOLOR=0 turns colors off.
+Each size carries its own unit in the value. Absent values print as -, empty
+lists as none and booleans as yes and no. Timestamps are in local time, a
+date alone in a table and the full time in a block. A mark before a state is
+decoration, and the word beside it is the value. The view may shorten, round
+or leave out long fields, while --json always has the whole value. Colors
+and live progress need a terminal, and NO_COLOR or CLICOLOR=0 turns colors
+off.
 
 `ark doctor` prints its checks in two groups. The first is this computer,
 and the second takes the Ark's name, or Ark when no connection could be
@@ -36,25 +37,27 @@ and a renamed field means a new major version, so scripts pin the version
 
 Every stderr line under --json is one event, however long its message:
 
-    {"event":"approve","message":"unlock on your phone","action":"unlock","where":"phone"}
+    {"event":"approve","message":"Approve the unlock on your phone, in Ark Companion","action":"unlock","where":"phone"}
 
 The kinds are progress, note, warning, approve, hint, step, log and error.
 A progress event carries stage, phase, step, steps, percent, done_bytes,
-total_bytes and remaining_seconds, each present and null when unknown.
-stage names ark's work; phase, step and steps carry the Ark's processing,
-with phase spelled as the Ark names it. An approve event carries action
-and where, either phone or button. A log event carries level, target and
-fields, and an error event the complete error object. A caller that merged
-the streams drops lines starting with `{"event":` and keeps the document.
+total_bytes and remaining_seconds, each present and null when unknown. Its
+stage names ark's own work, such as uploading, while phase, step and steps
+carry the Ark's processing, the phase spelled as the Ark names it. An
+approve event carries action, such as unlock or upload, and where, phone or
+button, or null when the Ark did not say. A log event carries level, target
+and fields, and an error event the whole error object. A caller that merged
+the streams drops the lines starting with `{"event":` and keeps the document.
 
 ## Events and verbosity
 
-Stages start behind › and finish behind ✓ with their elapsed time or a
-fact, or behind ✗ on failure. An approval starts with ! and its instruction.
-On a terminal its timer counts up on that line; in a pipe the instruction
-prints once, followed by its outcome. Only a deadline ark sets counts down.
-Durations read 14s, 1m 02s or 1h 05m. Diagnostics keep their labels,
-error[code]:, warning:, hint:, note: and log:. Steps indent two spaces.
+A stage in progress shows behind ›, and ends as a line behind ✓ with its
+time or a fact, or behind ✗ when it fails. An approval shows its instruction
+behind !, starting with Approve or Review. On a terminal its timer counts up
+on that line, and a pipe prints the instruction once, then its outcome. Only
+a deadline ark sets itself counts down. Durations read 14s, 1m 02s or
+1h 05m. Diagnostics keep their labels, error[code]:, warning:, hint:, note:
+and log:, and the steps -v adds indent two spaces.
 
 On a terminal, progress redraws in place once a second. Redirected, it
 prints a line at every ten percent or every 5s. -q hides progress, notes,
@@ -77,8 +80,9 @@ only once the owner releases it.
 A failure prints error[code]: message on stderr, then hint: lines naming the
 next step where ark knows one. Under --json the error event carries the
 error object. It holds code, message and hints, and for a refusal by the Ark
-also remote, with the Ark's own code and message. Error hints stay inside
-that object in JSON; hints unrelated to an error remain separate events.
+also remote, with the Ark's own code and message. Under --json an error's
+hints live only in that object, and a hint that belongs to no error stays an
+event of its own.
 
 A command that did part of its work keeps that result on stdout, reports
 the failure on stderr and exits non-zero. A command with no result prints
@@ -102,8 +106,9 @@ completions, --version and doctor starts with a note naming both versions
 and how to upgrade. Under --json it is an ordinary note event. The note
 never changes the result or the exit code, and -q hides it. doctor looks up
 afresh and reports its version and the answer together in the ark check.
-The check is ok on the newest release, warn with upgrade advice when a newer
-one is out, and skip when the lookup fails, under CI or in a local build.
+The check is ok on the newest release, warn with the upgrade command when a
+newer one is out, and skip when the lookup fails, under CI or in a local
+build.
 
 ## Error codes
 

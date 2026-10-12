@@ -49,7 +49,11 @@ pub enum ExecutionProgress {
     /// The Ark is awaiting the owner's review of the report.
     ///
     /// Reported once, when the first awaiting status arrives.
-    Reviewing,
+    Reviewing {
+        /// Time from scheduling to the first report awaiting review, on the
+        /// host's clock.
+        elapsed: Duration,
+    },
 }
 
 /// Released result, complete output streams and time spent running the app.
@@ -165,8 +169,9 @@ pub(crate) fn execute(
                 }
                 Ok(schema::ExecutionState::Awaiting) => {
                     if duration.is_none() {
-                        duration = Some(clock.elapsed(started));
-                        progress(ExecutionProgress::Reviewing);
+                        let elapsed = clock.elapsed(started);
+                        duration = Some(elapsed);
+                        progress(ExecutionProgress::Reviewing { elapsed });
                     }
                 }
                 Ok(schema::ExecutionState::Resolved) => {
@@ -540,7 +545,9 @@ mod tests {
                     ExecutionProgress::Running {
                         elapsed: Duration::ZERO,
                     },
-                    ExecutionProgress::Reviewing,
+                    ExecutionProgress::Reviewing {
+                        elapsed: Duration::from_millis(500)
+                    },
                 ]
             );
         }
@@ -629,7 +636,11 @@ mod tests {
         tester.advance_to(poll);
         let (outcome, progress) = worker.join().unwrap();
         assert_eq!(outcome.duration, Duration::from_millis(500));
-        assert!(!progress.contains(&ExecutionProgress::Reviewing));
+        assert!(
+            !progress
+                .iter()
+                .any(|stage| matches!(stage, ExecutionProgress::Reviewing { .. }))
+        );
         assert_eq!(
             observed.lock().unwrap().stages,
             [
@@ -684,7 +695,12 @@ mod tests {
         assert_eq!(outcome.duration, Duration::ZERO);
         assert_eq!(
             &progress[progress.len() - 2..],
-            [ExecutionProgress::Authorizing, ExecutionProgress::Reviewing]
+            [
+                ExecutionProgress::Authorizing,
+                ExecutionProgress::Reviewing {
+                    elapsed: Duration::ZERO
+                }
+            ]
         );
     }
 
@@ -787,7 +803,11 @@ mod tests {
             })
             .unwrap();
             assert_eq!(actual, expected);
-            assert!(!progress.contains(&ExecutionProgress::Reviewing));
+            assert!(
+                !progress
+                    .iter()
+                    .any(|stage| matches!(stage, ExecutionProgress::Reviewing { .. }))
+            );
             let observed = observed.lock().unwrap();
             assert_eq!(
                 observed

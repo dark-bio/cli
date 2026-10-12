@@ -11,7 +11,7 @@
 //! The HTTP range request opens only when replay reaches the missing suffix.
 //! Opening it earlier leaves the response unread while a large prefix uploads.
 
-use super::{Progress, cache, download, filled, select};
+use super::{Operation, Progress, cache, download, filled, select};
 use crate::{
     args::slot_name,
     context::{Connection, Context},
@@ -115,16 +115,7 @@ fn execute(
             );
             continue;
         }
-        let result = offer(slot).and_then(|source| {
-            if dry_run {
-                Ok(())
-            } else {
-                context
-                    .output
-                    .event("note", format!("Fetching {}", slot_name(slot.kind)));
-                install(&source)
-            }
-        });
+        let result = offer(slot).and_then(|source| if dry_run { Ok(()) } else { install(&source) });
         match result {
             Ok(()) => {
                 if !dry_run {
@@ -315,6 +306,7 @@ fn install(
 ) -> Result<(), Error> {
     let mut directory = directory;
     let clock = connection.client.clock();
+    let slot = source.dataset.slot.expect("reference slot");
 
     // Upload a complete cached copy first, removing one that is corrupt or
     // unreadable
@@ -324,7 +316,9 @@ fn install(
             let mut progress = Progress::new(
                 context,
                 clock.clone(),
-                source.dataset.slot.expect("reference slot"),
+                slot,
+                source.dataset.size,
+                Operation::Fetch,
             );
             let result = connection.client.upload_dataset(
                 &source.dataset,
@@ -388,7 +382,9 @@ fn install(
         let mut progress = Progress::new(
             context,
             clock.clone(),
-            source.dataset.slot.expect("reference slot"),
+            slot,
+            source.dataset.size,
+            Operation::Fetch,
         );
         let result = connection.client.upload_dataset(
             &source.dataset,
@@ -1080,12 +1076,9 @@ mod tests {
             );
             assert_eq!(
                 events.len(),
-                if scenario == "dry-run" { 1 } else { 3 },
+                if scenario == "failed" { 2 } else { 1 },
                 "{scenario}"
             );
-            if scenario != "dry-run" {
-                assert_eq!(events[1]["message"], "Fetching reference-genome");
-            }
         }
     }
 

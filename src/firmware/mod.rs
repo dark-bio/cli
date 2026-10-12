@@ -14,7 +14,7 @@ use crate::{
     error::Error,
     http,
     output::{Output, human},
-    progress::Transfer,
+    progress::{Transfer, Update},
     style::{self, Theme},
 };
 use darkbio_clock::Clock;
@@ -131,17 +131,17 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     context.output.event(
         "note",
         format!(
-            "firmware {} -> {} ({:.1} MiB): {}",
+            "{} to {}, {}: {}",
             connection.info.firmware_version,
             target.version,
-            target.size as f64 / 1048576.0,
+            style::bytes(target.size),
             package::headline(&target.summary)
         ),
     );
     if !yes
         && (!context.interactive()
             || !context.confirm(
-                &format!("Install {} and reboot the Ark?", target.version),
+                &format!("Install {} and restart the Ark?", target.version),
                 false,
             )?)
     {
@@ -170,35 +170,12 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         path: package::path(target),
         response: None,
     };
-    let mut transfer = Transfer::new(context.output.terminal(), clock.clone());
+    let mut narration = Narration::new(&context.output, clock.clone(), target.size, approval);
     let result = connection.client.update_firmware(
         &target.firmware(),
         &mut reader,
         context.timing(),
-        |stage| match stage {
-            UpdateProgress::Preparing => match approval {
-                Some(Approval::None) => {}
-                Some(Approval::Phone) => context
-                    .output
-                    .approve("firmware update", "phone", "firmware update (Ark Companion on your phone)"),
-                Some(Approval::Button) => context
-                    .output
-                    .approve("firmware update", "button", "firmware update (press the Ark's button with the pin that came with it, in the pinhole under the bottom right LED)"),
-                None => context.output.event(
-                    "note",
-                    "if requested, approve the update on your phone or press the Ark's button",
-                ),
-            },
-            UpdateProgress::Uploading { uploaded, total } => {
-                if let Some(line) = transfer.update(uploaded, total) {
-                    context.output.progress(&line);
-                }
-            }
-            UpdateProgress::Verifying => context
-                .output
-                .stage("verifying", "verifying firmware on the Ark"),
-            UpdateProgress::Installing => context.output.stage("installing", "installing firmware"),
-        },
+        |stage| narration.update(stage),
     );
 
     // A failed update prints the plan, with hints for a stale proof or the
@@ -232,10 +209,9 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     if !no_wait {
         let result = verify_reboot(context, &connection, &target.version, &mut value);
         if result.is_ok() {
-            context.output.end_stage(
-                Some(&format!("returned; verified {}", target.version)),
-                None,
-            );
+            context
+                .output
+                .end_stage(Some(&format!("Restarted on {}", target.version)), None);
         } else {
             context.output.fail_stage();
         }
@@ -243,6 +219,53 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         return result;
     }
     context.output.document(&value)
+}
+
+/// Narration of a firmware update, from its approval through the install.
+struct Narration<'a> {
+    /// Output the narration goes to, shared with the restart wait.
+    output: &'a Output,
+    /// Approval the Ark is expected to ask for, which the Ark decides.
+    approval: Option<Approval>,
+    /// Rate and time left of sending the firmware.
+    transfer: Transfer,
+}
+
+impl<'a> Narration<'a> {
+    /// Prepares to narrate sending `size` bytes after `approval`.
+    fn new(output: &'a Output, clock: Clock, size: u64, approval: Option<Approval>) -> Self {
+        Self {
+            output,
+            approval,
+            transfer: Transfer::new(
+                output.terminal(),
+                clock,
+                Update {
+                    completed: Some(format!("Sent {}", style::bytes(size))),
+                    ..Update::new("sending", "Sending")
+                },
+            ),
+        }
+    }
+
+    /// Narrates one step of the update, as an approval or a stage.
+    fn update(&mut self, stage: UpdateProgress) {
+        match stage {
+            UpdateProgress::Preparing => match self.approval {
+                Some(Approval::None) => {}
+                Some(Approval::Phone) => self.output.approve("update", Some("phone"), "Approve the update on your phone, in Ark Companion"),
+                Some(Approval::Button) => self.output.approve("update", Some("button"), "Approve the update on the Ark. Press its button with the pin that came with it, in the pinhole under the bottom right LED"),
+                None => self.output.approve("update", None, "Approve the update if the Ark asks, on your phone or with its button"),
+            },
+            UpdateProgress::Uploading { uploaded, total } => {
+                if let Some(line) = self.transfer.update(uploaded, total) {
+                    self.output.progress(&line);
+                }
+            }
+            UpdateProgress::Verifying => self.output.stage("verifying", "Verifying", Some("Verified by the Ark")),
+            UpdateProgress::Installing => self.output.stage("installing", "Installing", Some("Installed")),
+        }
+    }
 }
 
 /// Waits for the Ark to reboot and return running `target`, recording what it
@@ -259,12 +282,7 @@ fn verify_reboot(
 ) -> Result<(), Error> {
     // Poll the old session every 250ms until it ends, within the reboot window
     let clock = connection.client.clock();
-    let deadline = clock.now() + REBOOT_WAIT;
-    context.output.wait(
-        "restarting",
-        "waiting for the Ark to return",
-        crate::output::Wait::Deadline(deadline),
-    );
+    let deadline = restart(&context.output, &clock);
     loop {
         match connection.client.call(
             schema::DeviceInfoRequest {},
@@ -325,6 +343,18 @@ fn verify_reboot(
     // Report the timeout only once the whole window has passed
     clock.sleep_until(deadline);
     Err(reboot_timeout())
+}
+
+/// Starts the countdown to the 120s `ark` allows a restart, and returns that
+/// deadline.
+fn restart(output: &Output, clock: &Clock) -> std::time::Instant {
+    let deadline = clock.now() + REBOOT_WAIT;
+    output.wait(
+        "restarting",
+        "Waiting for the Ark to restart",
+        crate::output::Wait::Deadline(deadline),
+    );
+    deadline
 }
 
 /// Builds the error for an Ark that did not return within the reboot window.
@@ -424,16 +454,17 @@ fn listing(output: &Output, installed: &str, firmwares: &[Package]) -> Result<()
         );
     }
 
-    // JSON keeps the full release notes and the original row order
+    // JSON keeps the whole release notes, in the listing's order
     let update = select(firmwares, None, installed)?.map(|firmware| firmware.version.clone());
     let document = json!({"installed":installed,"update":update,"firmwares":rows});
     output.document_with(&document, |theme| listing_table(theme, rows))
 }
 
-/// Renders builds newest first, with complete candidate headlines below the table.
+/// Renders the builds newest first, with each candidate's whole headline below
+/// the table.
 fn listing_table(theme: &Theme, mut rows: Vec<Value>) -> String {
-    // Order the installed build alongside the candidates, including an
-    // installed build that has no entry in the package listing
+    // Sort the installed build in among the candidates, even when the listing
+    // lacks it
     rows.sort_by_cached_key(|row| {
         std::cmp::Reverse(package::Version::parse(row["version"].as_str().unwrap_or("")).ok())
     });
@@ -445,7 +476,7 @@ fn listing_table(theme: &Theme, mut rows: Vec<Value>) -> String {
         });
     }
 
-    // Headline text stays outside the compact comparison columns
+    // Print the headlines under the table, since a column would cut them
     let mut sections = vec![human::table(
         theme,
         &rows,
@@ -613,7 +644,8 @@ impl std::io::Read for Download<'_> {
     }
 }
 
-/// Tests of firmware listings, the compatibility gate and approval prediction.
+/// Tests of the firmware list, the compatibility gate, the approval guess and
+/// the update's narration.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +653,85 @@ mod tests {
     use clap::Parser;
     use std::io::Write;
 
-    /// Builds invented releases with two candidate headlines and an installed build.
+    /// Each kind of approval leads into the same sending and install stages.
+    #[test]
+    fn test_update_narration() {
+        for captured in
+            crate::testing::narration("firmware::tests::test_update_narration", |output, clock| {
+                for approval in [
+                    Some(Approval::Phone),
+                    Some(Approval::Button),
+                    None,
+                    Some(Approval::None),
+                ] {
+                    let mut narration = Narration::new(&output, clock.clock(), 35756441, approval);
+                    narration.update(UpdateProgress::Preparing);
+                    output.finish();
+                    clock.advance(Duration::from_secs(11));
+                    narration.update(UpdateProgress::Uploading {
+                        uploaded: 0,
+                        total: 35756441,
+                    });
+                    output.finish();
+                    clock.advance(Duration::from_secs(9));
+                    narration.update(UpdateProgress::Uploading {
+                        uploaded: 35756441,
+                        total: 35756441,
+                    });
+                    narration.update(UpdateProgress::Verifying);
+                    output.finish();
+                    clock.advance(Duration::from_secs(4));
+                    narration.update(UpdateProgress::Installing);
+                    output.finish();
+                    clock.advance(Duration::from_secs(6));
+                    output.end_stage(None, None);
+                }
+            })
+        {
+            captured.contains(&[
+                "Approve the update on your phone, in Ark Companion", "Approved on your phone · 11s",
+                "Sending", "Sent 34.1 MiB · 9s", "Verifying", "Verified by the Ark · 4s", "Installing", "Installed · 6s",
+                "Approve the update on the Ark. Press its button with the pin that came with it, in the pinhole under the bottom right LED", "Approved with the Ark's button · 11s",
+                "Approve the update if the Ark asks, on your phone or with its button", "Approved · 11s",
+            ]);
+            captured.approvals(&[
+                ("update", Some("phone")),
+                ("update", Some("button")),
+                ("update", None),
+            ]);
+            assert!(!captured.stderr.contains("Uploaded"));
+            assert!(!captured.stderr.contains("restart"));
+        }
+    }
+
+    /// The restart line counts down the same 120s the wait allows.
+    #[test]
+    fn test_restart_countdown() {
+        for captured in crate::testing::narration(
+            "firmware::tests::test_restart_countdown",
+            |output, clock| {
+                let start = clock.clock().now();
+                assert_eq!(
+                    restart(&output, &clock.clock()),
+                    start + Duration::from_secs(120)
+                );
+                output.finish();
+                clock.advance(Duration::from_secs(34));
+                output.redraw();
+                output.end_stage(Some("Restarted on 0.12.0-74d557e"), None);
+            },
+        ) {
+            captured.contains(&[
+                "Waiting for the Ark to restart · 2m 00s left",
+                "Waiting for the Ark to restart · 1m 26s left",
+                "Restarted on 0.12.0-74d557e · 34s",
+            ]);
+            if captured.json {
+                assert_eq!(captured.events()[1]["remaining_seconds"], 86);
+            }
+        }
+    }
+    /// Builds invented releases, two candidates and the installed build.
     fn releases() -> Vec<Package> {
         [
             (
@@ -656,10 +766,11 @@ mod tests {
         .collect()
     }
 
-    /// Listing writers keep JSON intact and print compact rows with whole headlines.
+    /// The list keeps JSON whole, and prints compact rows with the headlines
+    /// whole below them.
     #[test]
     fn test_firmware_listing_columns_order_and_headlines() {
-        // The child exercises the actual writer with an installed or unlisted build
+        // As the child, print the list for an installed build, listed or not
         if let Ok(installed) = std::env::var("ARK_TEST_FIRMWARE_INSTALLED") {
             let mut options = args::Cli::parse_from(["ark"]).options;
             options.json = std::env::var("ARK_TEST_FIRMWARE_JSON").unwrap() == "true";
@@ -669,7 +780,7 @@ mod tests {
             return;
         }
 
-        // Both installed cases keep the same candidate order and headline text
+        // Both installed builds get the same candidates and headlines
         for installed in ["2.8.0-aaaaaaa", "2.8.0-develop"] {
             for json in [false, true] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -739,7 +850,7 @@ mod tests {
                     continue;
                 }
 
-                // JSON preserves full notes, exact bytes, hashes, booleans and row order
+                // JSON keeps the whole notes, exact sizes, hashes, flags and order
                 let document: Value = serde_json::from_str(rendered).unwrap();
                 assert_eq!(document.as_object().unwrap().len(), 3);
                 assert_eq!(document["installed"], installed);
@@ -769,7 +880,8 @@ mod tests {
                     );
                 }
 
-                // Terminal dates are muted, headlines have headings and statuses stay plain
+                // On a terminal dates are muted, versions title the headlines and
+                // statuses stay plain
                 for width in [32, 80] {
                     let theme = Theme::test(width, Color::True, true);
                     let rendered = listing_table(&theme, rows.clone());
@@ -792,7 +904,8 @@ mod tests {
         }
     }
 
-    /// An installed develop build stays installed even when it is also a candidate.
+    /// An installed develop build reads installed, even when it is also a
+    /// candidate.
     #[test]
     fn test_installed_candidate_omits_its_headline() {
         let theme = Theme::test(80, Color::True, true);

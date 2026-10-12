@@ -221,7 +221,7 @@ mod tests {
             for kind in ["progress", "note", "warning", "hint", "step"] {
                 output.event(kind, "first line\nsecond line");
             }
-            output.approve("unlock", "phone", "first line\nsecond line");
+            output.approve("unlock", Some("phone"), "first line\nsecond line");
             output.event_value(json!({"event":"log", "message":"first line\nsecond line", "level":"debug", "target":"darkbio_connect", "fields":{"message":"first line\nsecond line"}}));
             output.event("step", "ready for signal");
             let _ = std::io::stdin().read_to_end(&mut Vec::new());

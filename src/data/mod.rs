@@ -17,7 +17,8 @@ use crate::{
     args::{self, slot_name},
     context::{Context, open_file},
     error::Error,
-    progress::{Processing, Transfer},
+    output::Output,
+    progress::{Processing, Transfer, Update},
 };
 use darkbio_clock::Clock;
 use darkbio_connect::{
@@ -81,15 +82,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
 
             // Empty the slot once the owner approves, where only a filled or
             // damaged slot counts as changed
-            context.output.approve(
-                if repair { "repair" } else { "delete" },
-                "phone",
-                format!(
-                    "{} {} (Ark Companion on your phone)",
-                    if repair { "repair" } else { "delete" },
-                    slot_name(slot.kind)
-                ),
-            );
+            approve_change(&context.output, slot.kind, repair);
             if repair {
                 connection.client.call(
                     schema::SlotRepairRequest { slot: slot.kind },
@@ -211,7 +204,7 @@ fn upload(
     // the required one
     context
         .output
-        .stage("identifying", &format!("identifying {}", path.display()));
+        .stage("identifying", &format!("Identifying {name}"), None);
     let identified = connection
         .client
         .identify_dataset(name, size, &mut file, context.timing())?;
@@ -239,17 +232,7 @@ fn upload(
         "phases": [],
         "duration_seconds": 0,
     });
-    context.output.end_stage(
-        Some(&format!("identified as {}", slot_name(identified.kind))),
-        Some(&format!("{} confidence", confidence(identified.conf))),
-    );
-    context.output.event("note", &identified.summary);
-    if confidence(identified.conf) == "low" {
-        context.output.event(
-            "warning",
-            "low identification confidence; the Ark will validate during processing",
-        );
-    }
+    identification(&context.output, &identified);
 
     // A dry run plans against the target slot's state and dependencies
     if dry_run {
@@ -276,7 +259,13 @@ fn upload(
     file.rewind()?;
     let clock = connection.client.clock();
     let started = clock.now();
-    let mut progress = Progress::new(context, clock.clone(), identified.kind);
+    let mut progress = Progress::new(
+        context,
+        clock.clone(),
+        identified.kind,
+        size,
+        Operation::Upload,
+    );
     context.interrupt.partial(value.clone());
     let result = connection.client.upload_dataset(
         &Dataset {
@@ -310,6 +299,44 @@ fn upload(
     result.map_err(Into::into)
 }
 
+/// Ends the identification with the slot and its confidence, keeping the
+/// Ark's summary of the file as a `-v` step.
+fn identification(output: &Output, identified: &schema::SlotIdentifyResponse) {
+    output.end_stage(
+        Some(&format!("Identified as {}", slot_name(identified.kind))),
+        Some(&format!("{} confidence", confidence(identified.conf))),
+    );
+    output.event("step", &identified.summary);
+    if confidence(identified.conf) == "low" {
+        output.event(
+            "warning",
+            "low identification confidence; the Ark will validate during processing",
+        );
+    }
+}
+
+/// Starts the phone approval of deleting or repairing `slot`.
+fn approve_change(output: &Output, slot: i32, repair: bool) {
+    output.approve(
+        if repair { "repair" } else { "delete" },
+        Some("phone"),
+        format!(
+            "Approve {} {} on your phone, in Ark Companion",
+            if repair { "repairing" } else { "deleting" },
+            slot_name(slot)
+        ),
+    );
+}
+
+/// Command whose transfer the narration follows.
+pub(super) enum Operation {
+    /// Upload of a local file, which the Ark identifies first.
+    Upload,
+    /// Fetch of a reference the Ark offers, read from the cache when it holds
+    /// a copy.
+    Fetch,
+}
+
 /// Upload presentation and partial-result facts shared by local and reference
 /// sources.
 pub(crate) struct Progress<'a> {
@@ -330,11 +357,31 @@ pub(crate) struct Progress<'a> {
 impl<'a> Progress<'a> {
     /// Starts a new dataset's progress without inheriting a previous transfer's
     /// estimates.
-    pub fn new(context: &'a Context, clock: Clock, slot: i32) -> Self {
+    pub fn new(
+        context: &'a Context,
+        clock: Clock,
+        slot: i32,
+        size: u64,
+        operation: Operation,
+    ) -> Self {
+        let transfer = match operation {
+            Operation::Upload => Update {
+                completed: Some(format!("Uploaded {}", crate::style::bytes(size))),
+                ..Update::new("uploading", "Uploading")
+            },
+            Operation::Fetch => Update {
+                completed: Some(format!(
+                    "Fetched {} · {}",
+                    slot_name(slot),
+                    crate::style::bytes(size)
+                )),
+                ..Update::new("fetching", &format!("Fetching {}", slot_name(slot)))
+            },
+        };
         Self {
             context,
             slot,
-            transfer: Transfer::new(context.output.terminal(), clock.clone()),
+            transfer: Transfer::new(context.output.terminal(), clock.clone(), transfer),
             processing: Processing::new(context.output.terminal(), clock),
             uploaded: 0,
             phases: Vec::new(),
@@ -345,31 +392,26 @@ impl<'a> Progress<'a> {
     /// presentation.
     pub fn update(&mut self, stage: UploadProgress) {
         match stage {
-            UploadProgress::Identifying => self
-                .context
-                .output
-                .stage("identifying", "identifying dataset"),
+            UploadProgress::Identifying => {
+                self.context
+                    .output
+                    .stage("identifying", "Identifying dataset", None)
+            }
             UploadProgress::Identified(info) => {
                 self.slot = info.kind;
-                self.context.output.end_stage(
-                    Some(&format!("identified {}", slot_name(info.kind))),
-                    Some(&format!("{} confidence", confidence(info.conf))),
-                );
+                identification(&self.context.output, &info);
             }
             UploadProgress::Preparing => {
                 if upload_approval(self.slot) {
                     self.context.output.approve(
                         "upload",
-                        "phone",
-                        format!(
-                            "upload {} (Ark Companion on your phone)",
-                            slot_name(self.slot)
-                        ),
+                        Some("phone"),
+                        "Approve the upload on your phone, in Ark Companion",
                     );
                 } else {
                     self.context
                         .output
-                        .stage("preparing", "preparing dataset upload");
+                        .stage("preparing", "Preparing the upload", None);
                 }
             }
             UploadProgress::Started { session } => {
@@ -377,7 +419,7 @@ impl<'a> Progress<'a> {
                 self.context
                     .interrupt
                     .target(crate::interrupt::Target::Upload(session));
-                self.context.output.stage("uploading", "Uploading");
+                self.context.output.progress(self.transfer.initial());
             }
             UploadProgress::Uploading { uploaded, total } => {
                 self.uploaded = uploaded;
@@ -523,6 +565,134 @@ pub(crate) fn metadata(slot: &SlotStatus) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Uploads and fetches narrate in their own words, and each Ark phase ends
+    /// with its time.
+    #[test]
+    fn test_dataset_narration() {
+        use clap::Parser;
+
+        for captured in
+            crate::testing::narration("data::tests::test_dataset_narration", |output, clock| {
+                let options = args::Cli::parse_from(["ark"]).options;
+                let context = Context {
+                    options,
+                    interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                    output,
+                };
+                let output = &context.output;
+                output.stage("identifying", "Identifying calls.vcf.gz", None);
+                identification(
+                    output,
+                    &schema::SlotIdentifyResponse {
+                        kind: schema::SlotKind::SnpIndelCalls as i32,
+                        conf: schema::SlotConfidence::High as i32,
+                        summary: "Sample calls".into(),
+                        ..Default::default()
+                    },
+                );
+                for (operation, slot, size, seconds, phase, duration) in [
+                    (
+                        Operation::Upload,
+                        schema::SlotKind::SnpIndelCalls as i32,
+                        307547341,
+                        22,
+                        "Compressing",
+                        62,
+                    ),
+                    (
+                        Operation::Fetch,
+                        schema::SlotKind::ReferenceGenome as i32,
+                        3221225472,
+                        250,
+                        "Indexing",
+                        151,
+                    ),
+                    (
+                        Operation::Upload,
+                        schema::SlotKind::ReferenceGenome as i32,
+                        1024,
+                        1,
+                        "Indexing",
+                        1,
+                    ),
+                ] {
+                    let mut progress =
+                        Progress::new(&context, clock.clock(), slot, size, operation);
+                    progress.update(UploadProgress::Preparing);
+                    output.finish();
+                    clock.advance(Duration::from_secs(14));
+                    progress.update(UploadProgress::Started { session: 7 });
+                    progress.update(UploadProgress::Uploading {
+                        uploaded: 0,
+                        total: size,
+                    });
+                    output.finish();
+                    clock.advance(Duration::from_secs(seconds));
+                    progress.update(UploadProgress::Uploading {
+                        uploaded: size,
+                        total: size,
+                    });
+                    let status = schema::SlotUploadProcessResponse {
+                        proc_start: 1,
+                        phase_start: 1,
+                        phase_in: 1,
+                        phases: vec![schema::SlotPhase {
+                            name: phase.into(),
+                            desc: String::new(),
+                        }],
+                        ..Default::default()
+                    };
+                    progress.update(UploadProgress::Processing(status.clone()));
+                    output.finish();
+                    clock.advance(Duration::from_secs(duration));
+                    progress.update(UploadProgress::Processing(
+                        schema::SlotUploadProcessResponse {
+                            phase_progress: 10000,
+                            ..status
+                        },
+                    ));
+                }
+                context.interrupt.clear();
+                for repair in [false, true] {
+                    approve_change(output, schema::SlotKind::SnpIndelCalls as i32, repair);
+                    output.finish();
+                    clock.advance(Duration::from_secs(6));
+                    output.end_stage(None, None);
+                }
+            })
+        {
+            captured.contains(&[
+                "Identifying calls.vcf.gz",
+                "Identified as snp-indel-calls · high confidence",
+                "Approve the upload on your phone, in Ark Companion",
+                "Approved on your phone · 14s",
+                "Uploading",
+                "Uploaded 293.3 MiB · 22s",
+                "Compressing · 1m 02s",
+                "Preparing the upload",
+                "Fetching reference-genome",
+                "Fetched reference-genome · 3.0 GiB · 4m 10s",
+                "Indexing · 2m 31s",
+                "Preparing the upload",
+                "Uploaded 1.0 KiB · 1s",
+                "Approve deleting snp-indel-calls on your phone, in Ark Companion",
+                "Approved on your phone · 6s",
+                "Approve repairing snp-indel-calls on your phone, in Ark Companion",
+                "Approved on your phone · 6s",
+            ]);
+            captured.approvals(&[
+                ("upload", Some("phone")),
+                ("delete", Some("phone")),
+                ("repair", Some("phone")),
+            ]);
+            assert!(!captured.stderr.contains("Sample calls"));
+            assert!(!captured.stderr.contains("note: Fetching"));
+            assert!(!captured.stderr.contains("✓ Preparing"));
+            assert!(!captured.stderr.contains("Preparing the upload ·"));
+        }
+    }
 
     /// Checks that uploads to the public reference slots predict no approval
     /// prompt, while personal data does.

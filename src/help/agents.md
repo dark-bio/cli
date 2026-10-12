@@ -64,9 +64,9 @@ These commands wait on the owner, for at most the window the Ark opens:
 Before you start such a command, let the person know what they will approve
 and where, so their phone or the Ark is at hand. Then pass on each approve
 event the moment it arrives, quoting its message. It is a line starting
-with ! and the instruction, or with `{"event":"approve"` under --json.
-The phone's notification may not arrive, and opening Ark Companion shows
-the request anyway.
+with `! Approve` or `! Review`, or with `{"event":"approve"` under --json.
+The phone's notification may not arrive, and opening Ark Companion shows the
+request anyway.
 
 A declined approval fails the command with approval-denied, and one that
 ran out with approval-timeout, both exit 6. approval-undelivered, exit 4,

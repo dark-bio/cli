@@ -36,7 +36,8 @@ use error::Error;
 use serde_json::json;
 use std::process::ExitCode;
 
-/// Published version or the Cargo version with a local build mark.
+/// Version this build prints, as published, or the Cargo version marked
+/// `-local`.
 pub(crate) const VERSION: &str = env!("ARK_BUILD_VERSION");
 
 /// Parses the invocation, installs output and interruption handling, then
@@ -172,20 +173,6 @@ fn checks_for_update(cli: &Cli) -> bool {
 /// Dispatches one command; an absent command prints top-level help without
 /// discovery.
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
-    // Show the pending connection before local checks or network lookups can wait
-    let _connecting = command
-        .as_ref()
-        .filter(|command| {
-            !matches!(
-                command,
-                Command::Devices | Command::Help { .. } | Command::Completions { .. }
-            )
-        })
-        .map(|_| {
-            context
-                .output
-                .connecting(context.options.device.as_deref().unwrap_or("an Ark"))
-        });
     match command {
         None => context.output.text(
             &help::command(&help::theme())
@@ -216,14 +203,15 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     }
 }
 
-/// Tests of invocation policy before command dispatch.
+/// Tests of which invocations print the release note.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::style::{Color, Theme};
 
-    /// Normal commands may announce releases; display, diagnostic and invalid
-    /// invocations never do, regardless of this test binary's build kind.
+    /// Commands may print the release note, while help, completions, the
+    /// version, the doctor and invalid invocations never do, whatever this
+    /// test's build.
     #[test]
     fn test_release_notes_follow_invocation_policy() {
         let theme = Theme::test(80, Color::Off, true);

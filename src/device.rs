@@ -35,7 +35,7 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         "name":device.name(),"serial":device.serial(),"image":device.image(),"environment":device.env(),"ready":device.ready(),
     })).collect();
 
-    // Print the table, pointing at --device when several Arks answer
+    // Print the table, and with several Arks a hint naming a selector for each
     context
         .output
         .document_with(&json!({"devices":rows}), |theme| {
@@ -52,7 +52,8 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
-/// Renders discovery metadata with launcher columns only when reported.
+/// Renders the devices table, with the launcher's columns only when an Ark
+/// reports them.
 fn devices_table(theme: &Theme, rows: &[Value]) -> String {
     // The `environment` and `ready` columns are launcher metadata, which
     // discovery leaves unset for hardware. They show only when a row has them,
@@ -71,9 +72,10 @@ fn devices_table(theme: &Theme, rows: &[Value]) -> String {
     human::table(theme, rows, &columns)
 }
 
-/// Suggests kind words for unique kinds and locators for the remaining Arks.
+/// Builds the hint naming a selector for each Ark, its kind when it is the
+/// only one of that kind, and its locator otherwise.
 pub(crate) fn selection_hint(locators: &[Locator]) -> String {
-    // Count both kinds before choosing a selector for each Ark
+    // Count each kind, since a kind word selects only an Ark alone of its kind
     let hardware = locators
         .iter()
         .filter(|locator| matches!(locator, Locator::Hardware { .. }))
@@ -156,7 +158,8 @@ fn print_status(output: &Output, value: &Value) -> Result<(), Error> {
     output.document_with(value, |theme| status_block(theme, value))
 }
 
-/// Groups identifying facts and readiness under the Ark's name.
+/// Renders the status block, which Ark this is and whether it is ready, under
+/// the Ark's name.
 fn status_block(theme: &Theme, value: &Value) -> String {
     let field = |key: &str| human::value(theme, key, &value[key]);
     let flag = |key: &str, yes: &str, no: &str, role: Role| match value[key].as_bool() {
@@ -340,18 +343,7 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
             Error::new(4, "environment-unknown", "cloud environment unknown")
                 .hint("select one with --env")
         })?;
-        let url = hub(env);
-        context
-            .output
-            .event("hint", format!("enroll online at {url}"));
-        context
-            .output
-            .document(&json!({"enrolled":false,"url":url}))?;
-        return Err(Error::new(
-            1,
-            "enrollment-required",
-            "online enrollment happens at Ark Hub",
-        ));
+        return online_enrollment(&context.output, env);
     };
 
     // Install the attestation, then reconnect without the pin to verify it
@@ -380,6 +372,22 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
     }
 }
 
+/// Prints the online enrollment document, then fails with the Ark Hub link as
+/// the error's hint.
+fn online_enrollment(
+    output: &Output,
+    env: darkbio_connect::trust::Environment,
+) -> Result<(), Error> {
+    let url = hub(env);
+    output.document(&json!({"enrolled":false,"url":url}))?;
+    Err(Error::new(
+        1,
+        "enrollment-required",
+        "online enrollment happens at Ark Hub",
+    )
+    .hint(format!("enroll online at {url}")))
+}
+
 /// Formats Unix seconds as UTC RFC 3339, leaving unrepresentable dates absent.
 pub(crate) fn timestamp(seconds: u64) -> Option<String> {
     i64::try_from(seconds)
@@ -398,15 +406,51 @@ pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
     }
 }
 
-/// Tests of the discovery table and human status layout.
+/// Tests of the devices table, the status block and enrollment.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Online enrollment prints its document, then fails with the link as the
+    /// error's hint.
+    #[test]
+    fn test_enrollment_error_hint() {
+        for captured in
+            crate::testing::narration("device::tests::test_enrollment_error_hint", |output, _| {
+                let error =
+                    online_enrollment(&output, darkbio_connect::trust::Environment::Release)
+                        .unwrap_err();
+                assert_eq!((error.class, error.code), (1, "enrollment-required"));
+                output.error(&error);
+            })
+        {
+            if captured.json {
+                let events = captured.events();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["event"], "error");
+                assert_eq!(
+                    events[0]["error"]["hints"],
+                    json!(["enroll online at https://hub.dark.bio"])
+                );
+                let document: Value = serde_json::from_str(&captured.stdout).unwrap();
+                assert_eq!(
+                    document,
+                    json!({"enrolled":false,"url":"https://hub.dark.bio"})
+                );
+            } else {
+                assert_eq!(
+                    captured.stderr,
+                    "\nerror[enrollment-required]: online enrollment happens at Ark Hub\nhint: enroll online at https://hub.dark.bio\n"
+                );
+            }
+        }
+    }
     use crate::style::Color;
     use clap::Parser;
     use std::io::Write;
 
-    /// Discovery omits KIND and shows each launcher column only when reported.
+    /// The devices table has no kind column, and shows each launcher column
+    /// only when reported.
     #[test]
     fn test_devices_table_omits_kind_and_keeps_reported_columns() {
         // Typical hardware and emulator names fit together at 80 columns
@@ -446,7 +490,7 @@ mod tests {
                 .all(|line| console::measure_text_width(line) <= 80)
         );
 
-        // Environment and readiness appear independently, including false readiness
+        // Environment and readiness show on their own, a false readiness included
         rows[1]["ready"] = json!(false);
         rows[1]["environment"] = Value::Null;
         let rendered = devices_table(&theme, &rows);
@@ -473,7 +517,7 @@ mod tests {
         assert_eq!(rendered.lines().count(), 2);
     }
 
-    /// Builds an invented attested status with the complete JSON field set.
+    /// Builds an invented status of an attested Ark, with every JSON field.
     fn status() -> Value {
         json!({
             "name":"Example Ark", "serial":"example-1",
@@ -485,7 +529,8 @@ mod tests {
         })
     }
 
-    /// The Ark's name titles two groups, with identifying facts before readiness.
+    /// The Ark's name titles two groups, which Ark this is before whether it is
+    /// ready.
     #[test]
     fn test_status_title_and_groups() {
         let theme = Theme::test(80, Color::Basic, true);
@@ -505,7 +550,7 @@ mod tests {
         );
     }
 
-    /// Mismatch and enrollment rows finish the identifying group.
+    /// Mismatch and enrollment rows end the first group.
     #[test]
     fn test_status_extra_identity_rows_precede_readiness() {
         let theme = Theme::test(80, Color::Off, true);
@@ -522,7 +567,8 @@ mod tests {
         assert_eq!(rendered.matches("\n\n").count(), 1);
     }
 
-    /// Unverified serials and unsynced cloud state are neutral; pairing needs action.
+    /// An unverified serial and an unsynced cloud are neutral, while pairing
+    /// and the lock need action.
     #[test]
     fn test_status_marks_unverified_and_not_ready_states() {
         // A self-signed or pinned identity carries no attested fields
@@ -552,7 +598,7 @@ mod tests {
             }
         }
 
-        // Unknown readiness stays distinct from false, including with ASCII marks
+        // Unknown readiness stays apart from false, with ASCII marks too
         for key in ["synced", "paired", "unlocked"] {
             value[key] = Value::Null;
         }
@@ -565,10 +611,10 @@ mod tests {
         assert!(plain.contains("  Serial       - unverified\n"));
     }
 
-    /// The status writer omits detailed identity fields only from the reading view.
+    /// The reading view leaves the identity details out, and JSON keeps them.
     #[test]
     fn test_status_json_preserves_details() {
-        // Run the actual writer in a child so stdout can be captured independently
+        // Run as a child, so the test reads the real stdout
         let value = status();
         if let Ok(json) = std::env::var("ARK_TEST_STATUS_JSON") {
             let mut options = args::Cli::parse_from(["ark"]).options;
@@ -579,7 +625,8 @@ mod tests {
             return;
         }
 
-        // JSON keeps the entire document, while the reading view omits its long fields
+        // JSON keeps the whole document, and the reading view leaves its long
+        // fields out
         for json in [false, true] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

@@ -19,7 +19,7 @@ use std::path::Path;
 /// a check. The full checklist is printed before the first failure determines
 /// the exit class.
 pub(crate) fn run(context: &Context) -> Result<(), Error> {
-    // Start with the tool's build version and whether a newer release exists
+    // Start with this tool's version and whether a newer release is out
     let mut checks = Checks {
         output: &context.output,
         rows: Vec::new(),
@@ -41,10 +41,11 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
 
     // Each discovery source reports on its own, so one failure keeps the other's
     // result
-    for (name, result) in [
-        ("hardware", darkbio_connect::hardware::list()),
-        ("emulator", darkbio_connect::emulator::list()),
-    ] {
+    for name in ["hardware", "emulator"] {
+        let result = checks.check(name, || match name {
+            "hardware" => darkbio_connect::hardware::list(),
+            _ => darkbio_connect::emulator::list(),
+        });
         match result {
             Ok(devices) => {
                 let count = devices.len();
@@ -69,10 +70,10 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
         }
     }
 
-    // Measure the reference cache before moving on to the Ark
+    // Measure the download cache, the last check of this computer
     let cache = crate::data::cache::directory();
     let home = directories::BaseDirs::new();
-    match crate::data::cache::size(&cache) {
+    match checks.check("cache", || crate::data::cache::size(&cache)) {
         Ok(size) => checks.ok(
             "cache",
             &cache_detail(&cache, size, home.as_ref().map(|dirs| dirs.home_dir())),
@@ -84,7 +85,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     // Connect past the compatibility gate, so outdated firmware is checked too,
     // and skip every device check when that fails
     let mut name = "Ark".to_string();
-    match context.connect_recovery(None) {
+    match checks.check("connection", || context.connect_recovery(None)) {
         Err(error) => {
             checks.fail("connection", error);
             for name in [
@@ -105,7 +106,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             // environment
             name = connection.device.name().unwrap_or("Ark").to_string();
             checks.ok("connection", "authenticated");
-            let current = match connection.require_current() {
+            let current = match checks.check("compatibility", || connection.require_current()) {
                 Ok(()) => {
                     checks.ok("compatibility", "firmware supports this tool");
                     true
@@ -115,7 +116,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                     false
                 }
             };
-            if let Some(env) = connection.env {
+            if let Some(env) = checks.check("environment", || connection.env) {
                 checks.ok("environment", &env.to_string());
             } else {
                 checks.fail(
@@ -129,9 +130,10 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             if connection.env.is_none() {
                 checks.skip("firmware", "needs a known cloud environment");
             } else {
-                match Packages::new(context, connection.client.clock(), connection.env)
-                    .and_then(|mut packages| packages.list(context))
-                {
+                match checks.check("firmware", || {
+                    Packages::new(context, connection.client.clock(), connection.env)
+                        .and_then(|mut packages| packages.list(context))
+                }) {
                     Ok(firmwares) => checks.ok(
                         "firmware",
                         &firmware_detail(
@@ -146,7 +148,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                 checks.skip("sync", "needs a known cloud environment");
                 false
             } else {
-                match connection.client.sync(context.timing()) {
+                match checks.check("sync", || connection.client.sync(context.timing())) {
                     Ok(()) => {
                         checks.ok("sync", "keys and clock accepted");
                         true
@@ -160,7 +162,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
 
             // The registry answers only after a successful sync
             if synced {
-                match connection.client.genuine(context.timing()) {
+                match checks.check("registry", || connection.client.genuine(context.timing())) {
                     Ok(registration) if registration.active() => checks.ok("registry", "active"),
                     Ok(_) => checks.fail(
                         "registry",
@@ -179,7 +181,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                     checks.skip(name, "needs a firmware update");
                 }
             } else {
-                let state = &connection.info;
+                let state = checks.check("pairing", || &connection.info);
                 checks.ok(
                     "pairing",
                     if !state.paired {
@@ -191,7 +193,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                     },
                 );
                 if synced && state.paired {
-                    match connection.client.attach_relay(context.timing()) {
+                    match checks.check("relay", || connection.client.attach_relay(context.timing()))
+                    {
                         Ok(()) => checks.ok("relay", "attached"),
                         Err(error) => checks.fail("relay", error.into()),
                     }
@@ -199,10 +202,11 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                     checks.skip("relay", "needs a paired Ark and cloud sync");
                 }
                 if synced && state.unlocked {
-                    match connection
-                        .client
-                        .call(schema::SlotListRequest {}, context.timing())
-                    {
+                    match checks.check("slots", || {
+                        connection
+                            .client
+                            .call(schema::SlotListRequest {}, context.timing())
+                    }) {
                         Ok(slots) => checks.ok("slots", &format!("{} readable", slots.slots.len())),
                         Err(error) => checks.fail("slots", error.into()),
                     }
@@ -225,7 +229,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     checks.failure.map_or(Ok(()), Err)
 }
 
-/// Describes the installed firmware against the newest catalog entry.
+/// Describes the installed firmware beside the newest published build.
 fn firmware_detail(installed: &str, newest: Option<&str>) -> String {
     match newest {
         Some(newest) if newest == installed => format!("{installed}, the newest published"),
@@ -234,7 +238,7 @@ fn firmware_detail(installed: &str, newest: Option<&str>) -> String {
     }
 }
 
-/// Describes the cache's size and location, shortening the home directory.
+/// Describes the cache's size and place, with the home directory as `~`.
 fn cache_detail(path: &Path, size: u64, home: Option<&Path>) -> String {
     let path = home
         .and_then(|home| path.strip_prefix(home).ok())
@@ -251,7 +255,7 @@ fn cache_detail(path: &Path, size: u64, home: Option<&Path>) -> String {
 
 /// Ordered diagnostic results and the first failure used for command status.
 struct Checks<'a> {
-    /// Invocation output, for verbose step diagnostics.
+    /// Output that shows each check as it runs, and as a `-v` step.
     output: &'a Output,
     /// Checks in execution order, including explicit skips and local hints.
     rows: Vec<Value>,
@@ -260,10 +264,17 @@ struct Checks<'a> {
 }
 
 impl Checks<'_> {
-    /// Records the build version and looks up the newest ark when permitted.
+    /// Runs `run` under its `Checking <name>` line on a terminal.
+    fn check<T>(&self, name: &str, run: impl FnOnce() -> T) -> T {
+        let _checking = self.output.checking(name);
+        run()
+    }
+
+    /// Adds the `ark` check, with this build's version and what the release
+    /// lookup found.
     ///
-    /// A newer one is a warn and a failed lookup a skip, so neither sets the
-    /// exit code.
+    /// A newer release is a warn and a failed lookup a skip, so neither sets
+    /// the exit code.
     fn ark(
         &mut self,
         version: &str,
@@ -271,7 +282,10 @@ impl Checks<'_> {
         ci: bool,
         lookup: impl FnOnce(update::Channel) -> Result<Version, &'static str>,
     ) {
-        // Local builds and CI never invoke the release lookup
+        // Show the check before the lookup can wait on the network
+        let _checking = self.output.checking("ark");
+
+        // Local builds and CI never look up releases
         if local {
             self.skip(
                 "ark",
@@ -284,7 +298,7 @@ impl Checks<'_> {
             return;
         }
 
-        // Compare semantic precedence on the build's own release channel
+        // Compare versions by semver precedence, within the build's own channel
         let running = Version::parse(version).expect("build version is semver");
         let channel = update::Channel::for_version(&running);
         match lookup(channel) {
@@ -338,15 +352,85 @@ impl Checks<'_> {
     }
 }
 
-/// Tests of release outcomes and the details shared by reading and JSON reports.
+/// Tests of the doctor's check lines and details.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args::Cli;
     use clap::Parser;
 
-    /// The ark check includes the build version in every outcome and only looks
-    /// up published builds outside CI.
+    /// The `Checking` lines vanish before the report, and pipes and JSON never
+    /// show them.
+    #[test]
+    fn test_check_narration() {
+        for captured in
+            crate::testing::narration("doctor::tests::test_check_narration", |output, _| {
+                let mut checks = Checks {
+                    output: &output,
+                    rows: Vec::new(),
+                    failure: None,
+                };
+                checks.ark("0.4.1", false, false, |_| {
+                    Ok(Version::parse("0.4.1").unwrap())
+                });
+                for name in [
+                    "hardware",
+                    "emulator",
+                    "cache",
+                    "connection",
+                    "compatibility",
+                    "environment",
+                    "firmware",
+                    "sync",
+                    "registry",
+                    "pairing",
+                    "relay",
+                    "slots",
+                ] {
+                    checks.check(name, || ());
+                    checks.ok(name, "checked");
+                }
+                output
+                    .checklist(
+                        &json!({"checks":checks.rows}),
+                        &[("This computer", &checks.rows)],
+                    )
+                    .unwrap();
+            })
+        {
+            if captured.terminal {
+                for name in [
+                    "ark",
+                    "hardware",
+                    "emulator",
+                    "cache",
+                    "connection",
+                    "compatibility",
+                    "environment",
+                    "firmware",
+                    "sync",
+                    "registry",
+                    "pairing",
+                    "relay",
+                    "slots",
+                ] {
+                    assert!(
+                        captured
+                            .stderr
+                            .contains(&format!("› Checking {name}{}", crate::style::CLEAR_LINE)),
+                        "{name}"
+                    );
+                }
+                assert!(captured.stderr.ends_with(crate::style::CLEAR_LINE));
+            } else {
+                assert!(captured.stderr.is_empty());
+            }
+            assert!(!captured.stdout.contains("Checking"));
+        }
+    }
+
+    /// The `ark` check names the build's version in every outcome, and looks up
+    /// releases only for a published build outside CI.
     #[test]
     fn test_ark_check_release_states() {
         let output = Output::new(&Cli::parse_from(["ark"]).options);
@@ -464,8 +548,8 @@ mod tests {
         }
     }
 
-    /// Firmware details distinguish a matching build, a different one and an
-    /// empty catalog without claiming an upgrade is required.
+    /// The firmware detail distinguishes a current build, an older one and an
+    /// empty catalog, without demanding an update.
     #[test]
     fn test_firmware_details_describe_the_catalog() {
         for (newest, expected) in [
@@ -484,8 +568,8 @@ mod tests {
         }
     }
 
-    /// Cache paths shorten only a complete home-directory prefix and keep the
-    /// size's unit in the detail.
+    /// The cache detail shortens only a whole home directory to `~`, and keeps
+    /// the size's unit.
     #[test]
     fn test_cache_details_shorten_the_home_directory() {
         let home = Path::new("/home/sample");
