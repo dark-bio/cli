@@ -705,9 +705,9 @@ fn tick(theme: &Theme, terminal: &mut Terminal, output: &mut impl Write, now: In
 
     // Count down to the bound, or up from the start
     let time = match wait.until {
-        Some(until) => format!("{} s left", until.saturating_duration_since(now).as_secs()),
+        Some(until) => format!("{}s left", until.saturating_duration_since(now).as_secs()),
         None => format!(
-            "{} s elapsed",
+            "{}s elapsed",
             now.saturating_duration_since(wait.started).as_secs()
         ),
     };
@@ -836,8 +836,8 @@ mod tests {
         second.join().unwrap();
         let frames = screen.frames();
         assert_eq!(frames.len(), 2);
-        assert!(frames[0].contains("first") && frames[0].contains("0 s elapsed"));
-        assert!(frames[1].contains("second") && frames[1].contains("0 s elapsed"));
+        assert!(frames[0].contains("first") && frames[0].contains("0s elapsed"));
+        assert!(frames[1].contains("second") && frames[1].contains("0s elapsed"));
 
         // Its worker alone redraws it a second later, then waits another second
         wait_deadline(&tester, start + Duration::from_secs(1));
@@ -845,7 +845,7 @@ mod tests {
         wait_deadline(&tester, start + Duration::from_secs(2));
         let frames = screen.frames();
         assert_eq!(frames.len(), 3);
-        assert!(frames[2].contains("second") && frames[2].contains("1 s elapsed"));
+        assert!(frames[2].contains("second") && frames[2].contains("1s elapsed"));
 
         // Dropping the output stops the waiting worker
         drop(output);
@@ -956,7 +956,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(output.clone()).unwrap(),
-            "         waiting \u{00b7} 2 s elapsed"
+            "         waiting \u{00b7} 2s elapsed"
         );
         output.clear();
 
@@ -970,7 +970,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(output.clone()).unwrap(),
-            format!("{}         waiting \u{00b7} 15 s left", style::CLEAR_LINE)
+            format!("{}         waiting \u{00b7} 15s left", style::CLEAR_LINE)
         );
         output.clear();
 

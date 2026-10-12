@@ -40,7 +40,7 @@ reading, so they are not a structured progress feed.
 ## Events and verbosity
 
 On a terminal, progress redraws in place once a second. Redirected, it
-prints a line at every ten percent or every 5 s. -q hides progress, notes,
+prints a line at every ten percent or every 5s. -q hides progress, notes,
 warnings and steps, and keeps errors, hints, approvals, logs and app output.
 -v adds steps. --log debug adds the diagnostics of ark's release lookup and
 its connection library, and --log trace adds the wire protocol too. Logs
@@ -74,7 +74,7 @@ At most once an hour, ark asks GitHub for its newest release. A release
 build reads the redirect at https://github.com/dark-bio/cli/releases/latest,
 and a development build reads the release list from api.github.com. The
 request carries nothing about this computer, its Arks or the running
-version. It runs in a detached copy of ark that exits within 30 s, so no
+version. It runs in a detached copy of ark that exits within 30s, so no
 command waits for it. The answer is kept in update.json in ark's cache
 directory, and a nonempty CI turns the lookup off.
 
@@ -174,8 +174,8 @@ Exit 6 is an approval that did not come.
   run `ark pair` again.
 
 Exit 7 is `timeout`, for a wait on a machine that ran past --timeout or past
-a fixed limit, such as the 5 s handshake that opens a connection or the
-120 s an Ark gets to return from a firmware update.
+a fixed limit, such as the 5s handshake that opens a connection or the
+120s an Ark gets to return from a firmware update.
 
 Exit 8 is `app-failed`, for an app that failed when the owner released its
 result. The document still holds what the Ark returned.

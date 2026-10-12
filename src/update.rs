@@ -194,7 +194,7 @@ pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
     }
 }
 
-/// Runs the lookup in the detached copy, which ends within 30 s whatever happens.
+/// Runs the lookup in the detached copy, which ends within 30s whatever happens.
 ///
 /// The copy opens no connection, so its clock is the real one.
 pub(crate) fn run() {
@@ -206,7 +206,7 @@ pub(crate) fn run() {
     let started = clock.now();
     let asked = DateTime::<Utc>::from(clock.system_time());
 
-    // End the process at 30 s, and skip the lookup when nothing can enforce that
+    // End the process at 30s, and skip the lookup when nothing can enforce that
     if watchdog(started, Duration::from_secs(30)).is_err() {
         return;
     }

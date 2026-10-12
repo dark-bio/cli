@@ -48,7 +48,7 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
         return if seconds >= 60 {
             format!("{}m {}s", seconds / 60, seconds % 60)
         } else {
-            format!("{seconds} s")
+            format!("{seconds}s")
         };
     }
 

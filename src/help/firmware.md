@@ -53,14 +53,14 @@ An installation runs in four steps:
 1. Confirmation on this computer. A terminal asks for it. Elsewhere --yes
    gives it, and without --yes the command fails with confirmation-required.
 2. The owner's approval, which depends on the Ark's state. An unpaired Ark
-   needs none. A paired, locked Ark wants a press of its button within 30 s,
+   needs none. A paired, locked Ark wants a press of its button within 30s,
    with the pin through the pinhole under its bottom right LED. An unlocked
    Ark asks the owner's phone, with 2 minutes to approve.
    --unlock unlocks a locked Ark first, so the phone approves the update
    instead of the button.
 3. The transfer. ark downloads the build from the package host and streams
    it to the Ark, which verifies it, installs it and reboots.
-4. The return. ark waits up to 120 s for the Ark to come back. It checks
+4. The return. ark waits up to 120s for the Ark to come back. It checks
    that the Ark holds the same identity key, and compares the running
    version with the one it installed.
 
@@ -68,7 +68,7 @@ In the result, installed turns true once the Ark accepts the build,
 returned once the Ark comes back with the same identity key, and verified
 once it runs the new version. The running field names the version it runs.
 A different version fails with update-unverified, and no return within
-120 s with timeout. --no-wait skips the return and exits once the
+120s with timeout. --no-wait skips the return and exits once the
 installation is acknowledged, with running null.
 
 An update can fail with proof-rejected when the cloud's keys have changed.

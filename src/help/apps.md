@@ -168,7 +168,7 @@ The map never carries a value from the owner's data.
 
 ## The sandbox
 
-- The manifest pass gets 32 MiB of memory, 250 ms and 64 KiB of output, and
+- The manifest pass gets 32 MiB of memory, 250ms and 64 KiB of output, and
   its stderr is discarded. It must exit 0.
 - The report pass gets 128 MiB of memory and 1 MiB per output stream, with
   no time limit. A stream that passes 1 MiB is cut there, and the run fails.

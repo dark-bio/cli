@@ -32,9 +32,9 @@ approve for them, so a command that needs approval waits until they act.
   command that started it and ends with it. Ctrl-C or SIGTERM asks the Ark
   to cancel the task or upload in flight, then exits 130 or 143. An upload
   the Ark is already processing keeps going.
-- --timeout, 60 s unless set, bounds each wait on a machine, such as a reply
+- --timeout, 60s unless set, bounds each wait on a machine, such as a reply
   from the Ark or the next chunk of a download. It never bounds an approval
-  or a whole command, and opening a connection has its own limit of 5 s. A
+  or a whole command, and opening a connection has its own limit of 5s. A
   cap on a whole command is yours to add.
 
 ## Approvals
@@ -46,14 +46,14 @@ These commands wait on the owner, for at most the window the Ark opens:
   Ark is locked.
 - `ark pair` waits up to 10 minutes for the owner to open its pairing link
   in Ark Companion. The Ark and the phone then show colors, and the owner
-  presses the Ark's button with its pin within 60 s when they match.
+  presses the Ark's button with its pin within 60s when they match.
 - `ark data upload` waits up to 1 minute for an approval on the phone, since
   it uploads the owner's own calls. References come through
   `ark data fetch`, which needs none.
 - `ark data delete` and `ark data repair` wait up to 2 minutes for an
   approval on the phone.
 - `ark firmware update` needs nothing while the Ark is unpaired. A paired,
-  locked Ark waits 30 s for a press of its button, and an unlocked one up to
+  locked Ark waits 30s for a press of its button, and an unlocked one up to
   2 minutes for the phone.
 - `ark app run` waits on the phone twice. First the owner approves the run
   within 5 minutes, seeing the app's name, version and what it reads. There
@@ -114,7 +114,7 @@ Nothing in ark waits for an Ark to appear. To wait for one, poll
 `ark status --json`, which fails with no-device until an Ark is attached.
 
 Never propose a reset or deleting the pairing in Ark Companion as a way past
-a locked Ark. Holding the Ark's button for 5 s arms a reset, which erases its
+a locked Ark. Holding the Ark's button for 5s arms a reset, which erases its
 data once the button is let go, and deleting the pairing discards the key
 that unlocks it. The button sits behind a pinhole under the bottom right
 LED, as `ark help devices` describes.
@@ -152,7 +152,7 @@ offers none for. The variant catalog alone takes an hour or more.
 ### Update firmware
 
 `ark firmware update --dry-run` shows the plan and who approves it.
-`ark firmware update --yes` installs it, then waits up to 120 s for the Ark
+`ark firmware update --yes` installs it, then waits up to 120s for the Ark
 to come back running it. `ark help firmware` covers the rest.
 
 ### Use an emulator

@@ -31,7 +31,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     context.require_unlocked(&connection, false)?;
 
     // The result starts unknown and fills in as the task goes. Running progress
-    // repeats at most every second on a terminal, and every 5 s elsewhere.
+    // repeats at most every second on a terminal, and every 5s elsewhere.
     let mut value = partial();
     let clock = connection.client.clock();
     let mut transfer = Transfer::new(context.output.terminal(), clock);
@@ -67,7 +67,7 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
                     if reported.is_none_or(|last| seconds >= last + report_interval) {
                         context
                             .output
-                            .event("progress", format!("running: {seconds} s elapsed"));
+                            .event("progress", format!("running: {seconds}s elapsed"));
                         reported = Some(seconds);
                     }
                 }
@@ -120,7 +120,7 @@ fn print(output: &Output, mut value: Value, outcome: ExecutionOutcome) -> Result
     output.event(
         "note",
         format!(
-            "{} {} finished in {} s",
+            "{} {} finished in {}s",
             result.name,
             result.version,
             outcome.duration.as_secs()
@@ -252,7 +252,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 events[0],
-                json!({"event":"note","message":"sample app 1.2.3 finished in 7 s"})
+                json!({"event":"note","message":"sample app 1.2.3 finished in 7s"})
             );
             assert_eq!(events.len(), if scenario == "failure" { 2 } else { 1 });
             if scenario == "failure" {

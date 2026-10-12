@@ -219,7 +219,7 @@ impl Peer {
     ///
     /// # Panics
     ///
-    /// Panics if the handshake failed, or did not finish within 15 s of real
+    /// Panics if the handshake failed, or did not finish within 15s of real
     /// time.
     #[expect(clippy::disallowed_methods, reason = "bounds a broken test only")]
     pub fn wait_connected(&self) {

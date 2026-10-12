@@ -115,13 +115,13 @@ const CONTRACTS: &[Contract] = &[
         paragraph: "Pairs an unpaired Ark with the owner's phone, once. ark prints a pairing \
             link, drawn as a QR code at a terminal and carried in an approve event elsewhere. \
             The owner opens it in Ark Companion within 10 minutes. The Ark and the phone then \
-            show colors, and the owner presses the Ark's button with its pin within 60 s when \
+            show colors, and the owner presses the Ark's button with its pin within 60s when \
             they match. The button sits behind a pinhole under the Ark's bottom right LED.",
         footer: Some(ContractFooter {
             requires: "an unpaired Ark and the cloud",
             approval: "the owner opens the link in Ark Companion, then presses the Ark's button \
-                within 60 s if its colors match the phone's",
-            time: "up to 10 minutes for the link and 60 s for the button, then the storage setup",
+                within 60s if its colors match the phone's",
+            time: "up to 10 minutes for the link and 60s for the button, then the storage setup",
             prints: "serial, paired; the pairing link on stderr",
             exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
             examples: "ark pair\nark pair --json",
@@ -340,15 +340,15 @@ const CONTRACTS: &[Contract] = &[
     Contract {
         path: "firmware update",
         paragraph: "Installs the newest candidate, or the build --version names, then waits up \
-            to 120 s for the Ark to come back running it. It needs confirmation, at a \
+            to 120s for the Ark to come back running it. It needs confirmation, at a \
             terminal or through --yes. The owner then approves nothing on an unpaired Ark, \
-            presses the Ark's button with its pin within 30 s on a locked one, and approves on \
+            presses the Ark's button with its pin within 30s on a locked one, and approves on \
             the phone within 2 minutes on an unlocked one.",
         footer: Some(ContractFooter {
             requires: "one Ark, the cloud and its package host",
-            approval: "none if unpaired; the Ark's button within 30 s if locked; your phone \
+            approval: "none if unpaired; the Ark's button within 30s if locked; your phone \
                 within 2 minutes if unlocked; --yes confirms the installation here",
-            time: "minutes, then up to 120 s for the Ark to return; --no-wait skips the return",
+            time: "minutes, then up to 120s for the Ark to return; --no-wait skips the return",
             prints: "from, to, size (JSON size_bytes), approval, installed, returned, verified, \
                 running",
             exit: "0 done; 1 local or unconfirmed; 2 usage; 3 device; 4 cloud; 5 Ark; \

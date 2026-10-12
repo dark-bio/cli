@@ -233,7 +233,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             context.output.human_event(
                 "progress",
                 format!(
-                    "returned after {} s; verified {}",
+                    "returned after {}s; verified {}",
                     clock.elapsed(started).as_secs(),
                     target.version
                 ),
@@ -257,7 +257,7 @@ fn verify_reboot(
     target: &str,
     value: &mut Value,
 ) -> Result<(), Error> {
-    // Poll the old session every 250 ms until it ends, within the reboot window
+    // Poll the old session every 250ms until it ends, within the reboot window
     let clock = connection.client.clock();
     let deadline = clock.now() + REBOOT_WAIT;
     loop {
@@ -274,7 +274,7 @@ fn verify_reboot(
         }
     }
 
-    // Rediscover the Ark every 500 ms while a handshake still fits in the
+    // Rediscover the Ark every 500ms while a handshake still fits in the
     // window
     connection.ark.close();
     let device = &connection.device;

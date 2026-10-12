@@ -40,7 +40,7 @@ permission error spells out.
 ## Identity and trust
 
 Every connection starts with a handshake that proves the Ark holds its
-identity key, within 5 s. ark trusts that key in one of three ways, which
+identity key, within 5s. ark trusts that key in one of three ways, which
 `ark status` reports as trust:
 
 - attested, by an attestation from Dark Bio's release, staging or develop
@@ -63,7 +63,7 @@ power loss.
 terminal ark also draws it as a QR code. Elsewhere the link arrives in an
 approve event, for the person to open on the phone that runs Ark Companion.
 The Ark and the phone then show colors, and the owner presses the Ark's
-button within 60 s when they match. The Ark then prepares its encrypted
+button within 60s when they match. The Ark then prepares its encrypted
 storage. A paired Ark refuses `ark pair` with already-paired.
 
 `ark unlock` asks the owner's phone and waits up to 2 minutes. The Ark then
@@ -75,7 +75,7 @@ run never unlocks.
 The Ark's button sits behind a small pinhole under its bottom right LED, to
 the right of the USB cable, and is pressed with the pin that came with the
 Ark. A short press confirms a pairing, or a firmware update on a locked Ark.
-Holding it for 5 s arms a reset, which erases the Ark's data and its pairing
+Holding it for 5s arms a reset, which erases the Ark's data and its pairing
 once the button is let go. An emulated Ark has its button in the Ark
 Emulator window. Deleting the pairing in Ark Companion discards the key that
 unlocks the Ark. Neither the reset nor deleting the pairing is a way past a
@@ -95,7 +95,7 @@ or `ark unlock`. With --json the document holds:
 - firmware, with version and published, the running build's publish time
 - trust, which is attested, self-signed or pinned
 - synced, whether the Ark synced with the cloud since it booted and its
-  clock is within 15 s of this computer's; it is not a registry check
+  clock is within 15s of this computer's; it is not a registry check
 - paired and unlocked
 - identity, the key's fingerprint, and pubkey, the whole key in hex, which
   only --json carries

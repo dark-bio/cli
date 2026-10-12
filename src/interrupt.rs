@@ -120,7 +120,7 @@ impl Interrupt {
     /// signal code.
     ///
     /// The state lock prevents commands from replacing the target during
-    /// cleanup. The work gets 5 s to confirm its cancellation, and a JSON
+    /// cleanup. The work gets 5s to confirm its cancellation, and a JSON
     /// invocation ends with the last partial result when there is one.
     fn cancel(&self, output: Output, code: i32) -> ! {
         // Hold the state until the process exits, so commands cannot swap the

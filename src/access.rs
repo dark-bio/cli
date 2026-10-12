@@ -69,7 +69,7 @@ impl darkbio_connect::CloudAuth for Login {
     /// Runs a browser login for an internal API host, only when the invocation
     /// allows prompts.
     ///
-    /// The login window is 600 s on the connection's clock, cut short by an
+    /// The login window is 600s on the connection's clock, cut short by an
     /// earlier caller deadline.
     fn login(&self, origin: &str, deadline: Option<Instant>) -> Result<HeaderMap, String> {
         if !matches!(
@@ -129,7 +129,7 @@ pub(crate) fn cached(context: &Context, clock: &Clock, origin: &str) -> Option<S
     .ok()
 }
 
-/// Runs a browser login for `origin` when prompts are permitted, within a 600 s
+/// Runs a browser login for `origin` when prompts are permitted, within a 600s
 /// window on the connection's clock.
 ///
 /// Any failure, a noninteractive invocation included, returns a

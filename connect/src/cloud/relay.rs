@@ -47,27 +47,27 @@ const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INFLIGHT: usize = 128;
 /// Largest message the socket assembles, the most one wire message carries.
 const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
-/// Hold of 10 s on each frame of the Ark, the time the Ark waits for its
+/// Hold of 10s on each frame of the Ark, the time the Ark waits for its
 /// answer before giving up on it.
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(10);
-/// Wait of 10 s for the Ark to answer a frame from the socket, which it does
+/// Wait of 10s for the Ark to answer a frame from the socket, which it does
 /// once it opened the frame. Ark Hub waits as long.
 const INBOUND_TIMEOUT: Duration = Duration::from_secs(10);
-/// Most time, 5 s, that written output may wait to flush into the socket.
+/// Most time, 5s, that written output may wait to flush into the socket.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Interval of 15 s from joining or a matching pong to the next liveness
+/// Interval of 15s from joining or a matching pong to the next liveness
 /// probe.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
-/// Wait of 10 s for the pong matching a probe.
+/// Wait of 10s for the pong matching a probe.
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
-/// First reconnect delay, 1 s, doubled after each failure as in Ark Hub.
+/// First reconnect delay, 1s, doubled after each failure as in Ark Hub.
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
-/// Longest reconnect delay, 30 s, the cap Ark Hub uses.
+/// Longest reconnect delay, 30s, the cap Ark Hub uses.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
-/// Time, 120 s, that reconnects keep trying after a failure, as in Ark Hub.
+/// Time, 120s, that reconnects keep trying after a failure, as in Ark Hub.
 const RETRY_WINDOW: Duration = Duration::from_secs(120);
 /// Cause of a frame whose hold ran out on a working socket or during a join.
-const UNSENT: &str = "relay could not send a frame within 10 s";
+const UNSENT: &str = "relay could not send a frame within 10s";
 /// Readiness token of the current socket.
 const SOCKET: Token = Token(0);
 /// Readiness token for new frames, passed deadlines, answers and closure.
@@ -842,7 +842,7 @@ fn pump(
                 }
                 Err(protocol::Error::Timeout) => {
                     return Err(Failure::Relay(
-                        "the Ark did not answer a relay frame within 10 s".into(),
+                        "the Ark did not answer a relay frame within 10s".into(),
                     ));
                 }
                 Err(error) => return Err(error.into()),
@@ -909,7 +909,7 @@ fn pump(
         let queued = !state.queue.is_empty();
         drop(state);
         if backlog.expired(shared.clock.now()) {
-            return Err(Failure::Relay("relay socket write stalled for 5 s".into()));
+            return Err(Failure::Relay("relay socket write stalled for 5s".into()));
         }
 
         // Read frames for the Ark while both limits leave room for a largest
@@ -1005,7 +1005,7 @@ struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// Schedules the first probe 15 s after joining.
+    /// Schedules the first probe 15s after joining.
     #[expect(
         clippy::disallowed_methods,
         reason = "socket heartbeat uses real time with mio readiness"
@@ -1063,7 +1063,7 @@ struct Backlog {
 }
 
 impl Backlog {
-    /// Starts the 5 s bound, keeping the deadline of a bound already running.
+    /// Starts the 5s bound, keeping the deadline of a bound already running.
     fn start(&mut self, now: Instant) {
         self.deadline.get_or_insert(now + WRITE_TIMEOUT);
     }
@@ -1989,7 +1989,7 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// An unanswered inbound frame closes the socket at its 10 s request deadline.
+    /// An unanswered inbound frame closes the socket at its 10s request deadline.
     #[test]
     fn test_inbound_timeout() {
         let mut tester = test_clock();
@@ -2012,7 +2012,7 @@ mod tests {
         server.join().unwrap();
         let shared = fixture.shared();
         retry(&shared);
-        assert!(shared.state.lock().unwrap().cause.contains("10 s"));
+        assert!(shared.state.lock().unwrap().cause.contains("10s"));
     }
 
     /// A dropped socket is replaced only after its jittered backoff and a forced sync.
@@ -2129,7 +2129,7 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// Consecutive failures stop retrying after 120 s until another Ark frame arrives.
+    /// Consecutive failures stop retrying after 120s until another Ark frame arrives.
     #[test]
     fn test_retry_window() {
         // Serve synchronization on demand until the test allows a successful join
@@ -2158,7 +2158,7 @@ mod tests {
         retry(&shared);
         let end = shared.state.lock().unwrap().failing.unwrap() + Duration::from_secs(120);
 
-        // Each failure doubles the delay to 30 s, with 20% jitter on each wait
+        // Each failure doubles the delay to 30s, with 20% jitter on each wait
         let mut base = Duration::from_secs(1);
         loop {
             let Some(next) = shared.state.lock().unwrap().retry else {
@@ -2379,7 +2379,7 @@ mod tests {
         shared.state.lock().unwrap().write_limit =
             Some(Arc::new(std::sync::atomic::AtomicUsize::new(1024)));
 
-        // Spend 6 s of both frame holds waiting for the join
+        // Spend 6s of both frame holds waiting for the join
         let held = fixture.outbound(vec![1]);
         queued(&shared, 2);
         tester.advance(Duration::from_secs(6));
@@ -2414,7 +2414,7 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// A 5 s write stall replaces the socket and preserves frames still in their hold.
+    /// A 5s write stall replaces the socket and preserves frames still in their hold.
     #[test]
     fn test_write_stall_reconnect() {
         // Leave the first message incomplete, then accept its replacement
@@ -2459,7 +2459,7 @@ mod tests {
         }
         wait_deadline(&tester, deadline);
 
-        // Queuing another frame after 3 s keeps the original stall deadline
+        // Queuing another frame after 3s keeps the original stall deadline
         tester.advance(Duration::from_secs(3));
         let held = fixture.outbound(vec![1]);
         queued(&shared, 2);
@@ -2477,7 +2477,7 @@ mod tests {
             assert!(!state.connected);
             assert!(state.write_deadline.is_none());
             assert_eq!(state.queue.len(), 2);
-            assert!(state.cause.contains("write stalled for 5 s"));
+            assert!(state.cause.contains("write stalled for 5s"));
         }
         closed.send(()).unwrap();
 
@@ -2560,7 +2560,7 @@ mod tests {
         assert_eq!(heartbeat.deadline(), deadline);
         heartbeat.pong(&first, clock.now());
 
-        // A later probe needs its own pong before its fixed 10 s deadline
+        // A later probe needs its own pong before its fixed 10s deadline
         tester.advance(Duration::from_secs(15));
         let second = heartbeat.ping(clock.now()).unwrap().unwrap();
         assert_ne!(first, second);

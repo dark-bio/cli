@@ -211,7 +211,7 @@ impl Transfer {
                     total as f64 / divisor
                 ),
                 speed,
-                human_eta(total.saturating_sub(uploaded), rate),
+                format!("eta {}", eta(total.saturating_sub(uploaded), rate)),
             ],
             detail_widths: Vec::new(),
         })
@@ -341,11 +341,11 @@ impl Processing {
             stage,
             stage_width,
             percent,
-            details: vec![human_eta(
-                10_000_u64.saturating_sub(status.phase_progress),
-                rate,
+            details: vec![format!(
+                "eta {}",
+                eta(10_000_u64.saturating_sub(status.phase_progress), rate)
             )],
-            detail_widths: vec!["eta estimating...".len(), "eta 0 s".len()],
+            detail_widths: vec!["eta estimating...".len(), "eta 0s".len()],
         }
     }
 }
@@ -385,7 +385,7 @@ impl Rate {
 /// Cadence at which progress observations are emitted.
 ///
 /// A terminal refreshes once a second as reports arrive, and shows completion
-/// at once. Line output waits for the next 10 % boundary or 5 s, which keeps
+/// at once. Line output waits for the next 10 % boundary or 5s, which keeps
 /// logs readable.
 struct Report {
     /// Whether the one-second terminal cadence applies instead of sparse log
@@ -461,18 +461,6 @@ fn eta(remaining: u64, rate: Option<f64>) -> String {
     }
 }
 
-/// Adds human spacing and an ETA label to the shared remaining-time estimate.
-fn human_eta(remaining: u64, rate: Option<f64>) -> String {
-    let eta = eta(remaining, rate);
-    if eta == "estimating..." {
-        return format!("eta {eta}");
-    }
-    format!(
-        "eta {}",
-        eta.replace('h', " h").replace('m', " m").replace('s', " s")
-    )
-}
-
 /// Tests of progress rendering, rate estimates and report cadence.
 #[cfg(test)]
 mod tests {
@@ -492,14 +480,14 @@ mod tests {
             details: vec![
                 "50.0/100.0 MiB".into(),
                 "10.0 MiB/s".into(),
-                "eta 5 s".into(),
+                "eta 5s".into(),
             ],
             detail_widths: Vec::new(),
         };
         let theme = Theme::test(120, Color::Basic, false);
         assert_eq!(
             update.render(&theme),
-            "progress: uploading \x1b[1m====================\x1b[0m--------------------  50 % - 50.0/100.0 MiB - 10.0 MiB/s - eta 5 s"
+            "progress: uploading \x1b[1m====================\x1b[0m--------------------  50 % - 50.0/100.0 MiB - 10.0 MiB/s - eta 5s"
         );
         for width in [32, 60, 80, 120] {
             let theme = Theme::test(width, Color::True, true);
@@ -512,7 +500,7 @@ mod tests {
             if width >= 60 {
                 assert!(rendered.contains('\u{2501}'));
                 assert!(rendered.contains("10.0 MiB/s"));
-                assert!(rendered.contains("eta 5 s"), "{width}: {rendered:?}");
+                assert!(rendered.contains("eta 5s"), "{width}: {rendered:?}");
             }
         }
     }
@@ -622,7 +610,7 @@ mod tests {
             assert!(console::measure_text_width(&rendered) < width);
             if width >= 100 {
                 assert!(rendered.contains("MiB/s"));
-                assert!(rendered.contains("eta 0 s"));
+                assert!(rendered.contains("eta 0s"));
             }
             if width >= 140 {
                 assert!(rendered.contains("290.0/290.0 MiB"));
@@ -671,13 +659,13 @@ mod tests {
         assert_eq!(next[0].stage, first[0].stage);
         assert_eq!(next[0].percent, 100);
         assert!(next[0].text.ends_with("100% | step ETA 0s"));
-        assert_eq!(next[0].details, ["eta 0 s"]);
+        assert_eq!(next[0].details, ["eta 0s"]);
         assert_eq!(next[1].percent, 92);
         let done: Vec<_> = processing.update(&status(2, 10_000)).collect();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].stage, next[1].stage);
         assert_eq!(done[0].percent, 100);
-        assert_eq!(done[0].details, ["eta 0 s"]);
+        assert_eq!(done[0].details, ["eta 0s"]);
     }
 
     /// A restarted step, a restarted run or a failure never completes the

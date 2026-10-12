@@ -76,7 +76,7 @@ pub struct Dataset {
 /// request and streaming the rest.
 ///
 /// After a failure it requests the session's cancellation within the remaining
-/// deadline, at most 1 s. Cancellation errors are ignored, so cleanup never
+/// deadline, at most 1s. Cancellation errors are ignored, so cleanup never
 /// replaces the original error, and it never retries an upload. Deadlines are
 /// measured on the clock of the requester's session.
 pub(crate) fn upload(
@@ -226,7 +226,7 @@ pub(crate) fn upload(
     })();
 
     // Request a failed session's cancellation within the remaining deadline, at
-    // most 1 s, ignoring the outcome
+    // most 1s, ignoring the outcome
     if result.is_err() {
         let cleanup = timing.io(clock).min(clock.now() + Duration::from_secs(1));
         let _ = requester
