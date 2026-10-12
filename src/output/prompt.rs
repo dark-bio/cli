@@ -135,9 +135,13 @@ pub(super) fn confirm(
     show()?;
     let ready = clock.now() + TYPEAHEAD_WINDOW;
 
-    // Drain every early key before accepting an answer
+    // Drain every early key before accepting an answer, while Ctrl-C always
+    // interrupts
     let answer = loop {
         let key = input.read()?;
+        if key == Key::CtrlC {
+            return Err(Error::new(130, "interrupted", "command interrupted"));
+        }
         if clock.now() < ready {
             continue;
         }
@@ -145,7 +149,6 @@ pub(super) fn confirm(
             Key::Char('y' | 'Y') => break true,
             Key::Char('n' | 'N') => break false,
             Key::Enter => break default,
-            Key::CtrlC => return Err(Error::new(130, "interrupted", "command interrupted")),
             _ => {}
         }
     };
@@ -252,7 +255,7 @@ mod tests {
                     (1, Key::Char('y')),
                     (25, Key::Char('n')),
                     (50, Key::Enter),
-                    (75, Key::CtrlC),
+                    (75, Key::ArrowLeft),
                     (99, Key::Char('Y')),
                     (100, Key::Char('n')),
                 ],
@@ -302,23 +305,26 @@ mod tests {
         }
     }
 
-    /// Keeps Ctrl-C as an interruption once the type-ahead window has passed.
+    /// Checks that Ctrl-C interrupts the question inside the type-ahead window
+    /// and after it.
     #[test]
     fn test_confirmation_interruption() {
-        let tester = RefCell::new(TestClock::new());
-        let clock = tester.borrow().clock();
-        let mut input = Input {
-            tester: &tester,
-            typed: vec![(clock.now() + Duration::from_millis(250), Key::CtrlC)].into(),
-        };
-        let error = confirm(
-            &mut input,
-            &clock,
-            false,
-            || Ok(()),
-            |_| panic!("interruption has no answer"),
-        )
-        .unwrap_err();
-        assert_eq!(error.class, 130);
+        for arrival in [25, 250] {
+            let tester = RefCell::new(TestClock::new());
+            let clock = tester.borrow().clock();
+            let mut input = Input {
+                tester: &tester,
+                typed: vec![(clock.now() + Duration::from_millis(arrival), Key::CtrlC)].into(),
+            };
+            let error = confirm(
+                &mut input,
+                &clock,
+                false,
+                || Ok(()),
+                |_| panic!("interruption has no answer"),
+            )
+            .unwrap_err();
+            assert_eq!(error.class, 130, "{arrival}ms");
+        }
     }
 }

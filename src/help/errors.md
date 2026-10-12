@@ -122,10 +122,10 @@ command again, since another run asks the owner again.
 ## Exit 7
 
 Exit 7 is `timeout`, for a wait on a machine that ran past --timeout or past
-a fixed limit. Fixed limits include the 5s handshake that opens a connection,
-the 30s a reference download may go without an acknowledgment, and the 120s
-an Ark gets to return from a firmware update. Another run may succeed. Check
-the connection and `ark status` first, and raise --timeout for a slow
+a fixed limit. Such limits are the 5s handshake that opens a connection and
+the 120s an Ark gets to return from a firmware update. A reference download
+also fails after 30s without an acknowledgment. Another run may succeed.
+Check the connection and `ark status` first, and raise --timeout for a slow
 machine.
 
 ## Exit 8
