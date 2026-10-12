@@ -152,9 +152,11 @@ pub(crate) enum Command {
     /// Read and change the datasets on the Ark
     #[command(subcommand)]
     Data(Data),
-    /// Run an app on the Ark
-    #[command(subcommand)]
-    App(App),
+    /// Run an app, approved on your phone; print its report
+    Run {
+        /// WebAssembly app to run
+        file: PathBuf,
+    },
     /// List and install Ark firmware
     #[command(subcommand)]
     Firmware(Firmware),
@@ -254,25 +256,16 @@ pub(crate) struct Change {
     pub dry_run: bool,
 }
 
-// App execution on the Ark
-#[derive(Subcommand)]
-pub(crate) enum App {
-    /// Run an app, approved on your phone; print its report
-    Run {
-        /// WebAssembly app to run
-        file: PathBuf,
-    },
-}
-
 // Published firmware selection and installation, including read-only planning
 #[derive(Subcommand)]
 pub(crate) enum Firmware {
     /// Show the installed build and the candidates
     List,
-    /// Install firmware and reboot the Ark
+    /// Install firmware and restart the Ark
     Update {
-        /// Install this published build instead
-        #[arg(long, value_name = "VERSION")]
+        /// Version to install, as `ark firmware list` prints it; the newest
+        /// candidate when omitted
+        #[arg(value_name = "VERSION")]
         version: Option<String>,
         /// Show the plan without installing
         #[arg(long, conflicts_with = "unlock")]
@@ -458,6 +451,25 @@ mod tests {
                 panic!("expected firmware update");
             };
             assert_eq!(yes, flag.is_some(), "{flag:?}");
+        }
+    }
+
+    /// `ark run` takes the app file, with the shared options before or after
+    /// it.
+    #[test]
+    fn test_run_accepts_the_app_file_and_shared_options() {
+        for args in [
+            vec!["ark", "--json", "--unlock", "run", "sample app.wasm"],
+            vec!["ark", "run", "sample app.wasm", "--json", "--unlock"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            cli.validate().unwrap();
+            assert!(cli.options.json, "{args:?}");
+            assert!(cli.options.unlock, "{args:?}");
+            let Some(Command::Run { file }) = cli.command else {
+                panic!("expected run");
+            };
+            assert_eq!(file, PathBuf::from("sample app.wasm"), "{args:?}");
         }
     }
 

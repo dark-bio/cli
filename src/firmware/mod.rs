@@ -392,7 +392,8 @@ fn approval(info: &schema::DeviceInfoResponse) -> Option<Approval> {
     })
 }
 
-/// Finds an exact requested build or the first candidate in a newest-first listing.
+/// Selects the published build `requested` names, or the newest candidate
+/// without one.
 ///
 /// Explicit selection permits reinstallation or downgrade requests; the Ark decides.
 fn select<'a>(
@@ -402,7 +403,8 @@ fn select<'a>(
 ) -> Result<Option<&'a Package>, Error> {
     // A requested build must be a valid version the listing publishes
     if let Some(version) = requested {
-        package::Version::parse(version)?;
+        package::Version::parse(version)
+            .map_err(|error| error.hint("pick a version from `ark firmware list`"))?;
         return firmwares
             .iter()
             .find(|firmware| firmware.version == version)
@@ -413,6 +415,7 @@ fn select<'a>(
                     "invalid-version",
                     format!("firmware {version} is not published for this environment"),
                 )
+                .hint("pick a version from `ark firmware list`")
             });
     }
 
@@ -644,8 +647,8 @@ impl std::io::Read for Download<'_> {
     }
 }
 
-/// Tests of the firmware list, the compatibility gate, the approval guess and
-/// the update's narration.
+/// Tests of firmware selection and listing, the compatibility gate, the
+/// approval guess and the update's narration.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +767,83 @@ mod tests {
             sha256: [42; 32],
         })
         .collect()
+    }
+
+    /// A version names the build to install, and without one the newest
+    /// candidate installs, or none when the Ark already runs it.
+    #[test]
+    fn test_firmware_version_argument_selects_a_build() {
+        let firmwares = releases();
+        for (version, installed, expected) in [
+            (None, "2.8.0-aaaaaaa", Some("2.10.0-ccccccc")),
+            (None, "2.10.0-ccccccc", None),
+            (
+                Some("2.9.0-bbbbbbb"),
+                "2.8.0-aaaaaaa",
+                Some("2.9.0-bbbbbbb"),
+            ),
+            (
+                Some("2.8.0-aaaaaaa"),
+                "2.8.0-aaaaaaa",
+                Some("2.8.0-aaaaaaa"),
+            ),
+            (
+                Some("2.8.0-aaaaaaa"),
+                "2.10.0-ccccccc",
+                Some("2.8.0-aaaaaaa"),
+            ),
+        ] {
+            // Parse the command line, then select from the listing
+            let cli = args::Cli::try_parse_from(
+                ["ark", "firmware", "update", "--dry-run"]
+                    .into_iter()
+                    .chain(version),
+            )
+            .unwrap();
+            cli.validate().unwrap();
+            let Some(args::Command::Firmware(args::Firmware::Update { version, .. })) = cli.command
+            else {
+                panic!("expected firmware update");
+            };
+            let selected = select(&firmwares, version.as_deref(), installed).unwrap();
+            assert_eq!(
+                selected.map(|package| package.version.as_str()),
+                expected,
+                "{version:?}, {installed}"
+            );
+        }
+    }
+
+    /// An unpublished or malformed version fails with `invalid-version`,
+    /// pointing at the list.
+    #[test]
+    fn test_firmware_version_argument_rejects_unknown_builds() {
+        let firmwares = releases();
+        for (version, message) in [
+            (
+                "2.9.0-0000000",
+                "firmware 2.9.0-0000000 is not published for this environment",
+            ),
+            ("2.9.0", "invalid firmware version \"2.9.0\""),
+        ] {
+            let cli = args::Cli::try_parse_from(["ark", "firmware", "update", version]).unwrap();
+            let Some(args::Command::Firmware(args::Firmware::Update { version, .. })) = cli.command
+            else {
+                panic!("expected firmware update");
+            };
+            let error = select(&firmwares, version.as_deref(), "2.8.0-aaaaaaa").unwrap_err();
+            assert_eq!(
+                (error.class, error.code),
+                (1, "invalid-version"),
+                "{version:?}"
+            );
+            assert_eq!(error.message, message, "{version:?}");
+            assert_eq!(
+                error.hints,
+                ["pick a version from `ark firmware list`"],
+                "{version:?}"
+            );
+        }
     }
 
     /// The list keeps JSON whole, and prints compact rows with the headlines

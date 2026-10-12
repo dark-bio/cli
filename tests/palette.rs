@@ -428,7 +428,7 @@ fn test_root_help_groups_commands_and_lists_shared_exits() {
         groups,
         [
             vec!["devices", "status", "enroll", "genuine", "pair", "unlock"],
-            vec!["data", "app"],
+            vec!["data", "run"],
             vec!["firmware", "doctor", "completions", "help"],
         ]
     );
@@ -496,6 +496,31 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             vec!["statsu"],
             "unknown command 'statsu'",
             vec!["a similar command exists: `ark status`"],
+        ),
+        (
+            vec!["app"],
+            "unknown command 'app'",
+            vec!["see `ark --help`"],
+        ),
+        (
+            vec!["app", "run", "app.wasm"],
+            "unknown command 'app'",
+            vec!["see `ark --help`"],
+        ),
+        (
+            vec!["run", "app.wasm", "--dry-run"],
+            "unknown option '--dry-run'",
+            vec!["see `ark run --help`"],
+        ),
+        (
+            vec!["firmware", "update", "--version", "2.9.0-bbbbbbb"],
+            "unknown option '--version'",
+            vec!["a similar option exists: `--verbose`"],
+        ),
+        (
+            vec!["firmware", "update", "-V"],
+            "unknown option '-V'",
+            vec!["see `ark firmware update --help`"],
         ),
         (
             vec!["data", "uplod"],
@@ -645,7 +670,7 @@ fn test_missing_arguments_use_words_and_command_help() {
             "missing the file to upload",
             "ark data upload",
         ),
-        (vec!["app", "run"], "missing the app to run", "ark app run"),
+        (vec!["run"], "missing the app to run", "ark run"),
         (
             vec!["data", "show"],
             "missing the slot name or id",
@@ -1115,7 +1140,14 @@ fn help_matches_the_supported_palette() {
     // The manual advertises no unsupported command, and both help flags show
     // the recovery options
     let manual = String::from_utf8(ark(&["help", "--all"]).stdout).unwrap();
-    for absent in ["ark app check", "ark lock"] {
+    for absent in [
+        "ark app check",
+        "ark run --dry-run",
+        "ark run FILE --dry-run",
+        "ark run app.wasm --dry-run",
+        "ark cancel",
+        "ark lock",
+    ] {
         assert!(!manual.contains(absent), "{absent} advertised prematurely");
     }
     assert!(
@@ -1128,6 +1160,62 @@ fn help_matches_the_supported_palette() {
             .unwrap()
             .contains("--pubkey")
     );
+}
+
+/// Checks that `ark run` keeps the app's contract and examples, and that
+/// `ark firmware update` takes its version as an argument, never as a flag.
+#[test]
+fn test_renamed_commands_keep_their_help_contracts() {
+    let run = String::from_utf8(ark(&["run", "--help"]).stdout).unwrap();
+    assert!(run.starts_with("Run an app, approved on your phone; print its report\n"));
+    assert!(run.contains("Usage: ark run <FILE>"));
+    assert!(!run.contains("--dry-run"));
+    assert!(!run.contains("Commands:"));
+    let contract = run.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(contract.contains(
+        "JSON task, app (name, version, develop), success, paths, media, stdout or stdout_base64, stderr or stderr_base64, duration_seconds"
+    ));
+    assert!(run.contains("  ark run app.wasm > report.md\n  ark run app.wasm --json"));
+
+    // Check the argument and option rows, leaving the paragraph's words free
+    let update = String::from_utf8(ark(&["firmware", "update", "--help"]).stdout).unwrap();
+    assert!(update.contains("Usage: ark firmware update [OPTIONS] [VERSION]"));
+    let arguments = update.split_once("Arguments:\n").unwrap().1;
+    assert!(arguments.contains("[VERSION]"));
+    assert!(!arguments.contains("--version"));
+    assert!(!arguments.contains("-V"));
+    assert!(update.contains("ark firmware update 0.12.0-74d557e --yes --json"));
+}
+
+/// Checks that `ark run` opens the app before looking for an Ark.
+#[test]
+fn test_run_dispatches_to_app_execution() {
+    // A missing app fails locally, even with a selector that matches no Ark
+    let path = format!("ark-missing-app-{}.wasm", std::process::id());
+    assert!(!std::path::Path::new(&path).exists());
+    for json in [false, true] {
+        let mut args = vec!["run", &path, "--device", "hardware:palette-no-device"];
+        if json {
+            args.push("--json");
+        }
+        let output = ark(&args);
+        assert_eq!(output.status.code(), Some(1), "json={json}");
+        if json {
+            let document = json_output(&output);
+            assert_eq!(document["error"]["code"], "file-not-found");
+            assert!(
+                document["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&path)
+            );
+        } else {
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.starts_with("error[file-not-found]: "));
+            assert!(stderr.contains(&path));
+        }
+    }
 }
 
 /// Checks that the manual names the example apps and the emulator, and the
@@ -1286,7 +1374,7 @@ fn test_command_paragraphs_name_unexpected_failures() {
         ("enroll", "enrollment-required"),
         ("status", "firmware-outdated"),
         ("genuine", "registry-inactive"),
-        ("app run", "app-failed"),
+        ("run", "app-failed"),
         ("doctor", "first failed check sets the exit code"),
     ] {
         let mut args: Vec<_> = path.split_whitespace().collect();

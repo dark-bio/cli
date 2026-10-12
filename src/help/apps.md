@@ -11,7 +11,7 @@ https://github.com/dark-bio/examples.
 
 ## Running an app
 
-`ark app run FILE` uploads the app, then follows its task to the end:
+`ark run FILE` uploads the app, then follows its task to the end:
 
 1. The Ark checks the module, runs the manifest pass, and checks the
    manifest and every grant. It refuses the app at the first check that
@@ -31,7 +31,7 @@ its report. Ending that connection, by stopping ark or losing the Ark,
 cancels a task still running and drops its report.
 
 Without --json the report goes to stdout exactly as the app printed it, so
-`ark app run app.wasm > report.md` keeps it. With --json the document holds:
+`ark run app.wasm > report.md` keeps it. With --json the document holds:
 
 - task, the task id
 - app, with name, version and develop from the manifest

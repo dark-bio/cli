@@ -112,7 +112,7 @@ pub(crate) fn from_clap(
 fn missing_argument(path: &str, argument: &str) -> String {
     match (path, argument) {
         ("ark data upload", "<FILE>") => "missing the file to upload".into(),
-        ("ark app run", "<FILE>") => "missing the app to run".into(),
+        ("ark run", "<FILE>") => "missing the app to run".into(),
         (_, "<SLOT>") => "missing the slot name or id".into(),
         ("ark completions", "<SHELL>") => "missing the shell for completions".into(),
         _ => format!("missing {argument}"),

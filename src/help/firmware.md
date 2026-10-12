@@ -44,9 +44,10 @@ Its summary is the whole release note.
 
 ## Updating
 
-`ark firmware update` installs the newest candidate. With --version it
-installs that exact published build instead, which may reinstall the running
-build or go back to an older one, if the Ark accepts it. With nothing newer
+`ark firmware update` installs the newest candidate. Given a version, as
+`ark firmware list` prints it, it installs that published build instead,
+which may reinstall the running build or go back to an older one, if the Ark
+accepts it. With nothing newer
 published, it notes so and exits 0. --dry-run prints the plan and changes
 nothing. The plan holds from, to, size_bytes and approval, which is none,
 button or phone, or null on firmware too old to report the Ark's state.

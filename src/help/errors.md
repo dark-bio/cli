@@ -17,8 +17,8 @@ run helps once the input is fixed or the confirmation given.
 - `invalid-slot` means the Ark identified another slot than --slot names, or
   has no such slot. `ark data list` shows the slots.
 - `invalid-key` means --pubkey is not a valid public key.
-- `invalid-version` means the --version build is not published for this
-  environment. `ark firmware list` shows what is.
+- `invalid-version` means the build given to `ark firmware update` is not
+  published for this environment. `ark firmware list` shows what is.
 - `confirmation-required` means installing firmware needs confirmation. Add
   --yes to `ark firmware update`.
 - `enrollment-required` means the Ark is enrolled in a browser at Ark Hub,

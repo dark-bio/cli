@@ -273,14 +273,7 @@ const CONTRACTS: &[Contract] = &[
         }),
     },
     Contract {
-        path: "app",
-        paragraph: "An app is a WebAssembly module the Ark runs against the owner's data, once \
-            the owner approves on their phone. `ark help apps` covers writing one and how a \
-            run goes.",
-        footer: None,
-    },
-    Contract {
-        path: "app run",
+        path: "run",
         paragraph: "Uploads the app and follows its task. The Ark checks it, then the owner \
             approves the run on their phone within 5 minutes, switching on optional grants \
             and answering the app's questions. Once the app ends, the owner reviews its \
@@ -297,7 +290,7 @@ const CONTRACTS: &[Contract] = &[
             json: "task, app (name, version, \
                 develop), success, paths, media, stdout or stdout_base64, stderr or \
                 stderr_base64, duration_seconds",
-            examples: "ark app run app.wasm > report.md\nark app run app.wasm --json",
+            examples: "ark run app.wasm > report.md\nark run app.wasm --json",
         }),
     },
     Contract {
@@ -323,8 +316,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "firmware update",
-        paragraph: "Installs the newest candidate, or the build --version names, then waits up \
-            to 120s for the Ark to come back running it. It needs confirmation, at a \
+        paragraph: "Installs the newest candidate, or the version given, then waits up to 120s \
+            for the Ark to come back running it. It needs confirmation, at a \
             terminal or through --yes. The owner then approves nothing on an unpaired Ark, \
             presses the Ark's button with its pin within 30s on a locked one, and approves on \
             the phone within 2 minutes on an unlocked one.",
@@ -335,7 +328,7 @@ const CONTRACTS: &[Contract] = &[
             time: "minutes, then up to 120s for the Ark to return; --no-wait skips the return",
             json: "from, to, size_bytes, approval, installed, returned, verified, \
                 running",
-            examples: "ark firmware update --dry-run\nark firmware update --yes --json",
+            examples: "ark firmware update --dry-run\nark firmware update 0.12.0-74d557e --yes --json",
         }),
     },
     Contract {
@@ -1086,7 +1079,7 @@ mod tests {
         let mut root = command(&theme);
 
         // Group pages point to their children without a contract of their own
-        for name in ["data", "app", "firmware"] {
+        for name in ["data", "firmware"] {
             let group = root.find_subcommand_mut(name).unwrap();
             let long = group.render_long_help().to_string();
             assert!(long.contains("Each subcommand has its own requirements"));

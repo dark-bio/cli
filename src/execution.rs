@@ -4,10 +4,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! The app command, which runs an app on the Ark and reports its result.
+//! The run command, which runs an app on the Ark and reports its result.
 
 use crate::{
-    args,
     context::{Context, open_file},
     error::Error,
     interrupt::Target,
@@ -17,16 +16,16 @@ use crate::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use darkbio_connect::{ExecutionOutcome, ExecutionProgress};
 use serde_json::{Value, json};
+use std::path::Path;
 
-/// Uploads and runs a local app after unlock.
+/// Uploads and runs the app at `path` after unlock.
 ///
 /// The connection library owns protocol sequencing, and the CLI owns progress,
 /// partial results and byte-preserving report output. An app failure retains
 /// its returned result.
-pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
+pub(crate) fn run(context: &Context, path: &Path) -> Result<(), Error> {
     // Open the app before connecting, then require an unlocked Ark
-    let args::App::Run { file: path } = command;
-    let (mut file, size) = open_file(&path)?;
+    let (mut file, size) = open_file(path)?;
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
@@ -213,6 +212,7 @@ fn bytes(value: &mut Value, name: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args;
     use clap::Parser;
     use darkbio_connect::schema;
     use std::io::Write;

@@ -180,7 +180,7 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         Some(Command::Unlock) => device::unlock(context),
         Some(Command::Enroll(args)) => device::enroll(context, args),
         Some(Command::Data(command)) => data::run(context, command),
-        Some(Command::App(command)) => execution::run(context, command),
+        Some(Command::Run { file }) => execution::run(context, &file),
         Some(Command::Firmware(command)) => firmware::run(context, command),
         Some(Command::Pair) => pairing::run(context),
         Some(Command::Doctor) => doctor::run(context),

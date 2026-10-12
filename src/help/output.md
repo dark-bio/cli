@@ -68,7 +68,7 @@ never carry credentials or authorization headers.
 
 ## App output
 
-Without --json, `ark app run` writes the released report to stdout exactly
+Without --json, `ark run` writes the released report to stdout exactly
 as the app printed it. The app's stderr, which only a develop build
 releases, follows on stderr after a note giving its size. With --json both
 streams are fields of the document, stdout and stderr when they are UTF-8,

@@ -23,7 +23,7 @@ approve for them, so a command that needs approval waits until they act.
   where it has one. Otherwise keep the streams and the exit code in files:
 
       rm -f exit.txt
-      (ark --json app run app.wasm > result.json 2> events.log
+      (ark --json run app.wasm > result.json 2> events.log
        echo $? > exit.txt) &
 
   Read events.log every few seconds. The command has ended once exit.txt
@@ -55,7 +55,7 @@ These commands wait on the owner, for at most the window the Ark opens:
 - `ark firmware update` needs nothing while the Ark is unpaired. A paired,
   locked Ark waits 30s for a press of its button, and an unlocked one up to
   2 minutes for the phone.
-- `ark app run` waits on the phone twice. First the owner approves the run
+- `ark run` waits on the phone twice. First the owner approves the run
   within 5 minutes, seeing the app's name, version and what it reads. There
   they switch on any optional grants and answer the app's questions. Once
   the app ends, they review its report within 10 minutes, then release it to
@@ -127,7 +127,7 @@ LED, as `ark help devices` describes.
 Check `ark status` first. Let the person know that the run asks them twice
 on the phone, then run this in the background, the way Running shows:
 
-    ark --json app run app.wasm > result.json 2> events.log
+    ark --json run app.wasm > result.json 2> events.log
 
 The report is the document's stdout field. Without --json, ark writes the
 report itself to stdout, so `> report.md` keeps it as the app printed it.
