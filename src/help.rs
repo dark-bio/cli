@@ -67,8 +67,9 @@ const CONTRACTS: &[Contract] = &[
     Contract {
         path: "devices",
         paragraph: "Discovery connects to none of them, so the names and serials are what it \
-            reports, and only a connection verifies them. With several Arks attached, the \
-            hint names a selector for each to pass to --device.",
+            reports, unverified. `ark status` shows the serial an Ark proves when it \
+            connects. With several Arks attached, the hint names a selector for each to \
+            pass to --device.",
         footer: Some(ContractFooter {
             requires: "nothing",
             approval: "none",
@@ -129,7 +130,7 @@ const CONTRACTS: &[Contract] = &[
         footer: Some(ContractFooter {
             requires: "a paired Ark and the cloud",
             approval: "on your phone, unless the Ark is unlocked already",
-            time: "up to 2 minutes for the approval; the Ark stays unlocked until it loses power",
+            time: "up to 2 minutes for the approval",
             json: "unlocked, changed",
             examples: "ark unlock\nark unlock --json",
         }),
@@ -191,9 +192,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data show",
-        paragraph: "Beside the slot's state and dependencies, it shows the Ark's description of \
-            the data and of the file that fills it, the slots that require it, the \
-            download it offers and whether this computer's cache holds that download.",
+        paragraph: "It shows the slot's state and dependencies beside the Ark's description of the \
+            data and of the file that fills it. It also lists the slots that require it, \
+            the download it offers and whether this computer's cache holds that download.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark, and the cloud unless status reports synced \
                 (--unlock only if status reports locked)",
@@ -224,9 +225,9 @@ const CONTRACTS: &[Contract] = &[
     Contract {
         path: "data fetch",
         paragraph: "ark streams the file the Ark offers for a slot that is not filled, checking it \
-            against the offered SHA-256 on the way, and keeps a copy in this computer's \
-            cache. --all fetches every reference slot that is not filled and offers a \
-            file, in the order their requirements set, and skips the rest.",
+            against the offered SHA-256 on the way. A copy stays in this computer's cache. \
+            --all fetches every reference slot that is not filled and offers a file, in \
+            the order their requirements set, and skips the rest.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark offering a download, the download host, and the \
                 cloud unless status reports synced (--unlock only if status reports locked)",

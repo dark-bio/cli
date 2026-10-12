@@ -145,10 +145,11 @@ runtime of its own, so an app runs on an Ark, hardware or emulated.
 
 `ark data list` shows each slot and its state, and `ark data show SLOT` what
 it requires. The owner's variant calls come first, through
-`ark data upload FILE` and an approval on the phone. `ark data fetch --all` then downloads the public references the Ark
-offers for the calls' assembly, without an approval, and skips any it
-offers none for. The variant catalog alone takes an hour or more.
-`ark help datasets` covers both.
+`ark data upload FILE` and an approval on the phone. `ark data fetch --all`
+then downloads the public references the Ark offers for the calls'
+assembly, without an approval, and skips any it offers none for. The
+variant catalog alone takes an hour or more. `ark help datasets` covers
+both.
 
 ### Update firmware
 

@@ -10,7 +10,13 @@
 
 use crate::error::Error;
 use console::{Key, Term};
+use darkbio_clock::Clock;
 use std::io;
+use std::time::Duration;
+
+/// Time after the question is flushed when keys count as type-ahead, since
+/// a person cannot read and answer a question within 100ms.
+const TYPEAHEAD_WINDOW: Duration = Duration::from_millis(100);
 
 /// Source of the keys that answer a prompt.
 pub(super) trait Keys {
@@ -60,8 +66,8 @@ impl Keys for Input {
                 return Err(io::Error::last_os_error());
             }
         }
-        // On Unix the early keys stay queued, since neither console nor any
-        // other direct dependency can flush terminal input
+        // On Unix the early keys stay queued for the timed filter below,
+        // since no direct dependency can flush terminal input
         Ok(())
     }
 
@@ -111,22 +117,31 @@ fn redirected_key() -> io::Result<Key> {
     }
 }
 
-/// Shows the question once type-ahead is dropped, and returns the answer of
-/// the first key that gives one.
+/// Shows the question and returns the first answer after the type-ahead window.
 ///
-/// `y` and `n` answer, Enter takes `default`, and other keys are ignored.
-/// Ctrl-C returns the interruption error, which the caller routes through
-/// cleanup.
+/// `show` flushes the question before it returns, and the window starts then,
+/// on `clock`. Keys read within the window are discarded. After it, `y` and
+/// `n` answer, Enter takes `default`, and other keys are ignored. Ctrl-C
+/// returns the interruption error for the caller's cleanup.
 pub(super) fn confirm(
     input: &mut impl Keys,
+    clock: &Clock,
     default: bool,
     show: impl FnOnce() -> Result<(), Error>,
     echo: impl FnOnce(bool) -> Result<(), Error>,
 ) -> Result<bool, Error> {
+    // Flush what the platform can, then time type-ahead from the shown question
     input.discard()?;
     show()?;
+    let ready = clock.now() + TYPEAHEAD_WINDOW;
+
+    // Drain every early key before accepting an answer
     let answer = loop {
-        match input.read()? {
+        let key = input.read()?;
+        if clock.now() < ready {
+            continue;
+        }
+        match key {
             Key::Char('y' | 'Y') => break true,
             Key::Char('n' | 'N') => break false,
             Key::Enter => break default,
@@ -134,6 +149,8 @@ pub(super) fn confirm(
             _ => {}
         }
     };
+
+    // Leave the accepted answer on the prompt's line
     echo(answer)?;
     Ok(answer)
 }
@@ -142,51 +159,61 @@ pub(super) fn confirm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkbio_clock::TestClock;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::time::Instant;
 
-    /// Checks that one key answers, other keys are ignored and type-ahead
-    /// never answers.
+    /// Keys with arrival times on a clock the test controls.
+    struct Input<'a> {
+        /// Clock advanced when a key arrives or the question is shown.
+        tester: &'a RefCell<TestClock>,
+        /// Keys in arrival order, including type-ahead.
+        typed: VecDeque<(Instant, Key)>,
+    }
+
+    impl Keys for Input<'_> {
+        fn discard(&mut self) -> io::Result<()> {
+            // Leave type-ahead queued, as on a terminal without a buffer flush
+            Ok(())
+        }
+
+        fn read(&mut self) -> io::Result<Key> {
+            let (arrived, key) = self.typed.pop_front().expect("test provides an answer");
+            self.tester.borrow_mut().advance_to(arrived);
+            Ok(key)
+        }
+    }
+
+    /// Checks that one key answers and other keys are ignored after the window.
     #[test]
     fn test_confirmation_keys() {
-        /// Keys typed before the question and after it.
-        struct Input {
-            /// Keys typed before the question, which must never answer it.
-            queued: VecDeque<Key>,
-            /// Keys typed once the question shows.
-            typed: VecDeque<Key>,
-        }
-        impl Keys for Input {
-            fn discard(&mut self) -> io::Result<()> {
-                self.queued.clear();
-                Ok(())
-            }
-            fn read(&mut self) -> io::Result<Key> {
-                Ok(self
-                    .queued
-                    .pop_front()
-                    .or_else(|| self.typed.pop_front())
-                    .expect("test provides an answer"))
-            }
-        }
-        for (keys, default, expected) in [
-            (vec![Key::Char('y')], false, true),
-            (vec![Key::Char('n')], true, false),
-            (vec![Key::Enter], true, true),
-            (vec![Key::Enter], false, false),
+        for (case, keys, default, expected) in [
+            ("yes", vec![Key::Char('y')], false, true),
+            ("uppercase yes", vec![Key::Char('Y')], false, true),
+            ("no", vec![Key::Char('n')], true, false),
+            ("uppercase no", vec![Key::Char('N')], true, false),
+            ("default yes", vec![Key::Enter], true, true),
+            ("default no", vec![Key::Enter], false, false),
             (
+                "ignored keys",
                 vec![Key::ArrowLeft, Key::Char('x'), Key::Char('y')],
                 false,
                 true,
             ),
         ] {
+            let tester = RefCell::new(TestClock::new());
+            let clock = tester.borrow().clock();
+            let arrived = clock.now() + Duration::from_millis(250);
             let mut input = Input {
-                queued: vec![Key::Char('n'), Key::Enter].into(),
-                typed: keys.into(),
+                tester: &tester,
+                typed: keys.into_iter().map(|key| (arrived, key)).collect(),
             };
             let mut echoed = None;
             assert_eq!(
                 confirm(
                     &mut input,
+                    &clock,
                     default,
                     || Ok(()),
                     |answer| {
@@ -195,16 +222,98 @@ mod tests {
                     }
                 )
                 .unwrap(),
-                expected
+                expected,
+                "{case}"
             );
-            assert_eq!(echoed, Some(expected));
+            assert_eq!(echoed, Some(expected), "{case}");
         }
+    }
+
+    /// Drops every early key and starts the window only once the question shows.
+    #[test]
+    fn test_confirmation_discards_typeahead() {
+        for (case, show_delay, keys, expected) in [
+            (
+                "queued burst",
+                0,
+                vec![
+                    (0, Key::Char('y')),
+                    (0, Key::Char('n')),
+                    (0, Key::Enter),
+                    (0, Key::Char('y')),
+                    (250, Key::Char('y')),
+                ],
+                true,
+            ),
+            (
+                "window boundary",
+                0,
+                vec![
+                    (1, Key::Char('y')),
+                    (25, Key::Char('n')),
+                    (50, Key::Enter),
+                    (75, Key::CtrlC),
+                    (99, Key::Char('Y')),
+                    (100, Key::Char('n')),
+                ],
+                false,
+            ),
+            (
+                "slow question",
+                1000,
+                vec![(0, Key::Char('y')), (99, Key::Enter), (250, Key::Char('n'))],
+                false,
+            ),
+        ] {
+            // Schedule arrivals relative to the question's flush, even if it waits
+            let tester = RefCell::new(TestClock::new());
+            let clock = tester.borrow().clock();
+            let shown = clock.now() + Duration::from_millis(show_delay);
+            let mut input = Input {
+                tester: &tester,
+                typed: keys
+                    .into_iter()
+                    .map(|(ms, key)| (shown + Duration::from_millis(ms), key))
+                    .collect(),
+            };
+
+            // Only the final key may answer, regardless of the earlier burst
+            let mut echoed = None;
+            assert_eq!(
+                confirm(
+                    &mut input,
+                    &clock,
+                    false,
+                    || {
+                        tester.borrow_mut().advance_to(shown);
+                        Ok(())
+                    },
+                    |answer| {
+                        echoed = Some(answer);
+                        Ok(())
+                    }
+                )
+                .unwrap(),
+                expected,
+                "{case}"
+            );
+            assert_eq!(echoed, Some(expected), "{case}");
+            assert!(input.typed.is_empty(), "{case}");
+        }
+    }
+
+    /// Keeps Ctrl-C as an interruption once the type-ahead window has passed.
+    #[test]
+    fn test_confirmation_interruption() {
+        let tester = RefCell::new(TestClock::new());
+        let clock = tester.borrow().clock();
         let mut input = Input {
-            queued: VecDeque::new(),
-            typed: vec![Key::CtrlC].into(),
+            tester: &tester,
+            typed: vec![(clock.now() + Duration::from_millis(250), Key::CtrlC)].into(),
         };
         let error = confirm(
             &mut input,
+            &clock,
             false,
             || Ok(()),
             |_| panic!("interruption has no answer"),

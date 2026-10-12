@@ -663,6 +663,7 @@ impl Output {
         let mut input = prompt::Input::new()?;
         let result = prompt::confirm(
             &mut input,
+            &self.clock(),
             default,
             || self.prompt(message, default),
             |answer| {
