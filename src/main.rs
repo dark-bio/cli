@@ -24,6 +24,7 @@ mod pairing;
 mod progress;
 mod style;
 mod update;
+mod usage;
 
 #[cfg(test)]
 mod testing;
@@ -71,14 +72,7 @@ fn main() -> ExitCode {
             options.json = json;
             let output = output::Output::new(&options);
             if code != 0 {
-                let message = error.to_string();
-                let message = message
-                    .split("\n\n")
-                    .next()
-                    .unwrap_or(&message)
-                    .trim_start_matches("error: ")
-                    .trim();
-                let error = Error::new(2, "usage", message);
+                let error = usage::from_clap(&error, &command, &arguments);
                 if output.json() {
                     let _ = output.document(&json!({"error":error.json()}));
                 }

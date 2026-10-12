@@ -90,6 +90,9 @@ nothing on stdout, or under --json a document holding only the error:
 
     {"error": {"code": "no-device", "message": "no Ark enclave found", "hints": []}}
 
+`ark help errors` lists every code with its next step, and says when
+running a command again can help.
+
 ## New releases
 
 At most once an hour, ark asks GitHub for its newest release. A release
@@ -109,104 +112,3 @@ afresh and reports its version and the answer together in the ark check.
 The check is ok on the newest release, warn with the upgrade command when a
 newer one is out, and skip when the lookup fails, under CI or in a local
 build.
-
-## Error codes
-
-Each code is stable and belongs to one exit class.
-
-Exit 1 is a problem with a local input or a missing confirmation.
-
-- `file-not-found`, `file-unreadable` and `file-empty` mean the named file
-  cannot be used. Check the path.
-- `file-rejected` means the Ark or ark refused the file's content, and the
-  message says why.
-- `invalid-slot` means the Ark identified another slot than --slot names, or
-  has no such slot. `ark data list` shows the slots.
-- `invalid-key` means --pubkey is not a valid public key.
-- `invalid-version` means the --version build is not published for this
-  environment. `ark firmware list` shows what is.
-- `confirmation-required` means installing firmware needs confirmation. Add
-  --yes to `ark firmware update`.
-- `enrollment-required` means the Ark is enrolled in a browser at Ark Hub,
-  at the address the hint gives.
-- `io` means a local read or write failed.
-
-Exit 2 is `usage`, for invalid arguments or an unknown help topic. A slot of
-0 or below is a usage error, and a positive one the Ark lacks is
-invalid-slot.
-
-Exit 3 is a problem reaching the Ark.
-
-- `no-device` means no Ark is attached, or none matches --device. Run
-  `ark devices`.
-- `ambiguous-device` means several Arks match. Pick one with --device from
-  the selectors the hint lists.
-- `device-busy` means another ark command or an Ark Hub browser tab holds
-  the Ark. Wait for the command to finish, or close the tab.
-- `device-unreachable` and `disconnected` mean the connection failed or
-  dropped. On Linux, a permission error's hint gives the udev rule.
-- `handshake-failed` means the Ark's attestation or identity did not verify.
-
-Exit 4 is a problem with the cloud.
-
-- `cloud-unreachable` means a request to the cloud, the package host or the
-  relay failed.
-- `approval-undelivered` means the approval never reached the phone. The
-  warning before it names the cause, and `ark doctor` checks the relay.
-- `environment-unknown` means no cloud environment is known. Select one with
-  --env.
-- `login-required` means a develop or staging host wants a browser login.
-  The hint gives the cloudflared command to run.
-- `proof-rejected` means the cloud refused the Ark's proof. Run
-  `ark doctor`. A firmware update refreshes the keys first, so run it again.
-- `pairing-failed` means the pairing exchange failed in the cloud or on the
-  phone. Run `ark pair` again.
-- `registry-inactive` means the Ark's registration is disabled, expired or
-  superseded. A disabled Ark needs Dark Bio. An expired or superseded
-  emulator becomes a fresh device through `ark-emulator stop`, `wipe` and
-  `start`, and is then enrolled again.
-
-Exit 5 is the Ark's state or its refusal.
-
-- `not-paired` means no phone is paired with the Ark yet. Run `ark pair`.
-- `locked` means the Ark needs unlocking. Run `ark unlock`, or add --unlock.
-  A dry run needs `ark unlock` first.
-- `already-paired` and `already-enrolled` mean the Ark is in that state
-  already.
-- `firmware-outdated` means the firmware is older than this tool supports.
-  Run `ark firmware update`, or install a newer Ark Emulator for an
-  emulator.
-- `update-unverified` means the Ark came back from a firmware update running
-  another build than the one installed.
-- `dependency-missing` means a reference slot requires a slot that is empty,
-  such as the owner's calls. Fill that one first.
-- `no-download` means the Ark offers no download for the slot
-  `ark data fetch` names.
-- `ark` means the Ark refused the request. Act on its message, never on its
-  number, which can change between firmware builds.
-- `unsupported` means the Ark never serves the request in its build or role,
-  such as a firmware update on an emulator.
-- `unavailable` means the Ark serves the request, but not in its current
-  state, such as before a cloud sync.
-- `unknown` means the Ark does not know the request, so the firmware and ark
-  are out of step. Update both.
-- `unanswered` means the Ark dropped the request without an answer.
-
-Exit 6 is an approval that did not come.
-
-- `approval-denied` means the owner declined the request or an app's
-  report, or Ark Companion sent an answer the Ark could not accept.
-- `approval-timeout` means nobody answered within the window. For pairing,
-  run `ark pair` again.
-
-Exit 7 is `timeout`, for a wait on a machine that ran past --timeout or past
-a fixed limit, such as the 5s handshake that opens a connection or the
-120s an Ark gets to return from a firmware update.
-
-Exit 8 is `app-failed`, for an app that failed when the owner released its
-result. The document still holds what the Ark returned.
-
-Exit 130 is `interrupted` and exit 143 `terminated`, for Ctrl-C and SIGTERM.
-ark asks the Ark to cancel the active task or upload before it exits, and
-under --json the document holds the last partial result. An upload the Ark
-is already processing keeps going.

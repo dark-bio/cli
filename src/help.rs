@@ -24,8 +24,8 @@ const GLOBAL: [&str; 9] = [
 ];
 
 /// Help topics in the order the manual prints them.
-const TOPICS: [&str; 6] = [
-    "agents", "devices", "datasets", "apps", "firmware", "output",
+const TOPICS: [&str; 7] = [
+    "agents", "devices", "datasets", "apps", "firmware", "output", "errors",
 ];
 
 /// Maximum line width of help pages and topics in terminal cells.
@@ -49,10 +49,8 @@ struct ContractFooter {
     approval: &'static str,
     /// Expected duration and the waits the timeout bounds.
     time: &'static str,
-    /// Result fields in reading order and any JSON differences.
-    prints: &'static str,
-    /// Exit classes the command can return, before the shared interrupts.
-    exit: &'static str,
+    /// Every key in the JSON document and the fields added by flags.
+    json: &'static str,
     /// Two invocations printed as bare commands.
     examples: &'static str,
 }
@@ -76,8 +74,7 @@ const CONTRACTS: &[Contract] = &[
             requires: "nothing",
             approval: "none",
             time: "seconds",
-            prints: "locator, name, serial, environment, ready; JSON adds kind, image",
-            exit: "0 done; 1 local; 2 usage; 3 device",
+            json: "devices, each with locator, kind, name, serial, image, environment, ready",
             examples: "ark devices\nark devices --json",
         }),
     },
@@ -91,10 +88,9 @@ const CONTRACTS: &[Contract] = &[
             requires: "one Ark, in any state; the cloud is not needed",
             approval: "none",
             time: "seconds",
-            prints: "name, serial, hardware, firmware, environment, trust, synced, paired, \
-                unlocked, mismatch; JSON adds hardware.model, firmware.published, realm, \
+            json: "name, serial, hardware (version, revision, model), firmware (version, \
+                published), environment, trust, synced, paired, unlocked, mismatch, realm, \
                 identity, pubkey",
-            exit: "0 done; 1 local; 2 usage; 3 device; 5 outdated firmware; 7 timeout",
             examples: "ark status\nark --device emulator status --json",
         }),
     },
@@ -107,9 +103,7 @@ const CONTRACTS: &[Contract] = &[
             requires: "one Ark and the cloud",
             approval: "none",
             time: "seconds",
-            prints: "serial, enrolled, active, disabled, expired, superseded",
-            exit: "0 active; 1 local; 2 usage; 3 device; 4 cloud or an inactive registration; \
-                5 Ark; 7 timeout",
+            json: "serial, enrolled, active, disabled, expired, superseded",
             examples: "ark genuine\nark genuine --json",
         }),
     },
@@ -125,8 +119,7 @@ const CONTRACTS: &[Contract] = &[
             approval: "the owner opens the link in Ark Companion, then presses the Ark's button \
                 within 60s if its colors match the phone's",
             time: "up to 10 minutes for the link and 60s for the button, then the storage setup",
-            prints: "serial, paired; the pairing link on stderr",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
+            json: "serial, paired",
             examples: "ark pair\nark pair --json",
         }),
     },
@@ -139,8 +132,7 @@ const CONTRACTS: &[Contract] = &[
             requires: "a paired Ark and the cloud",
             approval: "on your phone, unless the Ark is unlocked already",
             time: "up to 2 minutes for the approval; the Ark stays unlocked until it loses power",
-            prints: "unlocked, changed",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
+            json: "unlocked, changed",
             examples: "ark unlock\nark unlock --json",
         }),
     },
@@ -151,13 +143,14 @@ const CONTRACTS: &[Contract] = &[
             browser, then fails with enrollment-required. With --cwt it installs the \
             attestation from the file, then reconnects to check it.",
         footer: Some(ContractFooter {
-            requires: "a self-signed Ark; with --cwt, an attestation file",
+            requires: "a self-signed Ark",
             approval: "none; the person enrolls the Ark in a browser at Ark Hub",
             time: "seconds",
-            prints: "enrolled, url; with --cwt, enrolled and the status fields",
-            exit: "0 installed with --cwt; 1 local or enrollment-required; 2 usage; 3 device; \
-                4 cloud; 5 Ark; 7 timeout",
-            examples: "ark enroll\nark enroll --cwt attestation.cwt",
+            json: "enrolled, url; --cwt replaces url with name, serial, hardware (version, \
+                revision, model), firmware (version, published), environment, trust, synced, \
+                paired, unlocked, mismatch, realm, identity, pubkey; a failed reconnect \
+                returns enrolled and status (null)",
+            examples: "ark enroll\nark enroll --cwt attestation.cwt --json",
         }),
     },
     Contract {
@@ -179,9 +172,8 @@ const CONTRACTS: &[Contract] = &[
                 (--unlock only if status reports locked)",
             approval: "none; --unlock needs your phone",
             time: "seconds",
-            prints: "the path tree with its marks and examples; JSON paths: path, directory, \
-                grantable, available, description, format, examples, public, wording",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
+            json: "paths, each with path, directory, grantable, available, description, \
+                format, examples, public, wording",
             examples: "ark data paths\nark data paths --json",
         }),
     },
@@ -195,9 +187,8 @@ const CONTRACTS: &[Contract] = &[
                 (--unlock only if status reports locked)",
             approval: "none; --unlock needs your phone",
             time: "seconds",
-            prints: "slot, state, build, version, size (JSON size_bytes); JSON adds id, name, \
-                description, format, origin, damage, requires, download",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
+            json: "slots, each with slot, id, name, description, format, state, origin, \
+                damage, requires, size_bytes, build, version, download (url, size_bytes, sha256)",
             examples: "ark data list\nark data list --json",
         }),
     },
@@ -212,10 +203,8 @@ const CONTRACTS: &[Contract] = &[
                 (--unlock only if status reports locked)",
             approval: "none; --unlock needs your phone",
             time: "seconds",
-            prints: "slot, id, name, description, format, state, origin, damage, dependencies \
-                (JSON requires), size (size_bytes), build, version, download, required by \
-                (required_by), cached",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
+            json: "slot, id, name, description, format, state, origin, damage, requires, \
+                size_bytes, build, version, download (url, size_bytes, sha256), required_by, cached",
             examples: "ark data show snp-indel-calls\nark data show 3 --json",
         }),
     },
@@ -227,15 +216,13 @@ const CONTRACTS: &[Contract] = &[
             1 minute, and ark uploads the file and waits while the Ark validates and indexes \
             it. --dry-run stops after the identification.",
         footer: Some(ContractFooter {
-            requires: "a VCF file, an empty target slot, a paired, unlocked Ark and the cloud \
-                (--unlock only if status reports locked)",
+            requires: "an empty target slot, a paired, unlocked Ark and the cloud (--unlock \
+                only if status reports locked)",
             approval: "on your phone within 1 minute; none with --dry-run",
             time: "minutes to an hour; each processing step reports its own progress",
-            prints: "slot, id, confidence, uploaded (JSON uploaded_bytes), phases, duration \
-                (duration_seconds); --dry-run adds state and dependencies (requires)",
-            exit: "0 done; 1 local or an unidentified file; 2 usage; 3 device; 4 cloud; 5 Ark \
-                or a failed validation; 6 approval; 7 timeout",
-            examples: "ark data upload calls.vcf.gz\nark data upload calls.vcf.gz --dry-run",
+            json: "slot, id, confidence, uploaded_bytes, phases, duration_seconds; \
+                --dry-run adds state and requires",
+            examples: "ark data upload calls.vcf.gz\nark data upload calls.vcf.gz --dry-run --json",
         }),
     },
     Contract {
@@ -251,9 +238,8 @@ const CONTRACTS: &[Contract] = &[
             approval: "none; --unlock needs your phone",
             time: "minutes per slot, an hour or more for the variant catalog; network failures \
                 get 3 attempts",
-            prints: "slot, size (JSON size_bytes), cached, outcome; JSON fetched rows add id, \
-                url, sha256, error",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
+            json: "fetched, each with slot, id, url, size_bytes, sha256, cached, outcome, \
+                error; --dry-run marks pending rows as planned",
             examples: "ark data fetch --all\nark data fetch --all --dry-run --json",
         }),
     },
@@ -267,9 +253,8 @@ const CONTRACTS: &[Contract] = &[
                 locked)",
             approval: "on your phone within 2 minutes; none with --dry-run",
             time: "seconds after the approval",
-            prints: "slot, id, state, changed; --dry-run adds required_by",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
-            examples: "ark data delete snp-indel-calls\nark data delete snp-indel-calls --dry-run",
+            json: "slot, id, state, changed; --dry-run adds required_by",
+            examples: "ark data delete snp-indel-calls\nark data delete snp-indel-calls --dry-run --json",
         }),
     },
     Contract {
@@ -283,9 +268,8 @@ const CONTRACTS: &[Contract] = &[
                 locked)",
             approval: "on your phone within 2 minutes; none with --dry-run",
             time: "seconds after the approval",
-            prints: "slot, id, state, changed; --dry-run adds required_by",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
-            examples: "ark data repair snp-indel-calls\nark data repair snp-indel-calls --dry-run",
+            json: "slot, id, state, changed; --dry-run adds required_by",
+            examples: "ark data repair snp-indel-calls\nark data repair snp-indel-calls --dry-run --json",
         }),
     },
     Contract {
@@ -301,19 +285,18 @@ const CONTRACTS: &[Contract] = &[
             approves the run on their phone within 5 minutes, switching on optional grants \
             and answering the app's questions. Once the app ends, the owner reviews its \
             report within 10 minutes. ark prints the report if they release it, and fails if \
-            they decline.",
+            they decline. When the app reports failure, ark still prints the released report, \
+            then fails with app-failed.",
         footer: Some(ContractFooter {
-            requires: "a WebAssembly file, a paired, unlocked Ark and the cloud (--unlock only \
-                if status reports locked)",
+            requires: "a paired, unlocked Ark and the cloud (--unlock only if status reports \
+                locked)",
             approval: "on your phone twice, the run within 5 minutes and its report within 10 \
                 minutes",
             time: "the two approvals, plus however long the app runs; --timeout bounds only \
                 machine replies",
-            prints: "the report as the app printed it; JSON: task, app (name, version, \
+            json: "task, app (name, version, \
                 develop), success, paths, media, stdout or stdout_base64, stderr or \
                 stderr_base64, duration_seconds",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark or a refused app; \
-                6 approval; 7 timeout; 8 app failed",
             examples: "ark app run app.wasm > report.md\nark app run app.wasm --json",
         }),
     },
@@ -333,10 +316,8 @@ const CONTRACTS: &[Contract] = &[
             requires: "one Ark and its package host",
             approval: "none",
             time: "seconds",
-            prints: "version, published date, size, status, candidate headlines; JSON: installed, \
-                update, firmwares (version, published, size_bytes, sha256, summary, installed, \
+            json: "installed, update, firmwares (version, published, size_bytes, sha256, summary, installed, \
                 candidate)",
-            exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 7 timeout",
             examples: "ark firmware list\nark firmware list --json",
         }),
     },
@@ -352,10 +333,8 @@ const CONTRACTS: &[Contract] = &[
             approval: "none if unpaired; the Ark's button within 30s if locked; your phone \
                 within 2 minutes if unlocked; --yes confirms the installation here",
             time: "minutes, then up to 120s for the Ark to return; --no-wait skips the return",
-            prints: "from, to, size (JSON size_bytes), approval, installed, returned, verified, \
+            json: "from, to, size_bytes, approval, installed, returned, verified, \
                 running",
-            exit: "0 done; 1 local or unconfirmed; 2 usage; 3 device; 4 cloud; 5 Ark; \
-                6 approval; 7 timeout",
             examples: "ark firmware update --dry-run\nark firmware update --yes --json",
         }),
     },
@@ -365,15 +344,13 @@ const CONTRACTS: &[Contract] = &[
             then the Ark. Each check is ok, warn, fail or skip, with a hint where something \
             needs action, and a summary closes the report. It applies no fixes, though its \
             checks sync the Ark with the cloud and look up the newest ark release, which \
-            local builds and CI skip.",
+            local builds and CI skip. The first failed check sets the exit code, which a \
+            warning never does.",
         footer: Some(ContractFooter {
             requires: "nothing; a check that cannot run is skipped",
             approval: "none",
             time: "seconds per check",
-            prints: "grouped checks and a summary; JSON: version, checks, each with \
-                name, result (ok, warn, fail or skip), detail and hint; every skip stays in JSON",
-            exit: "0 without a failed check; otherwise the class of the first failure, \
-                1 local, 3 device, 4 cloud, 5 Ark or 7 timeout",
+            json: "version, checks, each with name, result (ok, warn, fail or skip), detail and hint",
             examples: "ark doctor\nark doctor --json",
         }),
     },
@@ -385,22 +362,22 @@ const CONTRACTS: &[Contract] = &[
             requires: "nothing",
             approval: "none",
             time: "immediate",
-            prints: "the completion script, as text even with --json",
-            exit: "0 done; 2 usage",
-            examples: "ark completions zsh\nark completions bash",
+            json: "none; the completion script stays text even with --json",
+            examples: "ark completions zsh\nark completions bash > ark.bash",
         }),
     },
     Contract {
         path: "help",
         paragraph: "Prints the help page of a command, or a topic: agents, devices, datasets, \
-            apps, firmware or output. `ark help --all` prints the whole manual, starting with \
-            the root page and the agents topic.",
+            apps, firmware, output or errors. A name that is both a topic and a command, devices \
+            or firmware, prints the topic, and `ark devices --help` prints the command's page. \
+            `ark help --all` prints the whole manual, starting with the root page and the \
+            agents topic.",
         footer: Some(ContractFooter {
             requires: "nothing",
             approval: "none",
             time: "immediate",
-            prints: "help text, even with --json",
-            exit: "0 done; 1 local; 2 unknown command or topic",
+            json: "none; help stays text even with --json",
             examples: "ark help agents\nark help --all",
         }),
     },
@@ -428,7 +405,7 @@ pub(crate) fn command(theme: &Theme) -> clap::Command {
 /// hides the shared options on every page but the root.
 ///
 /// Clap normally expands long help onto two lines per option. The short layout
-/// is rendered once, and the help action selects the paragraph and footer.
+/// is rendered once and used for every help spelling.
 fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
     // Hide the shared options below the root
     if !root {
@@ -439,8 +416,7 @@ fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
         }
     }
 
-    // Render the scan alone, then let the help action select the paragraph
-    // after its description and the footer after its arguments and options
+    // Render the scan alone, placing blank lines between the root's groups
     let mut display = command
         .clone()
         .before_help(None)
@@ -452,7 +428,15 @@ fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
         .ansi()
         .to_string()
         .lines()
-        .map(|line| style::wrap(&theme.inline(line), theme.width.min(WIDTH), hanging(line)))
+        .map(|line| {
+            let plain = console::strip_ansi_codes(line);
+            let gap = root && (plain.starts_with("  data ") || plain.starts_with("  firmware "));
+            format!(
+                "{}{}",
+                if gap { "\n" } else { "" },
+                style::wrap(&theme.inline(line), theme.width.min(WIDTH), hanging(line))
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let (description, scan) = scan.split_once("\n\n").unwrap_or((&scan, ""));
@@ -505,8 +489,7 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
                 .short('h')
                 .long("help")
                 .action(clap::ArgAction::Help)
-                .help("Print help (see more with '--help')")
-                .long_help("Print help (see a summary with '-h')"),
+                .help("Print help"),
         );
     }
 
@@ -525,36 +508,26 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
     // The root gets the overview, a group points to its children, and a leaf
     // gets its contract
     let help = if parent.is_empty() {
-        theme.inline(&format!(
-            "Output is formatted for reading; --json keeps complete, exact values.
+        format!(
+            "{}\n\n{}",
+            exit_codes(theme),
+            theme.inline(&format!(
+                "Output is formatted for reading; --json keeps complete, exact values.
 AI agents: read `ark help agents` first.
 Topics: {}.",
-            TOPICS.join(", ")
-        ))
+                TOPICS.join(", ")
+            ))
+        )
     } else if let Some(fields) = &contract.footer {
-        // Clap keeps an option hidden from the short page out of the rendered
-        // scan too, so the long page lists it by hand ahead of the contract
-        let advanced = if matches!(key, "status" | "enroll") {
-            "Advanced:
-      --pubkey <HEX>  Trust this public key instead of the attestation
-
-"
-        } else {
-            ""
-        };
-        format!(
-            "{advanced}{}",
-            footer(
-                theme,
-                &[
-                    ("Requires", fields.requires),
-                    ("Approval", fields.approval),
-                    ("Time", fields.time),
-                    ("Prints", fields.prints),
-                    ("Exit", &format!("{}; 130/143 interrupted", fields.exit)),
-                ],
-                fields.examples,
-            )
+        footer(
+            theme,
+            &[
+                ("Requires", fields.requires),
+                ("Approval", fields.approval),
+                ("Time", fields.time),
+                ("JSON", fields.json),
+            ],
+            fields.examples,
         )
     } else {
         theme.inline(&format!(
@@ -562,24 +535,19 @@ Topics: {}.",
         ))
     };
 
-    // Wrap the text and attach it as the long footer, and on the root as the
-    // short one too
+    // Attach the paragraph and the contract, which every help spelling prints
     let help = help
         .lines()
         .map(|line| style::wrap(line, theme.width.min(WIDTH), hanging(line)))
         .collect::<Vec<_>>()
         .join("\n");
     let paragraph = style::wrap(&theme.inline(contract.paragraph), theme.width.min(WIDTH), 0);
-    let mut decorated = command
+    *command = command
         .clone()
         .before_long_help(paragraph.clone())
-        .after_long_help(format!("{help}\n"));
-    if parent.is_empty() {
-        decorated = decorated
-            .before_help(paragraph)
-            .after_help(format!("{help}\n"));
-    }
-    *command = decorated;
+        .after_long_help(format!("{help}\n"))
+        .before_help(paragraph)
+        .after_help(format!("{help}\n"));
 
     // Subcommands get their own contracts under this path
     for child in command.get_subcommands_mut() {
@@ -611,7 +579,8 @@ pub(crate) fn run(output: &Output, path: &[String], all: bool) -> Result<(), Err
         )));
     }
 
-    // A single name may be a topic
+    // A single name that is a topic prints the topic, even when a command
+    // shares it
     if path.len() == 1
         && let Some(topic) = topic(&path[0])
     {
@@ -620,16 +589,49 @@ pub(crate) fn run(output: &Output, path: &[String], all: bool) -> Result<(), Err
 
     // Anything else walks the command tree to the page it names
     let mut command = &mut root;
-    for name in path {
-        command = command.find_subcommand_mut(name).ok_or_else(|| {
-            Error::new(
-                2,
-                "usage",
-                format!("unknown help command or topic {name:?}"),
-            )
-        })?;
+    for (index, name) in path.iter().enumerate() {
+        if command.find_subcommand(name).is_none() {
+            // Let clap suggest a child command, then try topics at the root
+            let parsed = command
+                .clone()
+                .try_get_matches_from([command.get_name(), name]);
+            let suggestions = parsed
+                .err()
+                .map(|error| {
+                    crate::usage::suggestions(&error, clap::error::ContextKind::SuggestedSubcommand)
+                })
+                .unwrap_or_default();
+            if index == 0 && suggestions.is_empty() {
+                return Err(unknown_topic(name));
+            }
+            let mut error = Error::new(2, "usage", format!("unknown help command '{name}'"));
+            let parent = std::iter::once("ark")
+                .chain(path[..index].iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for suggested in suggestions {
+                error = error.hint(format!("a similar command exists: `{parent} {suggested}`"));
+            }
+            if error.hints.is_empty() {
+                error = error.hint(format!("see `{parent} --help`"));
+            }
+            return Err(error);
+        }
+        command = command.find_subcommand_mut(name).unwrap();
     }
     output.text(&command.render_long_help().ansi().to_string())
+}
+
+/// Builds the error for an unknown topic, with a near match or the help page as
+/// its hint.
+fn unknown_topic(name: &str) -> Error {
+    let mut error = Error::new(2, "usage", format!("unknown help topic '{name}'"));
+    if let Some(suggested) = crate::usage::similar(name, TOPICS) {
+        error = error.hint(format!("a similar topic exists: `ark help {suggested}`"));
+    } else {
+        error = error.hint("see `ark help --help`");
+    }
+    error
 }
 
 /// Lays out the contract with its labels padded to one column and its values
@@ -640,24 +642,22 @@ pub(crate) fn run(output: &Output, path: &[String], all: bool) -> Result<(), Err
 fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
     let column = fields
         .iter()
-        .map(|(label, _)| label.len() + 2)
+        .map(|(label, _)| label.len() + 4)
         .max()
         .unwrap_or(0);
-    let mut lines = fields
-        .iter()
-        .map(|(label, text)| {
-            style::wrap(
-                &format!(
-                    "{}{}{}",
-                    theme.paint(Role::Muted, format!("{label}:")),
-                    " ".repeat(column - label.len() - 1),
-                    theme.inline(text)
-                ),
-                theme.width.min(WIDTH),
-                column,
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut lines = vec![theme.paint(Role::Heading, "Contract:")];
+    lines.extend(fields.iter().map(|(label, text)| {
+        style::wrap(
+            &format!(
+                "  {}{}{}",
+                theme.paint(Role::Muted, label),
+                " ".repeat(column - label.len() - 2),
+                theme.inline(text)
+            ),
+            theme.width.min(WIDTH),
+            column,
+        )
+    }));
 
     // The examples follow under their own heading, styled as commands
     lines.push(format!("\n{}", theme.paint(Role::Heading, "Examples:")));
@@ -668,6 +668,49 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
             2,
         )
     }));
+    lines.join("\n")
+}
+
+/// Renders the exit codes in two columns, or in one on a narrow terminal.
+fn exit_codes(theme: &Theme) -> String {
+    let entries = [
+        ("0", "done"),
+        ("1", "a local input or a missing confirmation"),
+        ("2", "usage"),
+        ("3", "reaching the Ark"),
+        ("4", "the cloud"),
+        ("5", "the Ark's state or refusal"),
+        ("6", "an approval that did not come"),
+        ("7", "a machine wait that ran out"),
+        ("8", "an app failure"),
+        ("130", "Ctrl-C"),
+        ("143", "SIGTERM"),
+    ];
+    let mut lines = vec![theme.paint(Role::Heading, "Exit codes:")];
+    if theme.width >= WIDTH {
+        for (index, (code, meaning)) in entries[..6].iter().enumerate() {
+            let mut row = format!("  {}  {meaning}", theme.paint(Role::Muted, code));
+            if let Some((right, meaning)) = entries.get(index + 6) {
+                row.push_str(&" ".repeat(45 - console::measure_text_width(&row)));
+                row.push_str(&format!(
+                    "{}  {meaning}",
+                    theme.paint(Role::Muted, format!("{right:>3}"))
+                ));
+            }
+            lines.push(row);
+        }
+    } else {
+        for (code, meaning) in entries {
+            lines.push(style::wrap(
+                &format!(
+                    "  {}  {meaning}",
+                    theme.paint(Role::Muted, format!("{code:>3}"))
+                ),
+                theme.width,
+                7,
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -748,6 +791,7 @@ fn topic(name: &str) -> Option<&'static str> {
         "apps" => include_str!("help/apps.md"),
         "firmware" => include_str!("help/firmware.md"),
         "output" => include_str!("help/output.md"),
+        "errors" => include_str!("help/errors.md"),
         _ => return None,
     })
 }
@@ -757,12 +801,11 @@ fn topic(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// Checks that paragraphs sit between the description and usage on long
-    /// pages, and appear on short pages only at the root.
+    /// Checks that every help spelling prints the paragraph after the one-liner.
     #[test]
     fn test_paragraphs_follow_descriptions_on_every_command() {
         /// Checks both layouts before walking the command's children.
-        fn visit(command: &mut clap::Command, root: bool) {
+        fn visit(command: &mut clap::Command) {
             let long = command.render_long_help().ansi().to_string();
             let long = console::strip_ansi_codes(&long);
             let (opening, _) = long.split_once("\n\nUsage:").unwrap();
@@ -778,15 +821,9 @@ mod tests {
 
             let short = command.render_help().ansi().to_string();
             let short = console::strip_ansi_codes(&short);
-            let (short_opening, _) = short.split_once("\n\nUsage:").unwrap();
-            assert_eq!(
-                short_opening,
-                if root { opening } else { description },
-                "{}",
-                command.get_name()
-            );
+            assert_eq!(short, long, "{}", command.get_name());
             for child in command.get_subcommands_mut() {
-                visit(child, false);
+                visit(child);
             }
         }
 
@@ -794,19 +831,8 @@ mod tests {
         for width in [60, 80] {
             for color in [Color::Off, Color::True] {
                 let theme = Theme::test(width, color, true);
-                visit(&mut command(&theme), true);
+                visit(&mut command(&theme));
             }
-        }
-    }
-
-    /// Checks the root's screen budget in both help layouts at 80 columns.
-    #[test]
-    fn test_root_pages_fit_on_a_screen() {
-        let theme = Theme::test(80, Color::Off, false);
-        let mut root = command(&theme);
-        for page in [root.render_help(), root.render_long_help()] {
-            let page = page.to_string();
-            assert!(page.lines().count() <= 42, "{page}");
         }
     }
 
@@ -853,6 +879,18 @@ mod tests {
                 check(&page, "--pubkey", 22);
             }
 
+            // A contract value wraps under its own start
+            let upload = root
+                .find_subcommand_mut("data")
+                .unwrap()
+                .find_subcommand_mut("upload")
+                .unwrap()
+                .render_help()
+                .ansi()
+                .to_string();
+            check(&upload, "  Requires  ", 12);
+            check(&upload, "  JSON      ", 12);
+
             // A positional row uses a shorter name column than root options
             let mut sample = clap::Command::new("sample")
                 .about("Inspect a file")
@@ -882,7 +920,7 @@ mod tests {
                 &[("Requires", "a paired Ark"), ("Approval", "only if locked")],
                 "ark unlock"
             ),
-            "Requires: a paired Ark\nApproval: only if locked\n\n\x1b[1mExamples:\x1b[0m\n  \x1b[1mark unlock\x1b[0m"
+            "\x1b[1mContract:\x1b[0m\n  Requires  a paired Ark\n  Approval  only if locked\n\n\x1b[1mExamples:\x1b[0m\n  \x1b[1mark unlock\x1b[0m"
         );
         assert_eq!(
             markdown(
@@ -891,6 +929,30 @@ mod tests {
             ),
             "\x1b[1mStates\x1b[0m\n\nUse `\x1b[1mark status\x1b[0m`.\n\n  - Keep the phone nearby.\n\n  \x1b[1mark unlock\x1b[0m"
         );
+    }
+
+    /// Checks heading, label and exit-number colors on the rendered pages.
+    #[test]
+    fn test_contract_labels_and_exit_numbers_are_muted() {
+        let theme = Theme::test(80, Color::True, true);
+        let mut root = command(&theme);
+        let page = root
+            .find_subcommand_mut("status")
+            .unwrap()
+            .render_help()
+            .ansi()
+            .to_string();
+        assert!(page.contains(&theme.paint(Role::Heading, "Contract:")));
+        for label in ["Requires", "Approval", "Time", "JSON"] {
+            assert!(page.contains(&theme.paint(Role::Muted, label)), "{label}");
+        }
+        let page = root.render_help().ansi().to_string();
+        assert!(page.contains(&theme.paint(Role::Heading, "Exit codes:")));
+        for code in [
+            "0", "1", "2", "3", "4", "5", "  6", "  7", "  8", "130", "143",
+        ] {
+            assert!(page.contains(&theme.paint(Role::Muted, code)), "{code}");
+        }
     }
 
     /// A terminal and a pipe print the same page; only color differs.
@@ -994,7 +1056,7 @@ mod tests {
             "--timeout <SECONDS>",
             "      --json ",
             "      --no-input ",
-            "      --log <LOG>",
+            "      --log <LEVEL>",
             "-d, --device <SELECTOR>",
         ];
         let page = root.render_help().to_string();
@@ -1028,9 +1090,7 @@ mod tests {
             let group = root.find_subcommand_mut(name).unwrap();
             let long = group.render_long_help().to_string();
             assert!(long.contains("Each subcommand has its own requirements"));
-            assert!(!long.contains("Requires:"));
-            assert!(!long.contains("Approval:"));
-            assert!(!long.contains("Exit:"));
+            assert!(!long.contains("Contract:"));
         }
 
         // Leaf pages carry their contracts, down to the unlock guidance

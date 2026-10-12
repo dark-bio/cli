@@ -80,9 +80,10 @@ command again, since each run asks them again.
   or refusal, 6 an approval that did not come, 7 a machine wait that ran
   out, 8 an app failure, 130 Ctrl-C and 143 SIGTERM.
 - A failure prints error[code]: message, then hint: lines naming the next
-  step. Codes are stable, and `ark help output` lists every one with its
-  next step. error[ark] is the Ark's own refusal. Act on its message, never
-  on its number, which can change between firmware builds.
+  step. Codes are stable, and `ark help errors` lists every one with its
+  next step and when another run can help. error[ark] is the Ark's own
+  refusal. Act on its message, never on its number, which can change
+  between firmware builds.
 - A command that did part of its work keeps that result on stdout and still
   exits non-zero. Under --json, a command with no result prints a document
   holding only the error.
