@@ -13,7 +13,7 @@ use crate::{
     output::{Output, human},
     style::{Role, Theme},
 };
-use darkbio_connect::{DeviceKind, Identity, schema};
+use darkbio_connect::{DeviceKind, Identity, Locator, schema};
 use serde_json::{Value, json};
 
 /// Lists discovery metadata without opening devices, retaining useful partial
@@ -35,6 +35,25 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         "name":device.name(),"serial":device.serial(),"image":device.image(),"environment":device.env(),"ready":device.ready(),
     })).collect();
 
+    // Print the table, pointing at --device when several Arks answer
+    context
+        .output
+        .document_with(&json!({"devices":rows}), |theme| {
+            devices_table(theme, &rows)
+        })?;
+    if rows.len() > 1 {
+        let locators: Vec<_> = found
+            .devices
+            .iter()
+            .map(|device| device.locator())
+            .collect();
+        context.output.event("hint", selection_hint(&locators));
+    }
+    Ok(())
+}
+
+/// Renders discovery metadata with launcher columns only when reported.
+fn devices_table(theme: &Theme, rows: &[Value]) -> String {
     // The `environment` and `ready` columns are launcher metadata, which
     // discovery leaves unset for hardware. They show only when a row has them,
     // since a dash under READY reads as "not ready" rather than "not asked".
@@ -42,7 +61,6 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         ("LOCATOR", "locator"),
         ("NAME", "name"),
         ("SERIAL", "serial"),
-        ("KIND", "kind"),
     ];
     for (label, key) in [("ENVIRONMENT", "environment"), ("READY", "ready")] {
         if rows.iter().any(|row| !row[key].is_null()) {
@@ -50,16 +68,26 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         }
     }
 
-    // Print the table, pointing at --device when several Arks answer
-    context
-        .output
-        .table(&json!({"devices":rows}), &rows, &columns)?;
-    if rows.len() > 1 {
-        context
-            .output
-            .event("hint", "select one with --device LOCATOR");
-    }
-    Ok(())
+    human::table(theme, rows, &columns)
+}
+
+/// Suggests kind words for unique kinds and locators for the remaining Arks.
+pub(crate) fn selection_hint(locators: &[Locator]) -> String {
+    // Count both kinds before choosing a selector for each Ark
+    let hardware = locators
+        .iter()
+        .filter(|locator| matches!(locator, Locator::Hardware { .. }))
+        .count();
+    let emulator = locators.len() - hardware;
+    let selectors: Vec<_> = locators
+        .iter()
+        .map(|locator| match locator {
+            Locator::Hardware { .. } if hardware == 1 => "hardware".into(),
+            Locator::Emulator { .. } if emulator == 1 => "emulator".into(),
+            _ => locator.to_string(),
+        })
+        .collect();
+    format!("select one with --device: {}", selectors.join(", "))
 }
 
 /// Prints the Ark's status, then fails on outdated firmware or hints at the
@@ -370,13 +398,80 @@ pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
     }
 }
 
-/// Tests of the human status layout.
+/// Tests of the discovery table and human status layout.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::style::Color;
     use clap::Parser;
     use std::io::Write;
+
+    /// Discovery omits KIND and shows each launcher column only when reported.
+    #[test]
+    fn test_devices_table_omits_kind_and_keeps_reported_columns() {
+        // Typical hardware and emulator names fit together at 80 columns
+        let theme = Theme::test(80, Color::Off, true);
+        let mut rows = vec![
+            json!({
+                "locator":"hardware:00:1", "kind":"hardware", "name":"Example Founder Ark",
+                "serial":"founder-1", "environment":null, "ready":null,
+            }),
+            json!({
+                "locator":"emulator:18181", "kind":"emulator", "name":"Lab Emulator",
+                "serial":"emulator-123456-3", "environment":"release", "ready":true,
+            }),
+        ];
+        let rendered = devices_table(&theme, &rows);
+        assert_eq!(rendered.lines().count(), 3);
+        assert_eq!(
+            rendered
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["LOCATOR", "NAME", "SERIAL", "ENVIRONMENT", "READY"]
+        );
+        assert!(rendered.contains("Example Founder Ark"));
+        assert!(
+            rendered
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with("release      yes")
+        );
+        assert!(
+            rendered
+                .lines()
+                .all(|line| console::measure_text_width(line) <= 80)
+        );
+
+        // Environment and readiness appear independently, including false readiness
+        rows[1]["ready"] = json!(false);
+        rows[1]["environment"] = Value::Null;
+        let rendered = devices_table(&theme, &rows);
+        assert!(rendered.lines().next().unwrap().ends_with("READY"));
+        assert!(rendered.lines().last().unwrap().ends_with("no"));
+        assert!(!rendered.contains("ENVIRONMENT"));
+        rows[1]["ready"] = Value::Null;
+        rows[1]["environment"] = json!("develop");
+        let rendered = devices_table(&theme, &rows);
+        assert!(rendered.lines().next().unwrap().ends_with("ENVIRONMENT"));
+        assert!(!rendered.contains("READY"));
+
+        // Hardware alone has only the three identifying columns
+        let rendered = devices_table(&theme, &rows[..1]);
+        assert_eq!(
+            rendered
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["LOCATOR", "NAME", "SERIAL"]
+        );
+        assert_eq!(rendered.lines().count(), 2);
+    }
 
     /// Builds an invented attested status with the complete JSON field set.
     fn status() -> Value {

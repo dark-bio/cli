@@ -125,25 +125,18 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
 
 /// Prints the compact slot inventory and hints for missing or damaged data.
 fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), Error> {
-    // JSON keeps plain dependency names, and the table shows their state
+    // The table keeps the fields that compare slots, and JSON keeps the details
     let rows: Vec<_> = slots.iter().map(metadata).collect();
     let document = json!({"slots":rows});
-    let rows: Vec<_> = rows
-        .into_iter()
-        .zip(slots)
-        .map(|(value, slot)| dependency_view(value, slot, slots))
-        .collect();
     output.table(
         &document,
         &rows,
         &[
             ("SLOT", "slot"),
             ("STATE", "state"),
-            ("ORIGIN", "origin"),
             ("BUILD", "build"),
             ("VERSION", "version"),
             ("SIZE", "size_bytes"),
-            ("REQUIRES", "requires"),
         ],
     )?;
 

@@ -64,17 +64,6 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
             };
             theme.mark(role, &text)
         }
-        "flags" => text
-            .split(", ")
-            .map(|flag| {
-                if flag == "installed" {
-                    theme.paint(Role::Success, theme.glyph("\u{2713}", "installed"))
-                } else {
-                    theme.paint(Role::Attention, flag)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(&theme.separator()),
         "slot" | "locator" | "identity" | "pubkey" | "url" | "requires" | "required_by" => {
             theme.paint(Role::Accent, text)
         }
@@ -192,19 +181,27 @@ fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<
 /// Fits a table by shrinking one free-text column, then falls back to blocks.
 ///
 /// Selectors, hashes and other actionable fields are never ellipsized by the table.
-pub(super) fn table(
-    theme: &Theme,
-    rows: &[Value],
-    columns: &[(&str, &str)],
-    groups: &[String],
-) -> String {
+pub(crate) fn table(theme: &Theme, rows: &[Value], columns: &[(&str, &str)]) -> String {
     // Style every cell and measure each column against its header
     let cells: Vec<Vec<_>> = rows
         .iter()
         .map(|row| {
             columns
                 .iter()
-                .map(|(_, key)| value(theme, key, &row[*key]))
+                .map(|(_, key)| {
+                    row[*key]
+                        .as_str()
+                        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                        .map(|time| {
+                            theme.paint(
+                                Role::Muted,
+                                time.with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d")
+                                    .to_string(),
+                            )
+                        })
+                        .unwrap_or_else(|| value(theme, key, &row[*key]))
+                })
                 .collect()
         })
         .collect();
@@ -235,7 +232,7 @@ pub(super) fn table(
 
     // A table that still overflows falls back to one block per row
     if total(&widths) > theme.width {
-        return cells
+        return rows
             .iter()
             .map(|row| {
                 block(
@@ -243,8 +240,7 @@ pub(super) fn table(
                     None,
                     &columns
                         .iter()
-                        .zip(row)
-                        .map(|((label, _), cell)| (label.to_string(), cell.clone()))
+                        .map(|(label, key)| (label.to_string(), value(theme, key, &row[*key])))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -283,7 +279,7 @@ pub(super) fn table(
         result
     };
 
-    // Print the header, then each row under a label whenever its group changes
+    // Print the header and each row at column zero
     let mut lines = vec![line(
         &columns
             .iter()
@@ -291,17 +287,7 @@ pub(super) fn table(
             .collect::<Vec<_>>(),
         true,
     )];
-    let mut previous = None;
-    for (index, row) in cells.iter().enumerate() {
-        if let Some(group) = groups.get(index)
-            && previous != Some(group)
-        {
-            if previous.is_some() {
-                lines.push(String::new());
-            }
-            lines.push(theme.paint(Role::Accent, group));
-            previous = Some(group);
-        }
+    for row in &cells {
         lines.push(line(row, false));
     }
     lines.join("\n")
@@ -452,13 +438,12 @@ mod tests {
                 &theme,
                 &rows,
                 &[("SLOT", "slot"), ("STATE", "state"), ("SIZE", "size_bytes")],
-                &[]
             ),
             "SLOT              STATE          SIZE\n\x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled    3.0 GiB\n\x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n\x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled  256.0 MiB"
         );
     }
 
-    /// Tables use column 0 for headers, groups and rows, fitting the full width.
+    /// Tables use column 0 for headers and rows, fitting the full width.
     #[test]
     fn test_tables_start_at_column_zero() {
         let theme = Theme::test(17, Color::True, true);
@@ -467,10 +452,62 @@ mod tests {
                 &theme,
                 &[json!({"name":"Examples", "size_bytes":1024})],
                 &[("NAME", "name"), ("SIZE", "size_bytes")],
-                &["Group".into()],
             ),
-            "\x1b[38;2;124;128;152mNAME\x1b[0m         \x1b[38;2;124;128;152mSIZE\x1b[0m\n\x1b[1m\x1b[38;2;137;180;250mGroup\x1b[0m\nExamples  1.0 KiB"
+            "\x1b[38;2;124;128;152mNAME\x1b[0m         \x1b[38;2;124;128;152mSIZE\x1b[0m\nExamples  1.0 KiB"
         );
+    }
+
+    /// Local dates are muted in tables, while blocks retain the clock and offset.
+    #[cfg(unix)]
+    #[test]
+    fn test_table_dates_and_block_timestamps_use_local_time() {
+        // Child processes isolate timezone settings and use a fixed instant
+        let Ok(zone) = std::env::var("ARK_TEST_DATE_ZONE") else {
+            for zone in ["Etc/GMT+5", "Etc/GMT-3"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "output::human::tests::test_table_dates_and_block_timestamps_use_local_time",
+                        "--nocapture",
+                    ])
+                    .env("ARK_TEST_DATE_ZONE", zone)
+                    .env("TZ", zone)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{zone}: {output:?}");
+            }
+            return;
+        };
+
+        // A timezone west of UTC crosses into the previous calendar date
+        let (date, clock) = if zone == "Etc/GMT+5" {
+            ("2026-10-10", "20:02:03 -05:00")
+        } else {
+            ("2026-10-11", "04:02:03 +03:00")
+        };
+        let rows = [json!({"name":"Example", "published":"2026-10-11T01:02:03Z"})];
+        let columns = [("NAME", "name"), ("PUBLISHED", "published")];
+        let theme = Theme::test(80, Color::True, true);
+        let rendered = table(&theme, &rows, &columns);
+        assert_eq!(
+            rendered.lines().last().unwrap(),
+            format!("Example   \x1b[38;2;124;128;152m{date}\x1b[0m")
+        );
+        let rendered = document(&theme, &rows[0]);
+        assert!(rendered.ends_with(&format!("{date} \x1b[38;2;124;128;152m{clock}\x1b[0m")));
+
+        // A narrow table falls back to full timestamps in blocks
+        let theme = Theme::test(18, Color::True, true);
+        let rendered = table(&theme, &rows, &columns);
+        let plain = console::strip_ansi_codes(&rendered);
+        let joined = plain.split_whitespace().collect::<String>();
+        assert!(joined.contains(&format!("{date}{}", clock.replace(' ', ""))));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| console::measure_text_width(line) <= 18)
+        );
+        assert!(!rendered.contains(&format!("\x1b[38;2;124;128;152m{date}")));
     }
 
     /// Tables show sizes in the same units as blocks.
@@ -481,12 +518,7 @@ mod tests {
             json!({"slot":"reference-genome","size_bytes":1_u64 << 28}),
             json!({"slot":"variant-catalog","size_bytes":3_u64 << 30}),
         ];
-        let rendered = table(
-            &theme,
-            &rows,
-            &[("SLOT", "slot"), ("SIZE", "size_bytes")],
-            &[],
-        );
+        let rendered = table(&theme, &rows, &[("SLOT", "slot"), ("SIZE", "size_bytes")]);
         for row in &rows {
             assert!(rendered.contains(&value(&theme, "size_bytes", &row["size_bytes"])));
         }
@@ -508,7 +540,6 @@ mod tests {
                 ("NAME", "name"),
                 ("SERIAL", "serial"),
             ],
-            &[],
         );
         assert!(
             rendered
@@ -528,12 +559,7 @@ mod tests {
         let theme = Theme::test(40, Color::Off, true);
         let rows =
             [json!({"name":"A name much longer than the available space","serial":"ark-123"})];
-        let rendered = table(
-            &theme,
-            &rows,
-            &[("NAME", "name"), ("SERIAL", "serial")],
-            &[],
-        );
+        let rendered = table(&theme, &rows, &[("NAME", "name"), ("SERIAL", "serial")]);
         assert!(rendered.contains('\u{2026}'));
         assert!(rendered.contains("ark-123"));
         assert!(

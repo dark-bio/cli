@@ -233,19 +233,7 @@ impl Output {
         rows: &[Value],
         columns: &[(&str, &str)],
     ) -> Result<(), Error> {
-        self.grouped_table(document, rows, columns, &[])
-    }
-
-    /// Renders rows as a table under group headings, given one group per row;
-    /// JSON keeps the complete document.
-    pub fn grouped_table(
-        &self,
-        document: &Value,
-        rows: &[Value],
-        columns: &[(&str, &str)],
-        groups: &[String],
-    ) -> Result<(), Error> {
-        self.document_with(document, |theme| human::table(theme, rows, columns, groups))
+        self.document_with(document, |theme| human::table(theme, rows, columns))
     }
 
     /// Renders diagnostic rows with local hints, or the equivalent machine result.

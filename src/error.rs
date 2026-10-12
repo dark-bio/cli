@@ -118,14 +118,8 @@ impl From<ConnectError> for Error {
                 Self::new(3, "no-device", error.to_string()).hint("run `ark devices`")
             }
             Ambiguous(locators) => {
-                Self::new(3, "ambiguous-device", "several Arks match").hint(format!(
-                    "select one with --device: {}",
-                    locators
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
+                Self::new(3, "ambiguous-device", "several Arks match")
+                    .hint(crate::device::selection_hint(&locators))
             }
             Busy(_) => Self::new(3, "device-busy", "the Ark is in use")
                 .hint("wait for the other ark command to finish; run commands one at a time, or close the Ark Hub browser tab"),
@@ -199,6 +193,55 @@ impl From<std::io::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ambiguity hints prefer a unique kind and otherwise keep each locator.
+    #[test]
+    fn test_ambiguous_device_hints_use_unique_kinds() {
+        // Fixed locators cover unique kinds, repeated kinds and mixed selections
+        use darkbio_connect::Locator;
+        let hardware = Locator::Hardware {
+            bus: "00".into(),
+            address: 1,
+        };
+        let other_hardware = Locator::Hardware {
+            bus: "00".into(),
+            address: 2,
+        };
+        let emulator = Locator::Emulator { port: 18181 };
+        let other_emulator = Locator::Emulator { port: 18182 };
+        for (locators, expected) in [
+            (
+                vec![hardware.clone(), emulator.clone()],
+                "select one with --device: hardware, emulator",
+            ),
+            (
+                vec![emulator.clone(), other_emulator.clone()],
+                "select one with --device: emulator:18181, emulator:18182",
+            ),
+            (
+                vec![hardware.clone(), other_hardware.clone()],
+                "select one with --device: hardware:00:1, hardware:00:2",
+            ),
+            (
+                vec![hardware.clone(), emulator.clone(), other_emulator.clone()],
+                "select one with --device: hardware, emulator:18181, emulator:18182",
+            ),
+            (
+                vec![hardware.clone(), emulator.clone(), other_hardware.clone()],
+                "select one with --device: hardware:00:1, emulator, hardware:00:2",
+            ),
+            (
+                vec![other_emulator, hardware, emulator, other_hardware],
+                "select one with --device: emulator:18182, hardware:00:1, emulator:18181, hardware:00:2",
+            ),
+        ] {
+            let error = Error::from(ConnectError::Ambiguous(locators));
+            assert_eq!(error.class, 3, "{expected}");
+            assert_eq!(error.code, "ambiguous-device", "{expected}");
+            assert_eq!(error.message, "several Arks match", "{expected}");
+            assert_eq!(error.hints, [expected], "{expected}");
+        }
+    }
 
     /// Checks that handshake and pairing failures keep their class, code and
     /// message.

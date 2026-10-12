@@ -8,13 +8,12 @@ Keep the two apart when parsing.
 
 The default output is formatted for reading, the same on a terminal and in a
 pipe. One item prints as a block of labels and values, several as a table.
-Sizes carry their unit in the value, and a size column shares one unit, so
-sizes compare down the column. Absent values print as -, empty lists as
-none and booleans as yes and no. Timestamps are in local time. A mark before
-a state is decoration, and the word beside it is the value. The view may
-shorten, round or leave out long fields, while --json always has the whole
-value. Colors and live progress need a terminal, and NO_COLOR or CLICOLOR=0
-turns colors off.
+Each size carries its own unit in the value. Absent values print as -,
+empty lists as none and booleans as yes and no. Timestamps are in local
+time, a date alone in a table and the full time in a block. A mark before a
+state is decoration, and the word beside it is the value. The view may shorten, round or leave out long fields,
+while --json always has the whole value. Colors and live progress need a
+terminal, and NO_COLOR or CLICOLOR=0 turns colors off.
 
 ## JSON
 
@@ -115,7 +114,7 @@ Exit 3 is a problem reaching the Ark.
 - `no-device` means no Ark is attached, or none matches --device. Run
   `ark devices`.
 - `ambiguous-device` means several Arks match. Pick one with --device from
-  the locators the hint lists.
+  the selectors the hint lists.
 - `device-busy` means another ark command or an Ark Hub browser tab holds
   the Ark. Wait for the command to finish, or close the tab.
 - `device-unreachable` and `disconnected` mean the connection failed or

@@ -13,7 +13,9 @@ use crate::{
     context::{Connection, Context},
     error::Error,
     http,
+    output::{Output, human},
     progress::Transfer,
+    style::{self, Theme},
 };
 use darkbio_clock::Clock;
 use darkbio_connect::{UpdateProgress, schema, trust::Environment};
@@ -80,7 +82,11 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     let mut packages = Packages::new(context, clock.clone(), connection.env)?;
     let firmwares = packages.list(context)?;
     if let args::Firmware::List = command {
-        return listing(context, &connection, &firmwares);
+        return listing(
+            &context.output,
+            &connection.info.firmware_version,
+            &firmwares,
+        );
     }
 
     // Plan the update, and print the plan alone when nothing is newer or on a
@@ -392,20 +398,19 @@ fn select<'a>(
 
 /// Shows the candidates and the installed build, adding the installed one when
 /// the listing lacks it.
-fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) -> Result<(), Error> {
+fn listing(output: &Output, installed: &str, firmwares: &[Package]) -> Result<(), Error> {
     // Keep the candidates and the installed build from the listing
-    let installed = &connection.info.firmware_version;
     let mut rows = Vec::new();
     for firmware in firmwares {
         let candidate = package::candidate(firmware, installed)?;
-        if candidate || &firmware.version == installed {
+        if candidate || firmware.version == installed {
             rows.push(json!({
                 "version": firmware.version,
                 "published": firmware.published,
                 "size_bytes": firmware.size,
                 "sha256": hex::encode(firmware.sha256),
                 "summary": firmware.summary,
-                "installed": &firmware.version == installed,
+                "installed": firmware.version == installed,
                 "candidate": candidate,
             }));
         }
@@ -420,51 +425,49 @@ fn listing(context: &Context, connection: &Connection, firmwares: &[Package]) ->
         );
     }
 
-    // The JSON document names the update and takes the rows before the table
-    // adds its flags and cuts each summary to its headline
+    // JSON keeps the full release notes and the original row order
     let update = select(firmwares, None, installed)?.map(|firmware| firmware.version.clone());
     let document = json!({"installed":installed,"update":update,"firmwares":rows});
+    output.document_with(&document, |theme| listing_table(theme, rows))
+}
+
+/// Renders builds newest first, with complete candidate headlines below the table.
+fn listing_table(theme: &Theme, mut rows: Vec<Value>) -> String {
+    // Order the installed build alongside the candidates, including an
+    // installed build that has no entry in the package listing
+    rows.sort_by_cached_key(|row| {
+        std::cmp::Reverse(package::Version::parse(row["version"].as_str().unwrap_or("")).ok())
+    });
     for row in &mut rows {
-        row["flags"] = json!(
-            [
-                (row["installed"] == true).then_some("installed"),
-                (row["candidate"] == true).then_some("update"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(", ")
-        );
-        if let Value::String(summary) = &mut row["summary"] {
-            summary.truncate(package::headline(summary).len());
-        }
+        row["status"] = json!(if row["installed"] == true {
+            "installed"
+        } else {
+            "update"
+        });
     }
 
-    // Group the table rows by semantic version, without the build suffix
-    let groups: Vec<_> = rows
-        .iter()
-        .map(|row| {
-            row["version"]
-                .as_str()
-                .unwrap_or("unknown")
-                .split('-')
-                .next()
-                .unwrap_or("unknown")
-                .to_string()
-        })
-        .collect();
-    context.output.grouped_table(
-        &document,
+    // Headline text stays outside the compact comparison columns
+    let mut sections = vec![human::table(
+        theme,
         &rows,
         &[
             ("VERSION", "version"),
             ("PUBLISHED", "published"),
             ("SIZE", "size_bytes"),
-            ("FLAGS", "flags"),
-            ("SUMMARY", "summary"),
+            ("STATUS", "status"),
         ],
-        &groups,
-    )
+    )];
+    for row in &rows {
+        if row["candidate"] == true && row["installed"] != true {
+            let headline = package::headline(row["summary"].as_str().unwrap_or(""));
+            sections.push(human::block(
+                theme,
+                row["version"].as_str(),
+                &[(String::new(), style::printable(headline))],
+            ));
+        }
+    }
+    sections.join("\n\n")
 }
 
 /// Environment-specific package client and optional Access credentials.
@@ -611,10 +614,207 @@ impl std::io::Read for Download<'_> {
     }
 }
 
-/// Tests of the firmware compatibility gate and the approval prediction.
+/// Tests of firmware listings, the compatibility gate and approval prediction.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::Color;
+    use clap::Parser;
+    use std::io::Write;
+
+    /// Builds invented releases with two candidate headlines and an installed build.
+    fn releases() -> Vec<Package> {
+        [
+            (
+                "2.10.0-ccccccc",
+                "2026-10-11T01:02:03Z",
+                "This example release adds support for a new sample format and improves how \
+                 apps read it. Note, apps built for the previous format need a rebuild before \
+                 they can run on this release.\n\nFurther release details.",
+                35_651_584,
+            ),
+            (
+                "2.9.0-bbbbbbb",
+                "2026-09-16T01:02:03Z",
+                "This earlier example release improves sample imports.\n\nEarlier release details.",
+                35_546_727,
+            ),
+            (
+                "2.8.0-aaaaaaa",
+                "2026-08-01T01:02:03Z",
+                "Installed headline that stays out of the reading view.",
+                34_603_008,
+            ),
+        ]
+        .into_iter()
+        .map(|(version, published, summary, size)| Package {
+            version: version.into(),
+            published: published.into(),
+            summary: summary.into(),
+            size,
+            sha256: [42; 32],
+        })
+        .collect()
+    }
+
+    /// Listing writers keep JSON intact and print compact rows with whole headlines.
+    #[test]
+    fn test_firmware_listing_columns_order_and_headlines() {
+        // The child exercises the actual writer with an installed or unlisted build
+        if let Ok(installed) = std::env::var("ARK_TEST_FIRMWARE_INSTALLED") {
+            let mut options = args::Cli::parse_from(["ark"]).options;
+            options.json = std::env::var("ARK_TEST_FIRMWARE_JSON").unwrap() == "true";
+            writeln!(std::io::stdout(), "<result>").unwrap();
+            listing(&Output::new(&options), &installed, &releases()).unwrap();
+            writeln!(std::io::stdout(), "</result>").unwrap();
+            return;
+        }
+
+        // Both installed cases keep the same candidate order and headline text
+        for installed in ["2.8.0-aaaaaaa", "2.8.0-develop"] {
+            for json in [false, true] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "firmware::tests::test_firmware_listing_columns_order_and_headlines",
+                        "--nocapture",
+                    ])
+                    .env("ARK_TEST_FIRMWARE_INSTALLED", installed)
+                    .env("ARK_TEST_FIRMWARE_JSON", json.to_string())
+                    .env("NO_COLOR", "1")
+                    .env("LC_ALL", "en_US.UTF-8")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{installed}, {json}: {output:?}");
+                assert!(output.stderr.is_empty());
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let rendered = stdout
+                    .split_once("<result>\n")
+                    .unwrap()
+                    .1
+                    .split_once("</result>\n")
+                    .unwrap()
+                    .0;
+                if !json {
+                    let (table, headlines) = rendered.split_once("\n\n").unwrap();
+                    let rows: Vec<_> = table.lines().collect();
+                    assert_eq!(
+                        rows[0].split_whitespace().collect::<Vec<_>>(),
+                        ["VERSION", "PUBLISHED", "SIZE", "STATUS"]
+                    );
+                    assert_eq!(
+                        rows.len(),
+                        if installed.ends_with("develop") { 5 } else { 4 }
+                    );
+                    assert!(rows[1].starts_with("2.10.0-ccccccc  "));
+                    assert!(rows[1].ends_with("34.0 MiB  update"));
+                    assert!(rows[2].starts_with("2.9.0-bbbbbbb   "));
+                    assert!(rows[2].ends_with("33.9 MiB  update"));
+                    assert!(rows.last().unwrap().starts_with(installed));
+                    assert!(rows.last().unwrap().ends_with("installed"));
+                    assert!(
+                        rendered
+                            .lines()
+                            .all(|line| console::measure_text_width(line) <= 80)
+                    );
+                    assert!(!rendered.ends_with("\n\n"));
+                    assert!(!headlines.contains("Further release details"));
+                    assert!(!headlines.contains("Earlier release details"));
+                    assert!(!headlines.contains("\n2.8.0-develop\n"));
+                    let sections: Vec<_> = headlines.trim_end().split("\n\n").collect();
+                    let candidates = if installed.ends_with("develop") { 3 } else { 2 };
+                    assert_eq!(sections.len(), candidates);
+                    for (section, release) in sections.iter().zip(releases()) {
+                        let (version, headline) = section.split_once('\n').unwrap();
+                        assert_eq!(version, release.version);
+                        assert!(headline.lines().all(|line| line.starts_with("  ")));
+                        let expected = release
+                            .summary
+                            .split_once("\n\n")
+                            .map_or(release.summary.as_str(), |(headline, _)| headline);
+                        assert_eq!(
+                            headline.split_whitespace().collect::<Vec<_>>().join(" "),
+                            expected
+                        );
+                    }
+                    continue;
+                }
+
+                // JSON preserves full notes, exact bytes, hashes, booleans and row order
+                let document: Value = serde_json::from_str(rendered).unwrap();
+                assert_eq!(document.as_object().unwrap().len(), 3);
+                assert_eq!(document["installed"], installed);
+                assert_eq!(document["update"], "2.10.0-ccccccc");
+                let rows = document["firmwares"].as_array().unwrap();
+                let offset = usize::from(installed.ends_with("develop"));
+                assert_eq!(rows.len(), 3 + offset);
+                if offset == 1 {
+                    assert_eq!(
+                        rows[0],
+                        json!({
+                            "version":"2.8.0-develop", "published":null, "size_bytes":null,
+                            "sha256":null, "summary":null, "installed":true, "candidate":false,
+                        })
+                    );
+                }
+                for (row, release) in rows[offset..].iter().zip(releases()) {
+                    assert_eq!(
+                        row,
+                        &json!({
+                            "version":release.version, "published":release.published,
+                            "size_bytes":release.size,
+                            "sha256":"2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+                            "summary":release.summary, "installed":release.version == installed,
+                            "candidate":release.version != installed,
+                        })
+                    );
+                }
+
+                // Terminal dates are muted, headlines have headings and statuses stay plain
+                for width in [32, 80] {
+                    let theme = Theme::test(width, Color::True, true);
+                    let rendered = listing_table(&theme, rows.clone());
+                    assert!(
+                        rendered
+                            .lines()
+                            .all(|line| console::measure_text_width(line) <= width)
+                    );
+                    assert!(rendered.contains("\n\n\x1b[1m2.10.0-ccccccc\x1b[0m\n  "));
+                    if width == 80 {
+                        let row = rendered.lines().nth(1).unwrap();
+                        let plain = console::strip_ansi_codes(row);
+                        let date = plain.split_whitespace().nth(1).unwrap();
+                        assert_eq!(date.len(), 10);
+                        assert!(row.contains(&format!("\x1b[38;2;124;128;152m{date}\x1b[0m")));
+                        assert!(row.ends_with("34.0 MiB  update"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// An installed develop build stays installed even when it is also a candidate.
+    #[test]
+    fn test_installed_candidate_omits_its_headline() {
+        let theme = Theme::test(80, Color::True, true);
+        let rendered = listing_table(
+            &theme,
+            vec![json!({
+                "version":"2.10.0-develop", "published":null, "size_bytes":35_651_584,
+                "summary":"The installed build's headline.", "installed":true, "candidate":true,
+            })],
+        );
+        assert_eq!(rendered.lines().count(), 2);
+        assert!(
+            rendered
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with("34.0 MiB  installed")
+        );
+        assert!(!rendered.contains("headline"));
+        assert!(!rendered.contains("update"));
+    }
 
     /// Builds device info reporting firmware `version`, published at `publish`
     /// in Unix seconds.

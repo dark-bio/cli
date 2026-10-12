@@ -70,13 +70,13 @@ const CONTRACTS: &[Contract] = &[
         path: "devices",
         paragraph: "Lists hardware Arks on USB and the emulators their launchers report, without \
             connecting to any. Names and serials are what discovery reports, and only a \
-            connection verifies them. With several Arks attached, --device takes a locator \
-            from this list.",
+            connection verifies them. With several Arks attached, the hint gives a selector \
+            for each to pass to --device.",
         footer: Some(ContractFooter {
             requires: "nothing",
             approval: "none",
             time: "seconds",
-            prints: "locator, name, serial, kind, environment, ready; JSON adds image",
+            prints: "locator, name, serial, environment, ready; JSON adds kind, image",
             exit: "0 done; 1 local; 2 usage; 3 device",
             examples: "ark devices\nark devices --json",
         }),
@@ -187,16 +187,16 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data list",
-        paragraph: "Lists every slot with its state, origin, build, version, size and the slots \
-            it requires, and hints at the command that fills or erases a slot. \
-            `ark data show` prints one slot in full.",
+        paragraph: "Lists every slot with its state, build, version and size, and hints at \
+            the command that fills or erases a slot. `ark data show` prints one slot in \
+            full, including its origin and requirements.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark, and the cloud unless status reports synced \
                 (--unlock only if status reports locked)",
             approval: "none; --unlock needs your phone",
             time: "seconds",
-            prints: "slot, state, origin, build, version, size (JSON size_bytes), requires; \
-                JSON adds id, name, description, format, damage, download",
+            prints: "slot, state, build, version, size (JSON size_bytes); JSON adds id, name, \
+                description, format, origin, damage, requires, download",
             exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 6 approval; 7 timeout",
             examples: "ark data list\nark data list --json",
         }),
@@ -327,14 +327,14 @@ const CONTRACTS: &[Contract] = &[
     Contract {
         path: "firmware list",
         paragraph: "Lists the installed build and the published builds an update may install, \
-            for the Ark's cloud environment. `ark help firmware` explains which builds are \
-            candidates.",
+            newest first, for the Ark's cloud environment. Each candidate's headline prints \
+            whole below the table. `ark help firmware` explains which builds are candidates.",
         footer: Some(ContractFooter {
             requires: "one Ark and its package host",
             approval: "none",
             time: "seconds",
-            prints: "version, published, size, flags, summary; JSON: installed, update, \
-                firmwares (version, published, size_bytes, sha256, summary, installed, \
+            prints: "version, published date, size, status, candidate headlines; JSON: installed, \
+                update, firmwares (version, published, size_bytes, sha256, summary, installed, \
                 candidate)",
             exit: "0 done; 1 local; 2 usage; 3 device; 4 cloud; 5 Ark; 7 timeout",
             examples: "ark firmware list\nark firmware list --json",

@@ -9,8 +9,8 @@ identity before its first request.
 `ark devices` lists hardware Arks on USB and the emulators that the emulator
 launchers on this computer report. It never connects, so the names and
 serials it shows are what discovery reported, not verified facts. The
-reading view shows locator, name, serial and kind, and environment and
-ready when an emulator reports them. --json adds image, an emulator's image
+reading view shows locator, name and serial, and environment and ready when
+an emulator reports them. --json adds kind and image, an emulator's image
 file name.
 
 The environment and ready fields come from the emulator launcher. They are
@@ -19,15 +19,18 @@ discovery source that fails prints a warning, and the Arks the other source
 found still show. Having no emulator running is normal.
 
 One attached Ark is picked on its own. With several, a command fails with
-ambiguous-device and lists their locators, and --device picks one by:
+ambiguous-device. Its hint and the hint from `ark devices` name a selector
+for each Ark, using its kind when it is the only one of that kind, and its
+locator otherwise. --device picks one by:
 
 - its locator, hardware:BUS:ADDR or emulator:PORT
 - its serial, name or emulator image name, when it is unique
 - the word hardware or emulator, when only one Ark of that kind is attached
 
 A selector matches exactly, without prefixes or case folding. USB addresses
-can change when an Ark reboots, and a serial from discovery never proves
-which Ark answered, since only the handshake does.
+and emulator ports can change when an Ark reboots, while kind words keep
+working. A serial from discovery never proves which Ark answered, since
+only the handshake does.
 
 An Ark serves one session at a time. While another ark command or an Ark
 Hub browser tab holds the Ark, a command fails with device-busy. Wait for

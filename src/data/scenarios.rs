@@ -160,6 +160,45 @@ fn inventory_output() {
             }
             "empty" => super::paths::print(&output, &[]).unwrap(),
             "list" => listing(&output, &slots()).unwrap(),
+            "four-slots" => {
+                let slots: Vec<_> = [
+                    (
+                        schema::SlotKind::ReferenceGenome,
+                        "GRCh38.p14",
+                        "",
+                        1_022_427_344,
+                    ),
+                    (
+                        schema::SlotKind::GeneAnnotations,
+                        "GRCh38.p14",
+                        "",
+                        215_062_938,
+                    ),
+                    (
+                        schema::SlotKind::SnpIndelCalls,
+                        "GRCh38.p13",
+                        "",
+                        307_547_341,
+                    ),
+                    (
+                        schema::SlotKind::VariantCatalog,
+                        "GRCh38.p14",
+                        "157",
+                        6_227_702_579,
+                    ),
+                ]
+                .into_iter()
+                .map(|(kind, build, version, bytes)| SlotStatus {
+                    kind: kind as i32,
+                    state: SlotState::Filled as i32,
+                    build: build.into(),
+                    version: version.into(),
+                    bytes,
+                    ..Default::default()
+                })
+                .collect();
+                listing(&output, &slots).unwrap();
+            }
             "show41" => show(&output, &slots(), 41).unwrap(),
             "show42" => show(&output, &slots(), 42).unwrap(),
             _ => panic!("unexpected scenario {scenario}"),
@@ -278,7 +317,7 @@ fn inventory_output() {
     let (stdout, stderr) = capture("list", false);
     assert_eq!(
         stdout,
-        "SLOT  STATE     ORIGIN     BUILD     VERSION     SIZE  REQUIRES\n41    \u{2713} filled  personal   sample-a  1        2.0 KiB  none\n42    \u{00b7} empty   reference  -         -            0 B  41 (filled)\n"
+        "SLOT  STATE     BUILD     VERSION     SIZE\n41    \u{2713} filled  sample-a  1        2.0 KiB\n42    \u{00b7} empty   -         -            0 B\n"
     );
     assert_eq!(stderr, "hint: run `ark data fetch 42`\n");
 
@@ -319,4 +358,27 @@ fn inventory_output() {
             assert!(joined.ends_with("Required by none Cached no"));
         }
     }
+}
+
+/// Four typical slots fit as five comparison columns and four rows at 80 columns.
+#[test]
+fn test_data_list_fits_four_slots_at_eighty_columns() {
+    let (stdout, stderr) = capture("four-slots", false);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.lines().count(), 5);
+    assert!(
+        stdout
+            .lines()
+            .all(|line| console::measure_text_width(line) <= 80)
+    );
+    assert_eq!(
+        stdout,
+        concat!(
+            "SLOT              STATE     BUILD       VERSION       SIZE\n",
+            "reference-genome  ✓ filled  GRCh38.p14  -        975.1 MiB\n",
+            "gene-annotations  ✓ filled  GRCh38.p14  -        205.1 MiB\n",
+            "snp-indel-calls   ✓ filled  GRCh38.p13  -        293.3 MiB\n",
+            "variant-catalog   ✓ filled  GRCh38.p14  157        5.8 GiB\n",
+        )
+    );
 }
