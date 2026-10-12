@@ -107,7 +107,7 @@ fn slots() -> Vec<SlotStatus> {
 /// Runs one scenario in a child test process, capturing its real stdout and
 /// stderr so results and hints stay distinguishable.
 fn capture(scenario: &str, json: bool) -> (String, String) {
-    // Run this test again as a child that prints the scenario without color
+    // Run this test again as a child with UTF-8 marks and no color
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -117,6 +117,7 @@ fn capture(scenario: &str, json: bool) -> (String, String) {
         .env("ARK_TEST_DATA_SCENARIO", scenario)
         .env("ARK_TEST_DATA_JSON", json.to_string())
         .env("NO_COLOR", "1")
+        .env("LC_ALL", "en_US.UTF-8")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -277,7 +278,7 @@ fn inventory_output() {
     let (stdout, stderr) = capture("list", false);
     assert_eq!(
         stdout,
-        "  SLOT  STATE      ORIGIN     BUILD     VERSION     SIZE  REQUIRES\n  41    ok filled  personal   sample-a  1        2.0 KiB  none\n  42    - empty    reference  -         -            0 B  41 (filled)\n"
+        "SLOT  STATE     ORIGIN     BUILD     VERSION     SIZE  REQUIRES\n41    \u{2713} filled  personal   sample-a  1        2.0 KiB  none\n42    \u{00b7} empty   reference  -         -            0 B  41 (filled)\n"
     );
     assert_eq!(stderr, "hint: run `ark data fetch 42`\n");
 
@@ -311,10 +312,10 @@ fn inventory_output() {
         }
         if id == 41 {
             assert!(joined.starts_with("Slot 41 Id 41 Name Sample A Description "));
-            assert!(joined.ends_with("State ok filled Origin personal Damage - Dependencies none Size 2.0 KiB Build sample-a Version 1 Download - Required by 42 Cached no"));
+            assert!(joined.ends_with("State \u{2713} filled Origin personal Damage - Dependencies none Size 2.0 KiB Build sample-a Version 1 Download - Required by 42 Cached no"));
         } else {
             assert!(joined.starts_with("Slot 42 Id 42 Name Sample B Description "));
-            assert!(joined.contains("State - empty Origin reference Damage - Dependencies 41 (filled) Size 0 B Build - Version - Download url https://example.test/sample Download size 4.0 KiB Download sha256 "));
+            assert!(joined.contains("State \u{00b7} empty Origin reference Damage - Dependencies 41 (filled) Size 0 B Build - Version - Download url https://example.test/sample Download size 4.0 KiB Download sha256 "));
             assert!(joined.ends_with("Required by none Cached no"));
         }
     }

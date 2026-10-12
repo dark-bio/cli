@@ -454,10 +454,9 @@ fn help_differs_exactly_where_it_promises_more() {
 /// nothing on stdout.
 #[test]
 fn documented_usage_errors_keep_the_text_prefix() {
-    // Topics render in a pipe as on a terminal, so code spans lose their
-    // backtick markers there and keep only their text
+    // Topics keep code spans in backticks in a pipe too
     let help = String::from_utf8(ark(&["help", "output"]).stdout).unwrap();
-    assert!(help.contains("Exit 2 is usage, for invalid arguments or an unknown help topic."));
+    assert!(help.contains("Exit 2 is `usage`, for invalid arguments or an unknown help topic."));
     for args in [
         vec!["bogus"],
         vec!["--timeout", "0", "status"],
@@ -477,7 +476,7 @@ fn documented_usage_errors_keep_the_text_prefix() {
     // A missing device is the documented no-device error
     let output = ark(&["status", "--device", "hardware:palette-no-device"]);
     assert_eq!(output.status.code(), Some(3));
-    assert!(help.contains("no-device means no Ark is attached, or none matches --device."));
+    assert!(help.contains("`no-device` means no Ark is attached, or none matches --device."));
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()

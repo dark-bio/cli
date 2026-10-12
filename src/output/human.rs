@@ -64,15 +64,6 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
             };
             theme.mark(role, &text)
         }
-        "environment" => theme.paint(
-            match text.as_str() {
-                "release" => Role::Accent,
-                "staging" => Role::Staging,
-                "develop" => Role::Develop,
-                _ => Role::Default,
-            },
-            text,
-        ),
         "flags" => text
             .split(", ")
             .map(|flag| {
@@ -102,45 +93,55 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
 
 /// Aligns label/value rows, stacking them when labels consume the available width.
 ///
-/// An empty pair separates groups; an empty label introduces an unlabeled row.
-pub(crate) fn block(theme: &Theme, rows: &[(String, String)]) -> String {
+/// An optional title starts at column 0, and rows indent two spaces. An empty
+/// pair separates groups; an empty label introduces an unlabeled row.
+pub(crate) fn block(theme: &Theme, title: Option<&str>, rows: &[(String, String)]) -> String {
+    // A title names the block above its rows
+    let mut lines = Vec::new();
+    if let Some(title) = title {
+        lines.push(style::wrap(
+            &theme.paint(Role::Heading, style::printable(title)),
+            theme.width,
+            0,
+        ));
+    }
+
+    // Align rows within the block, stacking values when the labels leave no room
     let labels = rows
         .iter()
         .map(|(label, _)| console::measure_text_width(label))
         .max()
         .unwrap_or(0);
     let stacked = labels + 8 > theme.width;
-    rows.iter()
-        .map(|(label, value)| {
-            if label.is_empty() && value.is_empty() {
-                return String::new();
-            }
-            if label.is_empty() {
-                return style::wrap(&format!("  {value}"), theme.width, 2);
-            }
-            if stacked {
-                return [theme.paint(Role::Muted, label), value.clone()]
-                    .iter()
-                    .map(|line| style::wrap(&format!("  {line}"), theme.width, 2))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            let line = format!(
-                "  {}{}  {value}",
-                theme.paint(Role::Muted, label),
-                " ".repeat(labels.saturating_sub(console::measure_text_width(label)))
-            );
-            style::wrap(&line, theme.width, labels + 4)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    lines.extend(rows.iter().map(|(label, value)| {
+        if label.is_empty() && value.is_empty() {
+            return String::new();
+        }
+        if label.is_empty() {
+            return style::wrap(&format!("  {value}"), theme.width, 2);
+        }
+        if stacked {
+            return [theme.paint(Role::Muted, label), value.clone()]
+                .iter()
+                .map(|line| style::wrap(&format!("  {line}"), theme.width, 2))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        let line = format!(
+            "  {}{}  {value}",
+            theme.paint(Role::Muted, label),
+            " ".repeat(labels.saturating_sub(console::measure_text_width(label)))
+        );
+        style::wrap(&line, theme.width, labels + 4)
+    }));
+    lines.join("\n")
 }
 
 /// Renders nested fields as readable labels with units in their values.
 pub(crate) fn document(theme: &Theme, value: &Value) -> String {
     let mut rows = Vec::new();
     fields(theme, "", "", value, &mut rows);
-    block(theme, &rows)
+    block(theme, None, &rows)
 }
 
 /// Flattens a value into rows, joining nested keys into readable labels
@@ -222,7 +223,7 @@ pub(super) fn table(
 
     // Shrink the one free-text column to fit, never below its header or 8 cells
     let total =
-        |widths: &[usize]| 2 + widths.iter().sum::<usize>() + columns.len().saturating_sub(1) * 2;
+        |widths: &[usize]| widths.iter().sum::<usize>() + columns.len().saturating_sub(1) * 2;
     let flexible = columns
         .iter()
         .position(|(_, key)| matches!(*key, "summary" | "description" | "name"));
@@ -239,6 +240,7 @@ pub(super) fn table(
             .map(|row| {
                 block(
                     theme,
+                    None,
                     &columns
                         .iter()
                         .zip(row)
@@ -252,7 +254,7 @@ pub(super) fn table(
 
     // Lay out a line, right-aligning sizes, durations and numeric columns
     let line = |cells: &[String], header: bool| {
-        let mut result = String::from("  ");
+        let mut result = String::new();
         for (i, cell) in cells.iter().enumerate() {
             let cell = if Some(i) == flexible {
                 theme.truncate(cell, widths[i])
@@ -297,7 +299,7 @@ pub(super) fn table(
             if previous.is_some() {
                 lines.push(String::new());
             }
-            lines.push(format!("  {}", theme.paint(Role::Accent, group)));
+            lines.push(theme.paint(Role::Accent, group));
             previous = Some(group);
         }
         lines.push(line(row, false));
@@ -374,10 +376,42 @@ mod tests {
                 &theme,
                 &json!({"firmware":{"version":"1.2.3","published":null},"paired":true})
             ),
-            "  Firmware version    1.2.3\n  Firmware published  -\n  Paired              \x1b[1m\u{2713} yes\x1b[0m"
+            "  Firmware version    1.2.3\n  Firmware published  -\n  Paired              \x1b[1m\u{2713}\x1b[0m yes"
         );
         assert_eq!(value(&theme, "name", &json!("failed")), "failed");
         assert_eq!(value(&theme, "serial", &Value::Null), "unverified");
+    }
+
+    /// Environment values stay plain beside their muted labels.
+    #[test]
+    fn test_environment_values_are_unstyled() {
+        let theme = Theme::test(80, Color::True, true);
+        for environment in ["release", "staging", "develop", "unknown"] {
+            assert_eq!(
+                document(&theme, &json!({"environment":environment})),
+                format!("  \x1b[38;2;124;128;152mEnvironment\x1b[0m  {environment}"),
+                "{environment}"
+            );
+        }
+    }
+
+    /// A block title starts at column 0 above aligned, indented groups.
+    #[test]
+    fn test_block_titles_start_at_column_zero() {
+        let theme = Theme::test(80, Color::Basic, true);
+        let rows = [
+            ("Serial".into(), "ark-1".into()),
+            (String::new(), String::new()),
+            ("State".into(), "ready".into()),
+        ];
+        assert_eq!(
+            block(&theme, Some("Example Ark"), &rows),
+            "\x1b[1mExample Ark\x1b[0m\n  Serial  ark-1\n\n  State   ready"
+        );
+        assert_eq!(
+            block(&theme, None, &rows),
+            "  Serial  ark-1\n\n  State   ready"
+        );
     }
 
     /// Sizes and durations show in their units, under labels without unit
@@ -420,7 +454,22 @@ mod tests {
                 &[("SLOT", "slot"), ("STATE", "state"), ("SIZE", "size_bytes")],
                 &[]
             ),
-            "  SLOT              STATE          SIZE\n  \x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m    3.0 GiB\n  \x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n  \x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713} filled\x1b[0m  256.0 MiB"
+            "SLOT              STATE          SIZE\n\x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled    3.0 GiB\n\x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n\x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled  256.0 MiB"
+        );
+    }
+
+    /// Tables use column 0 for headers, groups and rows, fitting the full width.
+    #[test]
+    fn test_tables_start_at_column_zero() {
+        let theme = Theme::test(17, Color::True, true);
+        assert_eq!(
+            table(
+                &theme,
+                &[json!({"name":"Examples", "size_bytes":1024})],
+                &[("NAME", "name"), ("SIZE", "size_bytes")],
+                &["Group".into()],
+            ),
+            "\x1b[38;2;124;128;152mNAME\x1b[0m         \x1b[38;2;124;128;152mSIZE\x1b[0m\n\x1b[1m\x1b[38;2;137;180;250mGroup\x1b[0m\nExamples  1.0 KiB"
         );
     }
 
@@ -506,7 +555,7 @@ mod tests {
         ];
         assert_eq!(
             checklist(&theme, &rows),
-            "  \x1b[1m\u{2713} usb\x1b[0m    1 device found\n  \x1b[1m\u{2717} relay\x1b[0m  no answer\n    \x1b[1mhint:\x1b[0m open \x1b[1mArk Companion\x1b[0m\n  \u{00b7} slots  skipped: Ark locked\n  \x1b[1m! tool\x1b[0m   new release\n    \x1b[1mhint:\x1b[0m run \x1b[1mbrew upgrade ark-cli\x1b[0m"
+            "  \x1b[1m\u{2713}\x1b[0m usb    1 device found\n  \x1b[1m\u{2717}\x1b[0m relay  no answer\n    \x1b[1mhint:\x1b[0m open `\x1b[1mArk Companion\x1b[0m`\n  \u{00b7} slots  skipped: Ark locked\n  \x1b[1m!\x1b[0m tool   new release\n    \x1b[1mhint:\x1b[0m run `\x1b[1mbrew upgrade ark-cli\x1b[0m`"
         );
     }
 }

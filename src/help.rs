@@ -7,8 +7,7 @@
 //! Help pages, topics and the manual, generated from the commands this build
 //! serves.
 //!
-//! A page has one shape on a terminal and in a pipe; only color and glyphs
-//! differ.
+//! A page has one shape on a terminal and in a pipe; only color differs.
 
 use crate::{
     args::Cli,
@@ -28,6 +27,9 @@ const GLOBAL: [&str; 9] = [
 const TOPICS: [&str; 6] = [
     "agents", "devices", "datasets", "apps", "firmware", "output",
 ];
+
+/// Maximum line width of help pages and topics in terminal cells.
+const WIDTH: usize = 80;
 
 /// A command's paragraph and optional leaf contract, selected by its path.
 struct Contract {
@@ -407,7 +409,7 @@ const CONTRACTS: &[Contract] = &[
 /// Resolves the stdout theme for help, which is written for reading even when
 /// the invocation selects JSON.
 ///
-/// The theme never follows that flag, but a pipe still loses color and glyphs.
+/// The theme never follows that flag, but a pipe still loses color.
 pub(crate) fn theme() -> Theme {
     Theme::new(false, false)
 }
@@ -450,7 +452,7 @@ fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
         .ansi()
         .to_string()
         .lines()
-        .map(|line| style::wrap(&theme.inline(line), theme.width, hanging(line)))
+        .map(|line| style::wrap(&theme.inline(line), theme.width.min(WIDTH), hanging(line)))
         .collect::<Vec<_>>()
         .join("\n");
     let (description, scan) = scan.split_once("\n\n").unwrap_or((&scan, ""));
@@ -523,12 +525,12 @@ fn decorate(command: &mut clap::Command, parent: &str, theme: &Theme) {
     // The root gets the overview, a group points to its children, and a leaf
     // gets its contract
     let help = if parent.is_empty() {
-        format!(
+        theme.inline(&format!(
             "Output is formatted for reading; --json keeps complete, exact values.
 AI agents: read `ark help agents` first.
 Topics: {}.",
             TOPICS.join(", ")
-        )
+        ))
     } else if let Some(fields) = &contract.footer {
         // Clap keeps an option hidden from the short page out of the rendered
         // scan too, so the long page lists it by hand ahead of the contract
@@ -555,19 +557,19 @@ Topics: {}.",
             )
         )
     } else {
-        format!(
+        theme.inline(&format!(
             "Each subcommand has its own requirements, approvals and output.\nRead `ark {key} COMMAND --help` for its contract."
-        )
+        ))
     };
 
     // Wrap the text and attach it as the long footer, and on the root as the
     // short one too
     let help = help
         .lines()
-        .map(|line| style::wrap(&theme.inline(line), theme.width, hanging(line)))
+        .map(|line| style::wrap(line, theme.width.min(WIDTH), hanging(line)))
         .collect::<Vec<_>>()
         .join("\n");
-    let paragraph = style::wrap(&theme.inline(contract.paragraph), theme.width, 0);
+    let paragraph = style::wrap(&theme.inline(contract.paragraph), theme.width.min(WIDTH), 0);
     let mut decorated = command
         .clone()
         .before_long_help(paragraph.clone())
@@ -605,7 +607,7 @@ pub(crate) fn run(output: &Output, path: &[String], all: bool) -> Result<(), Err
         );
         return output.text(&pages.join(&format!(
             "\n\n{}\n\n",
-            theme.paint(Role::Muted, "-".repeat(theme.width.min(80)))
+            theme.paint(Role::Muted, "-".repeat(theme.width.min(WIDTH)))
         )));
     }
 
@@ -651,7 +653,7 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
                     " ".repeat(column - label.len() - 1),
                     theme.inline(text)
                 ),
-                theme.width,
+                theme.width.min(WIDTH),
                 column,
             )
         })
@@ -662,7 +664,7 @@ fn footer(theme: &Theme, fields: &[(&str, &str)], examples: &str) -> String {
     lines.extend(examples.lines().map(|line| {
         style::wrap(
             &format!("  {}", theme.paint(Role::Accent, line)),
-            theme.width,
+            theme.width.min(WIDTH),
             2,
         )
     }));
@@ -717,7 +719,7 @@ fn markdown(theme: &Theme, text: &str) -> String {
                 (theme.inline(line), 0)
             }
         };
-        lines.push(style::wrap(&line, theme.width, hanging));
+        lines.push(style::wrap(&line, theme.width.min(WIDTH), hanging));
     }
     lines.join("\n").trim_end().to_string()
 }
@@ -887,7 +889,7 @@ mod tests {
                 &theme,
                 "# States\n\nUse `ark status`.\n\n- Keep the phone nearby.\n\n```sh\nark unlock\n```\n"
             ),
-            "\x1b[1mStates\x1b[0m\n\nUse \x1b[1mark status\x1b[0m.\n\n  - Keep the phone nearby.\n\n  \x1b[1mark unlock\x1b[0m"
+            "\x1b[1mStates\x1b[0m\n\nUse `\x1b[1mark status\x1b[0m`.\n\n  - Keep the phone nearby.\n\n  \x1b[1mark unlock\x1b[0m"
         );
     }
 
@@ -916,6 +918,46 @@ mod tests {
                 bare.render_long_help().to_string(),
                 "{path:?}"
             );
+        }
+    }
+
+    /// Help pages and topic prose wrap at 80 columns on a wide terminal.
+    #[test]
+    fn test_help_wraps_at_eighty_columns_on_wide_terminals() {
+        for color in [Color::Off, Color::True] {
+            // Every command page keeps its prose within the reading width
+            let theme = Theme::test(200, color, true);
+            let mut pages = Vec::new();
+            collect_help(&mut command(&theme), &mut pages);
+            for page in pages {
+                assert!(
+                    page.lines()
+                        .all(|line| console::measure_text_width(line) <= 80),
+                    "{color:?}: {page}"
+                );
+            }
+
+            // A topic wraps long paragraphs and bullets under their own text
+            let prose = "Read `ark status` before starting a task. Keep the phone nearby to approve access to the data on the Ark.";
+            let rendered = markdown(&theme, &format!("{prose}\n\n- {prose}"));
+            assert_eq!(
+                console::strip_ansi_codes(&rendered),
+                "Read `ark status` before starting a task. Keep the phone nearby to approve\naccess to the data on the Ark.\n\n  - Read `ark status` before starting a task. Keep the phone nearby to approve\n    access to the data on the Ark.",
+                "{color:?}"
+            );
+        }
+    }
+
+    /// Command pages keep backticks around inline commands with one style span.
+    #[test]
+    fn test_help_keeps_backticks() {
+        for (color, expected) in [
+            (Color::Off, "`ark help agents`"),
+            (Color::Basic, "`\x1b[1mark help agents\x1b[0m`"),
+        ] {
+            let theme = Theme::test(80, color, true);
+            let page = command(&theme).render_long_help().ansi().to_string();
+            assert!(page.contains(expected), "{color:?}");
         }
     }
 

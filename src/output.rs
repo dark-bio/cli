@@ -920,7 +920,7 @@ mod tests {
         let theme = Theme::test(80, Color::Basic, true);
         assert_eq!(
             event_line(&theme, "hint", "run `ark unlock` first"),
-            "\x1b[1mhint:\x1b[0m run \x1b[1mark unlock\x1b[0m first"
+            "\x1b[1mhint:\x1b[0m run `\x1b[1mark unlock\x1b[0m` first"
         );
         assert_eq!(
             event_line(&theme, "approve", "confirm on your phone"),

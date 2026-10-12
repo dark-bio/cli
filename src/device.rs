@@ -183,7 +183,7 @@ fn status_block(theme: &Theme, value: &Value) -> String {
     if value.get("enrolled").is_some() {
         rows.push(("Enrolled".into(), field("enrolled")));
     }
-    human::block(theme, &rows)
+    human::block(theme, None, &rows)
 }
 
 /// Suggests the next enrollment, pairing or unlock action from the reported state.
@@ -388,7 +388,7 @@ mod tests {
         });
         assert_eq!(
             status_block(&theme, &value),
-            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware     Ark I, revision B, model 01\n\n  Firmware     0.11.5, published -\n  Trust        \x1b[1m! self-signed\x1b[0m\n  Environment  -\n  Realm        -\n\n  Cloud        -\n  Pairing      \x1b[1m\u{2713} paired\x1b[0m\n  Lock         \x1b[1m! locked\x1b[0m\n  Identity     \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch     \x1b[1mArk II - A\x1b[0m"
+            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware     Ark I, revision B, model 01\n\n  Firmware     0.11.5, published -\n  Trust        \x1b[1m!\x1b[0m self-signed\n  Environment  -\n  Realm        -\n\n  Cloud        -\n  Pairing      \x1b[1m\u{2713}\x1b[0m paired\n  Lock         \x1b[1m!\x1b[0m locked\n  Identity     \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch     \x1b[1mArk II - A\x1b[0m"
         );
 
         // The fingerprint shows, while the full public key does not
@@ -398,6 +398,6 @@ mod tests {
 
         // A known negative sync state reads as an attention mark
         value["synced"] = json!(false);
-        assert!(status_block(&theme, &value).contains("! not synced"));
+        assert!(status_block(&theme, &value).contains("\x1b[1m!\x1b[0m not synced"));
     }
 }
