@@ -19,8 +19,12 @@ use serde_json::{Value, json};
 /// Lists discovery metadata without opening devices, retaining useful partial
 /// results.
 pub(crate) fn devices(context: &Context) -> Result<(), Error> {
-    // Nothing found fails only when some discovery source failed too
+    // Show a line while discovery runs, erased before the table
+    let looking = context.output.notice("Looking for Arks");
     let found = context.discover();
+    drop(looking);
+
+    // Nothing found fails only when some discovery source failed too
     if found.devices.is_empty() && !found.errors.is_empty() {
         return Err(Error::new(
             3,
@@ -47,7 +51,9 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
             .iter()
             .map(|device| device.locator())
             .collect();
-        context.output.event("hint", selection_hint(&locators));
+        context
+            .output
+            .event("hint", selection_hint(&locators, &locators));
     }
     Ok(())
 }
@@ -73,14 +79,14 @@ fn devices_table(theme: &Theme, rows: &[Value]) -> String {
 }
 
 /// Builds the hint naming a selector for each Ark, its kind when it is the
-/// only one of that kind, and its locator otherwise.
-pub(crate) fn selection_hint(locators: &[Locator]) -> String {
+/// only discovered Ark of that kind, and its locator otherwise.
+pub(crate) fn selection_hint(locators: &[Locator], available: &[Locator]) -> String {
     // Count each kind, since a kind word selects only an Ark alone of its kind
-    let hardware = locators
+    let hardware = available
         .iter()
         .filter(|locator| matches!(locator, Locator::Hardware { .. }))
         .count();
-    let emulator = locators.len() - hardware;
+    let emulator = available.len() - hardware;
     let selectors: Vec<_> = locators
         .iter()
         .map(|locator| match locator {
@@ -561,7 +567,7 @@ mod tests {
         assert!(rendered.contains(concat!(
             "  Environment  release\n",
             "  Mismatch     Ark II - A\n",
-            "  Enrolled     ✓ yes\n\n",
+            "  Enrolled     yes\n\n",
             "  Trust        ✓ attested",
         )));
         assert_eq!(rendered.matches("\n\n").count(), 1);

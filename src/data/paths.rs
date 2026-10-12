@@ -76,7 +76,7 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
                 } else {
                     Role::Default
                 },
-                name
+                style::printable(&name)
             )
         );
         if path.grantable {
@@ -118,7 +118,7 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
             continue;
         }
         let padding = " ".repeat(column - console::measure_text_width(&line));
-        let examples = theme.paint(Role::Muted, examples.join(", "));
+        let examples = theme.paint(Role::Muted, style::printable(&examples.join(", ")));
         lines.push(style::wrap(
             &format!("{line}{padding}{examples}"),
             theme.width,
@@ -133,6 +133,37 @@ fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
 mod tests {
     use super::*;
     use crate::style::Color;
+
+    /// Path names and examples from the device print with control characters
+    /// escaped.
+    #[test]
+    fn test_path_names_and_examples_escape_controls() {
+        let paths = [
+            DatasetPath {
+                path: "v1/\x1b[2Jroot".into(),
+                directory: true,
+                available: true,
+                ..Default::default()
+            },
+            DatasetPath {
+                path: "v1/\x1b[2Jroot/\x1b[31mleaf".into(),
+                available: true,
+                examples: vec!["\x1b[2Jvalue\nnext".into()],
+                ..Default::default()
+            },
+        ];
+        for color in [Color::Off, Color::True] {
+            let text = render(&Theme::test(80, color, true), &paths);
+            let plain = console::strip_ansi_codes(&text);
+            assert!(plain.contains("v1/\\u{1b}[2Jroot/"), "{color:?}");
+            assert!(plain.contains("    \\u{1b}[31mleaf"), "{color:?}");
+            assert!(plain.contains("\\u{1b}[2Jvalue\\nnext"), "{color:?}");
+            assert_eq!(plain.lines().count(), 3, "{color:?}");
+            if color == Color::Off {
+                assert!(!text.contains('\x1b'));
+            }
+        }
+    }
 
     /// Checks that unknown roots, missing parents and long names keep every
     /// path component in tree order.

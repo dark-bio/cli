@@ -287,16 +287,17 @@ fn upload(
 
     // Print the result, complete or partial, before any error
     context.interrupt.clear();
-    if result.is_ok() {
-        context.output.end_stage(None, None);
+    let result = result.map_err(Error::from);
+    if let Err(error) = &result {
+        context.output.fail_stage(Some(error));
     } else {
-        context.output.fail_stage();
+        context.output.end_stage(None, None);
     }
     value["uploaded_bytes"] = json!(progress.uploaded);
     value["phases"] = json!(progress.phases);
     value["duration_seconds"] = json!(clock.elapsed(started).as_secs());
     context.output.document(&value)?;
-    result.map_err(Into::into)
+    result
 }
 
 /// Ends the identification with the slot and its confidence, keeping the

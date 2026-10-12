@@ -35,7 +35,8 @@ lacks is `invalid-slot`.
 ## Exit 3
 
 Exit 3 is a problem reaching the Ark. Another run can succeed once the Ark
-is attached, selected and free, except after `handshake-failed`.
+is attached, selected and free, unless `handshake-failed` names a failed
+verification.
 
 - `no-device` means no Ark is attached, or none matches --device. Run
   `ark devices`.
@@ -46,8 +47,10 @@ is attached, selected and free, except after `handshake-failed`.
 - `device-unreachable` and `disconnected` mean the connection failed or
   dropped. Check that the Ark is plugged in or the emulator is running. On
   Linux, a permission error's hint gives the udev rule.
-- `handshake-failed` means the Ark's attestation or identity did not verify.
-  Another run cannot fix it, and `ark help devices` covers enrollment and
+- `handshake-failed` means the handshake did not complete, and the message
+  says why. A connection that dropped during it can pass on another run. A
+  failed verification, such as an attestation signed by an unknown key,
+  needs the identity fixed, and `ark help devices` covers enrollment and
   recovering an identity.
 
 ## Exit 4
@@ -119,10 +122,10 @@ command again, since another run asks the owner again.
 ## Exit 7
 
 Exit 7 is `timeout`, for a wait on a machine that ran past --timeout or past
-a fixed limit, such as the 5s handshake that opens a connection or the 120s
-an Ark gets to return from a firmware update. Another run may succeed. Check
-the connection and `ark status` first, and raise --timeout for a slow
-machine.
+a fixed limit. Those limits are the 5s handshake that opens a connection and
+the 120s an Ark gets to return from a firmware update. Another run may
+succeed. Check the connection and `ark status` first, and raise --timeout for
+a slow machine.
 
 ## Exit 8
 

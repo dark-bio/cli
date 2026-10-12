@@ -329,8 +329,6 @@ fn install(
             context.interrupt.clear();
             if result.is_ok() {
                 context.output.end_stage(None, None);
-            } else {
-                context.output.fail_stage();
             }
             match result {
                 Ok(()) => {
@@ -340,6 +338,7 @@ fn install(
                     return Ok(());
                 }
                 Err(darkbio_connect::Error::Integrity(_)) => {
+                    context.output.fail_stage(None);
                     context.output.event(
                         "warning",
                         "cached reference failed verification; downloading it again",
@@ -347,9 +346,14 @@ fn install(
                     let _ = fs::remove_file(&path);
                 }
                 Err(darkbio_connect::Error::DatasetRead(_)) => {
+                    context.output.fail_stage(None);
                     let _ = fs::remove_file(&path);
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let error = Error::from(error);
+                    context.output.fail_stage(Some(&error));
+                    return Err(error);
+                }
             }
         }
     }
@@ -402,17 +406,24 @@ fn install(
             },
         );
         context.interrupt.clear();
-        if result.is_ok() {
-            context.output.end_stage(None, None);
+        let corrupt = matches!(&result, Err(darkbio_connect::Error::Integrity(_)));
+        let failed = reader.failed;
+        let result = result.map_err(|error| {
+            reader.error.take().unwrap_or_else(|| match error {
+                darkbio_connect::Error::DatasetRead(error) if failed => http::read_error(error),
+                error => error.into(),
+            })
+        });
+        if let Err(error) = &result {
+            context.output.fail_stage(Some(error));
         } else {
-            context.output.fail_stage();
+            context.output.end_stage(None, None);
         }
 
         // A verified download is reusable even if the Ark later rejects processing.
         // Cache completion describes the source, not the slot's resulting state.
         let valid = reader.read == source.dataset.size
             && reader.hash.clone().finalize().as_slice() == source.dataset.sha256.unwrap();
-        let failed = reader.failed;
         let entry = if let Some(writer) = reader.writer.take() {
             let entry = writer.finish(valid);
             if entry.is_none() {
@@ -454,24 +465,15 @@ fn install(
                 }
                 return Ok(());
             }
-            Err(darkbio_connect::Error::Integrity(_)) if reader.offset > 0 && attempt < 2 => {
-                context.output.event(
-                    "warning",
-                    "cached prefix failed verification; restarting download",
-                )
-            }
+            Err(_) if corrupt && reader.offset > 0 && attempt < 2 => context.output.event(
+                "warning",
+                "cached prefix failed verification; restarting download",
+            ),
             Err(_) if failed && attempt < 2 => context.output.event(
                 "warning",
                 format!("download interrupted; retry {}/3", attempt + 2),
             ),
-            Err(error) if failed => {
-                return Err(reader.error.unwrap_or_else(|| match error {
-                    darkbio_connect::Error::Timeout => error.into(),
-                    darkbio_connect::Error::DatasetRead(error) => http::read_error(error),
-                    error => error.into(),
-                }));
-            }
-            Err(error) => return Err(reader.error.unwrap_or_else(|| error.into())),
+            Err(error) => return Err(error),
         }
     }
     unreachable!("last attempt returns its result")

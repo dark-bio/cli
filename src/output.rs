@@ -497,7 +497,7 @@ impl Output {
             .is_some_and(|active| active.approval.is_none() && active.update.same_stage(update));
         if !same {
             if update.failed {
-                self.fail_stage();
+                self.fail_stage(None);
             }
             self.start(update.clone(), None, None);
         } else {
@@ -520,7 +520,7 @@ impl Output {
         }
         // A finished stage leaves its outcome line, never its bar
         if update.failed {
-            self.fail_stage();
+            self.fail_stage(None);
         } else if update.facts.percent == Some(100) {
             self.end_stage(None, None);
         }
@@ -532,20 +532,38 @@ impl Output {
     /// Without `message` a stage prints its `completed` words, an approval its
     /// outcome and an Ark phase its own name. A transient stage prints nothing.
     pub fn end_stage(&self, message: Option<&str>, fact: Option<&str>) {
-        self.outcome(message, fact, false);
-    }
-
-    /// Ends the stage or approval in progress as failed, ahead of its error.
-    pub fn fail_stage(&self) {
-        self.outcome(None, None, true);
-    }
-
-    /// Stops the redraws and prints the one outcome of the stage in progress.
-    fn outcome(&self, message: Option<&str>, fact: Option<&str>, failed: bool) {
         let mut terminal = self.stop_ticker();
+        self.outcome(&mut terminal, message, fact, false);
+    }
+
+    /// Ends the stage in progress as failed, ahead of `error`.
+    ///
+    /// An approval prints `Not approved` only for an error of exit class 6, an
+    /// approval that did not come, and otherwise ends without a line.
+    pub fn fail_stage(&self, error: Option<&Error>) {
+        let mut terminal = self.stop_ticker();
+        if !error.is_some_and(|error| error.class == 6)
+            && terminal
+                .active
+                .as_ref()
+                .is_some_and(|active| active.approval.is_some())
+        {
+            terminal.active = None;
+        }
+        self.outcome(&mut terminal, None, None, true);
+    }
+
+    /// Prints the outcome of the stage in progress after its redraws stop.
+    fn outcome(
+        &self,
+        terminal: &mut Terminal,
+        message: Option<&str>,
+        fact: Option<&str>,
+        failed: bool,
+    ) {
         end_activity(
             &self.0.err,
-            &mut terminal,
+            terminal,
             &mut io::stderr().lock(),
             self.clock().now(),
             self.json(),
@@ -570,7 +588,7 @@ impl Output {
 
     /// Shows a transient line on a terminal, unless a stage or approval holds
     /// the line.
-    fn notice(&self, message: &str) -> Notice {
+    pub fn notice(&self, message: &str) -> Notice {
         let mut terminal = self.0.terminal.lock().expect("output not poisoned");
         if self.json() || !self.terminal() || self.0.quiet || terminal.active.is_some() {
             return Notice(None);
@@ -584,6 +602,7 @@ impl Output {
     /// allow, and starts the scan's approval below it.
     pub fn pairing(&self, url: &str) {
         self.end_stage(None, None);
+        let mut printed_code = false;
         if !self.json() {
             let mut terminal = self.0.terminal.lock().expect("output not poisoned");
             let mut stderr = io::stderr().lock();
@@ -599,14 +618,15 @@ impl Output {
                     .lines()
                     .all(|line| console::measure_text_width(line) + 2 <= self.0.err.width)
                 {
-                    let _ = writeln!(
+                    printed_code = writeln!(
                         stderr,
                         "\n{}",
                         qr.lines()
                             .map(|line| format!("  {line}"))
                             .collect::<Vec<_>>()
                             .join("\n")
-                    );
+                    )
+                    .is_ok();
                 }
             }
             let _ = writeln!(
@@ -629,8 +649,10 @@ impl Output {
             Some("phone"),
             if self.json() {
                 format!("Approve the pairing by opening {url} on your phone")
-            } else {
+            } else if printed_code {
                 "Approve the pairing by scanning this code in Ark Companion".into()
+            } else {
+                "Approve the pairing by opening this link on your phone".into()
             },
         );
     }
@@ -684,7 +706,7 @@ impl Output {
     /// Fails the stage in progress, then prints the error and its hints, which
     /// JSON carries inside the error object.
     pub fn error(&self, error: &Error) {
-        self.fail_stage();
+        self.fail_stage(Some(error));
         if self.json() {
             self.event_value(
                 json!({"event":"error", "message":error.message, "error":error.json()}),
@@ -1277,6 +1299,136 @@ mod tests {
                 "approval expired",
             ]);
             captured.approvals(&[("update", Some("button")), ("update", None)]);
+        }
+    }
+
+    /// Only an exit class 6 error ends an approval as not approved, while a
+    /// machine stage fails with its own words in every class.
+    #[test]
+    fn test_failures_after_approval_use_the_error_class() {
+        for captured in crate::testing::narration(
+            "output::tests::test_failures_after_approval_use_the_error_class",
+            |output, _| {
+                for class in [1, 2, 3, 4, 5, 6, 7, 8, 130, 143] {
+                    let error = Error::new(class, "scenario", format!("failure in class {class}"));
+                    output.approve("update", Some("phone"), "Approve the update on your phone");
+                    output.fail_stage(Some(&error));
+                    assert!(output.0.terminal.lock().unwrap().active.is_none());
+                    assert_eq!(output.0.terminal.lock().unwrap().live, 0);
+                    output.error(&error);
+                    output.stage(
+                        "download",
+                        "Downloading the report",
+                        Some("Downloaded the report"),
+                    );
+                    output.error(&error);
+                }
+            },
+        ) {
+            assert_eq!(captured.stderr.matches("Not approved").count(), 1);
+            assert!(!captured.stderr.contains("Approved on your phone"));
+            captured.contains(&["Not approved on your phone", "failure in class 6"]);
+            if captured.json {
+                let events = captured.events();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["event"] == "error")
+                        .count(),
+                    20
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["event"] == "progress"
+                            && event["message"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with("Downloading the report ·"))
+                        .count(),
+                    10
+                );
+            } else {
+                assert_eq!(
+                    captured.stderr.matches("✗ Downloading the report").count(),
+                    10
+                );
+            }
+        }
+    }
+
+    /// Pairing asks for a scan only when the QR code printed, and for the link
+    /// otherwise.
+    #[test]
+    fn test_pairing_instruction_follows_rendered_code() {
+        for captured in crate::testing::narration(
+            "output::tests::test_pairing_instruction_follows_rendered_code",
+            |output, clock| {
+                for (unicode, width) in [(true, 240), (false, 240), (true, 30)] {
+                    let mut pairing = Output::test(output.json(), output.terminal(), clock.clock());
+                    let state = Arc::get_mut(&mut pairing.0).unwrap();
+                    state.err.unicode = unicode;
+                    state.err.width = width;
+                    pairing.pairing("https://example.com/pair");
+                    pairing.finish();
+                }
+            },
+        ) {
+            if captured.json {
+                let events = captured.events();
+                assert_eq!(events.len(), 3);
+                for event in events {
+                    assert_eq!(event["event"], "approve");
+                    assert_eq!(
+                        event["message"],
+                        "Approve the pairing by opening https://example.com/pair on your phone"
+                    );
+                }
+            } else {
+                let text = captured
+                    .stderr
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(
+                    text.matches("by scanning this code in Ark Companion")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    text.matches("by opening this link on your phone").count(),
+                    2
+                );
+                assert_eq!(text.matches("https://example.com/pair").count(), 3);
+                assert!(text.contains('█') || text.contains('▀') || text.contains('▄'));
+            }
+        }
+    }
+
+    /// Discovery shows a line on a terminal, erased before the result, and none
+    /// in a pipe or JSON.
+    #[test]
+    fn test_discovery_notice_is_erased_before_result() {
+        for captured in crate::testing::narration(
+            "output::tests::test_discovery_notice_is_erased_before_result",
+            |output, _| {
+                let notice = output.notice("Looking for Arks");
+                assert_eq!(
+                    output.0.terminal.lock().unwrap().live,
+                    usize::from(output.terminal())
+                );
+                drop(notice);
+                assert_eq!(output.0.terminal.lock().unwrap().live, 0);
+                assert!(!output.0.terminal.lock().unwrap().err_printed);
+                output.document(&json!({"devices":[]})).unwrap();
+            },
+        ) {
+            if captured.terminal {
+                assert_eq!(captured.stderr, "› Looking for Arks\r\x1b[2K");
+            } else {
+                assert!(captured.stderr.is_empty());
+            }
+            assert!(!captured.stdout.is_empty());
         }
     }
 

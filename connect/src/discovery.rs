@@ -6,7 +6,7 @@
 
 //! Hardware and emulator discovery, with selection by locator or reported label.
 
-use crate::{Device, DeviceKind, Error, emulator, hardware};
+use crate::{Device, Error, Locator, emulator, hardware};
 
 /// Devices found and errors reported by independent discovery sources.
 #[derive(Debug, Default)]
@@ -35,42 +35,52 @@ impl Discovery {
     /// selection. The bare names `hardware` and `emulator` require one device of
     /// that kind. Label matches are exact and case-sensitive.
     pub fn select(&self, selector: Option<&str>) -> Result<&Device, Error> {
-        // A reported name must not shadow a locator, including an absent one
-        if let Some(selector) = selector
-            && (selector.starts_with("hardware:") || selector.starts_with("emulator:"))
-        {
-            return self
-                .devices
-                .iter()
-                .find(|device| device.locator().to_string() == selector)
-                .ok_or_else(|| Error::NoMatch(selector.into()));
-        }
+        let entries = self.devices.iter().map(|device| {
+            (
+                device.locator(),
+                [device.serial(), device.name(), device.image()],
+            )
+        });
+        select(entries, selector).map(|index| &self.devices[index])
+    }
+}
 
-        // Descriptive labels may be shared. Keep every match for ambiguity errors.
-        let matches: Vec<_> = self
-            .devices
-            .iter()
-            .filter(|device| {
-                selector.is_none_or(|selector| {
-                    match selector {
-                        "hardware" => return device.kind() == DeviceKind::Hardware,
-                        "emulator" => return device.kind() == DeviceKind::Emulator,
-                        _ => {}
-                    }
-                    [device.serial(), device.name(), device.image()]
-                        .into_iter()
-                        .flatten()
-                        .any(|value| value == selector)
-                })
-            })
-            .collect();
-        match matches.as_slice() {
-            [] => Err(selector.map_or(Error::NotFound, |selector| Error::NoMatch(selector.into()))),
-            [device] => Ok(device),
-            _ => Err(Error::Ambiguous(
-                matches.into_iter().map(Device::locator).collect(),
-            )),
+/// Returns the index of the one endpoint `selector` names, by locator, kind
+/// or label.
+fn select<'a>(
+    entries: impl Iterator<Item = (Locator, [Option<&'a str>; 3])>,
+    selector: Option<&str>,
+) -> Result<usize, Error> {
+    // Keep every locator so an ambiguity hint can distinguish repeated kinds
+    let mut available = Vec::new();
+    let mut matches = Vec::new();
+    for (locator, labels) in entries {
+        let matched = selector.is_none_or(|selector| match selector {
+            "hardware" => matches!(locator, Locator::Hardware { .. }),
+            "emulator" => matches!(locator, Locator::Emulator { .. }),
+            // Reported labels cannot shadow locators, including absent ones
+            _ if selector.starts_with("hardware:") || selector.starts_with("emulator:") => {
+                locator.to_string() == selector
+            }
+            _ => labels.into_iter().flatten().any(|label| label == selector),
+        });
+        if matched {
+            matches.push(available.len());
         }
+        available.push(locator);
+    }
+
+    // Select a unique match, and report every match otherwise
+    match matches.as_slice() {
+        [] => Err(selector.map_or(Error::NotFound, |selector| Error::NoMatch(selector.into()))),
+        [index] => Ok(*index),
+        _ => Err(Error::Ambiguous {
+            matches: matches
+                .into_iter()
+                .map(|index| available[index].clone())
+                .collect(),
+            available,
+        }),
     }
 }
 
@@ -112,7 +122,7 @@ mod tests {
         assert_eq!(found.devices[0].to_string(), found.devices[1].to_string());
         assert!(matches!(
             found.select(Some("ark.img")),
-            Err(Error::Ambiguous(_))
+            Err(Error::Ambiguous { .. })
         ));
         assert_eq!(
             found.select(Some("emulator:18182")).unwrap().locator(),
@@ -138,6 +148,44 @@ mod tests {
             found.select(Some("hardware:1:2")),
             Err(Error::NoMatch(_))
         ));
+    }
+
+    /// A shared name's ambiguity keeps every discovered Ark, matched or not.
+    #[test]
+    fn test_shared_name_keeps_all_discovered_kinds() {
+        let hardware = Locator::Hardware {
+            bus: "00".into(),
+            address: 1,
+        };
+        let other = Locator::Hardware {
+            bus: "00".into(),
+            address: 2,
+        };
+        let emulator = Locator::Emulator { port: 18181 };
+        let entries = [
+            (hardware.clone(), [None, Some("Shared Ark"), None]),
+            (other.clone(), [None, Some("Other Ark"), None]),
+            (
+                emulator.clone(),
+                [None, Some("Shared Ark"), Some("ark.img")],
+            ),
+        ];
+        let Err(Error::Ambiguous { matches, available }) =
+            select(entries.clone().into_iter(), Some("Shared Ark"))
+        else {
+            panic!("shared name must be ambiguous");
+        };
+        assert_eq!(matches, [hardware.clone(), emulator.clone()]);
+        assert_eq!(available, [hardware, other, emulator]);
+        assert!(matches!(
+            select(entries.clone().into_iter(), Some("hardware")),
+            Err(Error::Ambiguous { .. })
+        ));
+        assert_eq!(
+            select(entries.clone().into_iter(), Some("hardware:00:1")).unwrap(),
+            0
+        );
+        assert_eq!(select(entries.into_iter(), Some("emulator")).unwrap(), 2);
     }
 
     /// One source's failure preserves other endpoints and their reported metadata.

@@ -56,11 +56,12 @@ pub(crate) fn run(context: &Context, path: &Path) -> Result<(), Error> {
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            context.output.fail_stage();
+            let error = Error::from(error);
+            context.output.fail_stage(Some(&error));
             if context.output.json() && !value["task"].is_null() {
                 context.output.document(&value)?;
             }
-            return Err(error.into());
+            return Err(error);
         }
     };
     narration.finish(result.duration);

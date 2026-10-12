@@ -210,9 +210,15 @@ pub enum Error {
     #[error("no Ark enclave matches {0}")]
     NoMatch(String),
 
-    /// Several endpoints match; their locators let the caller distinguish them.
+    /// Several endpoints match, listed beside every discovered one, so a hint
+    /// names a kind only when it is unique.
     #[error("multiple Ark enclaves match; select an endpoint by its locator")]
-    Ambiguous(Vec<Locator>),
+    Ambiguous {
+        /// Endpoints matching the selector.
+        matches: Vec<Locator>,
+        /// Every discovered endpoint, including those the selector excluded.
+        available: Vec<Locator>,
+    },
 
     /// Enumerating, opening or configuring a USB device failed.
     #[error("USB operation failed: {0}")]

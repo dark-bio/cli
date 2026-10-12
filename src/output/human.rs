@@ -50,6 +50,9 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
 
     // Other values read as text, styled by what their key means
     let text = super::scalar(value);
+    if value.is_boolean() {
+        return text;
+    }
     match key {
         "trust" | "state" | "outcome" | "result" => {
             let role = match text.as_str() {
@@ -64,14 +67,6 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
             theme.paint(Role::Accent, text)
         }
         "damage" | "mismatch" => theme.paint(Role::Failure, text),
-        "synced" | "paired" | "unlocked" | "verified" | "active" | "enrolled" | "success"
-        | "returned" | "installed" => {
-            if let Some(yes) = value.as_bool() {
-                theme.mark(if yes { Role::Success } else { Role::Attention }, &text)
-            } else {
-                text
-            }
-        }
         _ => text,
     }
 }
@@ -432,7 +427,7 @@ mod tests {
                 &theme,
                 &json!({"firmware":{"version":"1.2.3","published":null},"paired":true})
             ),
-            "  Firmware version    1.2.3\n  Firmware published  -\n  Paired              \x1b[1m\u{2713}\x1b[0m yes"
+            "  Firmware version    1.2.3\n  Firmware published  -\n  Paired              yes"
         );
         assert_eq!(value(&theme, "name", &json!("failed")), "failed");
         assert_eq!(value(&theme, "serial", &Value::Null), "unverified");
@@ -511,6 +506,46 @@ mod tests {
             ),
             "SLOT              STATE          SIZE\n\x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled    3.0 GiB\n\x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n\x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled  256.0 MiB"
         );
+    }
+
+    /// Boolean fields stay plain yes and no in both blocks and tables.
+    #[test]
+    fn test_booleans_are_plain_words_in_blocks_and_tables() {
+        let fields = [
+            "installed",
+            "returned",
+            "verified",
+            "synced",
+            "paired",
+            "unlocked",
+            "active",
+            "enrolled",
+            "success",
+            "state",
+            "ready",
+        ];
+        for color in [Color::Off, Color::True] {
+            let theme = Theme::test(80, color, true);
+            for key in fields {
+                let rows = [json!({key:true}), json!({key:false})];
+                let rendered = table(&theme, &rows, &[("VALUE", key)]);
+                assert_eq!(
+                    rendered.lines().skip(1).collect::<Vec<_>>(),
+                    ["yes", "no"],
+                    "{key}"
+                );
+                let rendered = document(&theme, &json!({key:false}));
+                assert!(rendered.ends_with("  no"), "{key}: {rendered}");
+                assert_eq!(
+                    console::strip_ansi_codes(&rendered)
+                        .split_whitespace()
+                        .last(),
+                    Some("no"),
+                    "{key}"
+                );
+                assert!(!rendered.contains('!'), "{key}");
+            }
+        }
     }
 
     /// A table starts at column 0 and may fill the whole width.

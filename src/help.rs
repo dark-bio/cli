@@ -66,10 +66,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "devices",
-        paragraph: "Lists hardware Arks on USB and the emulators their launchers report, without \
-            connecting to any. Names and serials are what discovery reports, and only a \
-            connection verifies them. With several Arks attached, the hint gives a selector \
-            for each to pass to --device.",
+        paragraph: "Discovery connects to none of them, so the names and serials are what it \
+            reports, and only a connection verifies them. With several Arks attached, the \
+            hint names a selector for each to pass to --device.",
         footer: Some(ContractFooter {
             requires: "nothing",
             approval: "none",
@@ -80,10 +79,10 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "status",
-        paragraph: "Connects to the Ark and shows what it is, how ark trusts it, its firmware, \
-            and its cloud, pairing and lock state. It works offline, unpaired and locked, and \
-            hints at the next step. On firmware older than ark supports, it prints what it \
-            can read, then fails with firmware-outdated.",
+        paragraph: "It also shows how ark trusts the Ark and whether the Ark is in sync with the \
+            cloud, and hints at the next step. It works offline, unpaired and locked. On \
+            firmware older than ark supports, it prints what it can read, then fails with \
+            firmware-outdated.",
         footer: Some(ContractFooter {
             requires: "one Ark, in any state; the cloud is not needed",
             approval: "none",
@@ -96,9 +95,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "genuine",
-        paragraph: "Syncs the Ark with the cloud, then asks Dark Bio's device registry whether \
-            the Ark is enrolled and active. It fails with registry-inactive when the \
-            registration is disabled, expired or superseded.",
+        paragraph: "It syncs the Ark with the cloud first, then asks the registry whether the Ark \
+            is enrolled and active. It fails with registry-inactive when the registration \
+            is disabled, expired or superseded.",
         footer: Some(ContractFooter {
             requires: "one Ark and the cloud",
             approval: "none",
@@ -109,11 +108,11 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "pair",
-        paragraph: "Pairs an unpaired Ark with the owner's phone, once. ark prints a pairing \
-            link, drawn as a QR code at a terminal and carried in an approve event elsewhere. \
-            The owner opens it in Ark Companion within 10 minutes. The Ark and the phone then \
-            show colors, and the owner presses the Ark's button with its pin within 60s when \
-            they match. The button sits behind a pinhole under the Ark's bottom right LED.",
+        paragraph: "Pairing happens once. ark prints a pairing link, with a QR code where the \
+            locale and width allow, and under --json in the approve event. The owner opens \
+            it in Ark Companion. The Ark and the phone then show colors, and the owner \
+            presses the Ark's button with its pin when they match. The button sits behind \
+            a pinhole under the Ark's bottom right LED.",
         footer: Some(ContractFooter {
             requires: "an unpaired Ark and the cloud",
             approval: "the owner opens the link in Ark Companion, then presses the Ark's button \
@@ -125,9 +124,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "unlock",
-        paragraph: "Asks the owner's phone to unlock the Ark, and waits up to 2 minutes for the \
-            approval. The Ark then stays unlocked until it loses power. An Ark that is \
-            unlocked already stays as it is, with a note.",
+        paragraph: "The Ark then stays unlocked until it loses power. An Ark that is unlocked \
+            already stays as it is, with a note.",
         footer: Some(ContractFooter {
             requires: "a paired Ark and the cloud",
             approval: "on your phone, unless the Ark is unlocked already",
@@ -138,10 +136,10 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "enroll",
-        paragraph: "Gives a self-signed Ark, such as a fresh emulator, an attested identity. \
-            Without --cwt it prints the Ark Hub address where the person enrolls the Ark in a \
-            browser, then fails with enrollment-required. With --cwt it installs the \
-            attestation from the file, then reconnects to check it.",
+        paragraph: "Enrolling gives a self-signed Ark, such as a fresh emulator, an attested \
+            identity. Without --cwt ark prints the Ark Hub address where the person \
+            enrolls the Ark in a browser, then fails with enrollment-required. With --cwt \
+            it installs the attestation from the file, then reconnects to check it.",
         footer: Some(ContractFooter {
             requires: "a self-signed Ark",
             approval: "none; the person enrolls the Ark in a browser at Ark Hub",
@@ -163,10 +161,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data paths",
-        paragraph: "Prints every path an app can read on this Ark as a tree, marking \
-            directories, grantable paths and missing data, with examples beside them. --json \
-            describes each path in full, including how the phone words a grant of it. The \
-            map never shows a value from the owner's data.",
+        paragraph: "The tree marks directories, grantable paths and missing data, with examples \
+            beside them. --json describes each path in full, including how the phone words \
+            a grant of it. The map never shows a value from the owner's data.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark, and the cloud unless status reports synced \
                 (--unlock only if status reports locked)",
@@ -179,9 +176,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data list",
-        paragraph: "Lists every slot with its state, build, version and size, and hints at \
-            the command that fills or erases a slot. `ark data show` prints one slot in \
-            full, including its origin and requirements.",
+        paragraph: "Each row shows a slot's state, build, version and size, and a hint names the \
+            command that fills or erases a slot. `ark data show` prints one slot in full, \
+            with its origin and requirements.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark, and the cloud unless status reports synced \
                 (--unlock only if status reports locked)",
@@ -194,10 +191,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data show",
-        paragraph: "Prints one slot in full. Beside the slot's state and dependencies, it shows \
-            the Ark's description of the data and of the file that fills it, the slots that \
-            require it, the download it offers and whether this computer's cache holds that \
-            download.",
+        paragraph: "Beside the slot's state and dependencies, it shows the Ark's description of \
+            the data and of the file that fills it, the slots that require it, the \
+            download it offers and whether this computer's cache holds that download.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark, and the cloud unless status reports synced \
                 (--unlock only if status reports locked)",
@@ -210,11 +206,11 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data upload",
-        paragraph: "Uploads the owner's variant calls, a VCF file with one person's genotypes, \
-            into the empty snp-indel-calls slot. The Ark identifies the file from its first \
-            bytes and refuses any other kind. The owner then approves on their phone within \
-            1 minute, and ark uploads the file and waits while the Ark validates and indexes \
-            it. --dry-run stops after the identification.",
+        paragraph: "The Ark identifies the file from its first bytes and accepts one person's \
+            variant calls in VCF, plain or compressed, into the empty snp-indel-calls \
+            slot. The owner approves on their phone, then ark sends the file and waits \
+            while the Ark validates and indexes it. --dry-run stops after the \
+            identification.",
         footer: Some(ContractFooter {
             requires: "an empty target slot, a paired, unlocked Ark and the cloud (--unlock \
                 only if status reports locked)",
@@ -227,11 +223,10 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data fetch",
-        paragraph: "Downloads the public reference file the Ark offers for a slot that is not \
-            filled, and streams it to the Ark, checking it against the offered SHA-256 on the \
-            way. A copy stays in this computer's cache. --all fetches every reference slot \
-            that is not filled and offers a file, in the order their requirements set, and \
-            skips the rest. A reference needs no approval.",
+        paragraph: "ark streams the file the Ark offers for a slot that is not filled, checking it \
+            against the offered SHA-256 on the way, and keeps a copy in this computer's \
+            cache. --all fetches every reference slot that is not filled and offers a \
+            file, in the order their requirements set, and skips the rest.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark offering a download, the download host, and the \
                 cloud unless status reports synced (--unlock only if status reports locked)",
@@ -245,9 +240,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data delete",
-        paragraph: "Empties a slot that holds a dataset, once the owner approves on their phone \
-            within 2 minutes, and refuses an empty slot. --dry-run shows the slot and the \
-            slots that require it, and changes nothing.",
+        paragraph: "An empty slot is refused, and so is a damaged or half-written one, which `ark \
+            data repair` erases. --dry-run shows the slot and the slots that require it, \
+            and changes nothing.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark and the cloud (--unlock only if status reports \
                 locked)",
@@ -259,10 +254,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "data repair",
-        paragraph: "Erases a slot whatever its state, once the owner approves on their phone \
-            within 2 minutes. It recovers a damaged or half-written slot that delete refuses, \
-            and it erases a healthy dataset too. --dry-run shows the slot and the slots that \
-            require it, and changes nothing.",
+        paragraph: "It recovers a damaged or half-written slot that delete refuses, and it erases \
+            a healthy dataset too. --dry-run shows the slot and the slots that require it, \
+            and changes nothing.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark and the cloud (--unlock only if status reports \
                 locked)",
@@ -274,12 +268,11 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "run",
-        paragraph: "Uploads the app and follows its task. The Ark checks it, then the owner \
-            approves the run on their phone within 5 minutes, switching on optional grants \
-            and answering the app's questions. Once the app ends, the owner reviews its \
-            report within 10 minutes. ark prints the report if they release it, and fails if \
-            they decline. When the app reports failure, ark still prints the released report, \
-            then fails with app-failed.",
+        paragraph: "ark sends the app, and the Ark checks it before the owner approves the run, \
+            switching on optional grants and answering the app's questions. Once the app \
+            ends, the owner reviews its report. ark prints it if they release it, and \
+            fails if they decline. When the app reports failure, ark still prints the \
+            released report, then fails with app-failed.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark and the cloud (--unlock only if status reports \
                 locked)",
@@ -302,9 +295,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "firmware list",
-        paragraph: "Lists the installed build and the published builds an update may install, \
-            newest first, for the Ark's cloud environment. Each candidate's headline prints \
-            whole below the table. `ark help firmware` explains which builds are candidates.",
+        paragraph: "The builds list newest first, for the Ark's cloud environment, with each \
+            candidate's headline whole below the table. `ark help firmware` explains which \
+            builds are candidates.",
         footer: Some(ContractFooter {
             requires: "one Ark and its package host",
             approval: "none",
@@ -316,11 +309,9 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "firmware update",
-        paragraph: "Installs the newest candidate, or the version given, then waits up to 120s \
-            for the Ark to come back running it. It needs confirmation, at a \
-            terminal or through --yes. The owner then approves nothing on an unpaired Ark, \
-            presses the Ark's button with its pin within 30s on a locked one, and approves on \
-            the phone within 2 minutes on an unlocked one.",
+        paragraph: "It installs the newest candidate, or the version given, then waits for the Ark \
+            to come back running it. It needs confirmation, at a terminal or through \
+            --yes, and the Ark's state decides who approves.",
         footer: Some(ContractFooter {
             requires: "one Ark, the cloud and its package host",
             approval: "none if unpaired; the Ark's button within 30s if locked; your phone \
@@ -349,8 +340,7 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "completions",
-        paragraph: "Prints the completion script for the shell on stdout. It never installs \
-            the script.",
+        paragraph: "ark prints the script on stdout and never installs it.",
         footer: Some(ContractFooter {
             requires: "nothing",
             approval: "none",
@@ -361,11 +351,10 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "help",
-        paragraph: "Prints the help page of a command, or a topic: agents, devices, datasets, \
-            apps, firmware, output or errors. A name that is both a topic and a command, devices \
-            or firmware, prints the topic, and `ark devices --help` prints the command's page. \
-            `ark help --all` prints the whole manual, starting with the root page and the \
-            agents topic.",
+        paragraph: "A topic is agents, devices, datasets, apps, firmware, output or errors. A name \
+            that is both a topic and a command, devices or firmware, prints the topic, and \
+            `ark devices --help` prints the command's page. `ark help --all` prints the \
+            whole manual, starting with the root page and the agents topic.",
         footer: Some(ContractFooter {
             requires: "nothing",
             approval: "none",
@@ -400,22 +389,21 @@ pub(crate) fn command(theme: &Theme) -> clap::Command {
 /// Clap normally expands long help onto two lines per option. The short layout
 /// is rendered once and used for every help spelling.
 fn compact(command: &mut clap::Command, theme: &Theme, root: bool) {
-    // Hide the shared options below the root
-    if !root {
-        for name in GLOBAL {
-            *command = command
-                .clone()
-                .mut_arg(name, |argument| argument.hide(true));
-        }
-    }
-
-    // Render the scan alone, placing blank lines between the root's groups
+    // Hide shared options only in the display copy, since mut_arg moves
+    // arguments and invalidates the parser's indexes after build
     let mut display = command
         .clone()
         .before_help(None)
         .before_long_help(None)
         .after_help(None)
         .after_long_help(None);
+    if !root {
+        for name in GLOBAL {
+            display = display.mut_arg(name, |argument| argument.hide(true));
+        }
+    }
+
+    // Render the scan alone, placing blank lines between the root's groups
     let scan = display
         .render_help()
         .ansi()
@@ -793,6 +781,82 @@ fn topic(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
+
+    /// Every global option keeps its meaning at every level of the parsed tree.
+    #[test]
+    fn test_decorated_command_parses_global_options_at_every_level() {
+        // Check the whole option set so a flag cannot silently set another one
+        for (flags, key, expected) in [
+            (
+                vec!["--device", "hardware"],
+                "device",
+                serde_json::json!("hardware"),
+            ),
+            (
+                vec!["-d", "emulator"],
+                "device",
+                serde_json::json!("emulator"),
+            ),
+            (vec!["--json"], "json", serde_json::json!(true)),
+            (vec!["--unlock"], "unlock", serde_json::json!(true)),
+            (vec!["--no-input"], "no_input", serde_json::json!(true)),
+            (vec!["--timeout", "120"], "timeout", serde_json::json!(120)),
+            (
+                vec!["--env", "staging"],
+                "env",
+                serde_json::json!("staging"),
+            ),
+            (vec!["--quiet"], "quiet", serde_json::json!(true)),
+            (vec!["-q"], "quiet", serde_json::json!(true)),
+            (vec!["--verbose"], "verbose", serde_json::json!(true)),
+            (vec!["-v"], "verbose", serde_json::json!(true)),
+            (vec!["--log", "trace"], "log", serde_json::json!("Trace")),
+        ] {
+            for path in [vec!["status"], vec!["data", "list"]] {
+                for level in 0..=path.len() {
+                    let mut arguments = vec!["ark"];
+                    arguments.extend_from_slice(&path[..level]);
+                    arguments.extend_from_slice(&flags);
+                    arguments.extend_from_slice(&path[level..]);
+                    let matches = command(&Theme::test(80, Color::Off, true))
+                        .try_get_matches_from(&arguments)
+                        .unwrap_or_else(|error| panic!("{arguments:?}: {error}"));
+                    let options = Cli::from_arg_matches(&matches).unwrap().options;
+                    let actual = serde_json::json!({
+                        "device":options.device, "json":options.json,
+                        "unlock":options.unlock, "no_input":options.no_input,
+                        "timeout":options.timeout, "env":options.env.map(|env| env.to_string()),
+                        "quiet":options.quiet, "verbose":options.verbose,
+                        "log":options.log.map(|log| format!("{log:?}")),
+                    });
+                    let mut wanted = serde_json::json!({
+                        "device":null, "json":false, "unlock":false, "no_input":false,
+                        "timeout":60, "env":null, "quiet":false, "verbose":false, "log":null,
+                    });
+                    wanted[key] = expected.clone();
+                    assert_eq!(actual, wanted, "{arguments:?}");
+                }
+            }
+        }
+    }
+
+    /// `--no-input` never turns into `--unlock`, wherever it stands.
+    #[test]
+    fn test_decorated_no_input_never_unlocks() {
+        for arguments in [
+            vec!["ark", "--no-input", "data", "list"],
+            vec!["ark", "data", "--no-input", "list"],
+            vec!["ark", "data", "list", "--no-input"],
+        ] {
+            let matches = command(&Theme::test(80, Color::Off, true))
+                .try_get_matches_from(&arguments)
+                .unwrap();
+            let cli = Cli::from_arg_matches(&matches).unwrap();
+            assert!(cli.options.no_input, "{arguments:?}");
+            assert!(!cli.options.unlock, "{arguments:?}");
+        }
+    }
 
     /// Checks that every help spelling prints the paragraph after the one-liner.
     #[test]

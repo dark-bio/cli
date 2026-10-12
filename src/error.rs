@@ -118,9 +118,9 @@ impl From<ConnectError> for Error {
             NotFound | NoMatch(_) => {
                 Self::new(3, "no-device", error.to_string()).hint("run `ark devices`")
             }
-            Ambiguous(locators) => {
+            Ambiguous { matches, available } => {
                 Self::new(3, "ambiguous-device", "several Arks match")
-                    .hint(crate::device::selection_hint(&locators))
+                    .hint(crate::device::selection_hint(&matches, &available))
             }
             Busy(_) => Self::new(3, "device-busy", "the Ark is in use")
                 .hint("wait for the other ark command to finish; run commands one at a time, or close the Ark Hub browser tab"),
@@ -237,12 +237,38 @@ mod tests {
                 "select one with --device: emulator:18182, hardware:00:1, emulator:18181, hardware:00:2",
             ),
         ] {
-            let error = Error::from(ConnectError::Ambiguous(locators));
+            let error = Error::from(ConnectError::Ambiguous {
+                matches: locators.clone(),
+                available: locators,
+            });
             assert_eq!(error.class, 3, "{expected}");
             assert_eq!(error.code, "ambiguous-device", "{expected}");
             assert_eq!(error.message, "several Arks match", "{expected}");
             assert_eq!(error.hints, [expected], "{expected}");
         }
+    }
+
+    /// A shared name never makes a repeated hardware kind a unique selector.
+    #[test]
+    fn test_ambiguity_hint_counts_unmatched_hardware() {
+        use darkbio_connect::Locator;
+        let hardware = Locator::Hardware {
+            bus: "00".into(),
+            address: 1,
+        };
+        let other = Locator::Hardware {
+            bus: "00".into(),
+            address: 2,
+        };
+        let emulator = Locator::Emulator { port: 18181 };
+        let error = Error::from(ConnectError::Ambiguous {
+            matches: vec![hardware.clone(), emulator.clone()],
+            available: vec![hardware, other, emulator],
+        });
+        assert_eq!(
+            error.hints,
+            ["select one with --device: hardware:00:1, emulator"]
+        );
     }
 
     /// Checks that handshake and pairing failures keep their class, code and

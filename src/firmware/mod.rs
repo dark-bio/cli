@@ -181,9 +181,9 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     // A failed update prints the plan, with hints for a stale proof or the
     // emulator
     if let Err(error) = result {
-        context.output.fail_stage();
-        context.output.document(&value)?;
         let mut error: Error = error.into();
+        context.output.fail_stage(Some(&error));
+        context.output.document(&value)?;
         if error.code == "proof-rejected" {
             error.hints = vec!["cloud keys refreshed; retry the firmware update".into()];
         }
@@ -208,12 +208,12 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     // that
     if !no_wait {
         let result = verify_reboot(context, &connection, &target.version, &mut value);
-        if result.is_ok() {
+        if let Err(error) = &result {
+            context.output.fail_stage(Some(error));
+        } else {
             context
                 .output
                 .end_stage(Some(&format!("Restarted on {}", target.version)), None);
-        } else {
-            context.output.fail_stage();
         }
         context.output.document(&value)?;
         return result;
@@ -472,10 +472,10 @@ fn listing_table(theme: &Theme, mut rows: Vec<Value>) -> String {
         std::cmp::Reverse(package::Version::parse(row["version"].as_str().unwrap_or("")).ok())
     });
     for row in &mut rows {
-        row["status"] = json!(if row["installed"] == true {
-            "installed"
-        } else {
+        row["status"] = json!(if row["candidate"] == true {
             "update"
+        } else {
+            "installed"
         });
     }
 
@@ -491,7 +491,7 @@ fn listing_table(theme: &Theme, mut rows: Vec<Value>) -> String {
         ],
     )];
     for row in &rows {
-        if row["candidate"] == true && row["installed"] != true {
+        if row["candidate"] == true {
             let headline = package::headline(row["summary"].as_str().unwrap_or(""));
             sections.push(human::block(
                 theme,
@@ -984,28 +984,27 @@ mod tests {
         }
     }
 
-    /// An installed develop build reads installed, even when it is also a
-    /// candidate.
+    /// A newer build of the installed develop version reads `update` and prints
+    /// its headline.
     #[test]
-    fn test_installed_candidate_omits_its_headline() {
+    fn test_installed_candidate_shows_update_and_headline() {
         let theme = Theme::test(80, Color::True, true);
         let rendered = listing_table(
             &theme,
             vec![json!({
                 "version":"2.10.0-develop", "published":null, "size_bytes":35_651_584,
-                "summary":"The installed build's headline.", "installed":true, "candidate":true,
+                "summary":"Apps need a rebuild.\n\nFurther release notes.", "installed":true, "candidate":true,
             })],
         );
-        assert_eq!(rendered.lines().count(), 2);
         assert!(
             rendered
                 .lines()
-                .last()
+                .nth(1)
                 .unwrap()
-                .ends_with("34.0 MiB  installed")
+                .ends_with("34.0 MiB  update")
         );
-        assert!(!rendered.contains("headline"));
-        assert!(!rendered.contains("update"));
+        assert!(rendered.contains("\n\n\x1b[1m2.10.0-develop\x1b[0m\n  Apps need a rebuild."));
+        assert!(!rendered.contains("Further release notes"));
     }
 
     /// Builds device info reporting firmware `version`, published at `publish`
