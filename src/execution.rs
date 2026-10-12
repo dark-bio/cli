@@ -11,7 +11,7 @@ use crate::{
     context::{Context, open_file},
     error::Error,
     interrupt::Target,
-    output::Output,
+    output::{Output, Wait},
     progress::Transfer,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -30,13 +30,11 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, false)?;
 
-    // The result starts unknown and fills in as the task goes. Running progress
-    // repeats at most every second on a terminal, and every 5s elsewhere.
+    // The result starts unknown and fills in as the task goes
     let mut value = partial();
     let clock = connection.client.clock();
     let mut transfer = Transfer::new(context.output.terminal(), clock);
-    let report_interval = if context.output.terminal() { 1 } else { 5 };
-    let mut reported = None;
+    let mut running = false;
 
     // Upload and run the app, registering the task for interruption as soon as
     // the Ark names it
@@ -45,34 +43,34 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
             .client
             .execute(size, &mut file, context.timing(), |stage| match stage {
                 ExecutionProgress::Preparing => {
-                    context.output.event("progress", "preparing app upload")
+                    context.output.stage("preparing", "preparing app upload")
                 }
                 ExecutionProgress::Started { taskid } => {
                     value["task"] = json!(taskid.to_string());
                     context.interrupt.target(Target::Task(taskid));
                     context.interrupt.partial(value.clone());
-                    context.output.event("note", format!("task {taskid}"));
+                    context.output.event("step", format!("task {taskid}"));
+                    context.output.stage("uploading", "Uploading");
                 }
                 ExecutionProgress::Uploading { uploaded, total } => {
                     if let Some(line) = transfer.update(uploaded, total) {
                         context.output.progress(&line);
                     }
                 }
-                ExecutionProgress::Authorizing => context.output.event(
-                    "approve",
+                ExecutionProgress::Authorizing => context.output.approve(
+                    "run",
+                    "phone",
                     format!("run {} (Ark Companion on your phone)", path.display()),
                 ),
-                ExecutionProgress::Running { elapsed } => {
-                    let seconds = elapsed.as_secs();
-                    if reported.is_none_or(|last| seconds >= last + report_interval) {
-                        context
-                            .output
-                            .event("progress", format!("running: {seconds}s elapsed"));
-                        reported = Some(seconds);
+                ExecutionProgress::Running { .. } => {
+                    if !running {
+                        context.output.wait("running", "running", Wait::Elapsed);
+                        running = true;
                     }
                 }
-                ExecutionProgress::Reviewing => context.output.event(
-                    "approve",
+                ExecutionProgress::Reviewing => context.output.approve(
+                    "review",
+                    "phone",
                     format!(
                         "review the report of {} (Ark Companion on your phone)",
                         path.display()
@@ -85,12 +83,14 @@ pub(crate) fn run(context: &Context, command: args::App) -> Result<(), Error> {
     let result = match result {
         Ok(result) => result,
         Err(error) => {
+            context.output.fail_stage();
             if context.output.json() && !value["task"].is_null() {
                 context.output.document(&value)?;
             }
             return Err(error.into());
         }
     };
+    context.output.end_stage(None, None);
     print(&context.output, value, result)
 }
 
@@ -120,10 +120,10 @@ fn print(output: &Output, mut value: Value, outcome: ExecutionOutcome) -> Result
     output.event(
         "note",
         format!(
-            "{} {} finished in {}s",
+            "{} {} finished in {}",
             result.name,
             result.version,
-            outcome.duration.as_secs()
+            crate::style::duration(outcome.duration.as_secs())
         ),
     );
     if result.success {

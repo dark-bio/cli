@@ -45,11 +45,7 @@ pub(crate) fn value(theme: &Theme, key: &str, value: &Value) -> String {
     if key.ends_with("_seconds")
         && let Some(seconds) = value.as_u64()
     {
-        return if seconds >= 60 {
-            format!("{}m {}s", seconds / 60, seconds % 60)
-        } else {
-            format!("{seconds}s")
-        };
+        return style::duration(seconds);
     }
 
     // Other values read as text, styled by what their key means
@@ -484,7 +480,7 @@ mod tests {
                 }),
             );
             assert!(rendered.contains("975.1 MiB"));
-            assert!(rendered.contains("2m 0s"));
+            assert!(rendered.contains("2m 00s"));
             assert!(!rendered.contains("bytes"));
             assert!(!rendered.contains("seconds"));
             assert!(!rendered.contains("download."));

@@ -121,7 +121,7 @@ fn execute(
             } else {
                 context
                     .output
-                    .title(&format!("Fetching {}", slot_name(slot.kind)));
+                    .event("note", format!("Fetching {}", slot_name(slot.kind)));
                 install(&source)
             }
         });
@@ -333,6 +333,11 @@ fn install(
                 |stage| progress.update(stage),
             );
             context.interrupt.clear();
+            if result.is_ok() {
+                context.output.end_stage(None, None);
+            } else {
+                context.output.fail_stage();
+            }
             match result {
                 Ok(()) => {
                     context
@@ -401,6 +406,11 @@ fn install(
             },
         );
         context.interrupt.clear();
+        if result.is_ok() {
+            context.output.end_stage(None, None);
+        } else {
+            context.output.fail_stage();
+        }
 
         // A verified download is reusable even if the Ark later rejects processing.
         // Cache completion describes the source, not the slot's resulting state.
@@ -1068,7 +1078,14 @@ mod tests {
                 }),
                 "{scenario}"
             );
-            assert_eq!(events.len(), if scenario == "failed" { 2 } else { 1 });
+            assert_eq!(
+                events.len(),
+                if scenario == "dry-run" { 1 } else { 3 },
+                "{scenario}"
+            );
+            if scenario != "dry-run" {
+                assert_eq!(events[1]["message"], "Fetching reference-genome");
+            }
         }
     }
 

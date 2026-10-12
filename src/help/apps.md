@@ -25,9 +25,9 @@ https://github.com/dark-bio/examples.
 4. The owner reviews the report on their phone within 10 minutes, then
    releases it to this command or declines, which drops it from the Ark.
 
-ark notes the task id once the Ark assigns it, and passes on an approve
-event at steps 2 and 4. Only the connection that started the task receives
-its report. Ending that connection, by stopping ark or losing the Ark,
+With -v, ark shows the task id once the Ark assigns it. It passes on an
+approve event at steps 2 and 4. Only the connection that started the task
+receives its report. Ending that connection, by stopping ark or losing the Ark,
 cancels a task still running and drops its report.
 
 Without --json the report goes to stdout exactly as the app printed it, so

@@ -82,11 +82,6 @@ impl<S: Subscriber> Layer<S> for Log {
             if let Some(message) = fields.0.get("message").and_then(Value::as_str) {
                 self.0.event("step", message);
             }
-        } else if self.0.json() {
-            self.0.event_value(
-                json!({"event":"log", "level":metadata.level().as_str().to_ascii_lowercase(),
-                "target":metadata.target(), "fields":fields.0}),
-            );
         } else {
             let message = fields
                 .0
@@ -104,10 +99,14 @@ impl<S: Subscriber> Layer<S> for Log {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            self.0.event(
-                "log",
-                format!("{} {}: {message}", metadata.level(), metadata.target()),
-            );
+            let message = format!("{} {}: {message}", metadata.level(), metadata.target());
+            if self.0.json() {
+                self.0.event_value(json!({"event":"log", "message":message,
+                    "level":metadata.level().as_str().to_ascii_lowercase(),
+                    "target":metadata.target(), "fields":fields.0}));
+            } else {
+                self.0.event("log", message);
+            }
         }
     }
 }

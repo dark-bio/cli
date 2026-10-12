@@ -280,6 +280,17 @@ pub(crate) fn bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
+/// Formats whole seconds in the shared compact duration notation.
+pub(crate) fn duration(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// Wraps styled text at words to `width` terminal cells, indenting continued
 /// lines by `indent` cells.
 ///
@@ -372,6 +383,23 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Duration boundaries use seconds, minutes and hours consistently.
+    #[test]
+    fn test_duration_boundaries() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (14, "14s"),
+            (59, "59s"),
+            (60, "1m 00s"),
+            (62, "1m 02s"),
+            (3599, "59m 59s"),
+            (3600, "1h 00m"),
+            (3900, "1h 05m"),
+        ] {
+            assert_eq!(duration(seconds), expected, "{seconds}");
+        }
+    }
 
     /// Checks that piped marks follow the locale while color and cursor control
     /// stay off, including with a dumb terminal setting.

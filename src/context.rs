@@ -102,8 +102,13 @@ impl Context {
     /// Only diagnostics and the commands that upgrade or enroll an old device
     /// may cross the compatibility gate.
     pub fn connect_recovery(&self, pubkey: Option<&str>) -> Result<Connection, Error> {
+        // Name the selection immediately, then replace it with the discovered Ark
+        let connecting = self
+            .output
+            .connecting(self.options.device.as_deref().unwrap_or("an Ark"));
         let found = self.discover();
         let device = found.select(self.options.device.as_deref())?.clone();
+        drop(connecting);
         self.open(device, pubkey)
     }
 
@@ -132,9 +137,17 @@ impl Context {
 
         // Authenticate the Ark and route its cloud by the CLI's precedence
         let trust = trust(pubkey)?;
+        let connecting = self.output.connecting(
+            &device
+                .name()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| device.locator().to_string()),
+        );
         let (mut ark, identity) = device.connect_with_env(&trust, |identity| {
             environment(self.options.env, identity, device.env())
         })?;
+        drop(connecting);
         let client = ark.client();
         self.output.connection(client.clock());
 
@@ -224,30 +237,22 @@ impl Context {
     /// Announces the approval and requests the unlock.
     pub fn unlock(&self, connection: &Connection) -> Result<(), Error> {
         self.output
-            .event("approve", "unlock (Ark Companion on your phone)");
+            .approve("unlock", "phone", "unlock (Ark Companion on your phone)");
         connection
             .client
             .call(schema::UnlockRequest {}, self.timing())?;
-        self.output.finish();
-        self.output.human_event("progress", "unlocked");
+        self.output.end_stage(None, None);
         Ok(())
     }
 
-    /// Prompts for a yes or no answer, where an empty answer takes `default`.
+    /// Prompts for one yes or no key, with Enter taking the default.
     ///
-    /// End of input and unrecognized answers decline. The caller must first
-    /// check whether this invocation permits input.
+    /// The caller first checks whether this invocation permits input.
     pub fn confirm(&self, message: &str, default: bool) -> Result<bool, Error> {
-        self.output.prompt(message, default)?;
-        let mut answer = String::new();
-        if io::stdin().read_line(&mut answer)? == 0 {
-            return Ok(false);
+        match self.output.confirm(message, default) {
+            Err(error) if error.class == 130 => self.interrupt.cancel(self.output.clone(), 130),
+            result => result,
         }
-        Ok(match answer.trim().to_ascii_lowercase().as_str() {
-            "" => default,
-            "y" | "yes" => true,
-            _ => false,
-        })
     }
 }
 

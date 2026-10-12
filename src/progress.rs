@@ -4,153 +4,174 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Transfer rates and per-step estimates for progress reports.
+//! Transfer rates, processing estimates and live progress facts.
 
-use crate::style::{Role, Theme};
+use crate::style::{self, Role, Theme};
 use darkbio_clock::Clock;
 use darkbio_connect::schema::SlotUploadProcessResponse;
+use serde::Serialize;
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Bytes in one MiB, the divisor for displayed sizes and rates.
-const MIB: f64 = 1024.0 * 1024.0;
-/// Span of the rolling rate history, which also keeps the last sample from
-/// before it.
+/// Span of the rolling rate history, including the sample before it.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 /// Minimum observation span before publishing an estimate.
 const WARMUP: Duration = Duration::from_secs(1);
-/// Minimum interval between ordinary human progress observations.
-const HUMAN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
-/// Maximum silence between machine progress lines when reports keep arriving.
-const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One progress observation, with its stable text line and the facts for a
-/// terminal.
+/// Machine facts attached to every progress event, including unknown values.
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct Facts {
+    /// Stage owned by the CLI.
+    pub stage: Option<String>,
+    /// Processing phase spelled as the Ark reports it.
+    pub phase: Option<String>,
+    /// One-based processing step reported by the Ark.
+    pub step: Option<u64>,
+    /// Number of processing steps reported by the Ark.
+    pub steps: Option<u64>,
+    /// Completion percentage of this stage.
+    pub percent: Option<u64>,
+    /// Bytes acknowledged by the Ark.
+    pub done_bytes: Option<u64>,
+    /// Expected transfer length.
+    pub total_bytes: Option<u64>,
+    /// Estimated or caller-declared remaining time.
+    pub remaining_seconds: Option<u64>,
+}
+
+impl Facts {
+    /// Builds a progress event with its message first and every fact present.
+    pub fn event(&self, message: &str) -> Value {
+        let mut event = json!({"event":"progress", "message":message});
+        event.as_object_mut().unwrap().extend(
+            serde_json::to_value(self)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        event
+    }
+}
+
+/// One live observation and the facts used by every output format.
+#[derive(Clone, Default)]
 pub(crate) struct Update {
-    /// Stable text observation used by plain text and JSON events.
-    pub text: String,
-    /// Human stage label and live-line identity.
-    pub stage: String,
-    /// Label column shared by the known phases, measured in terminal cells.
-    pub stage_width: usize,
-    /// Completion percentage for this stage, not for the entire workflow.
-    pub percent: u64,
-    /// Human facts in discard order; the leftmost is dropped first on narrow
-    /// terminals.
+    /// Human stage label, independent of its machine identity.
+    pub label: String,
+    /// Structured progress facts.
+    pub facts: Facts,
+    /// Human facts in display order; narrow lines drop them from the right.
     pub details: Vec<String>,
-    /// Shared fact column widths, allowing narrower layouts without moving the bars.
-    pub detail_widths: Vec<usize>,
+    /// Whether the Ark reported a failed phase.
+    pub failed: bool,
+    /// Whether the Ark restarted processing without completing the prior phase.
+    pub restarted: bool,
 }
 
 impl Update {
-    /// Shares label and fact columns with another stage of the same operation.
-    pub(super) fn align(&mut self, other: &mut Self) {
-        // Measure what each update can show, from all its facts down to the
-        // last one, unless it already carries shared widths
-        let stage_width = self.stage_width.max(other.stage_width);
-        let mut detail_widths = Vec::new();
-        for update in [&*self, &*other] {
-            if update.detail_widths.is_empty() {
-                for index in 0..update.details.len() {
-                    detail_widths.push(console::measure_text_width(
-                        &update.details[index..].join(" - "),
-                    ));
-                }
-            } else {
-                detail_widths.extend_from_slice(&update.detail_widths);
-            }
+    /// Builds a stage without known amounts or device processing facts.
+    pub fn new(stage: &str, label: &str) -> Self {
+        Self {
+            label: label.into(),
+            facts: Facts {
+                stage: Some(stage.into()),
+                ..Default::default()
+            },
+            ..Default::default()
         }
-
-        // Both updates take the widest label and every fact width, so their
-        // bars line up
-        detail_widths.sort_unstable();
-        detail_widths.dedup();
-        self.stage_width = stage_width;
-        other.stage_width = stage_width;
-        self.detail_widths = detail_widths.clone();
-        other.detail_widths = detail_widths;
     }
 
-    /// Fits a stage, progress bar and optional facts into one terminal line.
+    /// Compares the stage and device step that own a live line.
+    pub fn same_stage(&self, other: &Self) -> bool {
+        self.facts.stage == other.facts.stage
+            && self.facts.phase == other.facts.phase
+            && self.facts.step == other.facts.step
+    }
+
+    /// Returns the complete unstyled line without its mark or bar.
+    pub fn message(&self) -> String {
+        let mut message = self.label.clone();
+        if let Some(percent) = self.facts.percent {
+            message.push_str(&format!(" {percent}%"));
+        }
+        for detail in &self.details {
+            message.push_str(&format!(" · {detail}"));
+        }
+        message
+    }
+
+    /// Fits a bar of 8 to 40 cells before dropping facts from the right.
     pub fn render(&self, theme: &Theme) -> String {
-        // Pad the stage to its shared column, capped at half the line or 8
-        // cells on a narrow one
+        // Leave a cell free so an unterminated live line cannot wrap itself
         let width = theme.width.saturating_sub(1);
-        let stage_width = self.stage_width.min((width / 2).max(8));
-        let stage = theme.truncate(&self.stage, stage_width);
-        let stage = format!(
-            "{stage}{}",
-            " ".repeat(stage_width.saturating_sub(console::measure_text_width(&stage)))
-        );
+        let label = theme.inline(&style::printable(&self.label));
+        let mark = theme.glyph("›", ">");
+        let Some(percent) = self.facts.percent else {
+            return theme.truncate(
+                &format!(
+                    "{mark} {}",
+                    theme
+                        .inline(&style::printable(&self.message()))
+                        .replace(" · ", &theme.separator())
+                ),
+                width,
+            );
+        };
+        let percent = format!("{percent}%");
+        let fixed = console::measure_text_width(&format!("{mark} {label}  {percent}"));
 
-        // Measure the fixed parts, and keep 9 cells for the bar on terminals of
-        // 60 cells or more
-        let prefix = theme.paint(Role::Muted, "progress:");
-        let percent = format!("{:3} %", self.percent);
-        let fixed = console::measure_text_width(&format!("progress: {stage} {percent}"));
-        let reserve = if theme.width >= 60 { 9 } else { 0 };
-        let available = width.saturating_sub(fixed + reserve);
-
-        // Drop facts from the left until the rest fits, in the widest shared
-        // column that fits when there is one
-        let shared = (!self.detail_widths.is_empty()).then(|| {
-            self.detail_widths
-                .iter()
-                .map(|width| width + console::measure_text_width(&theme.separator()))
-                .filter(|width| *width <= available)
-                .max()
-                .unwrap_or(0)
-        });
-        let mut details = self.details.clone();
-        let (facts, facts_width) = loop {
+        // Preserve the leftmost facts as the bar reaches its minimum width
+        let mut details: Vec<_> = self
+            .details
+            .iter()
+            .map(|text| theme.inline(&style::printable(text)))
+            .collect();
+        let (facts, size) = loop {
             let facts = if details.is_empty() {
                 String::new()
             } else {
-                format!("{}{}", theme.separator(), details.join(&theme.separator()))
+                format!("  {}", details.join(&theme.separator()))
             };
-            let facts_width = console::measure_text_width(&facts);
-            if facts_width <= shared.unwrap_or(available) || details.is_empty() {
-                break (facts, shared.unwrap_or(facts_width));
+            let size = width
+                .saturating_sub(fixed + console::measure_text_width(&facts))
+                .min(40);
+            if size >= 8 || details.is_empty() {
+                break (facts, size);
             }
-            details.remove(0);
+            details.pop();
         };
-
-        // Draw a bar of up to 40 cells in the space left, or none below 8 cells
-        let used = fixed + facts_width;
-        let size = width.saturating_sub(used + 1).min(40);
         let bar = if size >= 8 {
-            let filled = (size as u64 * self.percent.min(100) / 100) as usize;
+            let filled = (size as u64 * self.facts.percent.unwrap().min(100) / 100) as usize;
             format!(
                 "{}{} ",
-                theme.paint(Role::Success, theme.glyph("\u{2501}", "=").repeat(filled)),
-                theme.paint(
-                    Role::Muted,
-                    theme.glyph("\u{2500}", "-").repeat(size - filled)
-                )
+                theme.paint(Role::Success, theme.glyph("━", "=").repeat(filled)),
+                theme.paint(Role::Muted, theme.glyph("─", "-").repeat(size - filled))
             )
         } else {
             String::new()
         };
-        theme.truncate(&format!("{prefix} {stage} {bar}{percent}{facts}"), width)
+
+        // At exceptionally narrow widths shorten the label before the percentage
+        let used = console::measure_text_width(&format!("{mark}  {bar}{percent}{facts}"));
+        let label = theme.truncate(&label, width.saturating_sub(used));
+        theme.truncate(&format!("{mark} {label} {bar}{percent}{facts}"), width)
     }
 }
 
-/// Upload rate tracker that samples only acknowledged bytes, from the first
-/// upload report on.
-///
-/// Cloud setup and approval therefore never enter the rate estimate.
+/// Upload rate tracker sampling acknowledged bytes after approval.
 pub(super) struct Transfer {
-    /// Connection's clock, which times the samples.
+    /// Connection clock timing observations.
     clock: Clock,
-    /// Rolling samples of acknowledged bytes.
+    /// Rolling acknowledged-byte history.
     rate: Rate,
-    /// Emission cadence, independent of the sampling cadence.
+    /// Output cadence independent of sampling.
     report: Report,
 }
 
 impl Transfer {
-    /// Starts without rate history so setup and approval cannot skew the first
-    /// estimate.
+    /// Starts without rate history so setup never skews estimates.
     pub(super) fn new(human: bool, clock: Clock) -> Self {
         Self {
             clock,
@@ -159,84 +180,57 @@ impl Transfer {
         }
     }
 
-    /// Samples acknowledged bytes and emits an observation only when reporting
-    /// is due.
+    /// Samples every acknowledgment and returns observations at the output cadence.
     pub(super) fn update(&mut self, uploaded: u64, total: u64) -> Option<Update> {
         self.update_at(uploaded, total, self.clock.now())
     }
 
-    /// Updates byte-rate history at the supplied clock time, even if output is
-    /// throttled.
+    /// Samples bytes at an explicit instant, independently of the wall clock.
     fn update_at(&mut self, uploaded: u64, total: u64, now: Instant) -> Option<Update> {
-        // Sample every report, and emit only when the cadence is due
         let rate = self.rate.sample(uploaded, now);
         let percent = percent(uploaded, total);
         if !self.report.due(percent, now) {
             return None;
         }
-
-        // Word the speed, or why there is none yet, and the stable text line
-        let speed = rate.map_or_else(
-            || {
-                if uploaded >= total {
-                    "speed unavailable".into()
-                } else {
-                    "speed estimating...".into()
-                }
-            },
-            speed,
-        );
-        let text = format!(
-            "Uploading: {percent}% ({:.1}/{:.1} MiB) | {speed} | ETA {}",
-            uploaded as f64 / MIB,
-            total as f64 / MIB,
-            eta(total.saturating_sub(uploaded), rate),
-        );
-
-        // Show the human sizes in GiB from 1 GiB up, and in MiB below
-        let (divisor, unit) = if total >= 1 << 30 {
-            ((1_u64 << 30) as f64, "GiB")
-        } else {
-            (MIB, "MiB")
-        };
+        let remaining = eta(total.saturating_sub(uploaded), rate);
+        let mut details = Vec::new();
+        if let Some(rate) = rate {
+            details.push(format!("{}/s", style::bytes(rate.max(0.0) as u64)));
+        }
+        if let Some(seconds) = remaining {
+            details.push(format!("{} left", style::duration(seconds)));
+        }
         Some(Update {
-            text,
-            stage: "uploading".into(),
-            stage_width: "uploading".len(),
-            percent,
-            details: vec![
-                format!(
-                    "{:.1}/{:.1} {unit}",
-                    uploaded as f64 / divisor,
-                    total as f64 / divisor
-                ),
-                speed,
-                format!("eta {}", eta(total.saturating_sub(uploaded), rate)),
-            ],
-            detail_widths: Vec::new(),
+            label: "Uploading".into(),
+            facts: Facts {
+                stage: Some("uploading".into()),
+                percent: Some(percent),
+                done_bytes: Some(uploaded),
+                total_bytes: Some(total),
+                remaining_seconds: remaining,
+                ..Default::default()
+            },
+            details,
+            failed: false,
+            restarted: false,
         })
     }
 }
 
-/// Tracker of the Ark's processing steps, estimating each step on its own.
-///
-/// Progress percentages belong to individual steps. Device timestamps identify
-/// a restarted step; elapsed time is measured on the connection's monotonic clock.
+/// Per-step processing estimates, preserving the Ark's phase names.
 pub(super) struct Processing {
-    /// Connection's clock, which times the samples.
+    /// Connection clock timing observations.
     clock: Clock,
-    /// Last report, retained to finish a phase when the next report advances
-    /// past it.
+    /// Previous report, used to complete a phase when the Ark advances.
     previous: Option<SlotUploadProcessResponse>,
-    /// Basis-point progress samples for the current processing step only.
+    /// Basis-point samples for the current phase.
     rate: Rate,
-    /// Reporting cadence reset whenever a step starts or restarts.
+    /// Cadence reset whenever the phase starts or restarts.
     report: Report,
 }
 
 impl Processing {
-    /// Starts without a step identity or estimate; the first report establishes
-    /// both.
+    /// Starts without a phase identity or estimate.
     pub(super) fn new(human: bool, clock: Clock) -> Self {
         Self {
             clock,
@@ -246,16 +240,11 @@ impl Processing {
         }
     }
 
-    /// Finishes an observed phase before starting a later one in the same run.
-    ///
-    /// Restarts and failures never imply successful completion of the previous
-    /// phase.
+    /// Completes an observed phase before a later successful phase starts.
     pub(super) fn update(
         &mut self,
         status: &SlotUploadProcessResponse,
     ) -> impl Iterator<Item = Update> {
-        // A later phase of the same run, without a failure, first completes the
-        // unfinished previous one
         let completed = self
             .previous
             .as_ref()
@@ -274,9 +263,15 @@ impl Processing {
         completed.into_iter().chain(self.update_at(status, now))
     }
 
-    /// Builds a step-specific estimate from basis points and monotonic clock time.
+    /// Resets estimates for a new phase and samples at the supplied instant.
     fn update_at(&mut self, status: &SlotUploadProcessResponse, now: Instant) -> Option<Update> {
-        // A new or restarted step starts its estimate and cadence afresh
+        // A restart resets timing without implying completion of the old phase
+        let restarted = self.previous.as_ref().is_some_and(|previous| {
+            previous.proc_start != status.proc_start
+                || previous.phase_in > status.phase_in
+                || (previous.phase_in == status.phase_in
+                    && previous.phase_start != status.phase_start)
+        });
         let phase = (status.proc_start, status.phase_in, status.phase_start);
         if self.previous.as_ref().is_none_or(|previous| {
             (previous.proc_start, previous.phase_in, previous.phase_start) != phase
@@ -284,86 +279,59 @@ impl Processing {
             self.rate = Rate::default();
             self.report.last = None;
         }
-
-        // Keep and sample every report, and emit only when the cadence is due
+        // Sample every response, including ones hidden by the output cadence
         self.previous = Some(status.clone());
         let rate = self.rate.sample(status.phase_progress, now);
-        let percent = percent(status.phase_progress, 10_000);
-        if !self.report.due(percent, now) {
+        if !self.report.due(percent(status.phase_progress, 10_000), now)
+            && status.failure.is_empty()
+        {
             return None;
         }
-        Some(Self::observation(status, rate))
+        Some(Update {
+            restarted,
+            ..Self::observation(status, rate)
+        })
     }
 
-    /// Builds a step's observation, reserving room for the widest phase label and
-    /// ETA so the bars never move.
+    /// Builds a structured observation without inventing an unknown phase name.
     fn observation(status: &SlotUploadProcessResponse, rate: Option<f64>) -> Update {
-        // Word both lines with the step's name, or a generic one when the
-        // report lists no such phase
-        let percent = percent(status.phase_progress, 10_000);
         let name = status
             .phase_in
             .checked_sub(1)
             .and_then(|index| usize::try_from(index).ok())
-            .and_then(|index| status.phases.get(index).map(|phase| &phase.name))
-            .map(String::as_str)
-            .unwrap_or("Processing");
-        let text = format!(
-            "Processing [{}/{}] {name}: {percent}% | step ETA {}",
-            status.phase_in,
-            status.phases.len(),
-            eta(10_000_u64.saturating_sub(status.phase_progress), rate),
-        );
-        let stage = format!(
-            "processing [{}/{}] {name}",
-            status.phase_in,
-            status.phases.len()
-        );
-
-        // Size the stage column for every phase label, and the facts for every
-        // estimate
-        let stage_width = status
-            .phases
-            .iter()
-            .enumerate()
-            .map(|(index, phase)| {
-                console::measure_text_width(&format!(
-                    "processing [{}/{}] {}",
-                    index + 1,
-                    status.phases.len(),
-                    phase.name
-                ))
-            })
-            .max()
-            .unwrap_or_else(|| console::measure_text_width(&stage));
+            .and_then(|index| status.phases.get(index))
+            .map(|phase| phase.name.clone());
+        let remaining = eta(10_000_u64.saturating_sub(status.phase_progress), rate);
         Update {
-            text,
-            stage,
-            stage_width,
-            percent,
-            details: vec![format!(
-                "eta {}",
-                eta(10_000_u64.saturating_sub(status.phase_progress), rate)
-            )],
-            detail_widths: vec!["eta estimating...".len(), "eta 0s".len()],
+            label: name.clone().unwrap_or_else(|| "Processing".into()),
+            facts: Facts {
+                stage: Some("processing".into()),
+                phase: name,
+                step: Some(status.phase_in),
+                steps: Some(status.phases.len() as u64),
+                percent: Some(percent(status.phase_progress, 10_000)),
+                remaining_seconds: remaining,
+                ..Default::default()
+            },
+            details: remaining
+                .map(|seconds| format!("{} left", style::duration(seconds)))
+                .into_iter()
+                .collect(),
+            failed: !status.failure.is_empty(),
+            restarted: false,
         }
     }
 }
 
-/// Rolling rate of a counter over the last [`RATE_WINDOW`].
-///
-/// It keeps the sample just before the window's start, so a stalled or sparse
-/// counter does not hold on to a stale speed.
+/// Rolling rate of a counter over the last ten seconds.
 #[derive(Default)]
 struct Rate {
-    /// Time and monotonically increasing counter observations around the
-    /// rolling window.
+    /// Monotonic time and counter samples around the rolling window.
     samples: VecDeque<(Instant, u64)>,
 }
 
 impl Rate {
-    /// Returns units per second after warmup; counter or clock regression
-    /// resets history.
+    /// Returns units per second after warmup, resetting on a regression.
     fn sample(&mut self, value: u64, now: Instant) -> Option<f64> {
         if self
             .samples
@@ -382,35 +350,32 @@ impl Rate {
     }
 }
 
-/// Cadence at which progress observations are emitted.
-///
-/// A terminal refreshes once a second as reports arrive, and shows completion
-/// at once. Line output waits for the next 10 % boundary or 5s, which keeps
-/// logs readable.
+/// Emission cadence for terminal redraws and sparse pipe observations.
 struct Report {
-    /// Whether the one-second terminal cadence applies instead of sparse log
-    /// boundaries.
+    /// Whether the terminal's one-second cadence applies.
     human: bool,
-    /// Time and percentage of the last emitted observation.
+    /// Instant and percentage of the last emission.
     last: Option<(Instant, u64)>,
 }
 
 impl Report {
-    /// Starts a cadence that always emits the first observation.
+    /// Starts a cadence that emits its first observation immediately.
     fn new(human: bool) -> Self {
         Self { human, last: None }
     }
 
-    /// Claims an emission slot for elapsed cadence or a required completion
-    /// boundary.
+    /// Claims an emission slot for a cadence or percentage boundary.
     fn due(&mut self, percent: u64, now: Instant) -> bool {
+        if percent == 100 && self.last.is_some_and(|(_, previous)| previous == 100) {
+            return false;
+        }
         if self.last.is_none_or(|(time, previous)| {
             if self.human {
                 (percent == 100 && previous != 100)
-                    || now.saturating_duration_since(time) >= HUMAN_REPORT_INTERVAL
+                    || now.saturating_duration_since(time) >= Duration::from_secs(1)
             } else {
                 percent / 10 != previous / 10
-                    || now.saturating_duration_since(time) >= REPORT_INTERVAL
+                    || now.saturating_duration_since(time) >= Duration::from_secs(5)
             }
         }) {
             self.last = Some((now, percent));
@@ -421,7 +386,7 @@ impl Report {
     }
 }
 
-/// Computes a clamped integer percentage without overflowing 64-bit counters.
+/// Computes a clamped percentage without overflowing byte counters.
 fn percent(done: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
@@ -429,117 +394,85 @@ fn percent(done: u64, total: u64) -> u64 {
     (u128::from(done.min(total)) * 100 / u128::from(total)) as u64
 }
 
-/// Formats bytes per second in the smallest useful binary unit.
-fn speed(bytes: f64) -> String {
-    if bytes >= MIB {
-        format!("{:.1} MiB/s", bytes / MIB)
-    } else if bytes >= 1024.0 {
-        format!("{:.1} KiB/s", bytes / 1024.0)
-    } else {
-        format!("{bytes:.0} B/s")
-    }
-}
-
-/// Estimates rounded-up remaining time, withholding nonpositive or nonfinite rates.
-fn eta(remaining: u64, rate: Option<f64>) -> String {
+/// Estimates rounded-up seconds, withholding nonpositive or nonfinite rates.
+fn eta(remaining: u64, rate: Option<f64>) -> Option<u64> {
     if remaining == 0 {
-        return "0s".into();
+        return Some(0);
     }
-    let Some(seconds) = rate
-        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    rate.filter(|rate| rate.is_finite() && *rate > 0.0)
         .and_then(|rate| Duration::try_from_secs_f64((remaining as f64 / rate).ceil()).ok())
         .map(|duration| duration.as_secs())
-    else {
-        return "estimating...".into();
-    };
-    if seconds >= 3600 {
-        format!("~{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
-    } else if seconds >= 60 {
-        format!("~{}m {:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("~{seconds}s")
-    }
 }
 
-/// Tests of progress rendering, rate estimates and report cadence.
+/// Tests of rendering, rates, device phase transitions and report cadence.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::Color;
     use darkbio_clock::TestClock;
 
-    /// A progress line fits every width, keeping the bar, speed and ETA from 60
-    /// cells up.
+    /// Bars shrink to eight cells before facts drop from the right.
     #[test]
-    fn bar_keeps_speed_and_eta_in_the_available_width() {
-        use crate::style::Color;
-        let update = Update {
-            text: String::new(),
-            stage: "uploading".into(),
-            stage_width: "uploading".len(),
-            percent: 50,
-            details: vec![
-                "50.0/100.0 MiB".into(),
-                "10.0 MiB/s".into(),
-                "eta 5s".into(),
-            ],
-            detail_widths: Vec::new(),
-        };
-        let theme = Theme::test(120, Color::Basic, false);
+    fn test_bar_and_fact_priority() {
+        let mut update = Update::new("uploading", "Uploading");
+        update.facts.percent = Some(50);
+        update.details = vec!["10.0 MiB/s".into(), "5s left".into()];
+        let wide = update.render(&Theme::test(120, Color::Basic, false));
         assert_eq!(
-            update.render(&theme),
-            "progress: uploading \x1b[1m====================\x1b[0m--------------------  50 % - 50.0/100.0 MiB - 10.0 MiB/s - eta 5s"
+            wide,
+            "> Uploading \x1b[1m====================\x1b[0m-------------------- 50%  10.0 MiB/s - 5s left"
         );
-        for width in [32, 60, 80, 120] {
-            let theme = Theme::test(width, Color::True, true);
-            let rendered = update.render(&theme);
+        for (width, bar, rate, left) in [
+            (80, 40, true, true),
+            (48, 9, true, true),
+            (47, 8, true, true),
+            (46, 17, true, false),
+            (30, 13, false, false),
+        ] {
+            let rendered = update.render(&Theme::test(width, Color::True, true));
+            let plain = console::strip_ansi_codes(&rendered);
             assert!(
                 console::measure_text_width(&rendered) < width,
                 "{width}: {rendered}"
             );
-            assert!(rendered.contains("50 %"));
-            if width >= 60 {
-                assert!(rendered.contains('\u{2501}'));
-                assert!(rendered.contains("10.0 MiB/s"));
-                assert!(rendered.contains("eta 5s"), "{width}: {rendered:?}");
-            }
+            assert_eq!(
+                plain.chars().filter(|ch| matches!(ch, '━' | '─')).count(),
+                bar,
+                "{width}"
+            );
+            assert_eq!(plain.contains("10.0 MiB/s"), rate, "{width}");
+            assert_eq!(plain.contains("5s left"), left, "{width}");
+            assert!(plain.contains("50%"));
         }
     }
 
-    /// A transfer estimate counts only the bytes acknowledged after sampling
-    /// began.
-    ///
-    /// Counting the initial bytes as newly transferred would inflate speed and
-    /// shorten the ETA.
+    /// Upload estimates count only acknowledged bytes since sampling began.
     #[test]
-    fn test_transfer_estimate() {
+    fn test_transfer_estimate_and_unknown_facts() {
         let clock = TestClock::new().clock();
         let start = clock.now();
         let mut transfer = Transfer::new(false, clock);
         let mib = 1024 * 1024;
-        let first = transfer.update_at(25 * mib, 100 * mib, start).unwrap().text;
-        assert!(first.contains("speed estimating... | ETA estimating..."));
+        let first = transfer.update_at(25 * mib, 100 * mib, start).unwrap();
+        assert_eq!(first.message(), "Uploading 25%");
         let next = transfer
             .update_at(50 * mib, 100 * mib, start + Duration::from_secs(5))
-            .unwrap()
-            .text;
+            .unwrap();
+        assert_eq!(next.message(), "Uploading 50% · 5.0 MiB/s · 10s left");
+        assert_eq!(next.facts.done_bytes, Some(50 * mib));
+        assert_eq!(next.facts.remaining_seconds, Some(10));
         assert_eq!(
-            next,
-            "Uploading: 50% (50.0/100.0 MiB) | 5.0 MiB/s | ETA ~10s"
+            Facts::default().event("waiting"),
+            json!({"event":"progress","message":"waiting","stage":null,"phase":null,"step":null,"steps":null,"percent":null,"done_bytes":null,"total_bytes":null,"remaining_seconds":null})
         );
-        let done = transfer
-            .update_at(100 * mib, 100 * mib, start + Duration::from_secs(10))
-            .unwrap()
-            .text;
-        assert!(done.ends_with("ETA 0s"));
     }
 
-    /// Builds a report of a two-step run, in `phase` at `progress` basis
-    /// points.
+    /// Builds a device observation with two phases.
     fn status(phase: u64, progress: u64) -> SlotUploadProcessResponse {
         SlotUploadProcessResponse {
             proc_start: 100,
             phase_start: 100 + phase,
-            phases: ["Validate", "Index"]
+            phases: ["Compressing", "Sorting"]
                 .map(|name| darkbio_connect::schema::SlotPhase {
                     name: name.into(),
                     desc: String::new(),
@@ -551,127 +484,50 @@ mod tests {
         }
     }
 
-    /// Processing bars stay in one column across phase labels and estimates.
+    /// Phases complete on an advance, and estimates reset for each step.
     #[test]
-    fn processing_bars_align_across_labels_and_estimates() {
-        use crate::style::Color;
-        let mut report = status(1, 8200);
-        report.phases = ["Compressing", "Indexing", "\u{68c0}\u{9a8c}"]
-            .into_iter()
-            .cycle()
-            .take(12)
-            .map(|name| darkbio_connect::schema::SlotPhase {
-                name: name.into(),
-                desc: String::new(),
+    fn test_processing_lifecycle() {
+        let clock = TestClock::new().clock();
+        let start = clock.now();
+        let mut processing = Processing::new(false, clock);
+        assert_eq!(
+            processing
+                .update_at(&status(1, 1000), start)
+                .unwrap()
+                .message(),
+            "Compressing 10%"
+        );
+        let next = processing
+            .update_at(&status(1, 3000), start + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(next.message(), "Compressing 30% · 18s left");
+        assert_eq!(next.facts.phase.as_deref(), Some("Compressing"));
+        assert_eq!(next.facts.step, Some(1));
+        assert_eq!(next.facts.steps, Some(2));
+        let next: Vec<_> = processing.update(&status(2, 4000)).collect();
+        assert_eq!(next.len(), 2);
+        assert_eq!(next[0].facts.percent, Some(100));
+        assert_eq!(next[1].message(), "Sorting 40%");
+    }
+
+    /// A failed report never completes the preceding phase successfully.
+    #[test]
+    fn test_processing_failure() {
+        let mut processing = Processing::new(true, TestClock::new().clock());
+        assert_eq!(processing.update(&status(1, 8200)).count(), 1);
+        let updates: Vec<_> = processing
+            .update(&SlotUploadProcessResponse {
+                failure: "failed".into(),
+                ..status(2, 2000)
             })
             .collect();
-        for width in [60, 80, 100, 140] {
-            let theme = Theme::test(width, Color::True, true);
-            let mut expected = None;
-            for phase in 1..=12 {
-                report.phase_in = phase;
-                for (progress, rate) in [(8200, None), (9200, Some(500.0)), (10_000, None)] {
-                    report.phase_progress = progress;
-                    let rendered = Processing::observation(&report, rate).render(&theme);
-                    let line = console::strip_ansi_codes(&rendered);
-                    let position = bar_position(&line);
-                    assert_eq!(position, *expected.get_or_insert(position), "{line}");
-                    assert!(console::measure_text_width(&line) < width);
-                }
-            }
-        }
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].failed);
     }
 
-    /// Upload and processing lines share their bar column, and the upload keeps
-    /// its facts where the width allows.
+    /// Restarts retain no successful completion or estimate from the old phase.
     #[test]
-    fn upload_and_processing_share_columns_without_losing_transfer_facts() {
-        use crate::style::Color;
-        for width in [60, 80, 100, 140] {
-            // Finish an upload and align it with a processing observation
-            let theme = Theme::test(width, Color::True, true);
-            let clock = TestClock::new().clock();
-            let start = clock.now();
-            let total = 290 * 1024 * 1024;
-            let mut transfer = Transfer::new(true, clock.clone());
-            transfer.update_at(0, total, start);
-            let mut upload = transfer
-                .update_at(total, total, start + Duration::from_secs(8))
-                .unwrap();
-            let mut report = status(1, 8200);
-            report.phases[0].name = "Compressing".into();
-            report.phases[1].name = "Indexing".into();
-            Processing::observation(&report, None).align(&mut upload);
-
-            // The aligned upload keeps its speed and estimate from 100 cells
-            // wide, and its sizes from 140 cells
-            let rendered = upload.render(&theme);
-            let expected = bar_position(&rendered);
-            assert!(console::measure_text_width(&rendered) < width);
-            if width >= 100 {
-                assert!(rendered.contains("MiB/s"));
-                assert!(rendered.contains("eta 0s"));
-            }
-            if width >= 140 {
-                assert!(rendered.contains("290.0/290.0 MiB"));
-            }
-
-            // Every processing line puts its bar where the upload's is
-            let mut processing = Processing::new(true, clock);
-            for (phase, progress) in [(1, 8200), (2, 9200), (2, 10_000)] {
-                report.phase_in = phase;
-                report.phase_progress = progress;
-                for mut update in processing.update(&report) {
-                    update.align(&mut upload);
-                    let rendered = update.render(&theme);
-                    assert_eq!(bar_position(&rendered), expected, "{rendered}");
-                    assert!(console::measure_text_width(&rendered) < width);
-                }
-            }
-        }
-    }
-
-    /// Returns where a line's progress bar starts and how long it is, in
-    /// terminal cells.
-    fn bar_position(line: &str) -> (usize, usize) {
-        let line = console::strip_ansi_codes(line);
-        let bar = line
-            .find(['\u{2501}', '\u{2500}'])
-            .unwrap_or_else(|| panic!("missing progress bar: {line}"));
-        (
-            console::measure_text_width(&line[..bar]),
-            line[bar..]
-                .chars()
-                .take_while(|ch| matches!(ch, '\u{2501}' | '\u{2500}'))
-                .count(),
-        )
-    }
-
-    /// Advancing to a later phase first completes the previous one at 100 %.
-    #[test]
-    fn advancing_completes_the_previous_phase_before_rendering_the_next() {
-        let mut processing = Processing::new(true, TestClock::new().clock());
-        let first: Vec<_> = processing.update(&status(1, 8200)).collect();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].percent, 82);
-        let next: Vec<_> = processing.update(&status(2, 9200)).collect();
-        assert_eq!(next.len(), 2);
-        assert_eq!(next[0].stage, first[0].stage);
-        assert_eq!(next[0].percent, 100);
-        assert!(next[0].text.ends_with("100% | step ETA 0s"));
-        assert_eq!(next[0].details, ["eta 0s"]);
-        assert_eq!(next[1].percent, 92);
-        let done: Vec<_> = processing.update(&status(2, 10_000)).collect();
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].stage, next[1].stage);
-        assert_eq!(done[0].percent, 100);
-        assert_eq!(done[0].details, ["eta 0s"]);
-    }
-
-    /// A restarted step, a restarted run or a failure never completes the
-    /// previous phase.
-    #[test]
-    fn restarts_and_failures_do_not_complete_the_previous_phase() {
+    fn test_processing_restarts() {
         for next in [
             SlotUploadProcessResponse {
                 phase_start: 999,
@@ -681,90 +537,20 @@ mod tests {
                 proc_start: 999,
                 ..status(2, 2000)
             },
-            SlotUploadProcessResponse {
-                failure: "failed".into(),
-                ..status(2, 2000)
-            },
         ] {
             let mut processing = Processing::new(true, TestClock::new().clock());
             assert_eq!(processing.update(&status(1, 8200)).count(), 1);
-            assert!(processing.update(&next).all(|update| update.percent != 100));
+            let updates: Vec<_> = processing.update(&next).collect();
+            assert_eq!(updates.len(), 1);
+            assert!(updates[0].restarted);
+            assert_eq!(updates[0].facts.percent, Some(20));
+            assert_eq!(updates[0].facts.remaining_seconds, None);
         }
     }
 
-    /// Every step gets its own estimate, even if the first observation arrives
-    /// partway through it.
-    ///
-    /// A restarted step must not inherit its previous rate.
-    #[test]
-    fn test_step_estimate() {
-        // The first step estimates from its second report on
-        let clock = TestClock::new().clock();
-        let start = clock.now();
-        let mut processing = Processing::new(false, clock);
-        assert!(
-            processing
-                .update_at(&status(1, 1000), start)
-                .unwrap()
-                .text
-                .ends_with("step ETA estimating...")
-        );
-        assert_eq!(
-            processing
-                .update_at(&status(1, 3000), start + Duration::from_secs(5))
-                .unwrap()
-                .text,
-            "Processing [1/2] Validate: 30% | step ETA ~18s"
-        );
-
-        // The next step starts a fresh estimate, although first seen at 40 %
-        assert_eq!(
-            processing
-                .update_at(&status(2, 4000), start + Duration::from_secs(6))
-                .unwrap()
-                .text,
-            "Processing [2/2] Index: 40% | step ETA estimating..."
-        );
-        assert_eq!(
-            processing
-                .update_at(&status(2, 5000), start + Duration::from_secs(11))
-                .unwrap()
-                .text,
-            "Processing [2/2] Index: 50% | step ETA ~25s"
-        );
-
-        // A restart drops the step's rate, and a finished step needs none
-        let restarted = SlotUploadProcessResponse {
-            phase_start: 999,
-            ..status(2, 6000)
-        };
-        assert!(
-            processing
-                .update_at(&restarted, start + Duration::from_secs(12))
-                .unwrap()
-                .text
-                .ends_with("step ETA estimating...")
-        );
-        let done = SlotUploadProcessResponse {
-            phase_progress: 10_000,
-            ..restarted
-        };
-        assert!(
-            processing
-                .update_at(&done, start + Duration::from_secs(13))
-                .unwrap()
-                .text
-                .ends_with("step ETA 0s")
-        );
-    }
-
-    /// Recent stalls age out a formerly fast rate, and a regressing counter
-    /// starts over.
-    ///
-    /// Starting over avoids an underflow and an estimate from another run.
+    /// Stalls age out a fast rate and regressing counters reset the history.
     #[test]
     fn test_rate_stall_and_reset() {
-        // A rate shows once the warmup has passed
         let start = TestClock::new().clock().now();
         let mut rate = Rate::default();
         assert_eq!(rate.sample(0, start), None);
@@ -772,82 +558,29 @@ mod tests {
             rate.sample(100, start + Duration::from_secs(1)),
             Some(100.0)
         );
-
-        // A stall across the whole window drops the rate to zero, which gives
-        // no estimate
         for seconds in 2..=11 {
             rate.sample(100, start + Duration::from_secs(seconds));
         }
         let stopped = rate.sample(100, start + Duration::from_secs(12));
         assert_eq!(stopped, Some(0.0));
-        assert_eq!(eta(100, stopped), "estimating...");
-
-        // A regressing counter starts its history over
+        assert_eq!(eta(100, stopped), None);
         assert_eq!(rate.sample(50, start + Duration::from_secs(13)), None);
         assert_eq!(rate.sample(75, start + Duration::from_secs(14)), Some(25.0));
     }
 
-    /// Time-based reporting refreshes a stuck percentage, while short bursts
-    /// stay quiet.
-    ///
-    /// Completion is printed even inside the normal interval.
+    /// Pipes emit each ten percent or five seconds; terminals emit each second.
     #[test]
     fn test_report_cadence() {
         let start = TestClock::new().clock().now();
-        let mut report = Report::new(false);
-        assert!(report.due(91, start));
-        assert!(!report.due(92, start + Duration::from_secs(1)));
-        assert!(report.due(92, start + REPORT_INTERVAL));
-        assert!(report.due(100, start + REPORT_INTERVAL + Duration::from_millis(1)));
-        assert!(!report.due(100, start + REPORT_INTERVAL + Duration::from_millis(2)));
-    }
-
-    /// Terminal transfer reports refresh once a second and show completion at
-    /// once.
-    #[test]
-    fn test_human_transfer_cadence() {
-        let clock = TestClock::new().clock();
-        let start = clock.now();
-        let mut transfer = Transfer::new(true, clock);
-        assert!(transfer.update_at(0, 100, start).is_some());
-        assert!(
-            transfer
-                .update_at(90, 100, start + Duration::from_millis(500))
-                .is_none()
-        );
-        let next = start + Duration::from_secs(1);
-        assert!(transfer.update_at(90, 100, next).is_some());
-        assert!(
-            transfer
-                .update_at(100, 100, next + Duration::from_millis(1))
-                .is_some()
-        );
-        assert!(
-            transfer
-                .update_at(100, 100, next + Duration::from_millis(2))
-                .is_none()
-        );
-    }
-
-    /// Terminal step reports show a new step at once and then refresh once a
-    /// second.
-    #[test]
-    fn test_human_step_cadence() {
-        let clock = TestClock::new().clock();
-        let start = clock.now();
-        let mut processing = Processing::new(true, clock);
-        assert!(processing.update_at(&status(1, 1000), start).is_some());
-        let next = start + Duration::from_millis(500);
-        assert!(processing.update_at(&status(2, 1000), next).is_some());
-        assert!(
-            processing
-                .update_at(&status(2, 9000), next + Duration::from_millis(500))
-                .is_none()
-        );
-        assert!(
-            processing
-                .update_at(&status(2, 9000), next + Duration::from_secs(1))
-                .is_some()
-        );
+        for human in [false, true] {
+            let mut report = Report::new(human);
+            assert!(report.due(1, start));
+            assert!(!report.due(2, start + Duration::from_millis(100)));
+            assert_eq!(report.due(10, start + Duration::from_millis(200)), !human);
+            assert_eq!(report.due(11, start + Duration::from_secs(1)), human);
+            assert!(report.due(11, start + Duration::from_secs(6)));
+            assert!(report.due(100, start + Duration::from_millis(6100)));
+            assert!(!report.due(100, start + Duration::from_secs(20)));
+        }
     }
 }

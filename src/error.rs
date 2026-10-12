@@ -22,7 +22,7 @@ pub(crate) struct Error {
     pub code: &'static str,
     /// Primary diagnostic shown in every output format.
     pub message: String,
-    /// Follow-up actions emitted separately from the diagnostic.
+    /// Follow-up actions carried with the diagnostic.
     pub hints: Vec<String>,
     /// Original Ark refusal, including its full 64-bit code, when available.
     pub remote: Option<schema::Error>,
@@ -46,11 +46,11 @@ impl Error {
         self
     }
 
-    /// Encodes the error for the JSON result, leaving hints to stderr events.
+    /// Encodes the complete error for the JSON result and stderr event.
     ///
     /// The Ark's number is a decimal string, as every 64-bit value is in JSON.
     pub fn json(&self) -> Value {
-        let mut value = json!({"code": self.code, "message": self.message});
+        let mut value = json!({"code": self.code, "message": self.message, "hints": self.hints});
         if let Some(remote) = &self.remote {
             value["remote"] = json!({"code": remote.code.to_string(), "message": remote.msg});
         }

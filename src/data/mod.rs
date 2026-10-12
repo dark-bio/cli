@@ -17,7 +17,7 @@ use crate::{
     args::{self, slot_name},
     context::{Context, open_file},
     error::Error,
-    progress::{Processing, Transfer, Update},
+    progress::{Processing, Transfer},
 };
 use darkbio_clock::Clock;
 use darkbio_connect::{
@@ -81,8 +81,9 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
 
             // Empty the slot once the owner approves, where only a filled or
             // damaged slot counts as changed
-            context.output.event(
-                "approve",
+            context.output.approve(
+                if repair { "repair" } else { "delete" },
+                "phone",
                 format!(
                     "{} {} (Ark Companion on your phone)",
                     if repair { "repair" } else { "delete" },
@@ -102,6 +103,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
             }
             value["state"] = json!("empty");
             value["changed"] = json!(filled(slot) || slot.state == SlotState::Damaged as i32);
+            context.output.end_stage(None, None);
             context.output.document(&value)
         }
         args::Data::Fetch {
@@ -209,7 +211,7 @@ fn upload(
     // the required one
     context
         .output
-        .event("progress", format!("identifying {}", path.display()));
+        .stage("identifying", &format!("identifying {}", path.display()));
     let identified = connection
         .client
         .identify_dataset(name, size, &mut file, context.timing())?;
@@ -237,15 +239,11 @@ fn upload(
         "phases": [],
         "duration_seconds": 0,
     });
-    context.output.event(
-        "note",
-        format!(
-            "identified as {} ({}): {}",
-            slot_name(identified.kind),
-            confidence(identified.conf),
-            identified.summary
-        ),
+    context.output.end_stage(
+        Some(&format!("identified as {}", slot_name(identified.kind))),
+        Some(&format!("{} confidence", confidence(identified.conf))),
     );
+    context.output.event("note", &identified.summary);
     if confidence(identified.conf) == "low" {
         context.output.event(
             "warning",
@@ -300,6 +298,11 @@ fn upload(
 
     // Print the result, complete or partial, before any error
     context.interrupt.clear();
+    if result.is_ok() {
+        context.output.end_stage(None, None);
+    } else {
+        context.output.fail_stage();
+    }
     value["uploaded_bytes"] = json!(progress.uploaded);
     value["phases"] = json!(progress.phases);
     value["duration_seconds"] = json!(clock.elapsed(started).as_secs());
@@ -316,8 +319,6 @@ pub(crate) struct Progress<'a> {
     slot: i32,
     /// Rate history beginning at the first acknowledged upload observation.
     transfer: Transfer,
-    /// Last upload row, retained to align it when processing phases arrive.
-    last_upload: Option<Update>,
     /// Independent rate history for each device processing step.
     processing: Processing,
     /// Most recent byte count acknowledged by the Ark.
@@ -334,7 +335,6 @@ impl<'a> Progress<'a> {
             context,
             slot,
             transfer: Transfer::new(context.output.terminal(), clock.clone()),
-            last_upload: None,
             processing: Processing::new(context.output.terminal(), clock),
             uploaded: 0,
             phases: Vec::new(),
@@ -345,19 +345,22 @@ impl<'a> Progress<'a> {
     /// presentation.
     pub fn update(&mut self, stage: UploadProgress) {
         match stage {
-            UploadProgress::Identifying => {
-                self.context.output.event("progress", "identifying dataset")
-            }
+            UploadProgress::Identifying => self
+                .context
+                .output
+                .stage("identifying", "identifying dataset"),
             UploadProgress::Identified(info) => {
                 self.slot = info.kind;
-                self.context
-                    .output
-                    .event("note", format!("identified {}", slot_name(info.kind)));
+                self.context.output.end_stage(
+                    Some(&format!("identified {}", slot_name(info.kind))),
+                    Some(&format!("{} confidence", confidence(info.conf))),
+                );
             }
             UploadProgress::Preparing => {
                 if upload_approval(self.slot) {
-                    self.context.output.event(
-                        "approve",
+                    self.context.output.approve(
+                        "upload",
+                        "phone",
                         format!(
                             "upload {} (Ark Companion on your phone)",
                             slot_name(self.slot)
@@ -366,36 +369,29 @@ impl<'a> Progress<'a> {
                 } else {
                     self.context
                         .output
-                        .event("progress", "preparing dataset upload");
+                        .stage("preparing", "preparing dataset upload");
                 }
             }
-            UploadProgress::Started { session } => self
-                .context
-                .interrupt
-                .target(crate::interrupt::Target::Upload(session)),
+            UploadProgress::Started { session } => {
+                self.context.output.end_stage(None, None);
+                self.context
+                    .interrupt
+                    .target(crate::interrupt::Target::Upload(session));
+                self.context.output.stage("uploading", "Uploading");
+            }
             UploadProgress::Uploading { uploaded, total } => {
                 self.uploaded = uploaded;
                 if let Some(line) = self.transfer.update(uploaded, total) {
                     self.context.output.progress(&line);
-                    if self.context.output.terminal() {
-                        self.last_upload = Some(line);
-                    }
                 }
             }
             UploadProgress::Processing(status) => {
-                let first = self.phases.is_empty();
                 self.phases = status
                     .phases
                     .iter()
                     .map(|phase| phase.name.clone())
                     .collect();
-                for mut line in self.processing.update(&status) {
-                    if let Some(upload) = &mut self.last_upload {
-                        line.align(upload);
-                        if first {
-                            self.context.output.progress(upload);
-                        }
-                    }
+                for line in self.processing.update(&status) {
                     self.context.output.progress(&line);
                 }
             }

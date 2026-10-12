@@ -36,15 +36,25 @@ and a renamed field means a new major version, so scripts pin the version
 
 Every stderr line under --json is one event, however long its message:
 
-    {"event":"approve","message":"unlock (Ark Companion on your phone)"}
+    {"event":"approve","message":"unlock on your phone","action":"unlock","where":"phone"}
 
 The kinds are progress, note, warning, approve, hint, step, log and error.
-A log event also carries level, target and fields, and an error event the
-error object. A caller that merged the two streams drops the lines starting
-with `{"event":` and keeps the document. Progress messages are worded for
-reading, so they are not a structured progress feed.
+A progress event carries stage, phase, step, steps, percent, done_bytes,
+total_bytes and remaining_seconds, each present and null when unknown.
+stage names ark's work; phase, step and steps carry the Ark's processing,
+with phase spelled as the Ark names it. An approve event carries action
+and where, either phone or button. A log event carries level, target and
+fields, and an error event the complete error object. A caller that merged
+the streams drops lines starting with `{"event":` and keeps the document.
 
 ## Events and verbosity
+
+Stages start behind › and finish behind ✓ with their elapsed time or a
+fact, or behind ✗ on failure. An approval starts with ! and its instruction.
+On a terminal its timer counts up on that line; in a pipe the instruction
+prints once, followed by its outcome. Only a deadline ark sets counts down.
+Durations read 14s, 1m 02s or 1h 05m. Diagnostics keep their labels,
+error[code]:, warning:, hint:, note: and log:. Steps indent two spaces.
 
 On a terminal, progress redraws in place once a second. Redirected, it
 prints a line at every ten percent or every 5s. -q hides progress, notes,
@@ -66,14 +76,15 @@ only once the owner releases it.
 
 A failure prints error[code]: message on stderr, then hint: lines naming the
 next step where ark knows one. Under --json the error event carries the
-error object. It holds code and message, and for a refusal by the Ark also
-remote, with the Ark's own code and message.
+error object. It holds code, message and hints, and for a refusal by the Ark
+also remote, with the Ark's own code and message. Error hints stay inside
+that object in JSON; hints unrelated to an error remain separate events.
 
 A command that did part of its work keeps that result on stdout, reports
 the failure on stderr and exits non-zero. A command with no result prints
 nothing on stdout, or under --json a document holding only the error:
 
-    {"error": {"code": "no-device", "message": "no Ark enclave found"}}
+    {"error": {"code": "no-device", "message": "no Ark enclave found", "hints": []}}
 
 ## New releases
 

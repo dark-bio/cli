@@ -720,7 +720,9 @@ mod tests {
                         .unwrap()
                         .0;
                     if let Some(message) = message.filter(|_| !quiet) {
-                        let (note, result) = rendered.split_once('\n').unwrap();
+                        let (note, result) = rendered
+                            .split_once(if json { "\n" } else { "\n\n" })
+                            .unwrap();
                         if json {
                             assert_eq!(
                                 serde_json::from_str::<serde_json::Value>(note).unwrap(),
@@ -728,7 +730,12 @@ mod tests {
                                 "{case}"
                             );
                         } else {
-                            assert_eq!(note, format!("note: {message}"), "{case}");
+                            assert_eq!(
+                                note.split_whitespace().collect::<Vec<_>>().join(" "),
+                                format!("note: {message}"),
+                                "{case}"
+                            );
+                            assert!(note.lines().all(|line| line.chars().count() <= 80));
                         }
                         rendered = result;
                     }

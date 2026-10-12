@@ -273,7 +273,7 @@ fn inventory_output() {
                 if unavailable {
                     assert_eq!(
                         stderr,
-                        "hint: some paths are unavailable; run `ark data list`\n"
+                        "\nhint: some paths are unavailable; run `ark data list`\n"
                     );
                 }
             } else {
@@ -319,7 +319,7 @@ fn inventory_output() {
         stdout,
         "SLOT  STATE     BUILD     VERSION     SIZE\n41    \u{2713} filled  sample-a  1        2.0 KiB\n42    \u{00b7} empty   -         -            0 B\n"
     );
-    assert_eq!(stderr, "hint: run `ark data fetch 42`\n");
+    assert_eq!(stderr, "\nhint: run `ark data fetch 42`\n");
 
     // Each slot's page shows every field, wrapping long texts under their label
     for (index, id) in [41, 42].into_iter().enumerate() {

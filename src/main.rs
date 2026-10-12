@@ -172,6 +172,20 @@ fn checks_for_update(cli: &Cli) -> bool {
 /// Dispatches one command; an absent command prints top-level help without
 /// discovery.
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
+    // Show the pending connection before local checks or network lookups can wait
+    let _connecting = command
+        .as_ref()
+        .filter(|command| {
+            !matches!(
+                command,
+                Command::Devices | Command::Help { .. } | Command::Completions { .. }
+            )
+        })
+        .map(|_| {
+            context
+                .output
+                .connecting(context.options.device.as_deref().unwrap_or("an Ark"))
+        });
     match command {
         None => context.output.text(
             &help::command(&help::theme())

@@ -45,15 +45,14 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
             darkbio_connect::DeviceKind::Emulator => Realm::Emulator,
         });
 
-    // Terminals show the link and each stage live, other outputs plain events
-    let mut previous = None;
+    // Every output follows the same sequence of scan, exchange and approval
     let result = connection
         .client
         .pair(context.timing(), |event| match event {
             PairingProgress::Rendezvous {
                 colo,
                 secret,
-                deadline,
+                deadline: _,
                 fingerprint,
             } => {
                 // Colo is routing supplied by the cloud, never a URL or a host
@@ -78,43 +77,21 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                         ""
                     }
                 );
-                if context.output.terminal() {
-                    context.output.pairing(&url, deadline);
-                    previous = Some("rendezvous");
-                } else {
-                    context
-                        .output
-                        .event("approve", format!("scan with Ark Companion: {url}"));
-                }
+                context.output.pairing(&url);
             }
-            PairingProgress::Identity => {
-                stage(context, &mut previous, "identity", "exchanging identities")
-            }
-            PairingProgress::Storage => {
-                stage(context, &mut previous, "storage", "exchanging storage keys")
-            }
+            PairingProgress::Identity => context.output.stage("identity", "exchanging identities"),
+            PairingProgress::Storage => context.output.stage("storage", "exchanging storage keys"),
             PairingProgress::Approval => {
-                if let Some(name) = previous.take() {
-                    context.output.stage(name, true);
-                }
                 approve(&context.output, connection.device.kind());
-                if context.output.terminal() {
-                    previous = Some("approval");
-                }
             }
-            PairingProgress::Formatting => stage(
-                context,
-                &mut previous,
-                "formatting",
-                "preparing encrypted storage",
-            ),
+            PairingProgress::Formatting => context
+                .output
+                .stage("formatting", "preparing encrypted storage"),
         });
 
     // Complete the last stage only when pairing succeeded
-    if result.is_ok()
-        && let Some(name) = previous
-    {
-        context.output.stage(name, true);
+    if result.is_ok() {
+        context.output.end_stage(None, None);
     }
     result?;
 
@@ -130,27 +107,8 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
 
 /// Describes the color check and button location for the connected device kind.
 fn approve(output: &Output, kind: DeviceKind) {
-    output.event("approve", match kind {
+    output.approve("pair", "button", match kind {
         DeviceKind::Hardware => "if the colors on the Ark and your phone match, press the Ark's button with the pin that came with it, in the pinhole under the bottom right LED",
         DeviceKind::Emulator => "if the colors on the emulated Ark and your phone match, press its button in the Ark Emulator window, or run `ark-emulator button press --release-after 0`",
     });
-}
-
-/// Starts a human stage after completing the previous one, or emits the
-/// corresponding plain progress event outside a terminal.
-fn stage(
-    context: &Context,
-    previous: &mut Option<&'static str>,
-    name: &'static str,
-    message: &str,
-) {
-    if context.output.terminal() {
-        if let Some(name) = previous.take() {
-            context.output.stage(name, true);
-        }
-        context.output.stage(name, false);
-        *previous = Some(name);
-    } else {
-        context.output.event("progress", message);
-    }
 }

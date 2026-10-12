@@ -180,10 +180,10 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
                 Some(Approval::None) => {}
                 Some(Approval::Phone) => context
                     .output
-                    .event("approve", "firmware update (Ark Companion on your phone)"),
+                    .approve("firmware update", "phone", "firmware update (Ark Companion on your phone)"),
                 Some(Approval::Button) => context
                     .output
-                    .event("approve", "firmware update (press the Ark's button with the pin that came with it, in the pinhole under the bottom right LED)"),
+                    .approve("firmware update", "button", "firmware update (press the Ark's button with the pin that came with it, in the pinhole under the bottom right LED)"),
                 None => context.output.event(
                     "note",
                     "if requested, approve the update on your phone or press the Ark's button",
@@ -196,14 +196,15 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             }
             UpdateProgress::Verifying => context
                 .output
-                .event("progress", "verifying firmware on the Ark"),
-            UpdateProgress::Installing => context.output.event("progress", "installing firmware"),
+                .stage("verifying", "verifying firmware on the Ark"),
+            UpdateProgress::Installing => context.output.stage("installing", "installing firmware"),
         },
     );
 
     // A failed update prints the plan, with hints for a stale proof or the
     // emulator
     if let Err(error) = result {
+        context.output.fail_stage();
         context.output.document(&value)?;
         let mut error: Error = error.into();
         if error.code == "proof-rejected" {
@@ -221,6 +222,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
 
     // Record the installation, with the running build unknown until the Ark
     // returns
+    context.output.end_stage(None, None);
     value["installed"] = json!(true);
     value["running"] = Value::Null;
     context.interrupt.partial(value.clone());
@@ -228,22 +230,14 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
     // Wait for the Ark to return and verify its build, unless --no-wait skips
     // that
     if !no_wait {
-        context
-            .output
-            .event("progress", "waiting for the Ark to reboot");
-        context.output.wait("waiting for the Ark to return", None);
-        let started = clock.now();
         let result = verify_reboot(context, &connection, &target.version, &mut value);
-        context.output.finish();
         if result.is_ok() {
-            context.output.human_event(
-                "progress",
-                format!(
-                    "returned after {}s; verified {}",
-                    clock.elapsed(started).as_secs(),
-                    target.version
-                ),
+            context.output.end_stage(
+                Some(&format!("returned; verified {}", target.version)),
+                None,
             );
+        } else {
+            context.output.fail_stage();
         }
         context.output.document(&value)?;
         return result;
@@ -266,6 +260,11 @@ fn verify_reboot(
     // Poll the old session every 250ms until it ends, within the reboot window
     let clock = connection.client.clock();
     let deadline = clock.now() + REBOOT_WAIT;
+    context.output.wait(
+        "restarting",
+        "waiting for the Ark to return",
+        crate::output::Wait::Deadline(deadline),
+    );
     loop {
         match connection.client.call(
             schema::DeviceInfoRequest {},

@@ -650,16 +650,14 @@ fn test_doctor_report_keeps_checks_events_and_the_final_error() {
         .position(|event| event["event"] == "error")
         .unwrap();
     assert_eq!(events[error]["error"]["message"], failure["detail"]);
-    assert!(
-        events[error + 1..]
-            .iter()
-            .all(|event| event["event"] == "hint")
-    );
+    assert_eq!(error + 1, events.len());
     if let Some(hint) = failure["hint"].as_str() {
         assert!(
-            events[error + 1..]
+            events[error]["error"]["hints"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|event| event["message"] == hint)
+                .any(|value| value == hint)
         );
     }
 
@@ -667,7 +665,7 @@ fn test_doctor_report_keeps_checks_events_and_the_final_error() {
     let human = ark(&args);
     assert_eq!(human.status.code(), output.status.code());
     let stdout = String::from_utf8(human.stdout).unwrap();
-    assert!(stdout.starts_with("\nThis computer\n"));
+    assert!(stdout.starts_with("This computer\n"));
     assert!(stdout.contains("\n\nArk\n"));
     assert_eq!(stdout.matches("skipped without a connection").count(), 1);
     assert!(stdout.contains("8 checks"));
