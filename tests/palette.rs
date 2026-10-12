@@ -83,24 +83,11 @@ fn test_update_entry_point_is_silent_under_ci() {
     assert!(output.stderr.is_empty());
 }
 
-/// Stamps a kept update answer as asked now.
-///
-/// The spawned ark judges the answer's age against the real wall time, so the
-/// stamp reads it too.
-#[cfg(unix)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the spawned binary compares the answer's stamp with the real wall time"
-)]
-fn asked_now() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-/// Checks that a fresh isolated answer produces one stderr note, while help and
-/// invalid invocations stay quiet.
-#[cfg(unix)]
+/// Local builds skip both the release note and the background lookup, even
+/// when the kept answer is stale.
+#[cfg(all(unix, ark_local))]
 #[test]
-fn test_update_note_preserves_command_output_and_excludes_noncommands() {
+fn test_local_build_skips_release_notes_and_lookup() {
     /// Home and cache of the spawned processes, removed even after an assertion
     /// failure.
     struct Directory(
@@ -129,11 +116,11 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
     };
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
-    let version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let version = semver::Version::parse(env!("ARK_BUILD_VERSION")).unwrap();
     let newest = format!("{}.0.0", version.major + 1);
     let answer = serde_json::to_vec(&serde_json::json!({
         "channel": if version.pre.is_empty() { "release" } else { "develop" },
-        "asked": asked_now(),
+        "asked": "2000-01-01T00:00:00Z",
         "newest": newest,
     }))
     .unwrap();
@@ -154,10 +141,7 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
         command.output().unwrap()
     };
 
-    // The note precedes the error and repeats in both reading and JSON output
-    let message = format!(
-        "ark {newest} is available, this is {version}; download it from https://github.com/dark-bio/cli"
-    );
+    // Local builds keep the baseline output and leave the stale cache untouched
     for json in [false, true] {
         let mut args = vec!["status", "--device", "hardware:palette-no-device"];
         if json {
@@ -168,37 +152,10 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
             let output = invoke(&args, ci);
             assert_eq!(output.status.code(), Some(3), "json={json}, CI={ci:?}");
             assert_eq!(output.stdout, baseline.stdout, "json={json}, CI={ci:?}");
-            let stderr = String::from_utf8(output.stderr).unwrap();
-            if json {
-                let events: Vec<Value> = stderr
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                assert_eq!(
-                    events[0],
-                    serde_json::json!({"event":"note","message":message})
-                );
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| event["event"] == "note")
-                        .count(),
-                    1
-                );
-                assert_eq!(events[1]["event"], "error");
-            } else {
-                assert_eq!(stderr.lines().next().unwrap(), format!("note: {message}"));
-                assert_eq!(
-                    stderr
-                        .lines()
-                        .filter(|line| line.starts_with("note:"))
-                        .count(),
-                    1
-                );
-            }
+            assert_eq!(output.stderr, baseline.stderr, "json={json}, CI={ci:?}");
         }
 
-        // Quiet suppresses the notice without changing the result or status
+        // Quiet preserves the same result and absence of a release note
         args.push("-q");
         let quiet = invoke(&args, None);
         assert_eq!(quiet.stdout, baseline.stdout);
@@ -207,31 +164,18 @@ fn test_update_note_preserves_command_output_and_excludes_noncommands() {
         assert!(!String::from_utf8_lossy(&baseline.stderr).contains("is available"));
     }
 
-    // None of these paths may announce or refresh a release, even with a known
-    // newer build
-    for args in [
-        vec!["help"],
-        vec!["help", "--all"],
-        vec!["-h"],
-        vec!["--help"],
-        vec!["--help", "--all"],
-        vec!["status", "--help"],
-        vec!["completions", "zsh"],
-        vec!["--version"],
-        vec![],
-        vec!["--all"],
-        vec!["--timeout", "0", "status"],
-        vec!["bogus"],
-        vec!["--json", "data", "upload", "x", "--dry-run", "--unlock"],
-        vec!["--version", "status"],
-    ] {
-        let output = invoke(&args, None);
-        assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("is available"),
-            "{args:?}"
-        );
-    }
     assert_eq!(std::fs::read(cache.join("update.json")).unwrap(), answer);
+
+    // A local build also ignores the worker entry point and an empty cache
+    let output = invoke(&["__update"], None);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_eq!(std::fs::read(cache.join("update.json")).unwrap(), answer);
+    std::fs::remove_file(cache.join("update.json")).unwrap();
+    let output = invoke(&["status", "--device", "hardware:palette-no-device"], None);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(!cache.join("update.json").exists());
 }
 
 /// Walks the executable command tree through its generated help pages.
@@ -553,33 +497,62 @@ fn test_firmware_confirmation_is_local_to_update() {
     }
 }
 
-/// Checks that `--version --json` prints one document with the versions and
-/// the firmware minimums, and nothing on stderr.
+/// The version has one JSON field and one plain line, with no stderr output.
 #[test]
-fn version_is_a_single_structured_result() {
+fn test_version_is_one_line_or_one_json_field() {
+    // JSON exposes the build version alone
     let output = ark(&["--version", "--json"]);
     assert!(output.status.success());
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["tool"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(document["connect"], darkbio_connect::VERSION);
-    assert_eq!(document["wire"], darkbio_connect::wire::VERSION);
-    assert!(document.get("environments").is_none());
-    semver::Version::parse(document["minimum_firmware"].as_str().unwrap()).unwrap();
-    chrono::DateTime::parse_from_rfc3339(document["minimum_develop_publish"].as_str().unwrap())
-        .unwrap();
+    assert_eq!(document.as_object().unwrap().len(), 1);
+    let version = document["version"].as_str().unwrap();
+    semver::Version::parse(version).unwrap();
     assert!(output.stderr.is_empty());
+
+    // Both spellings print exactly one plain line with that same version
+    for flag in ["--version", "-V"] {
+        let output = ark(&[flag]);
+        assert!(output.status.success(), "{flag}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("ark {version}\n")
+        );
+        assert!(output.stderr.is_empty(), "{flag}");
+    }
 }
 
-/// Checks that piped output keeps the human layout without escape sequences.
+/// A checkout build marks the Cargo version as local in both output modes.
+#[cfg(ark_local)]
 #[test]
-fn default_pipes_have_layout_without_terminal_escapes() {
+fn test_checkout_version_is_local() {
+    let version = format!("{}-local", env!("CARGO_PKG_VERSION"));
+    let output = ark(&["--version", "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        serde_json::json!({"version": version})
+    );
     let output = ark(&["--version"]);
-    assert!(output.status.success());
-    assert!(!output.stdout.contains(&0x1b));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("ark {version}\n")
+    );
+}
+
+/// Root and status help describe the version line and the reduced reading block.
+#[test]
+fn test_version_and_status_help_match_output() {
+    let root = String::from_utf8(ark(&["--help"]).stdout).unwrap();
+    assert!(root.contains("Show the Ark's serial, firmware, pairing and lock"));
+    let version = root
+        .lines()
+        .find(|line| line.contains("-V, --version"))
+        .unwrap();
+    assert!(version.ends_with("Print the version"));
+
+    let status = String::from_utf8(ark(&["status", "--help"]).stdout).unwrap();
+    let status = status.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .starts_with("  Tool")
+        status.contains("JSON adds hardware.model, firmware.published, realm, identity, pubkey")
     );
 }
 

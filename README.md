@@ -86,7 +86,7 @@ The enrollment lasts 30 days. `ark-emulator stop`, `ark-emulator wipe` and
 | Command | What it does | Who approves |
 | --- | --- | --- |
 | `ark devices` | Lists hardware Arks and running emulators | nobody |
-| `ark status` | Shows identity, firmware, pairing and lock, offline | nobody |
+| `ark status` | Shows serial, firmware, pairing and lock, offline | nobody |
 | `ark genuine` | Checks the Ark against Dark Bio's device registry | nobody |
 | `ark enroll` | Gives an emulator an attested identity at Ark Hub | nobody; the person enrolls it in a browser |
 | `ark pair` | Pairs the Ark with Ark Companion, once | the owner, on the phone and the Ark's button |
@@ -136,9 +136,10 @@ the same on GitHub:
 ## Stability
 
 The Ark, its protocols and this tool still change quickly, and firmware,
-cloud and tool versions move together. `ark --version` prints the oldest
-firmware this build works with. The JSON documents and error codes follow
-`ark help output`, while the reading layouts may change.
+cloud and tool versions move together. `ark --version` prints this tool's
+version. Against firmware older than it supports, commands fail with
+`firmware-outdated`, which names the minimum version. The JSON documents and
+error codes follow `ark help output`, while the reading layouts may change.
 
 The connection library in `connect/` is internal to this package. Its Rust
 API is unstable and is not a supported integration interface.

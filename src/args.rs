@@ -27,7 +27,7 @@ pub(crate) struct Cli {
     // Options propagated to every command level by clap
     #[command(flatten)]
     pub options: Options,
-    /// Versions and the oldest firmware supported
+    /// Print the version
     #[arg(short = 'V', long)]
     pub version: bool,
     /// Print help; `ark help --all` prints the manual
@@ -122,7 +122,7 @@ pub(crate) enum Log {
 pub(crate) enum Command {
     /// List hardware Arks and running emulators
     Devices,
-    /// Show the Ark's identity, firmware, pairing and lock
+    /// Show the Ark's serial, firmware, pairing and lock
     Status(Recovery),
     /// Verify the Ark against Dark Bio's device registry
     Genuine,

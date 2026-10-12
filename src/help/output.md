@@ -76,7 +76,8 @@ and a development build reads the release list from api.github.com. The
 request carries nothing about this computer, its Arks or the running
 version. It runs in a detached copy of ark that exits within 30s, so no
 command waits for it. The answer is kept in update.json in ark's cache
-directory, and a nonempty CI turns the lookup off.
+directory, and a nonempty CI turns the lookup off. A local build, marked
+with -local in its version, skips this lookup and its note.
 
 While the kept answer names a newer version, every command except help,
 completions, --version and doctor starts with a note naming both versions

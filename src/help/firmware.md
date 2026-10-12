@@ -8,13 +8,14 @@ its update.
 
 ## Compatibility
 
-`ark --version` prints the oldest firmware this tool works with, and the
-develop cutoff beside it. A develop build also needs a publish time at or
-after the cutoff, whatever its version. Against older firmware every command
-fails with firmware-outdated, except the ones that lead out of it:
+This tool works with firmware from a minimum version on, and develop
+firmware also needs a publish time at or after a cutoff, whatever its
+version. Against older firmware every command fails with firmware-outdated,
+except the ones that lead out of it:
 `ark devices`, `ark status`, `ark doctor`, `ark firmware list`,
-`ark firmware update` and `ark enroll --cwt`. `ark status` still prints what
-it reads, with sync, pairing and lock null, then exits 5.
+`ark firmware update` and `ark enroll --cwt`. Below the minimum version the
+error names it. `ark status` still prints what it reads, with sync, pairing
+and lock null, then exits 5.
 
 A firmware that answers unknown does not know the request, so the firmware
 and this tool are out of step. Update both.

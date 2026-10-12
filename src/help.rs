@@ -91,8 +91,9 @@ const CONTRACTS: &[Contract] = &[
             requires: "one Ark, in any state; the cloud is not needed",
             approval: "none",
             time: "seconds",
-            prints: "name, serial, hardware, firmware, trust, environment, realm, synced, \
-                paired, unlocked, identity, mismatch; JSON adds pubkey",
+            prints: "name, serial, hardware, firmware, environment, trust, synced, paired, \
+                unlocked, mismatch; JSON adds hardware.model, firmware.published, realm, \
+                identity, pubkey",
             exit: "0 done; 1 local; 2 usage; 3 device; 5 outdated firmware; 7 timeout",
             examples: "ark status\nark --device emulator status --json",
         }),
