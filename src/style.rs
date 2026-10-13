@@ -26,10 +26,6 @@ pub(crate) enum Role {
     Muted,
     /// Commands, identifiers and links the user may act on.
     Accent,
-    /// Staging environment label.
-    Staging,
-    /// Develop environment label.
-    Develop,
 }
 
 /// Terminal color capability, separate from Unicode and interactive cursor control.
@@ -50,7 +46,7 @@ pub(crate) enum Color {
 pub(crate) struct Theme {
     /// Whether this stream permits cursor control and live line updates.
     pub interactive: bool,
-    /// Whether terminal and locale permit decorative Unicode glyphs.
+    /// Whether the locale permits Unicode glyphs outside JSON mode.
     pub unicode: bool,
     /// Available style depth after honoring color opt-out settings.
     pub color: Color,
@@ -104,7 +100,7 @@ impl Theme {
             .into_iter()
             .filter_map(|key| std::env::var(key).ok())
             .find(|value| !value.is_empty());
-        let unicode = interactive
+        let unicode = human
             && locale.is_none_or(|locale| {
                 let locale = locale.to_ascii_uppercase().replace('-', "");
                 locale.contains("UTF8") || cfg!(windows)
@@ -152,15 +148,12 @@ impl Theme {
             Role::Failure => (235, 96, 112),
             Role::Muted => (124, 128, 152),
             Role::Accent => (137, 180, 250),
-            Role::Staging => (147, 153, 178),
-            Role::Develop => (108, 112, 134),
             Role::Heading => return Style::new().bold(),
             Role::Default => unreachable!(),
         };
 
-        // Muted text and environment labels keep regular weight, and the other
-        // roles are bold
-        let style = if matches!(role, Role::Muted | Role::Staging | Role::Develop) {
+        // Muted text keeps regular weight, and the other roles are bold
+        let style = if matches!(role, Role::Muted) {
             Style::new()
         } else {
             Style::new().bold()
@@ -192,7 +185,7 @@ impl Theme {
         if self.unicode { unicode } else { ascii }
     }
 
-    /// Prefixes a state marker so meaning survives without color.
+    /// Prefixes the state's mark in its role's color, leaving the words plain.
     pub fn mark(&self, role: Role, text: &str) -> String {
         let icon = match role {
             Role::Success => self.glyph("\u{2713}", "ok"),
@@ -200,7 +193,7 @@ impl Theme {
             Role::Attention => "!",
             _ => self.glyph("\u{00b7}", "-"),
         };
-        self.paint(role, format!("{icon} {text}"))
+        format!("{} {text}", self.paint(role, icon))
     }
 
     /// Returns the muted separator used between related human facts.
@@ -222,7 +215,8 @@ impl Theme {
         console::truncate_str(text, width, tail).into_owned()
     }
 
-    /// Styles paired backtick spans as commands; unmatched backticks remain literal.
+    /// Styles each command between paired backticks and keeps the backticks,
+    /// while an unmatched backtick stays as typed.
     pub fn inline(&self, text: &str) -> String {
         let mut result = String::new();
         let mut remaining = text;
@@ -231,7 +225,9 @@ impl Theme {
                 break;
             };
             result.push_str(before);
+            result.push('`');
             result.push_str(&self.paint(Role::Accent, code));
+            result.push('`');
             remaining = rest;
         }
         result.push_str(remaining);
@@ -283,6 +279,18 @@ pub(crate) fn bytes(bytes: u64) -> String {
         }
     }
     format!("{bytes} B")
+}
+
+/// Formats seconds as `14s`, `1m 02s` or `1h 05m`, the one duration form of
+/// every output.
+pub(crate) fn duration(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Wraps styled text at words to `width` terminal cells, indenting continued
@@ -377,6 +385,84 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks that durations switch to minutes at 60s and to hours at 3600s,
+    /// padding the smaller unit.
+    #[test]
+    fn test_duration_boundaries() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (14, "14s"),
+            (59, "59s"),
+            (60, "1m 00s"),
+            (62, "1m 02s"),
+            (3599, "59m 59s"),
+            (3600, "1h 00m"),
+            (3900, "1h 05m"),
+        ] {
+            assert_eq!(duration(seconds), expected, "{seconds}");
+        }
+    }
+
+    /// Checks that a pipe's marks follow the locale alone, even under a dumb
+    /// terminal, while color and redraws stay off.
+    #[test]
+    fn test_pipe_marks_follow_locale() {
+        /// Variable that passes the expected mark to the child process.
+        const CHILD: &str = "ARK_TEST_PIPE_MARK";
+
+        // Run each locale in a child, so its settings stay out of other tests
+        let Ok(expected) = std::env::var(CHILD) else {
+            for (name, locale) in [
+                ("LC_ALL", "en_US.UTF-8"),
+                ("LC_CTYPE", "en_US.utf8"),
+                ("LANG", "en_US.UTF-8"),
+                ("LC_ALL", "C"),
+                ("", ""),
+            ] {
+                let expected = if locale == "C" && !cfg!(windows) {
+                    "ok done"
+                } else {
+                    "\u{2713} done"
+                };
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "style::tests::test_pipe_marks_follow_locale",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, expected)
+                    .env_remove("LC_ALL")
+                    .env_remove("LC_CTYPE")
+                    .env_remove("LANG")
+                    .env_remove("NO_COLOR")
+                    .env("TERM", "dumb")
+                    .env("COLORTERM", "truecolor")
+                    .env("CLICOLOR_FORCE", "1");
+                if !name.is_empty() {
+                    command.env(name, locale);
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{name}={locale}: {output:?}");
+            }
+            return;
+        };
+
+        // Both piped streams print the same mark, without color
+        for stderr in [false, true] {
+            let theme = Theme::new(false, stderr);
+            assert!(!theme.interactive);
+            assert_eq!(theme.color, Color::Off);
+            assert_eq!(theme.mark(Role::Success, "done"), expected);
+
+            // JSON turns glyphs, color and redraws off, whatever the locale
+            let json = Theme::new(true, stderr);
+            assert!(!json.interactive);
+            assert!(!json.unicode);
+            assert_eq!(json.color, Color::Off);
+        }
+    }
 
     /// Checks that a native Windows console gets exact colors without any
     /// color variable, while the opt-outs still turn them off.
@@ -526,6 +612,30 @@ mod tests {
         );
     }
 
+    /// Checks that a mark takes its role's color and weight, and its words stay
+    /// plain.
+    #[test]
+    fn test_marks_style_only_the_glyph() {
+        let theme = Theme::test(80, Color::True, true);
+        for (role, expected) in [
+            (
+                Role::Success,
+                "\x1b[1m\x1b[38;2;148;202;110m\u{2713}\x1b[0m state",
+            ),
+            (
+                Role::Failure,
+                "\x1b[1m\x1b[38;2;235;96;112m\u{2717}\x1b[0m state",
+            ),
+            (
+                Role::Attention,
+                "\x1b[1m\x1b[38;2;232;162;74m!\x1b[0m state",
+            ),
+            (Role::Muted, "\x1b[38;2;124;128;152m\u{00b7}\x1b[0m state"),
+        ] {
+            assert_eq!(theme.mark(role, "state"), expected, "{role:?}");
+        }
+    }
+
     /// Checks that wrapping and truncation measure terminal cells, and wrapping
     /// keeps every character of a styled link.
     #[test]
@@ -570,16 +680,29 @@ mod tests {
         );
     }
 
-    /// Checks that paired backticks become styled spans, while an unmatched one
-    /// stays literal.
+    /// Checks that inline commands keep their backticks with and without color,
+    /// and that an unmatched backtick stays.
     #[test]
-    fn inline_code_keeps_unmatched_backticks() {
-        let theme = Theme::test(80, Color::Basic, false);
-        assert_eq!(
-            theme.inline("run `ark unlock` first"),
-            "run \x1b[1mark unlock\x1b[0m first"
-        );
-        assert_eq!(theme.inline("an unmatched ` stays"), "an unmatched ` stays");
+    fn test_inline_code_keeps_backticks() {
+        for (color, expected) in [
+            (Color::Off, "run `ark unlock` first"),
+            (
+                Color::True,
+                "run `\x1b[1m\x1b[38;2;137;180;250mark unlock\x1b[0m` first",
+            ),
+        ] {
+            let theme = Theme::test(80, color, false);
+            assert_eq!(
+                theme.inline("run `ark unlock` first"),
+                expected,
+                "{color:?}"
+            );
+            assert_eq!(
+                theme.inline("an unmatched ` stays"),
+                "an unmatched ` stays",
+                "{color:?}"
+            );
+        }
     }
 
     /// Checks that inline styling does not move where text wraps.
@@ -588,7 +711,7 @@ mod tests {
         let theme = Theme::test(40, Color::True, true);
         let text = "Update hardware with `ark firmware update`;";
         let colored = wrap(&theme.inline(text), 40, 0);
-        let plain = wrap(&text.replace('`', ""), 40, 0);
+        let plain = wrap(text, 40, 0);
         assert_eq!(console::strip_ansi_codes(&colored), plain);
     }
 }

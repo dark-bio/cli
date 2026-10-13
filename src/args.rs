@@ -13,6 +13,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use darkbio_connect::trust::Environment;
 use std::path::PathBuf;
 
+/// Lists an enum's variants, and fails to compile when the list misses one.
+macro_rules! variants {
+    ($kind:ty, $($variant:path),+ $(,)?) => {{
+        /// Match that stops compiling when a variant is left out.
+        const _: fn($kind) = |value| match value {
+            $($variant => (),)+
+        };
+        [$($variant),+]
+    }};
+}
+
 // Parsed command and global options; cross-level conflicts are checked afterward
 #[derive(Parser)]
 #[command(
@@ -27,7 +38,7 @@ pub(crate) struct Cli {
     // Options propagated to every command level by clap
     #[command(flatten)]
     pub options: Options,
-    /// Versions and the oldest firmware supported
+    /// Print the version
     #[arg(short = 'V', long)]
     pub version: bool,
     /// Print help; `ark help --all` prints the manual
@@ -82,29 +93,35 @@ pub(crate) struct Options {
     /// Which Ark: locator, serial, name, image or kind
     #[arg(short = 'd', long, global = true, value_name = "SELECTOR")]
     pub device: Option<String>,
-    /// Print the result as JSON and events as JSON Lines
+    /// Print JSON, with events as JSON Lines on stderr
     #[arg(long, global = true)]
     pub json: bool,
-    /// Seconds to wait for each machine reply
-    #[arg(long, global = true, default_value_t = 60, value_parser = parse_timeout, value_name = "SECONDS")]
-    pub timeout: u64,
     /// Unlock a locked Ark first, approved on your phone
     #[arg(long, global = true)]
     pub unlock: bool,
     /// Never prompt; fail naming the flag instead
     #[arg(long, global = true)]
     pub no_input: bool,
+    /// Limit each wait on a machine
+    #[arg(long, global = true, default_value_t = 60, value_parser = parse_timeout, value_name = "SECONDS")]
+    pub timeout: u64,
     /// Cloud environment: release, staging or develop
     #[arg(long, global = true, value_parser = parse_env)]
     pub env: Option<Environment>,
-    /// Hide progress, notes and warnings
+    /// Hide progress, notes, warnings and steps
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
     /// Show steps
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
-    /// Diagnostic logs
-    #[arg(long, global = true, value_enum)]
+    /// Print diagnostics: debug or trace
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "LEVEL",
+        hide_possible_values = true
+    )]
     pub log: Option<Log>,
 }
 
@@ -122,22 +139,24 @@ pub(crate) enum Log {
 pub(crate) enum Command {
     /// List hardware Arks and running emulators
     Devices,
-    /// Show the Ark's identity, firmware, pairing and lock
+    /// Show the Ark's serial, firmware, pairing and lock
     Status(Recovery),
+    /// Enroll the Ark at Ark Hub, or install an attestation
+    Enroll(Enroll),
     /// Verify the Ark against Dark Bio's device registry
     Genuine,
     /// Pair the Ark with Ark Companion on your phone
     Pair,
     /// Unlock the Ark, approved on your phone
     Unlock,
-    /// Enroll the Ark at Ark Hub, or install an attestation
-    Enroll(Enroll),
     /// Read and change the datasets on the Ark
     #[command(subcommand)]
     Data(Data),
-    /// Run an app on the Ark
-    #[command(subcommand)]
-    App(App),
+    /// Run an app, approved on your phone; print its report
+    Run {
+        /// WebAssembly app to run
+        file: PathBuf,
+    },
     /// List and install Ark firmware
     #[command(subcommand)]
     Firmware(Firmware),
@@ -163,12 +182,7 @@ pub(crate) enum Command {
 #[derive(Args)]
 pub(crate) struct Recovery {
     /// Trust this public key instead of the attestation
-    #[arg(
-        long,
-        value_name = "HEX",
-        help_heading = "Advanced",
-        hide_short_help = true
-    )]
+    #[arg(long, value_name = "HEX", help_heading = "Advanced")]
     pub pubkey: Option<String>,
 }
 
@@ -242,25 +256,16 @@ pub(crate) struct Change {
     pub dry_run: bool,
 }
 
-// App execution on the Ark
-#[derive(Subcommand)]
-pub(crate) enum App {
-    /// Run an app, approved on your phone; print its report
-    Run {
-        /// WebAssembly app to run
-        file: PathBuf,
-    },
-}
-
 // Published firmware selection and installation, including read-only planning
 #[derive(Subcommand)]
 pub(crate) enum Firmware {
     /// Show the installed build and the candidates
     List,
-    /// Install firmware and reboot the Ark
+    /// Install firmware and restart the Ark
     Update {
-        /// Install this published build instead
-        #[arg(long, value_name = "VERSION")]
+        /// Version to install, as `ark firmware list` prints it; the newest
+        /// candidate when omitted
+        #[arg(value_name = "VERSION")]
         version: Option<String>,
         /// Show the plan without installing
         #[arg(long, conflicts_with = "unlock")]
@@ -276,14 +281,20 @@ pub(crate) enum Firmware {
 
 /// Parses a cloud environment name, one of `release`, `staging` or `develop`.
 pub(crate) fn parse_env(value: &str) -> Result<Environment, String> {
-    match value {
-        "release" => Ok(Environment::Release),
-        "staging" => Ok(Environment::Staging),
-        "develop" => Ok(Environment::Develop),
-        _ => Err(format!(
-            "unknown environment {value:?}; use release, staging or develop"
-        )),
-    }
+    environments()
+        .find(|environment| environment.to_string() == value)
+        .ok_or_else(|| format!("unknown environment {value:?}; use release, staging or develop"))
+}
+
+/// Lists every environment, for the parser and its suggestions.
+pub(crate) fn environments() -> impl Iterator<Item = Environment> {
+    variants!(
+        Environment,
+        Environment::Release,
+        Environment::Staging,
+        Environment::Develop,
+    )
+    .into_iter()
 }
 
 /// Parses a slot selector, either a positive numeric id or an exact slot name.
@@ -313,6 +324,22 @@ pub(crate) fn slot_name(id: i32) -> String {
                 .replace('_', "-")
         })
         .unwrap_or_else(|_| id.to_string())
+}
+
+/// Lists the name of every slot kind, spelled as [`parse_slot`] accepts it.
+pub(crate) fn slot_names() -> impl Iterator<Item = String> {
+    use darkbio_connect::schema::SlotKind;
+    variants!(
+        SlotKind,
+        SlotKind::Unspecified,
+        SlotKind::ReferenceGenome,
+        SlotKind::GeneAnnotations,
+        SlotKind::SnpIndelCalls,
+        SlotKind::VariantCatalog,
+    )
+    .into_iter()
+    .filter(|kind| *kind as i32 > 0)
+    .map(|kind| slot_name(kind as i32))
 }
 
 /// Parses a `--timeout` value in seconds, rejecting zero and values too large
@@ -424,6 +451,25 @@ mod tests {
                 panic!("expected firmware update");
             };
             assert_eq!(yes, flag.is_some(), "{flag:?}");
+        }
+    }
+
+    /// `ark run` takes the app file, with the shared options before or after
+    /// it.
+    #[test]
+    fn test_run_accepts_the_app_file_and_shared_options() {
+        for args in [
+            vec!["ark", "--json", "--unlock", "run", "sample app.wasm"],
+            vec!["ark", "run", "sample app.wasm", "--json", "--unlock"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            cli.validate().unwrap();
+            assert!(cli.options.json, "{args:?}");
+            assert!(cli.options.unlock, "{args:?}");
+            let Some(Command::Run { file }) = cli.command else {
+                panic!("expected run");
+            };
+            assert_eq!(file, PathBuf::from("sample app.wasm"), "{args:?}");
         }
     }
 

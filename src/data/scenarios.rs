@@ -107,7 +107,7 @@ fn slots() -> Vec<SlotStatus> {
 /// Runs one scenario in a child test process, capturing its real stdout and
 /// stderr so results and hints stay distinguishable.
 fn capture(scenario: &str, json: bool) -> (String, String) {
-    // Run this test again as a child that prints the scenario without color
+    // Run this test again as a child with UTF-8 marks and no color
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -117,6 +117,7 @@ fn capture(scenario: &str, json: bool) -> (String, String) {
         .env("ARK_TEST_DATA_SCENARIO", scenario)
         .env("ARK_TEST_DATA_JSON", json.to_string())
         .env("NO_COLOR", "1")
+        .env("LC_ALL", "en_US.UTF-8")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -159,6 +160,45 @@ fn inventory_output() {
             }
             "empty" => super::paths::print(&output, &[]).unwrap(),
             "list" => listing(&output, &slots()).unwrap(),
+            "four-slots" => {
+                let slots: Vec<_> = [
+                    (
+                        schema::SlotKind::ReferenceGenome,
+                        "GRCh38.p14",
+                        "",
+                        1_022_427_344,
+                    ),
+                    (
+                        schema::SlotKind::GeneAnnotations,
+                        "GRCh38.p14",
+                        "",
+                        215_062_938,
+                    ),
+                    (
+                        schema::SlotKind::SnpIndelCalls,
+                        "GRCh38.p13",
+                        "",
+                        307_547_341,
+                    ),
+                    (
+                        schema::SlotKind::VariantCatalog,
+                        "GRCh38.p14",
+                        "157",
+                        6_227_702_579,
+                    ),
+                ]
+                .into_iter()
+                .map(|(kind, build, version, bytes)| SlotStatus {
+                    kind: kind as i32,
+                    state: SlotState::Filled as i32,
+                    build: build.into(),
+                    version: version.into(),
+                    bytes,
+                    ..Default::default()
+                })
+                .collect();
+                listing(&output, &slots).unwrap();
+            }
             "show41" => show(&output, &slots(), 41).unwrap(),
             "show42" => show(&output, &slots(), 42).unwrap(),
             _ => panic!("unexpected scenario {scenario}"),
@@ -233,7 +273,7 @@ fn inventory_output() {
                 if unavailable {
                     assert_eq!(
                         stderr,
-                        "hint: some paths are unavailable; run `ark data list`\n"
+                        "\nhint: some paths are unavailable; run `ark data list`\n"
                     );
                 }
             } else {
@@ -277,9 +317,9 @@ fn inventory_output() {
     let (stdout, stderr) = capture("list", false);
     assert_eq!(
         stdout,
-        "  SLOT  STATE      ORIGIN     BUILD     VERSION     SIZE  REQUIRES\n  41    ok filled  personal   sample-a  1        2.0 KiB  none\n  42    - empty    reference  -         -            0 B  41 (filled)\n"
+        "SLOT  STATE     BUILD     VERSION     SIZE\n41    \u{2713} filled  sample-a  1        2.0 KiB\n42    \u{00b7} empty   -         -            0 B\n"
     );
-    assert_eq!(stderr, "hint: run `ark data fetch 42`\n");
+    assert_eq!(stderr, "\nhint: run `ark data fetch 42`\n");
 
     // Each slot's page shows every field, wrapping long texts under their label
     for (index, id) in [41, 42].into_iter().enumerate() {
@@ -311,11 +351,34 @@ fn inventory_output() {
         }
         if id == 41 {
             assert!(joined.starts_with("Slot 41 Id 41 Name Sample A Description "));
-            assert!(joined.ends_with("State ok filled Origin personal Damage - Dependencies none Size 2.0 KiB Build sample-a Version 1 Download - Required by 42 Cached no"));
+            assert!(joined.ends_with("State \u{2713} filled Origin personal Damage - Dependencies none Size 2.0 KiB Build sample-a Version 1 Download - Required by 42 Cached no"));
         } else {
             assert!(joined.starts_with("Slot 42 Id 42 Name Sample B Description "));
-            assert!(joined.contains("State - empty Origin reference Damage - Dependencies 41 (filled) Size 0 B Build - Version - Download url https://example.test/sample Download size 4.0 KiB Download sha256 "));
+            assert!(joined.contains("State \u{00b7} empty Origin reference Damage - Dependencies 41 (filled) Size 0 B Build - Version - Download url https://example.test/sample Download size 4.0 KiB Download sha256 "));
             assert!(joined.ends_with("Required by none Cached no"));
         }
     }
+}
+
+/// Four typical slots print as four rows of five columns within 80 columns.
+#[test]
+fn test_data_list_fits_four_slots_at_eighty_columns() {
+    let (stdout, stderr) = capture("four-slots", false);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.lines().count(), 5);
+    assert!(
+        stdout
+            .lines()
+            .all(|line| console::measure_text_width(line) <= 80)
+    );
+    assert_eq!(
+        stdout,
+        concat!(
+            "SLOT              STATE     BUILD       VERSION       SIZE\n",
+            "reference-genome  ✓ filled  GRCh38.p14  -        975.1 MiB\n",
+            "gene-annotations  ✓ filled  GRCh38.p14  -        205.1 MiB\n",
+            "snp-indel-calls   ✓ filled  GRCh38.p13  -        293.3 MiB\n",
+            "variant-catalog   ✓ filled  GRCh38.p14  157        5.8 GiB\n",
+        )
+    );
 }

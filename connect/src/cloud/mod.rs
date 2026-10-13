@@ -41,7 +41,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 /// reused for a request.
 ///
 /// Sync is needed when the Ark reports no setup since boot, or when its clock
-/// is 15 s or more away from the wall time of the [`Clock`]. That bound leaves
+/// is 15s or more away from the wall time of the [`Clock`]. That bound leaves
 /// headroom for proof verification. The marker records only setup since boot,
 /// so it cannot reveal changed cloud keys.
 pub fn cloud_synced(info: &crate::schema::DeviceInfoResponse, clock: &Clock) -> bool {
@@ -213,7 +213,7 @@ impl Services {
     }
 
     /// Ensures cloud sync, reusing the Ark's fresh setup and caching that
-    /// decision for 60 s.
+    /// decision for 60s.
     ///
     /// Each caller bounds its own wait, and only one exchange runs at a time.
     pub(crate) fn sync(
@@ -1000,7 +1000,7 @@ pub(crate) mod tests {
     }
 
     /// Device setup counts as fresh only with the boot marker set and a clock
-    /// less than 15 s away from the host's.
+    /// less than 15s away from the host's.
     #[test]
     fn test_sync_freshness() {
         use crate::schema::DeviceInfoResponse;

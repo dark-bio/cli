@@ -459,7 +459,7 @@ impl Client {
     /// Setup, upload, approvals and execution share any absolute deadline. Reads
     /// and progress callbacks run on this thread and must return promptly. The
     /// deadline cannot interrupt a blocking reader. Failed operations attempt
-    /// cancellation within the remaining time, at most 1 s, and are never
+    /// cancellation within the remaining time, at most 1s, and are never
     /// retried.
     ///
     /// [`ExecutionProgress::Started`] supplies the task ID for cancellation with

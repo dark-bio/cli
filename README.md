@@ -52,13 +52,13 @@ Plug in your Ark, or [start an emulated one](#emulated-arks), and run:
 
 ```sh
 ark devices                       # find the Ark
-ark status                        # trust, firmware, pairing and lock
+ark status                        # serial, firmware, pairing and lock
 ark pair                          # once, with your phone and the Ark's button
 ark unlock                        # after each power loss, approved on your phone
 ark data list                     # what the Ark holds
 ark data upload calls.vcf.gz      # your variant calls, approved on your phone
 ark data fetch --all              # the public references for them
-ark app run my.wasm > report.md   # approve on your phone, then release the report
+ark run my.wasm > report.md       # approve on your phone, then release the report
 ```
 
 Pairing happens once, and the Ark stays unlocked until it loses power. The
@@ -86,9 +86,9 @@ The enrollment lasts 30 days. `ark-emulator stop`, `ark-emulator wipe` and
 | Command | What it does | Who approves |
 | --- | --- | --- |
 | `ark devices` | Lists hardware Arks and running emulators | nobody |
-| `ark status` | Shows identity, firmware, pairing and lock, offline | nobody |
-| `ark genuine` | Checks the Ark against Dark Bio's device registry | nobody |
+| `ark status` | Shows serial, firmware, pairing and lock, offline | nobody |
 | `ark enroll` | Gives an emulator an attested identity at Ark Hub | nobody; the person enrolls it in a browser |
+| `ark genuine` | Checks the Ark against Dark Bio's device registry | nobody |
 | `ark pair` | Pairs the Ark with Ark Companion, once | the owner, on the phone and the Ark's button |
 | `ark unlock` | Unlocks the Ark after a power loss | the owner, on the phone |
 | `ark data list`, `show` | Shows the dataset slots and their state | nobody |
@@ -96,13 +96,13 @@ The enrollment lasts 30 days. `ark-emulator stop`, `ark-emulator wipe` and
 | `ark data upload` | Uploads the owner's variant calls | the owner, on the phone |
 | `ark data fetch` | Downloads public reference data onto the Ark | nobody |
 | `ark data delete`, `repair` | Empties or erases a slot | the owner, on the phone |
-| `ark app run` | Runs an app and prints its report | the owner, on the phone, for the run and its report |
+| `ark run` | Runs an app and prints its report | the owner, on the phone, for the run and its report |
 | `ark firmware list`, `update` | Lists and installs firmware | by the Ark's state: nobody, the Ark's button or the phone |
 | `ark doctor` | Checks this computer, the Ark and the cloud | nobody |
 
-Data and app commands need a paired, unlocked Ark. `ark <command> --help`
-prints a command's full contract: what it requires, who approves, how long it
-takes, what it prints and how it exits.
+The data commands and `ark run` need a paired, unlocked Ark.
+`ark <command> --help` prints a command's page with its contract: what it
+requires, who approves, how long it takes and what its JSON holds.
 
 ## AI agents
 
@@ -111,7 +111,8 @@ running commands in the background, passing on the owner's approvals,
 reading results and getting an Ark ready. Nothing prompts without a terminal
 or under `--json`. `--json` prints complete, exact values, and the exit code
 says what happened. [`ark help output`](src/help/output.md) defines the
-streams, the JSON documents and every error code.
+streams and the JSON documents, and [`ark help errors`](src/help/errors.md)
+every error code with its next step.
 
 The [examples](https://github.com/dark-bio/examples) repository has worked
 apps in Rust, Go, C and Python, with fixtures that run them on your computer.
@@ -129,16 +130,19 @@ the same on GitHub:
 | [`datasets`](src/help/datasets.md) | Slots, uploads, reference downloads and the cache |
 | [`apps`](src/help/apps.md) | Running an app, the manifest, grants, questions, the data map and the sandbox |
 | [`firmware`](src/help/firmware.md) | Compatibility, published builds and updates |
-| [`output`](src/help/output.md) | Reading output, JSON, events and error codes |
+| [`output`](src/help/output.md) | Reading output, JSON and events |
+| [`errors`](src/help/errors.md) | Every error code, its next step and when another run helps |
 
 `ark completions <shell>` prints completions for your shell.
 
 ## Stability
 
 The Ark, its protocols and this tool still change quickly, and firmware,
-cloud and tool versions move together. `ark --version` prints the oldest
-firmware this build works with. The JSON documents and error codes follow
-`ark help output`, while the reading layouts may change.
+cloud and tool versions move together. `ark --version` prints this tool's
+version. Against firmware older than it supports, commands fail with
+`firmware-outdated`, which names the minimum version. The JSON documents
+follow `ark help output` and the error codes `ark help errors`, while the
+reading layouts may change.
 
 The connection library in `connect/` is internal to this package. Its Rust
 API is unstable and is not a supported integration interface.

@@ -252,7 +252,7 @@ pub(super) mod tests {
     /// allowance does not bound it.
     #[test]
     fn login_retains_absolute_deadlines() {
-        // Let every browser login take 100 ms of the test clock
+        // Let every browser login take 100ms of the test clock
         let tester = Arc::new(Mutex::new(test_clock()));
         let clock = tester.lock().unwrap().clock();
         let auth = Authorization::default();

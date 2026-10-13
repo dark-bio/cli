@@ -11,7 +11,7 @@
 //! The HTTP range request opens only when replay reaches the missing suffix.
 //! Opening it earlier leaves the response unread while a large prefix uploads.
 
-use super::{Progress, cache, download, filled, select};
+use super::{Operation, Progress, cache, download, filled, select};
 use crate::{
     args::slot_name,
     context::{Connection, Context},
@@ -115,16 +115,7 @@ fn execute(
             );
             continue;
         }
-        let result = offer(slot).and_then(|source| {
-            if dry_run {
-                Ok(())
-            } else {
-                context
-                    .output
-                    .title(&format!("Fetching {}", slot_name(slot.kind)));
-                install(&source)
-            }
-        });
+        let result = offer(slot).and_then(|source| if dry_run { Ok(()) } else { install(&source) });
         match result {
             Ok(()) => {
                 if !dry_run {
@@ -315,6 +306,7 @@ fn install(
 ) -> Result<(), Error> {
     let mut directory = directory;
     let clock = connection.client.clock();
+    let slot = source.dataset.slot.expect("reference slot");
 
     // Upload a complete cached copy first, removing one that is corrupt or
     // unreadable
@@ -324,7 +316,9 @@ fn install(
             let mut progress = Progress::new(
                 context,
                 clock.clone(),
-                source.dataset.slot.expect("reference slot"),
+                slot,
+                source.dataset.size,
+                Operation::Fetch,
             );
             let result = connection.client.upload_dataset(
                 &source.dataset,
@@ -333,6 +327,9 @@ fn install(
                 |stage| progress.update(stage),
             );
             context.interrupt.clear();
+            if result.is_ok() {
+                context.output.end_stage(None, None);
+            }
             match result {
                 Ok(()) => {
                     context
@@ -341,6 +338,7 @@ fn install(
                     return Ok(());
                 }
                 Err(darkbio_connect::Error::Integrity(_)) => {
+                    context.output.fail_stage(None);
                     context.output.event(
                         "warning",
                         "cached reference failed verification; downloading it again",
@@ -348,9 +346,14 @@ fn install(
                     let _ = fs::remove_file(&path);
                 }
                 Err(darkbio_connect::Error::DatasetRead(_)) => {
+                    context.output.fail_stage(None);
                     let _ = fs::remove_file(&path);
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let error = Error::from(error);
+                    context.output.fail_stage(Some(&error));
+                    return Err(error);
+                }
             }
         }
     }
@@ -383,7 +386,9 @@ fn install(
         let mut progress = Progress::new(
             context,
             clock.clone(),
-            source.dataset.slot.expect("reference slot"),
+            slot,
+            source.dataset.size,
+            Operation::Fetch,
         );
         let result = connection.client.upload_dataset(
             &source.dataset,
@@ -401,12 +406,24 @@ fn install(
             },
         );
         context.interrupt.clear();
+        let corrupt = matches!(&result, Err(darkbio_connect::Error::Integrity(_)));
+        let failed = reader.failed;
+        let result = result.map_err(|error| {
+            reader.error.take().unwrap_or_else(|| match error {
+                darkbio_connect::Error::DatasetRead(error) if failed => http::read_error(error),
+                error => error.into(),
+            })
+        });
+        if let Err(error) = &result {
+            context.output.fail_stage(Some(error));
+        } else {
+            context.output.end_stage(None, None);
+        }
 
         // A verified download is reusable even if the Ark later rejects processing.
         // Cache completion describes the source, not the slot's resulting state.
         let valid = reader.read == source.dataset.size
             && reader.hash.clone().finalize().as_slice() == source.dataset.sha256.unwrap();
-        let failed = reader.failed;
         let entry = if let Some(writer) = reader.writer.take() {
             let entry = writer.finish(valid);
             if entry.is_none() {
@@ -448,24 +465,15 @@ fn install(
                 }
                 return Ok(());
             }
-            Err(darkbio_connect::Error::Integrity(_)) if reader.offset > 0 && attempt < 2 => {
-                context.output.event(
-                    "warning",
-                    "cached prefix failed verification; restarting download",
-                )
-            }
+            Err(_) if corrupt && reader.offset > 0 && attempt < 2 => context.output.event(
+                "warning",
+                "cached prefix failed verification; restarting download",
+            ),
             Err(_) if failed && attempt < 2 => context.output.event(
                 "warning",
                 format!("download interrupted; retry {}/3", attempt + 2),
             ),
-            Err(error) if failed => {
-                return Err(reader.error.unwrap_or_else(|| match error {
-                    darkbio_connect::Error::Timeout => error.into(),
-                    darkbio_connect::Error::DatasetRead(error) => http::read_error(error),
-                    error => error.into(),
-                }));
-            }
-            Err(error) => return Err(reader.error.unwrap_or_else(|| error.into())),
+            Err(error) => return Err(error),
         }
     }
     unreachable!("last attempt returns its result")
@@ -1068,7 +1076,11 @@ mod tests {
                 }),
                 "{scenario}"
             );
-            assert_eq!(events.len(), if scenario == "failed" { 2 } else { 1 });
+            assert_eq!(
+                events.len(),
+                if scenario == "failed" { 2 } else { 1 },
+                "{scenario}"
+            );
         }
     }
 

@@ -120,9 +120,9 @@ impl Interrupt {
     /// signal code.
     ///
     /// The state lock prevents commands from replacing the target during
-    /// cleanup. The work gets 5 s to confirm its cancellation, and a JSON
+    /// cleanup. The work gets 5s to confirm its cancellation, and a JSON
     /// invocation ends with the last partial result when there is one.
-    fn cancel(&self, output: Output, code: i32) -> ! {
+    pub(crate) fn cancel(&self, output: Output, code: i32) -> ! {
         // Hold the state until the process exits, so commands cannot swap the
         // target
         let state = self.0.lock().expect("cancellation not poisoned");
@@ -218,10 +218,11 @@ mod tests {
             let options = crate::args::Cli::parse_from(["ark", "--json", "-v"]).options;
             let output = Output::new(&options);
             let _interrupt = Interrupt::install(output.clone()).unwrap();
-            for kind in ["progress", "note", "warning", "approve", "hint", "step"] {
+            for kind in ["progress", "note", "warning", "hint", "step"] {
                 output.event(kind, "first line\nsecond line");
             }
-            output.event_value(json!({"event":"log", "level":"debug", "target":"darkbio_connect", "fields":{"message":"first line\nsecond line"}}));
+            output.approve("unlock", Some("phone"), "first line\nsecond line");
+            output.event_value(json!({"event":"log", "message":"first line\nsecond line", "level":"debug", "target":"darkbio_connect", "fields":{"message":"first line\nsecond line"}}));
             output.event("step", "ready for signal");
             let _ = std::io::stdin().read_to_end(&mut Vec::new());
             panic!("child input closed before signal");
@@ -251,7 +252,7 @@ mod tests {
             let mut stderr = BufReader::new(child.stderr.take().unwrap());
             let mut event = String::new();
             for kind in [
-                "progress", "note", "warning", "approve", "hint", "step", "log", "step",
+                "progress", "note", "warning", "hint", "step", "progress", "approve", "log", "step",
             ] {
                 event.clear();
                 assert!(stderr.read_line(&mut event).unwrap() > 0);

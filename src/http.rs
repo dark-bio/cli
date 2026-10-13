@@ -244,7 +244,7 @@ mod tests {
         }
     }
 
-    /// Builds a download client with a 300 ms allowance over a scripted
+    /// Builds a download client with a 300ms allowance over a scripted
     /// transport, returning where to hand it input and where its waits report.
     fn scripted(
         clock: &Clock,

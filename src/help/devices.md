@@ -9,8 +9,8 @@ identity before its first request.
 `ark devices` lists hardware Arks on USB and the emulators that the emulator
 launchers on this computer report. It never connects, so the names and
 serials it shows are what discovery reported, not verified facts. The
-reading view shows locator, name, serial and kind, and environment and
-ready when an emulator reports them. --json adds image, an emulator's image
+reading view shows locator, name and serial, and environment and ready when
+an emulator reports them. --json adds kind and image, an emulator's image
 file name.
 
 The environment and ready fields come from the emulator launcher. They are
@@ -19,15 +19,18 @@ discovery source that fails prints a warning, and the Arks the other source
 found still show. Having no emulator running is normal.
 
 One attached Ark is picked on its own. With several, a command fails with
-ambiguous-device and lists their locators, and --device picks one by:
+ambiguous-device. Its hint and the hint from `ark devices` name a selector
+for each Ark, using its kind when it is the only one of that kind, and its
+locator otherwise. --device picks one by:
 
 - its locator, hardware:BUS:ADDR or emulator:PORT
 - its serial, name or emulator image name, when it is unique
 - the word hardware or emulator, when only one Ark of that kind is attached
 
 A selector matches exactly, without prefixes or case folding. USB addresses
-can change when an Ark reboots, and a serial from discovery never proves
-which Ark answered, since only the handshake does.
+and emulator ports can change when an Ark reboots, while kind words keep
+working. A serial from discovery never proves which Ark answered, since
+only the handshake does.
 
 An Ark serves one session at a time. While another ark command or an Ark
 Hub browser tab holds the Ark, a command fails with device-busy. Wait for
@@ -40,7 +43,7 @@ permission error spells out.
 ## Identity and trust
 
 Every connection starts with a handshake that proves the Ark holds its
-identity key, within 5 s. ark trusts that key in one of three ways, which
+identity key, within 5s. ark trusts that key in one of three ways, which
 `ark status` reports as trust:
 
 - attested, by an attestation from Dark Bio's release, staging or develop
@@ -63,7 +66,7 @@ power loss.
 terminal ark also draws it as a QR code. Elsewhere the link arrives in an
 approve event, for the person to open on the phone that runs Ark Companion.
 The Ark and the phone then show colors, and the owner presses the Ark's
-button within 60 s when they match. The Ark then prepares its encrypted
+button within 60s when they match. The Ark then prepares its encrypted
 storage. A paired Ark refuses `ark pair` with already-paired.
 
 `ark unlock` asks the owner's phone and waits up to 2 minutes. The Ark then
@@ -75,7 +78,7 @@ run never unlocks.
 The Ark's button sits behind a small pinhole under its bottom right LED, to
 the right of the USB cable, and is pressed with the pin that came with the
 Ark. A short press confirms a pairing, or a firmware update on a locked Ark.
-Holding it for 5 s arms a reset, which erases the Ark's data and its pairing
+Holding it for 5s arms a reset, which erases the Ark's data and its pairing
 once the button is let go. An emulated Ark has its button in the Ark
 Emulator window. Deleting the pairing in Ark Companion discards the key that
 unlocks the Ark. Neither the reset nor deleting the pairing is a way past a
@@ -95,7 +98,7 @@ or `ark unlock`. With --json the document holds:
 - firmware, with version and published, the running build's publish time
 - trust, which is attested, self-signed or pinned
 - synced, whether the Ark synced with the cloud since it booted and its
-  clock is within 15 s of this computer's; it is not a registry check
+  clock is within 15s of this computer's; it is not a registry check
 - paired and unlocked
 - identity, the key's fingerprint, and pubkey, the whole key in hex, which
   only --json carries

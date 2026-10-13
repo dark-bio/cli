@@ -10,17 +10,21 @@ use crate::{
     args,
     context::{Connection, Context},
     error::Error,
-    output::human,
+    output::{Output, human},
     style::{Role, Theme},
 };
-use darkbio_connect::{DeviceKind, Identity, schema};
+use darkbio_connect::{DeviceKind, Identity, Locator, schema};
 use serde_json::{Value, json};
 
 /// Lists discovery metadata without opening devices, retaining useful partial
 /// results.
 pub(crate) fn devices(context: &Context) -> Result<(), Error> {
-    // Nothing found fails only when some discovery source failed too
+    // Show a line while discovery runs, erased before the table
+    let looking = context.output.notice("Looking for Arks");
     let found = context.discover();
+    drop(looking);
+
+    // Nothing found fails only when some discovery source failed too
     if found.devices.is_empty() && !found.errors.is_empty() {
         return Err(Error::new(
             3,
@@ -35,6 +39,28 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         "name":device.name(),"serial":device.serial(),"image":device.image(),"environment":device.env(),"ready":device.ready(),
     })).collect();
 
+    // Print the table, and with several Arks a hint naming a selector for each
+    context
+        .output
+        .document_with(&json!({"devices":rows}), |theme| {
+            devices_table(theme, &rows)
+        })?;
+    if rows.len() > 1 {
+        let locators: Vec<_> = found
+            .devices
+            .iter()
+            .map(|device| device.locator())
+            .collect();
+        context
+            .output
+            .event("hint", selection_hint(&locators, &locators));
+    }
+    Ok(())
+}
+
+/// Renders the devices table, with the launcher's columns only when an Ark
+/// reports them.
+fn devices_table(theme: &Theme, rows: &[Value]) -> String {
     // The `environment` and `ready` columns are launcher metadata, which
     // discovery leaves unset for hardware. They show only when a row has them,
     // since a dash under READY reads as "not ready" rather than "not asked".
@@ -42,7 +68,6 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         ("LOCATOR", "locator"),
         ("NAME", "name"),
         ("SERIAL", "serial"),
-        ("KIND", "kind"),
     ];
     for (label, key) in [("ENVIRONMENT", "environment"), ("READY", "ready")] {
         if rows.iter().any(|row| !row[key].is_null()) {
@@ -50,16 +75,27 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
         }
     }
 
-    // Print the table, pointing at --device when several Arks answer
-    context
-        .output
-        .table(&json!({"devices":rows}), &rows, &columns)?;
-    if rows.len() > 1 {
-        context
-            .output
-            .event("hint", "select one with --device LOCATOR");
-    }
-    Ok(())
+    human::table(theme, rows, &columns)
+}
+
+/// Builds the hint naming a selector for each Ark, its kind when it is the
+/// only discovered Ark of that kind, and its locator otherwise.
+pub(crate) fn selection_hint(locators: &[Locator], available: &[Locator]) -> String {
+    // Count each kind, since a kind word selects only an Ark alone of its kind
+    let hardware = available
+        .iter()
+        .filter(|locator| matches!(locator, Locator::Hardware { .. }))
+        .count();
+    let emulator = available.len() - hardware;
+    let selectors: Vec<_> = locators
+        .iter()
+        .map(|locator| match locator {
+            Locator::Hardware { .. } if hardware == 1 => "hardware".into(),
+            Locator::Emulator { .. } if emulator == 1 => "emulator".into(),
+            _ => locator.to_string(),
+        })
+        .collect();
+    format!("select one with --device: {}", selectors.join(", "))
 }
 
 /// Prints the Ark's status, then fails on outdated firmware or hints at the
@@ -69,7 +105,7 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
 pub(crate) fn status(context: &Context, recovery: args::Recovery) -> Result<(), Error> {
     let connection = context.connect_recovery(recovery.pubkey.as_deref())?;
     let value = status_value(&connection);
-    print_status(context, &value)?;
+    print_status(&context.output, &value)?;
     connection.require_current()?;
     status_hints(context, &connection, &value);
     Ok(())
@@ -124,58 +160,44 @@ fn status_value(connection: &Connection) -> Value {
 }
 
 /// Prints a status document, as the compact block for people and whole in JSON.
-fn print_status(context: &Context, value: &Value) -> Result<(), Error> {
-    context
-        .output
-        .document_with(value, |theme| status_block(theme, value))
+fn print_status(output: &Output, value: &Value) -> Result<(), Error> {
+    output.document_with(value, |theme| status_block(theme, value))
 }
 
-/// Groups identity and state facts; the full public key belongs in JSON.
+/// Renders the status block, which Ark this is and whether it is ready, under
+/// the Ark's name.
 fn status_block(theme: &Theme, value: &Value) -> String {
     let field = |key: &str| human::value(theme, key, &value[key]);
-    let flag = |key: &str, yes: &str, no: &str| match value[key].as_bool() {
+    let flag = |key: &str, yes: &str, no: &str, role: Role| match value[key].as_bool() {
         Some(true) => theme.mark(Role::Success, yes),
-        Some(false) => theme.mark(Role::Attention, no),
+        Some(false) => theme.mark(role, no),
         None => theme.paint(Role::Muted, "-"),
     };
     let hardware = &value["hardware"];
-    let firmware = &value["firmware"];
-    let fingerprint = value["identity"].as_str().unwrap_or("-");
+
+    // Name the Ark by its serial and builds, leaving keys and fingerprints to JSON
     let mut rows = vec![
         (
-            String::new(),
-            format!(
-                "{}  {}",
-                theme.paint(Role::Heading, value["name"].as_str().unwrap_or("Ark")),
-                theme.paint(Role::Muted, human::value(theme, "serial", &value["serial"]))
-            ),
+            "Serial".into(),
+            if value["serial"].is_null() {
+                theme.mark(Role::Muted, "unverified")
+            } else {
+                field("serial")
+            },
         ),
         (
             "Hardware".into(),
             format!(
-                "{}, revision {}, model {}",
+                "{}, revision {}",
                 crate::output::scalar(&hardware["version"]),
-                crate::output::scalar(&hardware["revision"]),
-                crate::output::scalar(&hardware["model"])
+                crate::output::scalar(&hardware["revision"])
             ),
         ),
-        (String::new(), String::new()),
         (
             "Firmware".into(),
-            format!(
-                "{}, published {}",
-                crate::output::scalar(&firmware["version"]),
-                human::value(theme, "published", &firmware["published"])
-            ),
+            crate::output::scalar(&value["firmware"]["version"]),
         ),
-        ("Trust".into(), field("trust")),
         ("Environment".into(), field("environment")),
-        ("Realm".into(), field("realm")),
-        (String::new(), String::new()),
-        ("Cloud".into(), flag("synced", "synced", "not synced")),
-        ("Pairing".into(), flag("paired", "paired", "unpaired")),
-        ("Lock".into(), flag("unlocked", "unlocked", "locked")),
-        ("Identity".into(), theme.paint(Role::Accent, fingerprint)),
     ];
     if !value["mismatch"].is_null() {
         rows.push(("Mismatch".into(), field("mismatch")));
@@ -183,7 +205,26 @@ fn status_block(theme: &Theme, value: &Value) -> String {
     if value.get("enrolled").is_some() {
         rows.push(("Enrolled".into(), field("enrolled")));
     }
-    human::block(theme, &rows)
+
+    // Readiness follows as its own group, where not synced is neutral since it
+    // needs nobody
+    rows.extend([
+        (String::new(), String::new()),
+        ("Trust".into(), field("trust")),
+        (
+            "Cloud".into(),
+            flag("synced", "synced", "not synced", Role::Muted),
+        ),
+        (
+            "Pairing".into(),
+            flag("paired", "paired", "not paired", Role::Attention),
+        ),
+        (
+            "Lock".into(),
+            flag("unlocked", "unlocked", "locked", Role::Attention),
+        ),
+    ]);
+    human::block(theme, Some(value["name"].as_str().unwrap_or("Ark")), &rows)
 }
 
 /// Suggests the next enrollment, pairing or unlock action from the reported state.
@@ -193,7 +234,7 @@ fn status_hints(context: &Context, connection: &Connection, value: &Value) {
     {
         context
             .output
-            .event("hint", "run `ark enroll` to obtain an attested identity");
+            .event("hint", "run `ark enroll` to get an attested identity");
     }
     if value["paired"] == false {
         context.output.event("hint", "run `ark pair`");
@@ -308,18 +349,7 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
             Error::new(4, "environment-unknown", "cloud environment unknown")
                 .hint("select one with --env")
         })?;
-        let url = hub(env);
-        context
-            .output
-            .event("hint", format!("enroll online at {url}"));
-        context
-            .output
-            .document(&json!({"enrolled":false,"url":url}))?;
-        return Err(Error::new(
-            1,
-            "enrollment-required",
-            "online enrollment happens at Ark Hub",
-        ));
+        return online_enrollment(&context.output, env);
     };
 
     // Install the attestation, then reconnect without the pin to verify it
@@ -337,7 +367,7 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
     {
         Ok(mut value) => {
             value["enrolled"] = json!(true);
-            print_status(context, &value)
+            print_status(&context.output, &value)
         }
         Err(error) => {
             context
@@ -346,6 +376,22 @@ pub(crate) fn enroll(context: &Context, args: args::Enroll) -> Result<(), Error>
             Err(error)
         }
     }
+}
+
+/// Prints the online enrollment document, then fails with the Ark Hub link as
+/// the error's hint.
+fn online_enrollment(
+    output: &Output,
+    env: darkbio_connect::trust::Environment,
+) -> Result<(), Error> {
+    let url = hub(env);
+    output.document(&json!({"enrolled":false,"url":url}))?;
+    Err(Error::new(
+        1,
+        "enrollment-required",
+        "online enrollment happens at Ark Hub",
+    )
+    .hint(format!("enroll online at {url}")))
 }
 
 /// Formats Unix seconds as UTC RFC 3339, leaving unrepresentable dates absent.
@@ -366,38 +412,266 @@ pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
     }
 }
 
-/// Tests of the human status layout.
+/// Tests of the devices table, the status block and enrollment.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::Color;
 
-    /// Checks that the status block marks unknown state with a dash, keeps a
-    /// mismatch visible and leaves the full public key to JSON.
+    /// Online enrollment prints its document, then fails with the link as the
+    /// error's hint.
     #[test]
-    fn status_distinguishes_unknown_state_and_keeps_mismatches_visible() {
-        // Unknown state renders as a dash, and a mismatch keeps its own row
-        let theme = Theme::test(80, Color::Basic, true);
-        let mut value = json!({
-            "name":"Example Ark", "serial":null,
-            "hardware":{"version":"Ark I","revision":"B","model":"01"},
-            "firmware":{"version":"0.11.5","published":null},
-            "trust":"self-signed","environment":null,"realm":null,
-            "synced":null,"paired":true,"unlocked":false,
-            "identity":"0123456789abcdef","pubkey":"abcdef0123456789","mismatch":"Ark II - A",
-        });
+    fn test_enrollment_error_hint() {
+        for captured in
+            crate::testing::narration("device::tests::test_enrollment_error_hint", |output, _| {
+                let error =
+                    online_enrollment(&output, darkbio_connect::trust::Environment::Release)
+                        .unwrap_err();
+                assert_eq!((error.class, error.code), (1, "enrollment-required"));
+                output.error(&error);
+            })
+        {
+            if captured.json {
+                let events = captured.events();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["event"], "error");
+                assert_eq!(
+                    events[0]["error"]["hints"],
+                    json!(["enroll online at https://hub.dark.bio"])
+                );
+                let document: Value = serde_json::from_str(&captured.stdout).unwrap();
+                assert_eq!(
+                    document,
+                    json!({"enrolled":false,"url":"https://hub.dark.bio"})
+                );
+            } else {
+                assert_eq!(
+                    captured.stderr,
+                    "\nerror[enrollment-required]: online enrollment happens at Ark Hub\nhint: enroll online at https://hub.dark.bio\n"
+                );
+            }
+        }
+    }
+    use crate::style::Color;
+    use clap::Parser;
+    use std::io::Write;
+
+    /// The devices table has no kind column, and shows each launcher column
+    /// only when reported.
+    #[test]
+    fn test_devices_table_omits_kind_and_keeps_reported_columns() {
+        // Typical hardware and emulator names fit together at 80 columns
+        let theme = Theme::test(80, Color::Off, true);
+        let mut rows = vec![
+            json!({
+                "locator":"hardware:00:1", "kind":"hardware", "name":"Example Founder Ark",
+                "serial":"founder-1", "environment":null, "ready":null,
+            }),
+            json!({
+                "locator":"emulator:18181", "kind":"emulator", "name":"Lab Emulator",
+                "serial":"emulator-123456-3", "environment":"release", "ready":true,
+            }),
+        ];
+        let rendered = devices_table(&theme, &rows);
+        assert_eq!(rendered.lines().count(), 3);
         assert_eq!(
-            status_block(&theme, &value),
-            "  \x1b[1mExample Ark\x1b[0m  unverified\n  Hardware     Ark I, revision B, model 01\n\n  Firmware     0.11.5, published -\n  Trust        \x1b[1m! self-signed\x1b[0m\n  Environment  -\n  Realm        -\n\n  Cloud        -\n  Pairing      \x1b[1m\u{2713} paired\x1b[0m\n  Lock         \x1b[1m! locked\x1b[0m\n  Identity     \x1b[1m0123456789abcdef\x1b[0m\n  Mismatch     \x1b[1mArk II - A\x1b[0m"
+            rendered
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["LOCATOR", "NAME", "SERIAL", "ENVIRONMENT", "READY"]
+        );
+        assert!(rendered.contains("Example Founder Ark"));
+        assert!(
+            rendered
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with("release      yes")
+        );
+        assert!(
+            rendered
+                .lines()
+                .all(|line| console::measure_text_width(line) <= 80)
         );
 
-        // The fingerprint shows, while the full public key does not
-        let rendered = status_block(&theme, &value);
-        assert!(rendered.contains("0123456789abcdef"));
-        assert!(!rendered.contains("abcdef0123456789"));
+        // Environment and readiness show on their own, a false readiness included
+        rows[1]["ready"] = json!(false);
+        rows[1]["environment"] = Value::Null;
+        let rendered = devices_table(&theme, &rows);
+        assert!(rendered.lines().next().unwrap().ends_with("READY"));
+        assert!(rendered.lines().last().unwrap().ends_with("no"));
+        assert!(!rendered.contains("ENVIRONMENT"));
+        rows[1]["ready"] = Value::Null;
+        rows[1]["environment"] = json!("develop");
+        let rendered = devices_table(&theme, &rows);
+        assert!(rendered.lines().next().unwrap().ends_with("ENVIRONMENT"));
+        assert!(!rendered.contains("READY"));
 
-        // A known negative sync state reads as an attention mark
+        // Hardware alone has only the three identifying columns
+        let rendered = devices_table(&theme, &rows[..1]);
+        assert_eq!(
+            rendered
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["LOCATOR", "NAME", "SERIAL"]
+        );
+        assert_eq!(rendered.lines().count(), 2);
+    }
+
+    /// Builds an invented status of an attested Ark, with every JSON field.
+    fn status() -> Value {
+        json!({
+            "name":"Example Ark", "serial":"example-1",
+            "hardware":{"version":"Ark I","revision":"0.9.0","model":"example-model"},
+            "firmware":{"version":"0.12.0-74d557e","published":"2026-10-10T16:27:08Z"},
+            "trust":"attested","environment":"release","realm":"hardware",
+            "synced":true,"paired":true,"unlocked":true,
+            "identity":"0123456789abcdef","pubkey":"abcdef0123456789","mismatch":null,
+        })
+    }
+
+    /// The Ark's name titles two groups, which Ark this is before whether it is
+    /// ready.
+    #[test]
+    fn test_status_title_and_groups() {
+        let theme = Theme::test(80, Color::Basic, true);
+        assert_eq!(
+            status_block(&theme, &status()),
+            concat!(
+                "\x1b[1mExample Ark\x1b[0m\n",
+                "  Serial       example-1\n",
+                "  Hardware     Ark I, revision 0.9.0\n",
+                "  Firmware     0.12.0-74d557e\n",
+                "  Environment  release\n\n",
+                "  Trust        \x1b[1m✓\x1b[0m attested\n",
+                "  Cloud        \x1b[1m✓\x1b[0m synced\n",
+                "  Pairing      \x1b[1m✓\x1b[0m paired\n",
+                "  Lock         \x1b[1m✓\x1b[0m unlocked",
+            )
+        );
+    }
+
+    /// Mismatch and enrollment rows end the first group.
+    #[test]
+    fn test_status_extra_identity_rows_precede_readiness() {
+        let theme = Theme::test(80, Color::Off, true);
+        let mut value = status();
+        value["mismatch"] = json!("Ark II - A");
+        value["enrolled"] = json!(true);
+        let rendered = status_block(&theme, &value);
+        assert!(rendered.contains(concat!(
+            "  Environment  release\n",
+            "  Mismatch     Ark II - A\n",
+            "  Enrolled     yes\n\n",
+            "  Trust        ✓ attested",
+        )));
+        assert_eq!(rendered.matches("\n\n").count(), 1);
+    }
+
+    /// An unverified serial and an unsynced cloud are neutral, while pairing
+    /// and the lock need action.
+    #[test]
+    fn test_status_marks_unverified_and_not_ready_states() {
+        // A self-signed or pinned identity carries no attested fields
+        let theme = Theme::test(80, Color::True, true);
+        let mut value = status();
+        value["serial"] = Value::Null;
+        value["realm"] = Value::Null;
+        value["environment"] = Value::Null;
+        value["hardware"]["model"] = Value::Null;
         value["synced"] = json!(false);
-        assert!(status_block(&theme, &value).contains("! not synced"));
+        value["paired"] = json!(false);
+        value["unlocked"] = json!(false);
+        for trust in ["self-signed", "pinned"] {
+            value["trust"] = json!(trust);
+            let rendered = status_block(&theme, &value);
+            for state in ["unverified", "not synced"] {
+                assert!(
+                    rendered.contains(&format!("\x1b[38;2;124;128;152m·\x1b[0m {state}")),
+                    "{trust}, {state}"
+                );
+            }
+            for state in [trust, "not paired", "locked"] {
+                assert!(
+                    rendered.contains(&format!("\x1b[1m\x1b[38;2;232;162;74m!\x1b[0m {state}")),
+                    "{trust}, {state}"
+                );
+            }
+        }
+
+        // Unknown readiness stays apart from false, with ASCII marks too
+        for key in ["synced", "paired", "unlocked"] {
+            value[key] = Value::Null;
+        }
+        let rendered = status_block(&theme, &value);
+        for label in ["Cloud", "Pairing", "Lock"] {
+            let row = rendered.lines().find(|line| line.contains(label)).unwrap();
+            assert!(row.ends_with("\x1b[38;2;124;128;152m-\x1b[0m"), "{label}");
+        }
+        let plain = status_block(&Theme::test(80, Color::Off, false), &value);
+        assert!(plain.contains("  Serial       - unverified\n"));
+    }
+
+    /// The reading view leaves the identity details out, and JSON keeps them.
+    #[test]
+    fn test_status_json_preserves_details() {
+        // Run as a child, so the test reads the real stdout
+        let value = status();
+        if let Ok(json) = std::env::var("ARK_TEST_STATUS_JSON") {
+            let mut options = args::Cli::parse_from(["ark"]).options;
+            options.json = json == "true";
+            writeln!(std::io::stdout(), "<result>").unwrap();
+            print_status(&Output::new(&options), &value).unwrap();
+            writeln!(std::io::stdout(), "</result>").unwrap();
+            return;
+        }
+
+        // JSON keeps the whole document, and the reading view leaves its long
+        // fields out
+        for json in [false, true] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "device::tests::test_status_json_preserves_details",
+                    "--nocapture",
+                ])
+                .env("ARK_TEST_STATUS_JSON", json.to_string())
+                .env("NO_COLOR", "1")
+                .env("LC_ALL", "en_US.UTF-8")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let rendered = stdout
+                .split_once("<result>\n")
+                .unwrap()
+                .1
+                .split_once("</result>\n")
+                .unwrap()
+                .0;
+            if json {
+                assert_eq!(serde_json::from_str::<Value>(rendered).unwrap(), value);
+            } else {
+                assert!(rendered.starts_with("Example Ark\n  Serial       example-1\n"));
+                for omitted in [
+                    "Identity",
+                    "0123456789abcdef",
+                    "abcdef0123456789",
+                    "Realm",
+                    "hardware",
+                    "example-model",
+                    "published",
+                    "2026-10-10",
+                ] {
+                    assert!(!rendered.contains(omitted), "{omitted}");
+                }
+            }
+        }
     }
 }

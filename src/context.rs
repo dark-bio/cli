@@ -85,8 +85,11 @@ impl Context {
         for error in &found.errors {
             self.output.event("warning", error.to_string());
         }
-        self.output
-            .event("step", format!("discovered {} Arks", found.devices.len()));
+        let count = found.devices.len();
+        self.output.event(
+            "step",
+            format!("found {count} {}", if count == 1 { "Ark" } else { "Arks" }),
+        );
         found
     }
 
@@ -102,8 +105,13 @@ impl Context {
     /// Only diagnostics and the commands that upgrade or enroll an old device
     /// may cross the compatibility gate.
     pub fn connect_recovery(&self, pubkey: Option<&str>) -> Result<Connection, Error> {
+        // Show the selector at once, until discovery names the Ark
+        let connecting = self
+            .output
+            .connecting(self.options.device.as_deref().unwrap_or("an Ark"));
         let found = self.discover();
         let device = found.select(self.options.device.as_deref())?.clone();
+        drop(connecting);
         self.open(device, pubkey)
     }
 
@@ -132,9 +140,17 @@ impl Context {
 
         // Authenticate the Ark and route its cloud by the CLI's precedence
         let trust = trust(pubkey)?;
+        let connecting = self.output.connecting(
+            &device
+                .name()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| device.locator().to_string()),
+        );
         let (mut ark, identity) = device.connect_with_env(&trust, |identity| {
             environment(self.options.env, identity, device.env())
         })?;
+        drop(connecting);
         let client = ark.client();
         self.output.connection(client.clock());
 
@@ -205,15 +221,7 @@ impl Context {
                 .hint("run `ark unlock` separately before the dry run"));
         }
         if self.options.unlock
-            || (self.interactive()
-                && self.confirm(
-                    if self.output.terminal() {
-                        "Unlock the Ark first?"
-                    } else {
-                        "The Ark is locked. Unlock it now? You will approve on your phone."
-                    },
-                    true,
-                )?)
+            || (self.interactive() && self.confirm("Unlock the Ark first?", true)?)
         {
             return self.unlock(connection);
         }
@@ -223,32 +231,41 @@ impl Context {
 
     /// Announces the approval and requests the unlock.
     pub fn unlock(&self, connection: &Connection) -> Result<(), Error> {
-        self.output
-            .event("approve", "unlock (Ark Companion on your phone)");
-        connection
-            .client
-            .call(schema::UnlockRequest {}, self.timing())?;
-        self.output.finish();
-        self.output.human_event("progress", "unlocked");
-        Ok(())
-    }
-
-    /// Prompts for a yes or no answer, where an empty answer takes `default`.
-    ///
-    /// End of input and unrecognized answers decline. The caller must first
-    /// check whether this invocation permits input.
-    pub fn confirm(&self, message: &str, default: bool) -> Result<bool, Error> {
-        self.output.prompt(message, default)?;
-        let mut answer = String::new();
-        if io::stdin().read_line(&mut answer)? == 0 {
-            return Ok(false);
-        }
-        Ok(match answer.trim().to_ascii_lowercase().as_str() {
-            "" => default,
-            "y" | "yes" => true,
-            _ => false,
+        approve_unlock(&self.output, || {
+            connection
+                .client
+                .call(schema::UnlockRequest {}, self.timing())?;
+            Ok(())
         })
     }
+
+    /// Asks a yes or no question, answered by one key, where Enter takes
+    /// `default`.
+    ///
+    /// The caller first checks that this invocation may prompt. Ctrl-C at the
+    /// question cancels the command's work and exits.
+    pub fn confirm(&self, message: &str, default: bool) -> Result<bool, Error> {
+        match self.output.confirm(message, default) {
+            Err(error) if error.class == 130 => self.interrupt.cancel(self.output.clone(), 130),
+            result => result,
+        }
+    }
+}
+
+/// Narrates an unlock around `request`, leaving a refused approval for the
+/// error to end.
+fn approve_unlock(
+    output: &Output,
+    request: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    output.approve(
+        "unlock",
+        Some("phone"),
+        "Approve the unlock on your phone, in Ark Companion",
+    );
+    request()?;
+    output.end_stage(Some("Unlocked on your phone"), None);
+    Ok(())
 }
 
 /// Picks the cloud environment from the `--env` override, the attestation, the
@@ -329,6 +346,38 @@ mod tests {
         trust,
         wire::crypto::{cwt::claims::eat, xdsa},
     };
+
+    /// Every way to unlock shows the same instruction, timer and outcome.
+    #[test]
+    fn test_unlock_narration() {
+        for captured in
+            crate::testing::narration("context::tests::test_unlock_narration", |output, clock| {
+                approve_unlock(&output, || {
+                    output.finish();
+                    clock.advance(Duration::from_secs(6));
+                    Ok(())
+                })
+                .unwrap();
+                let error = approve_unlock(&output, || {
+                    output.finish();
+                    clock.advance(Duration::from_secs(4));
+                    Err(Error::new(6, "approval-denied", "the owner declined"))
+                })
+                .unwrap_err();
+                output.error(&error);
+            })
+        {
+            captured.contains(&[
+                "Approve the unlock on your phone, in Ark Companion",
+                "Unlocked on your phone · 6s",
+                "Approve the unlock on your phone, in Ark Companion",
+                "Not approved on your phone · 4s",
+                "the owner declined",
+            ]);
+            captured.approvals(&[("unlock", Some("phone")), ("unlock", Some("phone"))]);
+            assert!(!captured.stderr.contains("progress: unlocked"));
+        }
+    }
 
     /// Checks that the environment follows the override, then the attestation,
     /// then the launcher's report, then release.

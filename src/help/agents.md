@@ -23,7 +23,7 @@ approve for them, so a command that needs approval waits until they act.
   where it has one. Otherwise keep the streams and the exit code in files:
 
       rm -f exit.txt
-      (ark --json app run app.wasm > result.json 2> events.log
+      (ark --json run app.wasm > result.json 2> events.log
        echo $? > exit.txt) &
 
   Read events.log every few seconds. The command has ended once exit.txt
@@ -32,9 +32,9 @@ approve for them, so a command that needs approval waits until they act.
   command that started it and ends with it. Ctrl-C or SIGTERM asks the Ark
   to cancel the task or upload in flight, then exits 130 or 143. An upload
   the Ark is already processing keeps going.
-- --timeout, 60 s unless set, bounds each wait on a machine, such as a reply
+- --timeout, 60s unless set, bounds each wait on a machine, such as a reply
   from the Ark or the next chunk of a download. It never bounds an approval
-  or a whole command, and opening a connection has its own limit of 5 s. A
+  or a whole command, and opening a connection has its own limit of 5s. A
   cap on a whole command is yours to add.
 
 ## Approvals
@@ -46,16 +46,16 @@ These commands wait on the owner, for at most the window the Ark opens:
   Ark is locked.
 - `ark pair` waits up to 10 minutes for the owner to open its pairing link
   in Ark Companion. The Ark and the phone then show colors, and the owner
-  presses the Ark's button with its pin within 60 s when they match.
+  presses the Ark's button with its pin within 60s when they match.
 - `ark data upload` waits up to 1 minute for an approval on the phone, since
   it uploads the owner's own calls. References come through
   `ark data fetch`, which needs none.
 - `ark data delete` and `ark data repair` wait up to 2 minutes for an
   approval on the phone.
 - `ark firmware update` needs nothing while the Ark is unpaired. A paired,
-  locked Ark waits 30 s for a press of its button, and an unlocked one up to
+  locked Ark waits 30s for a press of its button, and an unlocked one up to
   2 minutes for the phone.
-- `ark app run` waits on the phone twice. First the owner approves the run
+- `ark run` waits on the phone twice. First the owner approves the run
   within 5 minutes, seeing the app's name, version and what it reads. There
   they switch on any optional grants and answer the app's questions. Once
   the app ends, they review its report within 10 minutes, then release it to
@@ -64,9 +64,9 @@ These commands wait on the owner, for at most the window the Ark opens:
 Before you start such a command, let the person know what they will approve
 and where, so their phone or the Ark is at hand. Then pass on each approve
 event the moment it arrives, quoting its message. It is a line starting
-with approve:, or with `{"event":"approve"` under --json. The phone's
-notification may not arrive, and opening Ark Companion shows the request
-anyway.
+with `! Approve` or `! Review`, or with `{"event":"approve"` under --json.
+The phone's notification may not arrive, and opening Ark Companion shows the
+request anyway.
 
 A declined approval fails the command with approval-denied, and one that
 ran out with approval-timeout, both exit 6. approval-undelivered, exit 4,
@@ -80,9 +80,10 @@ command again, since each run asks them again.
   or refusal, 6 an approval that did not come, 7 a machine wait that ran
   out, 8 an app failure, 130 Ctrl-C and 143 SIGTERM.
 - A failure prints error[code]: message, then hint: lines naming the next
-  step. Codes are stable, and `ark help output` lists every one with its
-  next step. error[ark] is the Ark's own refusal. Act on its message, never
-  on its number, which can change between firmware builds.
+  step. Codes are stable, and `ark help errors` lists every one with its
+  next step and when another run can help. error[ark] is the Ark's own
+  refusal. Act on its message, never on its number, which can change
+  between firmware builds.
 - A command that did part of its work keeps that result on stdout and still
   exits non-zero. Under --json, a command with no result prints a document
   holding only the error.
@@ -114,7 +115,7 @@ Nothing in ark waits for an Ark to appear. To wait for one, poll
 `ark status --json`, which fails with no-device until an Ark is attached.
 
 Never propose a reset or deleting the pairing in Ark Companion as a way past
-a locked Ark. Holding the Ark's button for 5 s arms a reset, which erases its
+a locked Ark. Holding the Ark's button for 5s arms a reset, which erases its
 data once the button is let go, and deleting the pairing discards the key
 that unlocks it. The button sits behind a pinhole under the bottom right
 LED, as `ark help devices` describes.
@@ -126,7 +127,7 @@ LED, as `ark help devices` describes.
 Check `ark status` first. Let the person know that the run asks them twice
 on the phone, then run this in the background, the way Running shows:
 
-    ark --json app run app.wasm > result.json 2> events.log
+    ark --json run app.wasm > result.json 2> events.log
 
 The report is the document's stdout field. Without --json, ark writes the
 report itself to stdout, so `> report.md` keeps it as the app printed it.
@@ -142,17 +143,18 @@ runtime of its own, so an app runs on an Ark, hardware or emulated.
 
 ### Load data
 
-`ark data list` shows each slot and what it requires. The owner's variant
-calls come first, through `ark data upload FILE` and an approval on the
-phone. `ark data fetch --all` then downloads the public references the Ark
-offers for the calls' assembly, without an approval, and skips any it
-offers none for. The variant catalog alone takes an hour or more.
-`ark help datasets` covers both.
+`ark data list` shows each slot and its state, and `ark data show SLOT` what
+it requires. The owner's variant calls come first, through
+`ark data upload FILE` and an approval on the phone. `ark data fetch --all`
+then downloads the public references the Ark offers for the calls'
+assembly, without an approval, and skips any it offers none for. The
+variant catalog alone takes an hour or more. `ark help datasets` covers
+both.
 
 ### Update firmware
 
 `ark firmware update --dry-run` shows the plan and who approves it.
-`ark firmware update --yes` installs it, then waits up to 120 s for the Ark
+`ark firmware update --yes` installs it, then waits up to 120s for the Ark
 to come back running it. `ark help firmware` covers the rest.
 
 ### Use an emulator

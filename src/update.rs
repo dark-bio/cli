@@ -46,7 +46,7 @@ impl Channel {
         }
     }
 
-    /// Names the channel in the detail of doctor's update check.
+    /// Names the channel in the detail of doctor's `ark` check.
     pub fn description(self) -> &'static str {
         match self {
             Self::Release => "release",
@@ -113,13 +113,17 @@ impl Answer {
         result
     }
 
-    /// Words the note while the kept version is newer than the running one.
-    fn note(&self, running: &Version, hint: &str) -> Option<String> {
-        let newest = self.newest.as_ref()?;
-        newest
-            .cmp_precedence(running)
-            .is_gt()
-            .then(|| format!("ark {newest} is available, this is {running}; {hint}"))
+    /// Prints the release note when the kept version is newer than the running
+    /// one.
+    fn announce(&self, output: &Output, running: &Version, hint: &str) {
+        if let Some(newest) = &self.newest
+            && newest.cmp_precedence(running).is_gt()
+        {
+            output.event(
+                "note",
+                format!("ark {newest} is available, this is {running}; {hint}"),
+            );
+        }
     }
 }
 
@@ -130,7 +134,7 @@ pub(crate) fn disabled() -> bool {
 
 /// Parses the version stamped into this executable by Cargo or the publish workflow.
 pub(crate) fn running() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version is semver")
+    Version::parse(crate::VERSION).expect("build version is semver")
 }
 
 /// Prints the note from the kept answer and starts a background lookup when
@@ -138,8 +142,8 @@ pub(crate) fn running() -> Version {
 ///
 /// The lookup runs in a detached copy of `ark`.
 pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
-    // Under CI nothing is read, printed or looked up
-    if disabled() {
+    // Local builds and CI read no kept answer and start no lookup
+    if cfg!(ark_local) || disabled() {
         return;
     }
 
@@ -148,11 +152,8 @@ pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
     let channel = Channel::for_version(&running);
     let directory = crate::data::cache::directory();
     let answer = Answer::read(&directory, channel);
-    if let Some(note) = answer
-        .as_ref()
-        .and_then(|answer| answer.note(&running, &hint(channel)))
-    {
-        output.event("note", note);
+    if let Some(answer) = &answer {
+        answer.announce(output, &running, &hint(channel));
     }
     if !Answer::stale(answer.as_ref(), channel, now) {
         return;
@@ -194,19 +195,19 @@ pub(crate) fn start(output: &Output, now: DateTime<Utc>) {
     }
 }
 
-/// Runs the lookup in the detached copy, which ends within 30 s whatever happens.
+/// Runs the lookup in the detached copy, which ends within 30s whatever happens.
 ///
 /// The copy opens no connection, so its clock is the real one.
 pub(crate) fn run() {
-    // Under CI the copy does nothing
-    if disabled() {
+    // Local builds and CI do nothing, even when the copy is started by hand
+    if cfg!(ark_local) || disabled() {
         return;
     }
     let clock = Clock::real();
     let started = clock.now();
     let asked = DateTime::<Utc>::from(clock.system_time());
 
-    // End the process at 30 s, and skip the lookup when nothing can enforce that
+    // End the process at 30s, and skip the lookup when nothing can enforce that
     if watchdog(started, Duration::from_secs(30)).is_err() {
         return;
     }
@@ -453,7 +454,9 @@ fn upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -613,49 +616,143 @@ mod tests {
         assert!(claim(&file, Channel::Release, now).is_err());
     }
 
-    /// Only a newer kept version produces the exact notice, regardless of claim age.
+    /// Checks that a published build prints one release note before the result,
+    /// as text or a JSON event, unless quiet hides it or the kept version is
+    /// not newer.
     #[test]
-    fn test_note_requires_a_newer_kept_version() {
-        // The old timestamp deliberately leaves the notice independent of freshness
-        let mut answer = Answer {
-            channel: Channel::Release,
-            asked: "2026-01-01T00:00:00Z".parse().unwrap(),
-            newest: None,
-        };
-        let running = Version::parse("0.3.6").unwrap();
-        let hint = "upgrade with `brew update && brew upgrade ark-cli`";
-        assert!(answer.note(&running, hint).is_none());
-        for newest in ["0.3.5", "0.3.6", "0.3.6+different-build"] {
-            answer.newest = Some(Version::parse(newest).unwrap());
-            assert!(answer.note(&running, hint).is_none(), "{newest}");
+    fn test_published_release_note_output() {
+        // As the child, announce a kept answer to a published version, whatever
+        // build or CI this test runs under
+        if let Ok(case) = std::env::var("ARK_TEST_UPDATE_CASE") {
+            let mut options = crate::args::Cli::parse_from(["ark"]).options;
+            options.json = std::env::var("ARK_TEST_UPDATE_JSON").unwrap() == "true";
+            options.quiet = std::env::var("ARK_TEST_UPDATE_QUIET").unwrap() == "true";
+            let output = Output::new(&options);
+            let running = Version::parse(if case == "develop" {
+                "0.3.6-dev.9"
+            } else {
+                "0.3.6"
+            })
+            .unwrap();
+            let newest = match case.as_str() {
+                "none" => None,
+                "older" => Some("0.3.5"),
+                "equal" => Some("0.3.6"),
+                "metadata" => Some("0.3.6+different-build"),
+                "release" | "unknown-install" => Some("0.3.7"),
+                "develop" => Some("0.3.6-dev.34"),
+                _ => panic!("unexpected case {case}"),
+            };
+            let hint = match case.as_str() {
+                "develop" => "upgrade with `brew update && brew upgrade ark-cli-dev`",
+                "unknown-install" => "download it from https://github.com/dark-bio/cli",
+                _ => "upgrade with `brew update && brew upgrade ark-cli`",
+            };
+
+            // Keep and read an old answer, since its age never hides a newer release
+            let directory = Directory::new();
+            let channel = Channel::for_version(&running);
+            Answer {
+                channel,
+                asked: "2026-01-01T00:00:00Z".parse().unwrap(),
+                newest: newest.map(|version| Version::parse(version).unwrap()),
+            }
+            .write(&directory.path)
+            .unwrap();
+            let answer = Answer::read(&directory.path, channel).unwrap();
+            writeln!(std::io::stdout(), "<result>").unwrap();
+            answer.announce(&output, &running, hint);
+            output.document(&json!({"command":"done"})).unwrap();
+            writeln!(std::io::stdout(), "</result>").unwrap();
+            return;
         }
 
-        // Both known and unknown installation methods keep the promised sentence
-        answer.newest = Some(Version::parse("0.3.7").unwrap());
-        assert_eq!(
-            answer.note(&running, hint).unwrap(),
-            "ark 0.3.7 is available, this is 0.3.6; upgrade with `brew update && brew upgrade ark-cli`"
-        );
-        assert_eq!(
-            answer
-                .note(&running, "download it from https://github.com/dark-bio/cli")
-                .unwrap(),
-            "ark 0.3.7 is available, this is 0.3.6; download it from https://github.com/dark-bio/cli"
-        );
-
-        // Numeric prerelease identifiers follow semantic precedence rather than
-        // text order
-        answer.channel = Channel::Develop;
-        answer.newest = Some(Version::parse("0.3.6-dev.34").unwrap());
-        assert_eq!(
-            answer
-                .note(
-                    &Version::parse("0.3.6-dev.9").unwrap(),
-                    "upgrade with `brew update && brew upgrade ark-cli-dev`"
-                )
-                .unwrap(),
-            "ark 0.3.6-dev.34 is available, this is 0.3.6-dev.9; upgrade with `brew update && brew upgrade ark-cli-dev`"
-        );
+        // Capture both streams into one file, so the note's place before the
+        // result shows
+        let directory = Directory::new();
+        for (case, message) in [
+            ("none", None),
+            ("older", None),
+            ("equal", None),
+            ("metadata", None),
+            (
+                "release",
+                Some(
+                    "ark 0.3.7 is available, this is 0.3.6; upgrade with `brew update && brew upgrade ark-cli`",
+                ),
+            ),
+            (
+                "unknown-install",
+                Some(
+                    "ark 0.3.7 is available, this is 0.3.6; download it from https://github.com/dark-bio/cli",
+                ),
+            ),
+            (
+                "develop",
+                Some(
+                    "ark 0.3.6-dev.34 is available, this is 0.3.6-dev.9; upgrade with `brew update && brew upgrade ark-cli-dev`",
+                ),
+            ),
+        ] {
+            for json in [false, true] {
+                for quiet in [false, true] {
+                    let path = directory.path.join("output");
+                    let file = File::create(&path).unwrap();
+                    let result = Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "update::tests::test_published_release_note_output",
+                            "--nocapture",
+                        ])
+                        .env("ARK_TEST_UPDATE_CASE", case)
+                        .env("ARK_TEST_UPDATE_JSON", json.to_string())
+                        .env("ARK_TEST_UPDATE_QUIET", quiet.to_string())
+                        .env("NO_COLOR", "1")
+                        .stdout(file.try_clone().unwrap())
+                        .stderr(file)
+                        .status()
+                        .unwrap();
+                    let transcript = fs::read_to_string(path).unwrap();
+                    assert!(result.success(), "{transcript}");
+                    let mut rendered = transcript
+                        .split_once("<result>\n")
+                        .unwrap()
+                        .1
+                        .split_once("</result>\n")
+                        .unwrap()
+                        .0;
+                    if let Some(message) = message.filter(|_| !quiet) {
+                        let (note, result) = rendered
+                            .split_once(if json { "\n" } else { "\n\n" })
+                            .unwrap();
+                        if json {
+                            assert_eq!(
+                                serde_json::from_str::<serde_json::Value>(note).unwrap(),
+                                json!({"event":"note", "message":message}),
+                                "{case}"
+                            );
+                        } else {
+                            assert_eq!(
+                                note.split_whitespace().collect::<Vec<_>>().join(" "),
+                                format!("note: {message}"),
+                                "{case}"
+                            );
+                            assert!(note.lines().all(|line| line.chars().count() <= 80));
+                        }
+                        rendered = result;
+                    }
+                    assert_eq!(
+                        rendered,
+                        if json {
+                            "{\n  \"command\": \"done\"\n}\n"
+                        } else {
+                            "  Command  done\n"
+                        },
+                        "{case}, json={json}, quiet={quiet}"
+                    );
+                }
+            }
+        }
     }
 
     /// Stable redirects must name this repository and a strict release version.

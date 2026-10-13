@@ -24,6 +24,7 @@ mod pairing;
 mod progress;
 mod style;
 mod update;
+mod usage;
 
 #[cfg(test)]
 mod testing;
@@ -33,8 +34,12 @@ use clap::{FromArgMatches, Parser};
 use context::Context;
 use darkbio_clock::Clock;
 use error::Error;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::process::ExitCode;
+
+/// Version this build prints, as published, or the Cargo version marked
+/// `-local`.
+pub(crate) const VERSION: &str = env!("ARK_BUILD_VERSION");
 
 /// Parses the invocation, installs output and interruption handling, then
 /// reports one outcome.
@@ -67,14 +72,7 @@ fn main() -> ExitCode {
             options.json = json;
             let output = output::Output::new(&options);
             if code != 0 {
-                let message = error.to_string();
-                let message = message
-                    .split("\n\n")
-                    .next()
-                    .unwrap_or(&message)
-                    .trim_start_matches("error: ")
-                    .trim();
-                let error = Error::new(2, "usage", message);
+                let error = usage::from_clap(&error, &command, &arguments);
                 if output.json() {
                     let _ = output.document(&json!({"error":error.json()}));
                 }
@@ -107,36 +105,31 @@ fn main() -> ExitCode {
 
     // A failed validation becomes the result, reported like any command failure
     let validation = cli.validate();
+    let check_update = validation.is_ok() && checks_for_update(&cli);
     let context = Context {
         options: cli.options,
         output,
         interrupt,
     };
 
-    // Valid commands print the newer release note, except help, completions,
-    // --version, a bare run and doctor. The note comes before any connection,
-    // so it reads the real clock.
-    if validation.is_ok()
-        && !cli.help
-        && !cli.version
-        && !matches!(
-            &cli.command,
-            None | Some(Command::Help { .. } | Command::Completions { .. } | Command::Doctor)
-        )
-    {
+    // The release note precedes the command and any connection, so it reads
+    // the real clock
+    if check_update {
         update::start(
             &context.output,
             chrono::DateTime::from(Clock::real().system_time()),
         );
     }
 
-    // Run the command, or print the top-level help or the versions when asked
+    // Run the command, or print the top-level help or the version when asked
     let result = if let Err(error) = validation {
         Err(error)
     } else if cli.help {
         help::run(&context.output, &[], cli.all)
     } else if cli.version {
-        context.output.document(&versions())
+        context
+            .output
+            .document_with(&json!({"version": VERSION}), |_| format!("ark {VERSION}"))
     } else {
         run(&context, cli.command)
     };
@@ -157,6 +150,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Selects the invocations that print the release note and refresh its answer.
+///
+/// Help, completions, the version and a bare `ark` keep their output to
+/// themselves, and doctor reports releases in its own check. The caller checks
+/// that the invocation is valid first.
+fn checks_for_update(cli: &Cli) -> bool {
+    !cli.help
+        && !cli.version
+        && !matches!(
+            &cli.command,
+            None | Some(Command::Help { .. } | Command::Completions { .. } | Command::Doctor)
+        )
+}
+
 /// Dispatches one command; an absent command prints top-level help without
 /// discovery.
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
@@ -173,7 +180,7 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         Some(Command::Unlock) => device::unlock(context),
         Some(Command::Enroll(args)) => device::enroll(context, args),
         Some(Command::Data(command)) => data::run(context, command),
-        Some(Command::App(command)) => execution::run(context, command),
+        Some(Command::Run { file }) => execution::run(context, &file),
         Some(Command::Firmware(command)) => firmware::run(context, command),
         Some(Command::Pair) => pairing::run(context),
         Some(Command::Doctor) => doctor::run(context),
@@ -190,13 +197,52 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     }
 }
 
-/// Reports compiled crate versions and the firmware compatibility baseline.
-pub(crate) fn versions() -> Value {
-    json!({
-        "tool": env!("CARGO_PKG_VERSION"),
-        "connect": darkbio_connect::VERSION,
-        "wire": darkbio_connect::wire::VERSION,
-        "minimum_firmware": firmware::MINIMUM_VERSION,
-        "minimum_develop_publish": device::timestamp(firmware::MINIMUM_DEVELOP_PUBLISH),
-    })
+/// Tests of which invocations print the release note.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::{Color, Theme};
+
+    /// Commands may print the release note, while help, completions, the
+    /// version, the doctor and invalid invocations never do, whatever this
+    /// test's build.
+    #[test]
+    fn test_release_notes_follow_invocation_policy() {
+        let theme = Theme::test(80, Color::Off, true);
+        for (args, expected) in [
+            (vec!["devices"], true),
+            (vec!["status"], true),
+            (vec!["status", "--json"], true),
+            (vec!["status", "--quiet"], true),
+            (vec!["data", "list"], true),
+            (vec!["firmware", "list"], true),
+            (vec![], false),
+            (vec!["--json"], false),
+            (vec!["-h"], false),
+            (vec!["--help"], false),
+            (vec!["--help", "--all"], false),
+            (vec!["help"], false),
+            (vec!["help", "--all"], false),
+            (vec!["help", "status"], false),
+            (vec!["status", "-h"], false),
+            (vec!["status", "--help"], false),
+            (vec!["completions", "zsh"], false),
+            (vec!["--version"], false),
+            (vec!["-V", "--json"], false),
+            (vec!["doctor"], false),
+            (vec!["doctor", "--json"], false),
+            (vec!["--all"], false),
+            (vec!["--timeout", "0", "status"], false),
+            (vec!["bogus"], false),
+            (vec!["--version", "status"], false),
+            (vec!["data", "upload", "x", "--dry-run", "--unlock"], false),
+        ] {
+            let cli = help::command(&theme)
+                .try_get_matches_from(std::iter::once("ark").chain(args.iter().copied()))
+                .and_then(|matches| Cli::from_arg_matches(&matches));
+            let check_update =
+                cli.is_ok_and(|cli| cli.validate().is_ok() && checks_for_update(&cli));
+            assert_eq!(check_update, expected, "{args:?}");
+        }
+    }
 }

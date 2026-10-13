@@ -28,7 +28,7 @@ test = true
 
 [dependencies]
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive", "string"] }
 darkbio-clock = { version = "0.4", features = ["crossbeam"] }
 darkbio-crypto = { version = "0.20.0", features = ["cbor", "xdsa", "rand"] }
 darkbio-trust = { version = "0.7.0", features = ["release", "staging", "develop"] }

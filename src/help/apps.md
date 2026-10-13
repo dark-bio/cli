@@ -11,7 +11,7 @@ https://github.com/dark-bio/examples.
 
 ## Running an app
 
-`ark app run FILE` uploads the app, then follows its task to the end:
+`ark run FILE` uploads the app, then follows its task to the end:
 
 1. The Ark checks the module, runs the manifest pass, and checks the
    manifest and every grant. It refuses the app at the first check that
@@ -25,13 +25,13 @@ https://github.com/dark-bio/examples.
 4. The owner reviews the report on their phone within 10 minutes, then
    releases it to this command or declines, which drops it from the Ark.
 
-ark notes the task id once the Ark assigns it, and passes on an approve
-event at steps 2 and 4. Only the connection that started the task receives
+Under -v, ark shows the task id once the Ark assigns it. At steps 2 and 4 it
+passes on an approval. Only the connection that started the task receives
 its report. Ending that connection, by stopping ark or losing the Ark,
 cancels a task still running and drops its report.
 
 Without --json the report goes to stdout exactly as the app printed it, so
-`ark app run app.wasm > report.md` keeps it. With --json the document holds:
+`ark run app.wasm > report.md` keeps it. With --json the document holds:
 
 - task, the task id
 - app, with name, version and develop from the manifest
@@ -168,7 +168,7 @@ The map never carries a value from the owner's data.
 
 ## The sandbox
 
-- The manifest pass gets 32 MiB of memory, 250 ms and 64 KiB of output, and
+- The manifest pass gets 32 MiB of memory, 250ms and 64 KiB of output, and
   its stderr is discarded. It must exit 0.
 - The report pass gets 128 MiB of memory and 1 MiB per output stream, with
   no time limit. A stream that passes 1 MiB is cut there, and the run fails.
