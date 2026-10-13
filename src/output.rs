@@ -289,13 +289,21 @@ impl Output {
     }
 
     /// Emits rows as a table, or the whole document under JSON.
+    ///
+    /// `empty` is the sentence a table with no rows prints in its place, and
+    /// only a table that is never empty omits it.
+    ///
+    /// # Panics
+    ///
+    /// Panics in the reading output when `rows` is empty and `empty` is omitted.
     pub fn table(
         &self,
         document: &Value,
         rows: &[Value],
         columns: &[(&str, &str)],
+        empty: Option<&str>,
     ) -> Result<(), Error> {
-        self.document_with(document, |theme| human::table(theme, rows, columns))
+        self.document_with(document, |theme| human::table(theme, rows, columns, empty))
     }
 
     /// Emits titled check groups and their summary, or the document under
@@ -1519,7 +1527,7 @@ mod tests {
         let value = json!({"name":"Example"});
         for result in [
             human::document(&theme, &value),
-            human::table(&theme, &[value], &[("NAME", "name")]),
+            human::table(&theme, &[value], &[("NAME", "name")], None),
             human::checklist(&theme, &[("Ark", &[])]),
         ] {
             for (kind, expected) in [
@@ -1550,10 +1558,15 @@ mod tests {
                     &event_line(&theme, kind, "after"),
                 );
                 emit(&mut terminal, &mut stderr, false, Value::Null, "hint: last");
-                assert_eq!(String::from_utf8(stdout).unwrap(), format!("{result}\n"));
+                assert_eq!(
+                    String::from_utf8(stdout).unwrap(),
+                    format!("{result}\n"),
+                    "{kind}"
+                );
                 assert_eq!(
                     String::from_utf8(stderr).unwrap(),
-                    format!("note: before\n\n\n{expected}\nhint: last\n")
+                    format!("note: before\n\n\n{expected}\nhint: last\n"),
+                    "{kind}",
                 );
             }
         }

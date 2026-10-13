@@ -489,6 +489,7 @@ fn listing_table(theme: &Theme, mut rows: Vec<Value>) -> String {
             ("SIZE", "size_bytes"),
             ("STATUS", "status"),
         ],
+        None,
     )];
     for row in &rows {
         if row["candidate"] == true {
@@ -843,6 +844,67 @@ mod tests {
                 ["pick a version from `ark firmware list`"],
                 "{version:?}"
             );
+        }
+    }
+
+    /// The installed build stays a row when the catalog is empty or holds only
+    /// older releases.
+    #[test]
+    fn test_firmware_listing_keeps_installed_without_candidates() {
+        for captured in crate::testing::narration(
+            "firmware::tests::test_firmware_listing_keeps_installed_without_candidates",
+            |output, clock| {
+                // Each listing gets its own output, since an output writes one result
+                let older = Output::test(output.json(), output.terminal(), clock.clock());
+                for (catalog, output, firmwares) in
+                    [("empty", output, Vec::new()), ("older", older, releases())]
+                {
+                    let result = listing(&output, "2.11.0-ddddddd", &firmwares);
+                    assert!(result.is_ok(), "{catalog}: {result:?}");
+                }
+            },
+        ) {
+            assert_eq!(captured.stderr, "", "neither catalog emits events");
+
+            // Both catalogs leave the installed row alone, with no update
+            if captured.json {
+                let documents = serde_json::Deserializer::from_str(&captured.stdout)
+                    .into_iter::<Value>()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(documents.len(), 2, "one document per catalog");
+                for (catalog, document) in ["empty", "older"].into_iter().zip(documents) {
+                    assert_eq!(
+                        document,
+                        json!({
+                            "installed":"2.11.0-ddddddd", "update":null,
+                            "firmwares":[{
+                                "version":"2.11.0-ddddddd", "published":null,
+                                "size_bytes":null, "sha256":null, "summary":null,
+                                "installed":true, "candidate":false,
+                            }],
+                        }),
+                        "{catalog}",
+                    );
+                }
+            } else {
+                let rows: Vec<_> = captured
+                    .stdout
+                    .lines()
+                    .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                    .collect();
+                assert_eq!(rows.len(), 4, "one header and installed row per catalog");
+                for (catalog, rows) in ["empty", "older"].into_iter().zip(rows.as_chunks::<2>().0) {
+                    assert_eq!(
+                        rows,
+                        &[
+                            vec!["VERSION", "PUBLISHED", "SIZE", "STATUS"],
+                            vec!["2.11.0-ddddddd", "-", "-", "installed"],
+                        ],
+                        "{catalog}",
+                    );
+                }
+            }
         }
     }
 

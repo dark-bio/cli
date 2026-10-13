@@ -46,7 +46,7 @@ fn metadata(path: &DatasetPath) -> Value {
 /// line up in one column right of the widest row and wrap within it.
 fn render(theme: &Theme, paths: &[DatasetPath]) -> String {
     if paths.is_empty() {
-        return format!("  {}", theme.paint(Role::Muted, "No dataset paths"));
+        return style::wrap("No dataset paths", theme.width, 0);
     }
 
     // Lay out one row per entry, indented under its closest listed parent
@@ -235,10 +235,13 @@ mod tests {
             }
         }
 
-        // An empty map prints a placeholder
-        assert_eq!(
-            render(&Theme::test(80, Color::Off, false), &[]),
-            "  No dataset paths"
-        );
+        // An empty map prints its sentence in place of the tree
+        for color in [Color::Off, Color::True] {
+            assert_eq!(
+                render(&Theme::test(80, color, false), &[]),
+                "No dataset paths",
+                "{color:?}",
+            );
+        }
     }
 }

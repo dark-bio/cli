@@ -172,7 +172,26 @@ fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<
 /// Fits a table by shrinking one free-text column, then falls back to blocks.
 ///
 /// Selectors, hashes and other actionable fields are never ellipsized by the table.
-pub(crate) fn table(theme: &Theme, rows: &[Value], columns: &[(&str, &str)]) -> String {
+/// A table with no rows prints the `empty` sentence in its place.
+///
+/// # Panics
+///
+/// Panics when `rows` is empty and `empty` is omitted.
+pub(crate) fn table(
+    theme: &Theme,
+    rows: &[Value],
+    columns: &[(&str, &str)],
+    empty: Option<&str>,
+) -> String {
+    // With no rows, the sentence takes the table's place
+    if rows.is_empty() {
+        return style::wrap(
+            &style::printable(empty.expect("empty tables need a sentence")),
+            theme.width,
+            0,
+        );
+    }
+
     // Style every cell and measure each column against its header
     let cells: Vec<Vec<_>> = rows
         .iter()
@@ -417,6 +436,62 @@ mod tests {
     use crate::style::Color;
     use serde_json::json;
 
+    /// Empty block lists keep their labels and print a muted `none`.
+    #[test]
+    fn test_empty_block_lists_are_muted() {
+        for (key, label) in [
+            ("requires", "Dependencies"),
+            ("required_by", "Required by"),
+            ("phases", "Phases"),
+            ("fetched", "Fetched"),
+            ("hints", "Hints"),
+        ] {
+            for color in [Color::Off, Color::True] {
+                let theme = Theme::test(80, color, true);
+                assert_eq!(
+                    document(&theme, &json!({key:[]})),
+                    if color == Color::Off {
+                        format!("  {label}  none")
+                    } else {
+                        format!(
+                            "  \x1b[38;2;124;128;152m{label}\x1b[0m  \x1b[38;2;124;128;152mnone\x1b[0m"
+                        )
+                    },
+                    "{key}, {color:?}",
+                );
+            }
+        }
+    }
+
+    /// Empty tables print their sentence at any width and color depth.
+    #[test]
+    fn test_empty_table_prints_a_sentence() {
+        for width in [8, 80, 160] {
+            for color in [Color::Off, Color::Basic, Color::Ansi256, Color::True] {
+                for unicode in [false, true] {
+                    assert_eq!(
+                        table(
+                            &Theme::test(width, color, unicode),
+                            &[],
+                            &[
+                                ("LOCATOR", "locator"),
+                                ("NAME", "name"),
+                                ("SERIAL", "serial")
+                            ],
+                            Some("No Arks found"),
+                        ),
+                        if width == 8 {
+                            "No Arks\nfound"
+                        } else {
+                            "No Arks found"
+                        },
+                        "{width}, {color:?}, unicode={unicode}",
+                    );
+                }
+            }
+        }
+    }
+
     /// Nested fields become labels, absent values stay visible, and free text
     /// gets no status color.
     #[test]
@@ -491,7 +566,7 @@ mod tests {
 
     /// A table right-aligns sizes and marks states.
     #[test]
-    fn table_aligns_sizes_and_marks_states() {
+    fn test_table_aligns_sizes_and_marks_states() {
         let theme = Theme::test(80, Color::Basic, true);
         let rows = [
             json!({"slot":"reference-genome","state":"filled","size_bytes":3_u64 << 30}),
@@ -503,8 +578,10 @@ mod tests {
                 &theme,
                 &rows,
                 &[("SLOT", "slot"), ("STATE", "state"), ("SIZE", "size_bytes")],
+                None,
             ),
-            "SLOT              STATE          SIZE\n\x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled    3.0 GiB\n\x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n\x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled  256.0 MiB"
+            "SLOT              STATE          SIZE\n\x1b[1mreference-genome\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled    3.0 GiB\n\x1b[1mvariant-catalog\x1b[0m   \u{00b7} empty           -\n\x1b[1mgene-annotations\x1b[0m  \x1b[1m\u{2713}\x1b[0m filled  256.0 MiB",
+            "populated slot table",
         );
     }
 
@@ -528,7 +605,7 @@ mod tests {
             let theme = Theme::test(80, color, true);
             for key in fields {
                 let rows = [json!({key:true}), json!({key:false})];
-                let rendered = table(&theme, &rows, &[("VALUE", key)]);
+                let rendered = table(&theme, &rows, &[("VALUE", key)], None);
                 assert_eq!(
                     rendered.lines().skip(1).collect::<Vec<_>>(),
                     ["yes", "no"],
@@ -557,8 +634,10 @@ mod tests {
                 &theme,
                 &[json!({"name":"Examples", "size_bytes":1024})],
                 &[("NAME", "name"), ("SIZE", "size_bytes")],
+                None,
             ),
-            "\x1b[38;2;124;128;152mNAME\x1b[0m         \x1b[38;2;124;128;152mSIZE\x1b[0m\nExamples  1.0 KiB"
+            "\x1b[38;2;124;128;152mNAME\x1b[0m         \x1b[38;2;124;128;152mSIZE\x1b[0m\nExamples  1.0 KiB",
+            "table uses the full width",
         );
     }
 
@@ -594,45 +673,65 @@ mod tests {
         let rows = [json!({"name":"Example", "published":"2026-10-11T01:02:03Z"})];
         let columns = [("NAME", "name"), ("PUBLISHED", "published")];
         let theme = Theme::test(80, Color::True, true);
-        let rendered = table(&theme, &rows, &columns);
+        let rendered = table(&theme, &rows, &columns, None);
         assert_eq!(
             rendered.lines().last().unwrap(),
-            format!("Example   \x1b[38;2;124;128;152m{date}\x1b[0m")
+            format!("Example   \x1b[38;2;124;128;152m{date}\x1b[0m"),
+            "{zone}",
         );
         let rendered = document(&theme, &rows[0]);
-        assert!(rendered.ends_with(&format!("{date} \x1b[38;2;124;128;152m{clock}\x1b[0m")));
+        assert!(
+            rendered.ends_with(&format!("{date} \x1b[38;2;124;128;152m{clock}\x1b[0m")),
+            "{zone}"
+        );
 
         // A narrow table falls back to full timestamps in blocks
         let theme = Theme::test(18, Color::True, true);
-        let rendered = table(&theme, &rows, &columns);
+        let rendered = table(&theme, &rows, &columns, None);
         let plain = console::strip_ansi_codes(&rendered);
         let joined = plain.split_whitespace().collect::<String>();
-        assert!(joined.contains(&format!("{date}{}", clock.replace(' ', ""))));
+        assert!(
+            joined.contains(&format!("{date}{}", clock.replace(' ', ""))),
+            "{zone}"
+        );
         assert!(
             rendered
                 .lines()
-                .all(|line| console::measure_text_width(line) <= 18)
+                .all(|line| console::measure_text_width(line) <= 18),
+            "{zone}",
         );
-        assert!(!rendered.contains(&format!("\x1b[38;2;124;128;152m{date}")));
+        assert!(
+            !rendered.contains(&format!("\x1b[38;2;124;128;152m{date}")),
+            "{zone}"
+        );
     }
 
     /// Tables show sizes in the same units as blocks.
     #[test]
-    fn tables_and_blocks_agree_on_byte_units() {
+    fn test_tables_and_blocks_agree_on_byte_units() {
         let theme = Theme::test(80, Color::Off, false);
         let rows = [
             json!({"slot":"reference-genome","size_bytes":1_u64 << 28}),
             json!({"slot":"variant-catalog","size_bytes":3_u64 << 30}),
         ];
-        let rendered = table(&theme, &rows, &[("SLOT", "slot"), ("SIZE", "size_bytes")]);
-        for row in &rows {
-            assert!(rendered.contains(&value(&theme, "size_bytes", &row["size_bytes"])));
+        let rendered = table(
+            &theme,
+            &rows,
+            &[("SLOT", "slot"), ("SIZE", "size_bytes")],
+            None,
+        );
+        for (row, expected) in rows.iter().zip(["256.0 MiB", "3.0 GiB"]) {
+            assert!(rendered.contains(expected), "{expected} in the table");
+            assert!(
+                document(&theme, row).contains(expected),
+                "{expected} in the block"
+            );
         }
     }
 
     /// A narrow table fits the width and keeps actionable values whole.
     #[test]
-    fn narrow_tables_keep_actionable_values() {
+    fn test_narrow_tables_keep_actionable_values() {
         let theme = Theme::test(32, Color::True, true);
         let locator = "emulator:127.0.0.1:18181";
         let rows = [
@@ -646,32 +745,40 @@ mod tests {
                 ("NAME", "name"),
                 ("SERIAL", "serial"),
             ],
+            None,
         );
         assert!(
             rendered
                 .lines()
-                .all(|line| console::measure_text_width(line) <= theme.width)
+                .all(|line| console::measure_text_width(line) <= theme.width),
+            "narrow table fits the width",
         );
         let plain = console::strip_ansi_codes(&rendered);
         let joined = plain.split_whitespace().collect::<String>();
-        assert!(joined.contains(locator));
-        assert!(joined.contains("ark-123456789"));
-        assert!(!plain.contains('\u{2026}'));
+        assert!(joined.contains(locator), "locator stays whole");
+        assert!(joined.contains("ark-123456789"), "serial stays whole");
+        assert!(!plain.contains('\u{2026}'), "blocks do not truncate");
     }
 
     /// A table truncates only its free-text column to fit.
     #[test]
-    fn table_truncates_only_free_text() {
+    fn test_table_truncates_only_free_text() {
         let theme = Theme::test(40, Color::Off, true);
         let rows =
             [json!({"name":"A name much longer than the available space","serial":"ark-123"})];
-        let rendered = table(&theme, &rows, &[("NAME", "name"), ("SERIAL", "serial")]);
-        assert!(rendered.contains('\u{2026}'));
-        assert!(rendered.contains("ark-123"));
+        let rendered = table(
+            &theme,
+            &rows,
+            &[("NAME", "name"), ("SERIAL", "serial")],
+            None,
+        );
+        assert!(rendered.contains('\u{2026}'), "long name is truncated");
+        assert!(rendered.contains("ark-123"), "serial stays whole");
         assert!(
             rendered
                 .lines()
-                .all(|line| console::measure_text_width(line) <= theme.width)
+                .all(|line| console::measure_text_width(line) <= theme.width),
+            "table fits the width",
         );
     }
 
