@@ -139,7 +139,7 @@ fn narrate(
 fn approve(output: &Output, kind: DeviceKind) {
     output.approve("pair", Some("button"), match kind {
         DeviceKind::Hardware => "Approve the pairing on the Ark if its colors match your phone. Press its button with the pin that came with it, in the pinhole under the bottom right LED",
-        DeviceKind::Emulator => "Approve the pairing in the Ark Emulator window if its colors match your phone. Press its button there, or run `ark-emulator button press --release-after 0`",
+        DeviceKind::Emulator => "Approve the pairing in the Ark Emulator window if its colors match your phone. Press its button there, or run `ark-emulator button press`",
     });
 }
 
@@ -204,26 +204,38 @@ mod tests {
                 "Exchanging identities", "Exchanged identities · 1s", "Exchanging storage keys", "Exchanged storage keys · 2s",
                 "Approve the pairing on the Ark if its colors match your phone. Press its button with the pin that came with it, in the pinhole under the bottom right LED",
                 "Approved with the Ark's button · 9s", "Preparing encrypted storage", "Prepared encrypted storage · 30s",
-                "Approve the pairing in the Ark Emulator window if its colors match your phone. Press its button there, or run `ark-emulator button press --release-after 0`",
+                "Approve the pairing in the Ark Emulator window if its colors match your phone. Press its button there, or run `ark-emulator button press`",
             ]);
             captured.approvals(&[
                 ("pair", Some("phone")),
                 ("pair", Some("button")),
                 ("pair", Some("button")),
             ]);
-            assert!(!captured.stderr.contains("left"));
+            assert!(
+                !captured.stderr.contains("left"),
+                "pairing has no countdown"
+            );
             if captured.terminal {
-                assert!(captured.stderr.contains("Ark Companion · 12s"));
+                assert!(
+                    captured.stderr.contains("Ark Companion · 12s"),
+                    "the pairing timer counts up"
+                );
             }
         }
         if !captures.is_empty() {
             // A terminal and a pipe print the same QR code and link
             let terminal = captures[0].stderr.split_once("! Approve").unwrap().0;
             let pipe = captures[1].stderr.split_once("! Approve").unwrap().0;
-            assert_eq!(terminal, pipe);
-            assert!(pipe.contains('█'));
-            assert!(pipe.contains("\n  https://app.dark.bio/pair/sample?"));
-            assert!(pipe.ends_with("\n\n"));
+            assert_eq!(terminal, pipe, "the pairing code matches in both views");
+            assert!(pipe.contains('█'), "the pipe keeps the QR code");
+            assert!(
+                pipe.contains("\n  https://app.dark.bio/pair/sample?"),
+                "the link follows the code"
+            );
+            assert!(
+                pipe.ends_with("\n\n"),
+                "the instruction follows a blank line"
+            );
         }
     }
 }

@@ -81,5 +81,5 @@ ark refreshes them before it exits, so run the command again.
 ## Emulated Arks
 
 An emulated Ark refuses firmware updates with unsupported. Its firmware is
-the build bundled with Ark Emulator, and `ark-emulator --version` names it.
+the build bundled with Ark Emulator, and `ark-emulator doctor` names it.
 A newer Ark Emulator release carries newer firmware.
