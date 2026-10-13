@@ -133,6 +133,7 @@ fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), E
             ("VERSION", "version"),
             ("SIZE", "size_bytes"),
         ],
+        Some("No slots found"),
     )?;
 
     // Hint at repairing damage, fetching missing references and filling
@@ -567,6 +568,30 @@ pub(crate) fn metadata(slot: &SlotStatus) -> Value {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// An empty slot reply reads as its sentence, and JSON keeps the empty list.
+    #[test]
+    fn test_empty_slot_listing() {
+        for captured in
+            crate::testing::narration("data::tests::test_empty_slot_listing", |output, _| {
+                let result = listing(&output, &[]);
+                assert!(result.is_ok(), "empty slot listing succeeds: {result:?}");
+            })
+        {
+            assert_eq!(
+                captured.stdout,
+                if captured.json {
+                    "{\n  \"slots\": []\n}\n"
+                } else {
+                    "No slots found\n"
+                },
+                "json={}, terminal={}",
+                captured.json,
+                captured.terminal,
+            );
+            assert_eq!(captured.stderr, "", "empty slot listing has no hints");
+        }
+    }
 
     /// Uploads and fetches narrate in their own words, and each Ark phase ends
     /// with its time.

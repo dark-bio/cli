@@ -277,7 +277,7 @@ fn inventory_output() {
                     );
                 }
             } else {
-                assert_eq!(stdout, "  No dataset paths\n");
+                assert_eq!(stdout, "No dataset paths\n", "empty path result");
             }
             if !unavailable {
                 assert!(stderr.is_empty());

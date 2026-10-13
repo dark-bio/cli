@@ -13,7 +13,7 @@ use crate::{
     output::{Output, human},
     style::{Role, Theme},
 };
-use darkbio_connect::{DeviceKind, Identity, Locator, schema};
+use darkbio_connect::{DeviceKind, Discovery, Identity, Locator, schema};
 use serde_json::{Value, json};
 
 /// Lists discovery metadata without opening devices, retaining useful partial
@@ -23,7 +23,12 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
     let looking = context.output.notice("Looking for Arks");
     let found = context.discover();
     drop(looking);
+    print_devices(&context.output, &found)
+}
 
+/// Prints the Arks discovery found, with a hint naming a selector for each
+/// when several match.
+fn print_devices(output: &Output, found: &Discovery) -> Result<(), Error> {
     // Nothing found fails only when some discovery source failed too
     if found.devices.is_empty() && !found.errors.is_empty() {
         return Err(Error::new(
@@ -40,20 +45,16 @@ pub(crate) fn devices(context: &Context) -> Result<(), Error> {
     })).collect();
 
     // Print the table, and with several Arks a hint naming a selector for each
-    context
-        .output
-        .document_with(&json!({"devices":rows}), |theme| {
-            devices_table(theme, &rows)
-        })?;
+    output.document_with(&json!({"devices":rows}), |theme| {
+        devices_table(theme, &rows)
+    })?;
     if rows.len() > 1 {
         let locators: Vec<_> = found
             .devices
             .iter()
             .map(|device| device.locator())
             .collect();
-        context
-            .output
-            .event("hint", selection_hint(&locators, &locators));
+        output.event("hint", selection_hint(&locators, &locators));
     }
     Ok(())
 }
@@ -75,7 +76,7 @@ fn devices_table(theme: &Theme, rows: &[Value]) -> String {
         }
     }
 
-    human::table(theme, rows, &columns)
+    human::table(theme, rows, &columns, Some("No Arks found"))
 }
 
 /// Builds the hint naming a selector for each Ark, its kind when it is the
@@ -416,6 +417,61 @@ pub(crate) fn hub(env: darkbio_connect::trust::Environment) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding nothing succeeds, with its sentence for reading and an empty list
+    /// in JSON.
+    #[test]
+    fn test_empty_devices_output() {
+        for captured in
+            crate::testing::narration("device::tests::test_empty_devices_output", |output, _| {
+                let result = print_devices(&output, &Discovery::default());
+                assert!(result.is_ok(), "empty discovery succeeds: {result:?}");
+            })
+        {
+            assert_eq!(
+                captured.stdout,
+                if captured.json {
+                    "{\n  \"devices\": []\n}\n"
+                } else {
+                    "No Arks found\n"
+                },
+                "json={}, terminal={}",
+                captured.json,
+                captured.terminal,
+            );
+            assert_eq!(captured.stderr, "", "empty discovery has no hints");
+        }
+    }
+
+    /// Finding nothing because a source failed returns the error and no result.
+    #[test]
+    fn test_failed_empty_discovery_has_no_result() {
+        for captured in crate::testing::narration(
+            "device::tests::test_failed_empty_discovery_has_no_result",
+            |output, _| {
+                let found = Discovery {
+                    devices: Vec::new(),
+                    errors: vec![darkbio_connect::Error::Registry(std::io::Error::other(
+                        "discovery unavailable",
+                    ))],
+                };
+                let error = print_devices(&output, &found).unwrap_err();
+                assert_eq!(error.class, 3, "discovery failure keeps its exit class");
+                assert_eq!(
+                    error.json(),
+                    json!({
+                        "code":"no-device",
+                        "message":"no Arks found; discovery was incomplete",
+                        "hints":[],
+                    }),
+                    "discovery failure keeps its error",
+                );
+            },
+        ) {
+            assert_eq!(captured.stdout, "", "failed discovery has no result");
+            assert_eq!(captured.stderr, "", "the caller reports the error");
+        }
+    }
 
     /// Online enrollment prints its document, then fails with the link as the
     /// error's hint.

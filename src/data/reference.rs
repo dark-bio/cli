@@ -143,6 +143,7 @@ fn execute(
             ("CACHED", "cached"),
             ("OUTCOME", "outcome"),
         ],
+        Some("No reference datasets to fetch"),
     )?;
     failure.map_or(Ok(()), Err)
 }
@@ -742,12 +743,54 @@ mod tests {
     use super::*;
     use clap::Parser;
     use darkbio_clock::TestClock;
-    use darkbio_connect::schema::{SlotDownload, SlotOrigin, SlotState};
+    use darkbio_connect::schema::{SlotDownload, SlotKind, SlotOrigin, SlotState};
     use std::io::Write;
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+
+    /// A fetch with nothing to fetch reads as its sentence, and JSON keeps the
+    /// empty list.
+    #[test]
+    fn test_fetch_without_reference_slots() {
+        for captured in crate::testing::narration(
+            "data::reference::tests::test_fetch_without_reference_slots",
+            |output, _| {
+                // Plan from an inventory that holds only personal data
+                let slots = [SlotStatus {
+                    kind: SlotKind::SnpIndelCalls as i32,
+                    origin: SlotOrigin::Personal as i32,
+                    ..Default::default()
+                }];
+                let ordered = plan(&slots, None).unwrap();
+                let context = Context {
+                    options: crate::args::Cli::parse_from(["ark"]).options,
+                    interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                    output,
+                };
+
+                // Print the empty plan, which installs nothing
+                let result = execute(&context, &ordered, false, None, |_| {
+                    panic!("an empty reference plan has no installation")
+                });
+                assert!(result.is_ok(), "empty fetch succeeds: {result:?}");
+            },
+        ) {
+            assert_eq!(
+                captured.stdout,
+                if captured.json {
+                    "{\n  \"fetched\": []\n}\n"
+                } else {
+                    "No reference datasets to fetch\n"
+                },
+                "json={}, terminal={}",
+                captured.json,
+                captured.terminal,
+            );
+            assert_eq!(captured.stderr, "", "empty fetch has no events");
+        }
+    }
 
     /// Counter that keeps parallel fixtures in separate temporary directories.
     static NEXT: AtomicU64 = AtomicU64::new(0);
