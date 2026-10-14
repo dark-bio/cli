@@ -845,7 +845,7 @@ mod tests {
     /// Checks HG00096's source against its separately measured size and digest.
     #[test]
     fn test_sample_source_matches_independent_pin() {
-        for value in ["HG00096", "orange-ravine"] {
+        for value in ["HG00096", "notable-owen"] {
             let source = offer(&sample_slot(sample(value))).unwrap();
             assert_eq!(
                 source.url,
@@ -891,7 +891,7 @@ mod tests {
     /// Runs a sample plan that must install nothing, and checks its output.
     fn check_sample_plan(test: &str, filled: bool, dry_run: bool) {
         for captured in crate::testing::narration(test, |output, _| {
-            let sample = sample("orange-ravine");
+            let sample = sample("notable-owen");
             let mut slot = sample_slot(sample);
             if filled {
                 slot.state = SlotState::Filled as i32;
@@ -917,7 +917,7 @@ mod tests {
                 );
                 let row = &document["fetched"][0];
                 assert_eq!(row["sample"], "HG00096", "selected sample");
-                assert_eq!(row["name"], "orange-ravine", "selected name");
+                assert_eq!(row["name"], "notable-owen", "selected name");
                 assert_eq!(row["size_bytes"], 437_027_190, "pinned file length");
                 assert_eq!(
                     row["sha256"],
@@ -996,7 +996,7 @@ mod tests {
                 );
                 let server = serve(listener, vec![(200, String::new(), bytes.to_vec())]);
                 let directory = Directory::new();
-                let sample = sample("orange-ravine");
+                let sample = sample("notable-owen");
                 let mut slot = sample_slot(sample);
                 let download = slot.download.as_mut().unwrap();
                 download.bytes = bytes.len() as u64;
@@ -1159,7 +1159,7 @@ mod tests {
                         "size_bytes": 26,
                         "sha256": "df9a83175f9bf0ab03383500321104f6bd1ae0367631ce81c2909d7813f68a79",
                         "cached": false, "outcome": "done", "error": null,
-                        "sample": "HG00096", "name": "orange-ravine",
+                        "sample": "HG00096", "name": "notable-owen",
                     }),
                     "completed sample fetch row"
                 );

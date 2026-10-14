@@ -8,7 +8,8 @@
 
 mod adjectives;
 mod codec;
-mod nouns;
+mod female;
+mod male;
 mod people;
 mod pins;
 mod populations;
@@ -64,12 +65,14 @@ pub(crate) struct Sample(
 impl Sample {
     /// Finds the catalog person a sample ID or a name stands for.
     fn parse(value: &str) -> Option<Self> {
-        let decoded = codec::decode(value);
-        let sample = decoded.as_deref().unwrap_or(value);
-        PEOPLE
-            .binary_search_by_key(&sample, |person| person.sample)
-            .ok()
-            .map(|index| Self(&PEOPLE[index]))
+        codec::decode(value)
+            .or_else(|| {
+                PEOPLE
+                    .binary_search_by_key(&value, |person| person.sample)
+                    .ok()
+                    .map(|index| &PEOPLE[index])
+            })
+            .map(Self)
     }
 
     /// Returns the sample ID, such as `NA12878`.
@@ -77,9 +80,9 @@ impl Sample {
         self.0.sample
     }
 
-    /// Derives the person's two-word name, such as `forked-knoll`.
+    /// Derives the person's name, such as `affable-hazel`.
     pub(super) fn name(self) -> String {
-        codec::encode(self.0.sample).expect("catalog sample IDs lie in the codec's domain")
+        codec::encode(self.0)
     }
 
     /// Builds an offer for the person's DRAGEN 4.4.7 calls from their pin.
@@ -204,17 +207,21 @@ fn population_rows() -> Vec<Value> {
 
 /// Builds a row per person of the given population and sex, in sample ID order.
 fn sample_rows(population: Option<&str>, sex: Option<Sex>) -> Vec<Value> {
-    PEOPLE.iter()
+    PEOPLE
+        .iter()
         .filter(|person| population.is_none_or(|code| code == person.population))
         .filter(|person| sex.is_none_or(|sex| sex == person.sex))
-        .map(|person| json!({
-            "name": codec::encode(person.sample).expect("every cohort sample ID lies in the codec's domain"),
-            "sample": person.sample,
-            "population": person.population,
-            "sex": person.sex,
-            "father": person.father,
-            "mother": person.mother,
-        })).collect()
+        .map(|person| {
+            json!({
+                "name": codec::encode(person),
+                "sample": person.sample,
+                "population": person.population,
+                "sex": person.sex,
+                "father": person.father,
+                "mother": person.mother,
+            })
+        })
+        .collect()
 }
 
 /// Lays out the populations, letting only the descriptions truncate.
@@ -300,7 +307,7 @@ mod tests {
     #[test]
     fn test_sample_selection_requires_a_catalog_person() {
         for person in PEOPLE {
-            let name = codec::encode(person.sample).unwrap();
+            let name = codec::encode(person);
             for value in [person.sample, name.as_str()] {
                 assert_eq!(Sample::parse(value).unwrap().id(), person.sample, "{value}");
             }
@@ -309,17 +316,21 @@ mod tests {
             "HG00000",
             "hg00096",
             "HG30000",
-            "orange-ravin",
-            "ravine-orange",
+            "NA30000",
+            "XX00001",
+            "HG0001",
+            "HG+0096",
+            "HG000096",
+            "HGé096",
+            "NA99999",
+            "notable-owe",
+            "owen-notable",
+            "notable-rachel",
+            "vibrant-jane",
             "",
         ] {
             assert!(Sample::parse(value).is_none(), "unknown sample {value:?}");
         }
-        let outside = codec::encode("HG00000").unwrap();
-        assert!(
-            Sample::parse(&outside).is_none(),
-            "name outside the catalog"
-        );
     }
 
     /// Checks the catalog's size, order, population codes, counts and parents.
@@ -425,7 +436,7 @@ mod tests {
         assert_eq!(
             rows[0],
             json!({
-                "name": "laced-brook", "sample": "NA18939", "population": "JPT",
+                "name": "humble-barbara", "sample": "NA18939", "population": "JPT",
                 "sex": "female", "father": null, "mother": null,
             }),
             "first female JPT sample"
@@ -459,7 +470,7 @@ mod tests {
         assert_eq!(
             rows.iter().find(|row| row["sample"] == "HG00405").unwrap(),
             &json!({
-                "name": "lemon-grass", "sample": "HG00405", "population": "CHS",
+                "name": "innovative-josefa", "sample": "HG00405", "population": "CHS",
                 "sex": "female", "father": "HG00403", "mother": "HG00404",
             }),
             "in-cohort parents are sample IDs"
@@ -489,7 +500,7 @@ mod tests {
         for width in [32, 80] {
             let theme = Theme::test(width, Color::True, true);
             let rendered = sample_table(&theme, &rows, true);
-            for text in ["orange-ravine", "HG00096", "GBR"] {
+            for text in ["notable-owen", "HG00096", "GBR"] {
                 assert!(
                     rendered.contains(&format!("\x1b[1m\x1b[38;2;137;180;250m{text}\x1b[0m")),
                     "width={width}, {text}"

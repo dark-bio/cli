@@ -4,9 +4,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Two-word names for sample IDs, derived both ways by arithmetic.
+//! Sample names, an adjective and a given name, derived from each person's
+//! sample ID and sex.
 
-use super::{adjectives::ADJECTIVES, nouns::NOUNS};
+use super::{Person, Sex, adjectives::ADJECTIVES, female::FEMALE, male::MALE, people::PEOPLE};
 
 /// Multiplier of the affine permutation, 2654435761 reduced modulo 65536.
 const MULTIPLIER: u16 = 2_654_435_761u32 as u16;
@@ -15,192 +16,245 @@ const OFFSET: u16 = 1_013_904_223u32 as u16;
 /// Inverse of [`MULTIPLIER`] modulo 65536, which undoes its multiplication.
 const INVERSE: u16 = 12_113;
 
-/// Derives the name of a sample ID, or `None` for an ID outside the domain.
-///
-/// The domain is `HG` or `NA` followed by five digits below 30000. IDs outside
-/// the cohort have names too, so the catalog decides who exists.
-pub(super) fn encode(sample: &str) -> Option<String> {
-    // Split the ID into prefix and digits, refusing any ID outside the domain
-    if sample.len() != 7 {
-        return None;
-    }
-    let base = match sample.get(..2)? {
+/// Derives a person's name, taking the given name from the list of their sex.
+pub(super) fn encode(person: &Person) -> String {
+    // Split the sample ID into its prefix and digits
+    let base = match &person.sample[..2] {
         "HG" => 0,
         "NA" => 30_000,
-        _ => return None,
+        _ => unreachable!("catalog sample IDs start with HG or NA"),
     };
-    let digits = &sample[2..];
-    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let digits: u16 = digits.parse().ok()?;
-    if digits >= 30_000 {
-        return None;
-    }
+    let digits: u16 = person.sample[2..]
+        .parse()
+        .expect("catalog sample IDs end in five digits");
 
-    // Permute the index modulo 65536 by wrapping, then pick a word per byte
+    // Permute the index modulo 65536 by wrapping, then pick the adjective by
+    // the high byte and the given name by the low one
     let y = (base + digits)
         .wrapping_mul(MULTIPLIER)
         .wrapping_add(OFFSET);
-    Some(format!(
+    let given = match person.sex {
+        Sex::Female => &FEMALE,
+        Sex::Male => &MALE,
+    };
+    format!(
         "{}-{}",
         ADJECTIVES[usize::from(y / 256)],
-        NOUNS[usize::from(y % 256)]
-    ))
+        given[usize::from(y % 256)]
+    )
 }
 
-/// Derives the sample ID a name stands for, or `None` for a name no ID has.
+/// Finds the person a name stands for, or `None` for a name nobody has.
 ///
-/// Unknown words, a missing or extra hyphen and the 5,536 pairs outside the
-/// domain decode to nothing. Words of a list differ in two letters or more, so
-/// a one-letter slip never names another person.
-pub(super) fn decode(name: &str) -> Option<String> {
-    // Refuse anything longer than two eight-letter words, then look both up
-    if name.len() > 17 {
+/// Unknown words, malformed names, IDs outside the catalog and a given name of
+/// the other sex all decode to nothing. No word is in both name lists, so the
+/// list that holds the given name gives the sex.
+pub(super) fn decode(name: &str) -> Option<&'static Person> {
+    // Refuse anything longer than the longest name, then look up both words
+    if name.len() > 18 {
         return None;
     }
-    let (adjective, noun) = name.split_once('-')?;
-    let high = ADJECTIVES.iter().position(|word| *word == adjective)?;
-    let low = NOUNS.iter().position(|word| *word == noun)?;
+    let (adjective, given) = name.split_once('-')?;
+    let high = ADJECTIVES.binary_search(&adjective).ok()?;
+    let (sex, low) = match FEMALE.binary_search(&given) {
+        Ok(index) => (Sex::Female, index),
+        Err(_) => (Sex::Male, MALE.binary_search(&given).ok()?),
+    };
 
-    // Undo the permutation, where indexes past the domain belong to no ID
+    // Undo the permutation, then find the person and check their sex
     let y = (high * 256 + low) as u16;
     let x = y.wrapping_sub(OFFSET).wrapping_mul(INVERSE);
     if x >= 60_000 {
         return None;
     }
-    Some(format!(
-        "{}{:05}",
-        if x < 30_000 { "HG" } else { "NA" },
-        x % 30_000
-    ))
+    let sample = format!("{}{:05}", if x < 30_000 { "HG" } else { "NA" }, x % 30_000);
+    let index = PEOPLE
+        .binary_search_by_key(&sample.as_str(), |person| person.sample)
+        .ok()?;
+    let person = &PEOPLE[index];
+    (person.sex == sex).then_some(person)
 }
 
-/// Tests of the codec over its whole domain and against the reference names.
+/// Tests of the names, every word pair and the screening of the lists.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::samples::people::PEOPLE;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
 
-    /// Checks that every ID in the domain round trips through its own name.
+    /// Checks that every person round trips through a name of their own.
     #[test]
-    fn test_domain_is_bijective() {
+    fn test_catalog_names_are_bijective() {
         let mut names = HashSet::new();
-        for prefix in ["HG", "NA"] {
-            for digits in 0..30_000 {
-                let sample = format!("{prefix}{digits:05}");
-                let name = encode(&sample).expect("domain IDs encode");
-                assert_eq!(decode(&name).as_deref(), Some(sample.as_str()), "{sample}");
-                assert!(names.insert(name), "duplicate name for {sample}");
-            }
+        for person in PEOPLE {
+            let name = encode(person);
+            assert_eq!(
+                decode(&name).map(|person| person.sample),
+                Some(person.sample),
+                "{name}"
+            );
+            assert!(names.insert(name), "duplicate name for {}", person.sample);
         }
-        assert_eq!(names.len(), 60_000, "all domain names are distinct");
+        assert_eq!(names.len(), 3_202, "all catalog names are distinct");
 
-        // Decode every pair, so the unused count does not lean on the encoder
-        let mut unreachable = 0;
+        // Decode every word pair, which names its own person or nobody
+        let mut accepted = 0;
         for adjective in ADJECTIVES {
-            for noun in NOUNS {
-                let name = format!("{adjective}-{noun}");
-                match decode(&name) {
-                    Some(sample) => assert_eq!(encode(&sample), Some(name.clone()), "{name}"),
-                    None => unreachable += 1,
+            for given in FEMALE.into_iter().chain(MALE) {
+                let name = format!("{adjective}-{given}");
+                if let Some(person) = decode(&name) {
+                    assert_eq!(
+                        encode(person),
+                        name,
+                        "{} with the matching sex",
+                        person.sample
+                    );
+                    accepted += 1;
                 }
             }
         }
-        assert_eq!(unreachable, 5_536, "word pairs outside the ID domain");
+        assert_eq!(accepted, 3_202, "only catalog names decode");
     }
 
-    /// Checks that bad IDs and names, reversed names and unused pairs all fail.
+    /// Checks that malformed names, unknown words, given names of the other
+    /// sex and pairs outside the catalog decode to nothing.
     #[test]
-    fn test_invalid_inputs_are_rejected() {
-        for sample in [
-            "HG30000", "NA30000", "XX00001", "HG0001", "hg00096", "HG+0096", "HG000096", "HGé096",
-            "", "NA99999",
-        ] {
-            assert_eq!(encode(sample), None, "{sample:?}");
-        }
+    fn test_invalid_names_are_rejected() {
         for name in [
-            "unknown-ravine",
-            "orange-unknown",
-            "orangeravine",
-            "orange--ravine",
-            "orange-ravine-",
-            "-orange-ravine",
-            "ravine-orange",
+            "unknown-owen",
+            "notable-unknown",
+            "notableowen",
+            "notable--owen",
+            "notable-owen-",
+            "-notable-owen",
+            "owen-notable",
+            "notable-Owen",
             "",
-            "grooved-ravine",
+            "upstanding-stephenx",
+            "notable-rachel",
+            "affable-giorgio",
+            "vibrant-jane",
+            "gentle-rachel",
         ] {
-            assert_eq!(decode(name), None, "{name:?}");
+            assert!(decode(name).is_none(), "{name:?}");
         }
     }
 
-    /// Checks the names against the design's examples and the reference codec.
+    /// Checks names against the reviewed preview, by example and by a digest
+    /// over the whole cohort.
     #[test]
     fn test_reference_names() {
         for (sample, name) in [
-            ("HG00096", "orange-ravine"),
-            ("HG00097", "blue-hill"),
-            ("HG04239", "woven-crystal"),
-            ("NA12878", "forked-knoll"),
-            ("NA19238", "opaque-soil"),
-            ("NA21144", "pebbled-patio"),
+            ("HG00096", "notable-owen"),
+            ("HG00097", "assured-lata"),
+            ("HG00183", "upstanding-stephen"),
+            ("HG03730", "affable-hazel"),
+            ("HG04239", "wonderful-enzo"),
+            ("NA12878", "excellent-lola"),
+            ("NA19238", "noble-sayuri"),
+            ("NA21144", "perceptive-naoko"),
         ] {
-            assert_eq!(encode(sample).as_deref(), Some(name), "{sample}");
-            assert_eq!(decode(name).as_deref(), Some(sample), "{name}");
+            let person = &PEOPLE[PEOPLE
+                .binary_search_by_key(&sample, |person| person.sample)
+                .unwrap()];
+            assert_eq!(encode(person), name, "{sample}");
+            assert_eq!(
+                decode(name).map(|person| person.sample),
+                Some(sample),
+                "{name}"
+            );
         }
 
-        // Hash every name and ID in sample ID order, the way the reference was
+        // Hash the cohort as name and sample ID lines in sample ID order, as the
+        // preview lists them
         let mut digest = Sha256::new();
         for person in PEOPLE {
-            digest.update(format!(
-                "{} {}\n",
-                encode(person.sample).unwrap(),
-                person.sample
-            ));
+            digest.update(format!("{} {}\n", encode(person), person.sample));
         }
         assert_eq!(
             hex::encode(digest.finalize()),
-            "bb2148264972232e75e45c25b2d425f746b86cfed09faf58f1b1224f4b34552d",
-            "reference codec cohort digest"
+            "445a166775045fe823c468bf078b9b1c986944adde2a14ce2a2bcf2f5377961a",
+            "reference preview cohort digest"
         );
     }
 
-    /// Checks that the wordlists keep the design's screening rules.
+    /// Checks the lists' sizes, letters, lengths and order, and that any two
+    /// words a typo could confuse are at least two edits apart.
     #[test]
     fn test_wordlist_screening() {
-        for words in [&ADJECTIVES, &NOUNS] {
+        for (words, limit) in [(&ADJECTIVES, 10), (&FEMALE, 7), (&MALE, 7)] {
             assert_eq!(words.len(), 256, "codec word count");
-            for (index, word) in words.iter().enumerate() {
-                assert!((4..=8).contains(&word.len()), "length of {word}");
+            for word in words {
+                assert!((1..=limit).contains(&word.len()), "length of {word}");
                 assert!(word.bytes().all(|byte| byte.is_ascii_lowercase()), "{word}");
+            }
+            for pair in words.windows(2) {
+                assert!(
+                    pair[0] < pair[1],
+                    "sorted distinct words: {}, {}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+
+        // Screen the given names as one set, so a single typo cannot cross the
+        // sexes
+        for word in FEMALE {
+            assert!(!MALE.contains(&word), "name in both lists: {word}");
+        }
+        let given: Vec<_> = FEMALE.into_iter().chain(MALE).collect();
+        for words in [ADJECTIVES.as_slice(), given.as_slice()] {
+            for (index, word) in words.iter().enumerate() {
                 for other in &words[index + 1..] {
-                    assert_ne!(word, other, "repeated word {word}");
-                    assert_ne!(&word[..4], &other[..4], "{word}, {other}");
                     assert!(distance(word, other) >= 2, "{word}, {other}");
                 }
             }
         }
-        for word in ADJECTIVES {
-            assert!(!NOUNS.contains(&word), "word in both lists: {word}");
+    }
+
+    /// Checks that the distance counts a swap of neighboring letters as one
+    /// edit, and never edits a substring twice.
+    #[test]
+    fn test_distance_counts_adjacent_swaps() {
+        for (left, right, expected) in [
+            ("", "abc", 3),
+            ("same", "same", 0),
+            ("form", "from", 1),
+            ("abc", "acb", 1),
+            ("ca", "abc", 3),
+            ("ab", "ba", 1),
+        ] {
+            assert_eq!(distance(left, right), expected, "{left}, {right}");
+            assert_eq!(distance(right, left), expected, "{right}, {left}");
         }
     }
 
-    /// Counts the single-letter edits between two words, as Levenshtein does.
+    /// Counts the edits between two words, a swap of neighboring letters
+    /// being one, as optimal string alignment does.
     fn distance(left: &str, right: &str) -> usize {
-        let mut previous: Vec<_> = (0..=right.len()).collect();
-        for (i, a) in left.bytes().enumerate() {
-            let mut next = vec![i + 1];
-            for (j, b) in right.bytes().enumerate() {
-                next.push(
-                    (previous[j] + usize::from(a != b))
-                        .min(previous[j + 1] + 1)
-                        .min(next[j] + 1),
-                );
-            }
-            previous = next;
+        // Seed the cost of turning each prefix into an empty word
+        let left = left.as_bytes();
+        let right = right.as_bytes();
+        let mut costs = vec![vec![0; right.len() + 1]; left.len() + 1];
+        for (index, row) in costs.iter_mut().enumerate() {
+            row[0] = index;
         }
-        previous[right.len()]
+        for (index, cost) in costs[0].iter_mut().enumerate() {
+            *cost = index;
+        }
+
+        // Take the cheapest of an insertion, a deletion, a substitution or a swap
+        for i in 1..=left.len() {
+            for j in 1..=right.len() {
+                costs[i][j] = (costs[i - 1][j] + 1)
+                    .min(costs[i][j - 1] + 1)
+                    .min(costs[i - 1][j - 1] + usize::from(left[i - 1] != right[j - 1]));
+                if i > 1 && j > 1 && left[i - 1] == right[j - 2] && left[i - 2] == right[j - 1] {
+                    costs[i][j] = costs[i][j].min(costs[i - 2][j - 2] + 1);
+                }
+            }
+        }
+        costs[left.len()][right.len()]
     }
 }

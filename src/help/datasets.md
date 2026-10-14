@@ -114,11 +114,13 @@ holds only public files, references and samples.
 They are the variant calls of the 1000 Genomes Project's 3,202 people, made
 by Illumina's DRAGEN 4.4.7. The list is built into ark and needs no Ark.
 
-Each sample keeps a fixed name made from its sample ID, two words such as
-quick-prairie for HG02345. The name never changes, so a test, a bug report
-and a colleague all reach the same genome. Commands take the name or the
-ID. The words of each list differ by at least two letters, so a one-letter
-typo fails instead of reaching another person.
+Each sample keeps a fixed name made from its sample ID, an adjective and a
+given name that matches the person's sex, such as affable-hazel for HG03730.
+The name never changes, so a test, a bug report and a colleague all reach
+the same genome. Commands take the name or the ID. Any two adjectives, and
+any two given names, differ by at least two edits, counting two swapped
+neighboring letters as one. So one wrong, missing, extra or swapped letter
+fails instead of reaching another person.
 
 With no population the command lists the 26 populations, each with its
 code, its number of people and a description. A code lists that

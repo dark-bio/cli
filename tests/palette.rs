@@ -198,7 +198,7 @@ fn test_samples_views_and_json() {
             assert_eq!(
                 samples[0],
                 serde_json::json!({
-                    "name": "orange-ravine", "sample": "HG00096", "population": "GBR",
+                    "name": "notable-owen", "sample": "HG00096", "population": "GBR",
                     "sex": "male", "father": null, "mother": null,
                 }),
                 "first sample JSON row"
@@ -209,7 +209,7 @@ fn test_samples_views_and_json() {
                     .find(|sample| sample["sample"] == "HG00405")
                     .unwrap(),
                 &serde_json::json!({
-                    "name": "lemon-grass", "sample": "HG00405", "population": "CHS",
+                    "name": "innovative-josefa", "sample": "HG00405", "population": "CHS",
                     "sex": "female", "father": "HG00403", "mother": "HG00404",
                 }),
                 "sample JSON parents"
@@ -290,7 +290,7 @@ fn test_samples_help_and_completion() {
         "sex completion values"
     );
     assert!(
-        text.contains("forked-knoll\\:\"NA12878 · CEU · female\""),
+        text.contains("excellent-lola\\:\"NA12878 · CEU · female\""),
         "sample description in zsh completion"
     );
 
@@ -315,7 +315,7 @@ fn test_samples_help_and_completion() {
         "help omits sample value lists"
     );
     assert!(
-        !text.contains("orange-ravine"),
+        !text.contains("notable-owen"),
         "help omits catalog names beyond its examples"
     );
 }
@@ -899,11 +899,11 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
                 "fetch",
                 "snp-indel-calls",
                 "--sample",
-                "orange-ravin",
+                "notable-owe",
             ],
-            "unknown sample 'orange-ravin'",
+            "unknown sample 'notable-owe'",
             vec![
-                "a similar value exists: `orange-ravine`",
+                "a similar value exists: `notable-owen`",
                 "use a sample name or id from `ark data samples`",
             ],
         ),
@@ -918,12 +918,12 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             vec!["run `ark data fetch reference-genome`"],
         ),
         (
-            vec!["data", "fetch", "1", "--sample", "orange-ravine"],
+            vec!["data", "fetch", "1", "--sample", "notable-owen"],
             "--sample fills snp-indel-calls, not reference-genome",
             vec!["run `ark data fetch reference-genome`"],
         ),
         (
-            vec!["data", "fetch", "42", "--sample", "orange-ravine"],
+            vec!["data", "fetch", "42", "--sample", "notable-owen"],
             "--sample fills snp-indel-calls, not 42",
             vec![],
         ),
@@ -1178,7 +1178,7 @@ fn usage_errors_are_json_in_both_streams() {
 fn test_sample_fetch_requires_a_slot_and_conflicts_with_all() {
     for (args, message) in [
         (
-            vec!["data", "fetch", "--all", "--sample", "orange-ravine"],
+            vec!["data", "fetch", "--all", "--sample", "notable-owen"],
             "--all cannot be combined with --sample",
         ),
         (

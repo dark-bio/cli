@@ -244,17 +244,18 @@ const CONTRACTS: &[Contract] = &[
             json: "fetched, each with slot, id, url, size_bytes, sha256, cached, outcome, \
                 error; --sample adds sample and name; --dry-run marks pending rows as planned",
             examples: "ark data fetch --all\n\
-                ark data fetch snp-indel-calls --sample quick-prairie --dry-run --json",
+                ark data fetch snp-indel-calls --sample affable-hazel --dry-run --json",
         }),
     },
     Contract {
         path: "data samples",
         paragraph: "The genomes are the variant calls of the 1000 Genomes Project's 3,202 \
-            people, made by Illumina's DRAGEN 4.4.7. Each keeps a fixed name made from \
-            its sample ID, such as quick-prairie for HG02345, and `ark data fetch \
-            --sample` takes either. With no population the list shows the 26 \
-            populations, and with one it shows that population's people. --all shows \
-            everyone instead of a population, and --sex narrows either to one sex.",
+            people, made by Illumina's DRAGEN 4.4.7. Each keeps a fixed name, an \
+            adjective and a given name of the person's sex, such as affable-hazel for \
+            HG03730, and `ark data fetch --sample` takes either. With no population the \
+            list shows the 26 populations, and with one it shows that population's \
+            people. --all shows everyone instead of a population, and --sex narrows \
+            either to one sex.",
         footer: Some(ContractFooter {
             requires: "nothing, since the list is built into ark",
             approval: "none",
