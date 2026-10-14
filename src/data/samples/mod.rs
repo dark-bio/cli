@@ -245,20 +245,12 @@ fn population_table(theme: &Theme, rows: &[Value]) -> String {
 
 /// Lays out people, adding a population column when they span populations.
 fn sample_table(theme: &Theme, rows: &[Value], all: bool) -> String {
-    let mut columns = vec![
-        Column {
-            label: "NAME",
-            key: "name",
-            accent: true,
-            flexible: false,
-        },
-        Column {
-            label: "SAMPLE",
-            key: "sample",
-            accent: true,
-            flexible: false,
-        },
-    ];
+    let mut columns = vec![Column {
+        label: "SAMPLE",
+        key: "sample",
+        accent: true,
+        flexible: false,
+    }];
     if all {
         columns.push(Column {
             label: "POPULATION",
@@ -268,6 +260,12 @@ fn sample_table(theme: &Theme, rows: &[Value], all: bool) -> String {
         });
     }
     columns.push(Column::from(("SEX", "sex")));
+    columns.push(Column {
+        label: "NAME",
+        key: "name",
+        accent: true,
+        flexible: false,
+    });
     human::table(theme, rows, &columns, Some("No samples found"))
 }
 
@@ -454,7 +452,7 @@ mod tests {
                 .unwrap()
                 .split_whitespace()
                 .collect::<Vec<_>>(),
-            ["NAME", "SAMPLE", "SEX"],
+            ["SAMPLE", "SEX", "NAME"],
             "population view columns"
         );
         assert_eq!(rendered.lines().count(), 49, "header and filtered rows");
@@ -483,7 +481,7 @@ mod tests {
                 .unwrap()
                 .split_whitespace()
                 .collect::<Vec<_>>(),
-            ["NAME", "SAMPLE", "POPULATION", "SEX"],
+            ["SAMPLE", "POPULATION", "SEX", "NAME"],
             "all-samples view columns"
         );
         assert_eq!(rendered.lines().count(), 3_203, "header and entire cohort");

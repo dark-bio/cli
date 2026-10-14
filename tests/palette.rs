@@ -115,22 +115,22 @@ fn test_samples_views_and_json() {
         (
             vec!["data", "samples", "JPT"],
             104,
-            vec!["NAME", "SAMPLE", "SEX"],
+            vec!["SAMPLE", "SEX", "NAME"],
         ),
         (
             vec!["data", "samples", "JPT", "--sex", "female"],
             48,
-            vec!["NAME", "SAMPLE", "SEX"],
+            vec!["SAMPLE", "SEX", "NAME"],
         ),
         (
             vec!["data", "samples", "JPT", "--sex", "male"],
             56,
-            vec!["NAME", "SAMPLE", "SEX"],
+            vec!["SAMPLE", "SEX", "NAME"],
         ),
         (
             vec!["data", "samples", "--all"],
             3_202,
-            vec!["NAME", "SAMPLE", "POPULATION", "SEX"],
+            vec!["SAMPLE", "POPULATION", "SEX", "NAME"],
         ),
     ] {
         let output = ark(&args);
