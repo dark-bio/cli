@@ -9,6 +9,7 @@
 pub(crate) mod cache;
 mod paths;
 mod reference;
+pub(crate) mod samples;
 
 #[cfg(test)]
 mod scenarios;
@@ -34,6 +35,16 @@ use std::io::Seek;
 /// does not predict whether a requested delete, repair or upload will be
 /// accepted.
 pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
+    // The sample catalog is built in, so it lists without an Ark
+    if let args::Data::Samples {
+        population,
+        sex,
+        all,
+    } = command
+    {
+        return samples::print(&context.output, population.as_deref(), sex, all);
+    }
+
     // An upload opens its file before it connects, so it runs on its own
     if let args::Data::Upload {
         file,
@@ -114,7 +125,9 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
             cache.as_deref(),
             no_cache,
         ),
-        args::Data::Upload { .. } | args::Data::Paths => unreachable!(),
+        args::Data::Upload { .. } | args::Data::Paths | args::Data::Samples { .. } => {
+            unreachable!()
+        }
     }
 }
 

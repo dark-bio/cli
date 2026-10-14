@@ -30,6 +30,263 @@ fn ark(args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Checks that the population list needs no Ark, whatever the device options.
+#[test]
+fn test_samples_list_populations_without_an_ark() {
+    for args in [
+        vec!["data", "samples"],
+        vec![
+            "--device",
+            "emulator:0",
+            "--unlock",
+            "--env",
+            "develop",
+            "data",
+            "samples",
+        ],
+        vec![
+            "data",
+            "samples",
+            "--device",
+            "invalid selector",
+            "--unlock",
+            "--no-input",
+        ],
+    ] {
+        let output = ark(&args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {:?}", output.stderr);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 27, "{args:?}");
+        assert_eq!(
+            text.lines().take(3).collect::<Vec<_>>(),
+            [
+                "POPULATION  SAMPLES  DESCRIPTION",
+                "ACB             116  African Caribbean in Barbados",
+                "ASW              74  African Ancestry in Southwest US",
+            ],
+            "{args:?}"
+        );
+        assert!(!text.contains('\x1b'), "pipe output has no ANSI escapes");
+    }
+
+    // The JSON document holds every population with its count and description
+    let output = ark(&["data", "samples", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "population JSON succeeds");
+    assert!(
+        output.stderr.is_empty(),
+        "population JSON is silent on stderr"
+    );
+    let document = json_output(&output);
+    assert_eq!(
+        document.as_object().unwrap().len(),
+        1,
+        "population document fields"
+    );
+    let populations = document["populations"].as_array().unwrap();
+    assert_eq!(populations.len(), 26, "population JSON count");
+    assert_eq!(
+        populations[0],
+        serde_json::json!({
+            "population": "ACB", "count": 116, "description": "African Caribbean in Barbados",
+        }),
+        "first population JSON row"
+    );
+    assert_eq!(
+        populations
+            .iter()
+            .map(|row| row["count"].as_u64().unwrap())
+            .sum::<u64>(),
+        3_202,
+        "total cohort count"
+    );
+    assert!(
+        populations
+            .windows(2)
+            .all(|pair| pair[0]["population"].as_str() < pair[1]["population"].as_str()),
+        "population code order"
+    );
+}
+
+/// Checks the people listings and their JSON, by population, sex or neither.
+#[test]
+fn test_samples_views_and_json() {
+    for (args, count, columns) in [
+        (
+            vec!["data", "samples", "JPT"],
+            104,
+            vec!["NAME", "SAMPLE", "SEX"],
+        ),
+        (
+            vec!["data", "samples", "JPT", "--sex", "female"],
+            48,
+            vec!["NAME", "SAMPLE", "SEX"],
+        ),
+        (
+            vec!["data", "samples", "JPT", "--sex", "male"],
+            56,
+            vec!["NAME", "SAMPLE", "SEX"],
+        ),
+        (
+            vec!["data", "samples", "--all"],
+            3_202,
+            vec!["NAME", "SAMPLE", "POPULATION", "SEX"],
+        ),
+    ] {
+        let output = ark(&args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), count + 1, "{args:?}");
+        assert_eq!(
+            text.lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            columns,
+            "{args:?}"
+        );
+
+        // The JSON holds every field, including those the table leaves out
+        let mut invocation = args.clone();
+        invocation.push("--json");
+        let output = ark(&invocation);
+        assert_eq!(output.status.code(), Some(0), "{invocation:?}");
+        assert!(output.stderr.is_empty(), "{invocation:?}");
+        let document = json_output(&output);
+        assert_eq!(document.as_object().unwrap().len(), 1, "{invocation:?}");
+        let samples = document["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), count, "{invocation:?}");
+        assert!(
+            samples
+                .windows(2)
+                .all(|pair| pair[0]["sample"].as_str() < pair[1]["sample"].as_str()),
+            "sample order: {invocation:?}"
+        );
+        for sample in samples {
+            assert_eq!(
+                sample
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["name", "sample", "population", "sex", "father", "mother"],
+                "{sample}"
+            );
+            assert!(
+                matches!(sample["sex"].as_str(), Some("male" | "female")),
+                "{sample}"
+            );
+            if args.contains(&"JPT") {
+                assert_eq!(sample["population"], "JPT", "{sample}");
+            }
+            if args.contains(&"--sex") {
+                assert_eq!(sample["sex"], *args.last().unwrap(), "{sample}");
+            }
+        }
+        if args.contains(&"--all") {
+            assert!(
+                samples
+                    .iter()
+                    .find(|sample| sample["sample"] == "HG00155")
+                    .unwrap()["mother"]
+                    .is_null(),
+                "parents outside the cohort are null"
+            );
+            assert_eq!(
+                samples[0],
+                serde_json::json!({
+                    "name": "orange-ravine", "sample": "HG00096", "population": "GBR",
+                    "sex": "male", "father": null, "mother": null,
+                }),
+                "first sample JSON row"
+            );
+            assert_eq!(
+                samples
+                    .iter()
+                    .find(|sample| sample["sample"] == "HG00405")
+                    .unwrap(),
+                &serde_json::json!({
+                    "name": "lemon-grass", "sample": "HG00405", "population": "CHS",
+                    "sex": "female", "father": "HG00403", "mother": "HG00404",
+                }),
+                "sample JSON parents"
+            );
+        }
+    }
+
+    // The sex filter applies across all populations too
+    let output = ark(&["data", "samples", "--all", "--sex", "female", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "all-population sex filter");
+    let document = json_output(&output);
+    let samples = document["samples"].as_array().unwrap();
+    assert!(!samples.is_empty(), "female samples exist");
+    assert!(
+        samples.iter().all(|sample| sample["sex"] == "female"),
+        "all-population filter selects females"
+    );
+}
+
+/// Checks where samples sits in the data group, its help and its completion.
+#[test]
+fn test_samples_help_and_completion() {
+    let output = ark(&["data", "-h"]);
+    assert_eq!(output.status.code(), Some(0), "data help succeeds");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let commands = text
+        .split_once("Commands:\n")
+        .unwrap()
+        .1
+        .split_once("\nOptions:")
+        .unwrap()
+        .0;
+    assert_eq!(
+        commands
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<Vec<_>>(),
+        [
+            "paths", "list", "show", "upload", "fetch", "samples", "delete", "repair"
+        ],
+        "data command order"
+    );
+    let help = ark(&["data", "samples", "-h"]);
+    assert_eq!(help.status.code(), Some(0), "samples help succeeds");
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        text.contains("Usage: ark data samples [OPTIONS] [POPULATION]"),
+        "samples usage"
+    );
+    assert!(
+        !text.contains("ACB") && !text.contains("YRI"),
+        "help omits population value lists"
+    );
+
+    // The zsh script describes each population, while help leaves the codes out
+    let output = ark(&["completions", "zsh"]);
+    assert_eq!(output.status.code(), Some(0), "zsh completion succeeds");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("JPT\\:\"Japanese in Tokyo, Japan\""),
+        "JPT description in zsh completion"
+    );
+    for code in [
+        "ACB", "ASW", "BEB", "CDX", "CEU", "CHB", "CHS", "CLM", "ESN", "FIN", "GBR", "GIH", "GWD",
+        "IBS", "ITU", "JPT", "KHV", "LWK", "MSL", "MXL", "PEL", "PJL", "PUR", "STU", "TSI", "YRI",
+    ] {
+        assert!(
+            text.contains(&format!("{code}\\:\"")),
+            "described completion for {code}"
+        );
+    }
+    assert!(
+        text.contains("male") && text.contains("female"),
+        "sex completion values"
+    );
+}
+
 /// Checks that every help route reports a failed stdout write as local I/O,
 /// retaining text output and the selected error-event format.
 #[cfg(unix)]
@@ -566,6 +823,42 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             vec!["data", "show", "bogus"],
             "unknown slot 'bogus'",
             vec!["use a slot name or id from `ark data list`"],
+        ),
+        (
+            vec!["data", "fetch", "referense-genome"],
+            "unknown slot 'referense-genome'",
+            vec![
+                "a similar value exists: `reference-genome`",
+                "use a slot name or id from `ark data list`",
+            ],
+        ),
+        (
+            vec!["data", "samples", "JTP"],
+            "unknown population 'JTP'",
+            vec![
+                "a similar value exists: `JPT`",
+                "use a population code from `ark data samples`",
+            ],
+        ),
+        (
+            vec!["data", "samples", "unknown"],
+            "unknown population 'unknown'",
+            vec!["use a population code from `ark data samples`"],
+        ),
+        (
+            vec!["data", "samples", "--sex", "female"],
+            "--sex needs a population or --all",
+            vec!["see `ark data samples --help`"],
+        ),
+        (
+            vec!["data", "samples", "JPT", "--all"],
+            "[POPULATION] cannot be combined with --all",
+            vec!["see `ark data samples --help`"],
+        ),
+        (
+            vec!["data", "samples", "--all", "JPT"],
+            "[POPULATION] cannot be combined with --all",
+            vec!["see `ark data samples --help`"],
         ),
         (
             vec!["data", "show", "snp-indel-call"],

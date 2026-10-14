@@ -9,6 +9,7 @@
 //! Clap consumes doc comments on arguments and variants as public help text.
 //! Developer-only notes beside those declarations use ordinary comments.
 
+use crate::data::samples::{self, Sex};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use darkbio_connect::trust::Environment;
 use std::path::PathBuf;
@@ -53,13 +54,29 @@ pub(crate) struct Cli {
 }
 
 impl Cli {
-    /// Checks the flag conflicts that span command levels, failing with a usage
-    /// error of class 2.
+    /// Checks the flag rules clap does not express, failing with a usage error
+    /// of class 2.
     ///
     /// Clap checks conflicts within one parser level, while a global flag may
     /// come from any level. This rejects `--dry-run` with `--unlock`, `--quiet`
-    /// with `--verbose`, and `--version` with a command.
+    /// with `--verbose`, `--version` with a command, and `--sex` on
+    /// `ark data samples` without a population or `--all`.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
+        // --sex narrows a list of people, which takes a population or --all
+        if matches!(
+            &self.command,
+            Some(Command::Data(Data::Samples {
+                population: None,
+                all: false,
+                sex: Some(_),
+            }))
+        ) {
+            return Err(
+                crate::error::Error::new(2, "usage", "--sex needs a population or --all")
+                    .hint("see `ark data samples --help`"),
+            );
+        }
+
         let dry = matches!(
             &self.command,
             Some(Command::Data(
@@ -239,6 +256,18 @@ pub(crate) enum Data {
         #[arg(long)]
         no_cache: bool,
     },
+    /// List the public genomes fetch can download
+    Samples {
+        /// Population code from `ark data samples`
+        #[arg(value_parser = populations(), hide_possible_values = true, conflicts_with = "all")]
+        population: Option<String>,
+        /// Only male or female samples
+        #[arg(long, value_enum)]
+        sex: Option<Sex>,
+        /// List every sample of every population
+        #[arg(long)]
+        all: bool,
+    },
     /// Empty a filled slot, approved on your phone
     Delete(Change),
     /// Erase a slot in any state, approved on your phone
@@ -277,6 +306,13 @@ pub(crate) enum Firmware {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+}
+
+/// Accepts a population code, and completes each one with its description.
+fn populations() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(samples::POPULATIONS.iter().map(|population| {
+        clap::builder::PossibleValue::new(population.code).help(population.description)
+    }))
 }
 
 /// Parses a cloud environment name, one of `release`, `staging` or `develop`.

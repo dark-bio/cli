@@ -169,6 +169,43 @@ fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<
     }
 }
 
+/// A table column: its header, the row field it shows and how that prints.
+#[derive(Clone, Copy)]
+pub(crate) struct Column<'a> {
+    /// Uppercase header, which also labels the field in a fallback block.
+    pub label: &'a str,
+    /// Row field the column shows.
+    pub key: &'a str,
+    /// Whether the column holds names a reader types, printed in Accent.
+    pub accent: bool,
+    /// Whether the column is the free text, which shrinks with an ellipsis.
+    pub flexible: bool,
+}
+
+impl Column<'_> {
+    /// Styles the column's field of a row, in Accent for a column of names.
+    fn value(&self, theme: &Theme, row: &Value) -> String {
+        if self.accent && !row[self.key].is_null() {
+            theme.paint(Role::Accent, super::scalar(&row[self.key]))
+        } else {
+            value(theme, self.key, &row[self.key])
+        }
+    }
+}
+
+impl<'a> From<(&'a str, &'a str)> for Column<'a> {
+    /// Makes a column with the field's default styling, where `summary`,
+    /// `description` and `name` are the free text.
+    fn from((label, key): (&'a str, &'a str)) -> Self {
+        Self {
+            label,
+            key,
+            accent: false,
+            flexible: matches!(key, "summary" | "description" | "name"),
+        }
+    }
+}
+
 /// Fits a table by shrinking one free-text column, then falls back to blocks.
 ///
 /// Selectors, hashes and other actionable fields are never ellipsized by the table.
@@ -177,10 +214,10 @@ fn fields(theme: &Theme, prefix: &str, key: &str, value: &Value, rows: &mut Vec<
 /// # Panics
 ///
 /// Panics when `rows` is empty and `empty` is omitted.
-pub(crate) fn table(
+pub(crate) fn table<'a>(
     theme: &Theme,
     rows: &[Value],
-    columns: &[(&str, &str)],
+    columns: &[impl Copy + Into<Column<'a>>],
     empty: Option<&str>,
 ) -> String {
     // With no rows, the sentence takes the table's place
@@ -193,13 +230,14 @@ pub(crate) fn table(
     }
 
     // Style every cell and measure each column against its header
+    let columns: Vec<Column<'a>> = columns.iter().map(|column| (*column).into()).collect();
     let cells: Vec<Vec<_>> = rows
         .iter()
         .map(|row| {
             columns
                 .iter()
-                .map(|(_, key)| {
-                    row[*key]
+                .map(|column| {
+                    row[column.key]
                         .as_str()
                         .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
                         .map(|time| {
@@ -210,7 +248,7 @@ pub(crate) fn table(
                                     .to_string(),
                             )
                         })
-                        .unwrap_or_else(|| value(theme, key, &row[*key]))
+                        .unwrap_or_else(|| column.value(theme, row))
                 })
                 .collect()
         })
@@ -218,26 +256,24 @@ pub(crate) fn table(
     let mut widths: Vec<_> = columns
         .iter()
         .enumerate()
-        .map(|(i, (label, _))| {
+        .map(|(i, column)| {
             cells
                 .iter()
                 .map(|row| console::measure_text_width(&row[i]))
                 .max()
                 .unwrap_or(0)
-                .max(label.len())
+                .max(column.label.len())
         })
         .collect();
 
     // Shrink the one free-text column to fit, never below its header or 8 cells
     let total =
         |widths: &[usize]| widths.iter().sum::<usize>() + columns.len().saturating_sub(1) * 2;
-    let flexible = columns
-        .iter()
-        .position(|(_, key)| matches!(*key, "summary" | "description" | "name"));
+    let flexible = columns.iter().position(|column| column.flexible);
     if let Some(index) = flexible {
         widths[index] = widths[index]
             .saturating_sub(total(&widths).saturating_sub(theme.width))
-            .max(columns[index].0.len().max(8));
+            .max(columns[index].label.len().max(8));
     }
 
     // A table that still overflows falls back to one block per row
@@ -250,7 +286,7 @@ pub(crate) fn table(
                     None,
                     &columns
                         .iter()
-                        .map(|(label, key)| (label.to_string(), value(theme, key, &row[*key])))
+                        .map(|column| (column.label.to_string(), column.value(theme, row)))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -259,6 +295,14 @@ pub(crate) fn table(
     }
 
     // Lay out a line, right-aligning sizes, durations and numeric columns
+    let right: Vec<_> = columns
+        .iter()
+        .map(|column| {
+            column.key.ends_with("_bytes")
+                || column.key.ends_with("_seconds")
+                || rows.iter().any(|row| row[column.key].is_number())
+        })
+        .collect();
     let line = |cells: &[String], header: bool| {
         let mut result = String::new();
         for (i, cell) in cells.iter().enumerate() {
@@ -267,11 +311,8 @@ pub(crate) fn table(
             } else {
                 cell.clone()
             };
-            let right = columns[i].1.ends_with("_bytes")
-                || columns[i].1.ends_with("_seconds")
-                || rows.iter().any(|row| row[columns[i].1].is_number());
             let padding = " ".repeat(widths[i].saturating_sub(console::measure_text_width(&cell)));
-            if right {
+            if right[i] {
                 result.push_str(&padding);
             }
             result.push_str(&if header {
@@ -280,7 +321,7 @@ pub(crate) fn table(
                 cell
             });
             if i + 1 < cells.len() {
-                if !right {
+                if !right[i] {
                     result.push_str(&padding);
                 }
                 result.push_str("  ");
@@ -293,7 +334,7 @@ pub(crate) fn table(
     let mut lines = vec![line(
         &columns
             .iter()
-            .map(|(label, _)| label.to_string())
+            .map(|column| column.label.to_string())
             .collect::<Vec<_>>(),
         true,
     )];
@@ -562,6 +603,29 @@ mod tests {
             assert!(!rendered.contains("download."));
             assert!(rendered.contains("Download size"));
         }
+    }
+
+    /// Checks that device names stay plain and truncate beside Accent locators.
+    #[test]
+    fn test_device_columns_keep_existing_rendering() {
+        let rows = [json!({
+            "locator": "hardware:00:1", "name": "Example Founder Ark", "serial": "founder-1",
+        })];
+        let rendered = table(
+            &Theme::test(40, Color::Basic, true),
+            &rows,
+            &[
+                ("LOCATOR", "locator"),
+                ("NAME", "name"),
+                ("SERIAL", "serial"),
+            ],
+            Some("No Arks found"),
+        );
+        assert_eq!(
+            rendered,
+            "LOCATOR        NAME            SERIAL\n\x1b[1mhardware:00:1\x1b[0m  Example Found…  founder-1",
+            "device names keep their flexible plain column"
+        );
     }
 
     /// A table right-aligns sizes and marks states.

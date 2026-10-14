@@ -156,8 +156,8 @@ const CONTRACTS: &[Contract] = &[
         path: "data",
         paragraph: "An Ark keeps its data in slots, one per kind of dataset. These commands \
             describe the slots and the paths apps read, upload the owner's calls, download \
-            public references and empty slots. Each needs a paired, unlocked Ark, and \
-            `ark help datasets` covers them all.",
+            public data, list public genomes and empty slots. All but samples need a \
+            paired, unlocked Ark, and `ark help datasets` covers them all.",
         footer: None,
     },
     Contract {
@@ -237,6 +237,24 @@ const CONTRACTS: &[Contract] = &[
             json: "fetched, each with slot, id, url, size_bytes, sha256, cached, outcome, \
                 error; --dry-run marks pending rows as planned",
             examples: "ark data fetch --all\nark data fetch --all --dry-run --json",
+        }),
+    },
+    Contract {
+        path: "data samples",
+        paragraph: "The genomes are the variant calls of the 1000 Genomes Project's 3,202 \
+            people, made by Illumina's DRAGEN 4.4.7, and every donor consented to full \
+            public release. Each keeps a fixed name made from its sample ID, such as \
+            forked-knoll for NA12878, the genome GIAB benchmarks as HG001, and `ark data \
+            fetch --sample` takes either. With no population the list shows the 26 \
+            populations, and with one it shows that population's people. --all shows \
+            everyone instead of a population, and --sex narrows either to one sex.",
+        footer: Some(ContractFooter {
+            requires: "nothing, since the list is built into ark",
+            approval: "none",
+            time: "instant",
+            json: "populations, each with population, count, description; with a population \
+                or --all, samples, each with name, sample, population, sex, father, mother",
+            examples: "ark data samples JPT\nark data samples JPT --sex female --json",
         }),
     },
     Contract {

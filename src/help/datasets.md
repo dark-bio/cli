@@ -3,9 +3,10 @@
 An Ark keeps its data in slots, one per kind of dataset. The personal slot
 holds the owner's variant calls, which ark uploads with their approval on
 the phone. The reference slots hold public data that the Ark offers for
-download, which ark fetches without an approval. Every data command needs a
-paired, unlocked Ark, as `ark help devices` describes. `ark data paths` maps
-what apps read from the slots, as `ark help apps` describes.
+download, which ark fetches without an approval. Every data command but
+`ark data samples` needs a paired, unlocked Ark, as `ark help devices`
+describes. `ark data paths` maps what apps read from the slots, as
+`ark help apps` describes.
 
 ## Slots
 
@@ -103,6 +104,31 @@ without a download. An interrupted download keeps what arrived and resumes
 from there, and network failures get 3 attempts in all. --cache picks
 another directory, and --no-cache streams without keeping a copy. The cache
 holds only public reference files.
+
+## Public samples
+
+`ark data samples` lists public genomes for testing an Ark with real data.
+They are the variant calls of the 1000 Genomes Project's 3,202 people, made
+by Illumina's DRAGEN 4.4.7, and every donor consented to full public
+release. The list is built into ark and needs no Ark.
+
+Each sample keeps a fixed name made from its sample ID, two words such as
+forked-knoll for NA12878. The name never changes, so a test, a bug report
+and a colleague all reach the same genome. Commands take the name or the
+ID. The words of each list differ by at least two letters, so a one-letter
+typo fails instead of reaching another person.
+
+With no population the command lists the 26 populations, each with its
+code, its number of people and a description. A code lists that
+population's people in sample ID order, --sex narrows them, and --all lists
+all 3,202. NA12878, forked-knoll, is the genome GIAB benchmarks as HG001
+with a published truth set, and its parents are lucid-kelp and
+windy-cistern.
+
+--json returns populations, each with population, count and description.
+With a population or --all it returns samples, each with name, sample,
+population, sex, father and mother, where a parent outside the cohort is
+null.
 
 ## Emptying a slot
 

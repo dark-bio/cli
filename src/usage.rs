@@ -45,12 +45,18 @@ pub(crate) fn from_clap(
             format!("missing a value for {option}")
         }
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => match option {
-            "<SLOT>" | "--slot" => format!("unknown slot '{value}'"),
+            "<SLOT>" | "[SLOT]" | "--slot" => format!("unknown slot '{value}'"),
+            "<POPULATION>" | "[POPULATION]" => format!("unknown population '{value}'"),
             "--env" => format!("unknown environment '{value}'"),
             "--timeout" => "timeout must be a positive number of seconds".into(),
             "<SHELL>" => format!("unknown shell '{value}'"),
             _ => format!("unknown value '{value}' for {option}"),
         },
+        ErrorKind::ArgumentConflict
+            if option == "--all" && context(error, ContextKind::PriorArg) == "[POPULATION]" =>
+        {
+            "[POPULATION] cannot be combined with --all".into()
+        }
         ErrorKind::ArgumentConflict => format!(
             "{argument} cannot be combined with {}",
             context(error, ContextKind::PriorArg)
@@ -77,14 +83,15 @@ pub(crate) fn from_clap(
         }
     }
 
-    // A slot or an environment goes through a custom parser, so match its
-    // spelling with clap's matcher here
+    // Slots and environments go through custom parsers, and clap misses swapped
+    // letters in population codes, so match their spelling here
     if matches!(
         error.kind(),
         ErrorKind::InvalidValue | ErrorKind::ValueValidation
     ) {
         let suggested = match option {
-            "<SLOT>" | "--slot" => similar(&value, args::slot_names()),
+            "<SLOT>" | "[SLOT]" | "--slot" => similar(&value, args::slot_names()),
+            "<POPULATION>" | "[POPULATION]" => similar_population(&value),
             "--env" => similar(
                 &value,
                 args::environments().map(|environment| environment.to_string()),
@@ -92,20 +99,44 @@ pub(crate) fn from_clap(
             _ => None,
         };
         if let Some(suggested) = suggested {
-            result
-                .hints
-                .push(format!("a similar value exists: `{suggested}`"));
+            let hint = format!("a similar value exists: `{suggested}`");
+            if !result.hints.contains(&hint) {
+                result.hints.push(hint);
+            }
         }
-        if matches!(option, "<SLOT>" | "--slot") {
+        if matches!(option, "<SLOT>" | "[SLOT]" | "--slot") {
             result
                 .hints
                 .push("use a slot name or id from `ark data list`".into());
+        }
+        if matches!(option, "<POPULATION>" | "[POPULATION]") {
+            result
+                .hints
+                .push("use a population code from `ark data samples`".into());
         }
     }
     if result.hints.is_empty() {
         result.hints.push(format!("see `{path} --help`"));
     }
     result
+}
+
+/// Finds the population code a mistyped one most likely means.
+fn similar_population(value: &str) -> Option<String> {
+    use crate::data::samples::POPULATIONS;
+
+    // Try clap's matcher, then the codes with two neighboring letters swapped
+    similar(value, POPULATIONS.iter().map(|population| population.code)).or_else(|| {
+        let &[a, b, c] = value.as_bytes() else {
+            return None;
+        };
+        POPULATIONS
+            .iter()
+            .find(|population| {
+                population.code.as_bytes() == [b, a, c] || population.code.as_bytes() == [a, c, b]
+            })
+            .map(|population| population.code.to_owned())
+    })
 }
 
 /// Words a missing positional by what it is, rather than by its placeholder.
