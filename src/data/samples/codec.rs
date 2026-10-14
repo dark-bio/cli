@@ -54,13 +54,6 @@ pub(super) fn encode(sample: &str) -> Option<String> {
 /// Unknown words, a missing or extra hyphen and the 5,536 pairs outside the
 /// domain decode to nothing. Words of a list differ in two letters or more, so
 /// a one-letter slip never names another person.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "listings only encode; decoding serves names typed by people"
-    )
-)]
 pub(super) fn decode(name: &str) -> Option<String> {
     // Refuse anything longer than two eight-letter words, then look both up
     if name.len() > 17 {

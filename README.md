@@ -94,13 +94,15 @@ The enrollment lasts 30 days. `ark-emulator stop`, `ark-emulator wipe` and
 | `ark data list`, `show` | Shows the dataset slots and their state | nobody |
 | `ark data paths` | Maps the data an app can read | nobody |
 | `ark data upload` | Uploads the owner's variant calls | the owner, on the phone |
-| `ark data fetch` | Downloads public reference data onto the Ark | nobody |
+| `ark data fetch` | Downloads public data onto the Ark | nobody; the owner, on the phone, for a sample |
+| `ark data samples` | Lists public genomes to test an Ark with | nobody |
 | `ark data delete`, `repair` | Empties or erases a slot | the owner, on the phone |
 | `ark run` | Runs an app and prints its report | the owner, on the phone, for the run and its report |
 | `ark firmware list`, `update` | Lists and installs firmware | by the Ark's state: nobody, the Ark's button or the phone |
 | `ark doctor` | Checks this computer, the Ark and the cloud | nobody |
 
-The data commands and `ark run` need a paired, unlocked Ark.
+`ark run` and every data command but `ark data samples` need a paired,
+unlocked Ark.
 `ark <command> --help` prints a command's page with its contract: what it
 requires, who approves, how long it takes and what its JSON holds.
 
@@ -127,7 +129,7 @@ the same on GitHub:
 | --- | --- |
 | [`agents`](src/help/agents.md) | Running ark from an AI agent, the approvals it waits on, and common tasks |
 | [`devices`](src/help/devices.md) | Finding an Ark, trust, pairing and unlocking, emulators and cloud environments |
-| [`datasets`](src/help/datasets.md) | Slots, uploads, reference downloads and the cache |
+| [`datasets`](src/help/datasets.md) | Slots, uploads, downloads, public samples and the cache |
 | [`apps`](src/help/apps.md) | Running an app, the manifest, grants, questions, the data map and the sandbox |
 | [`firmware`](src/help/firmware.md) | Compatibility, published builds and updates |
 | [`output`](src/help/output.md) | Reading output, JSON and events |

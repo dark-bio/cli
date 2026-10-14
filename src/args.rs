@@ -59,8 +59,9 @@ impl Cli {
     ///
     /// Clap checks conflicts within one parser level, while a global flag may
     /// come from any level. This rejects `--dry-run` with `--unlock`, `--quiet`
-    /// with `--verbose`, `--version` with a command, and `--sex` on
-    /// `ark data samples` without a population or `--all`.
+    /// with `--verbose`, `--version` with a command, `--sex` on
+    /// `ark data samples` without a population or `--all`, and `--sample` on a
+    /// slot other than snp-indel-calls.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         // --sex narrows a list of people, which takes a population or --all
         if matches!(
@@ -75,6 +76,26 @@ impl Cli {
                 crate::error::Error::new(2, "usage", "--sex needs a population or --all")
                     .hint("see `ark data samples --help`"),
             );
+        }
+
+        // --sample fills only snp-indel-calls, refused before anything connects
+        if let Some(Command::Data(Data::Fetch {
+            slot: Some(slot),
+            sample: Some(_),
+            ..
+        })) = &self.command
+            && *slot != darkbio_connect::schema::SlotKind::SnpIndelCalls as i32
+        {
+            let name = slot_name(*slot);
+            let mut error = crate::error::Error::new(
+                2,
+                "usage",
+                format!("--sample fills snp-indel-calls, not {name}"),
+            );
+            if slot_names().any(|known| known == name) {
+                error = error.hint(format!("run `ark data fetch {name}`"));
+            }
+            return Err(error);
         }
 
         let dry = matches!(
@@ -238,7 +259,7 @@ pub(crate) enum Data {
         #[arg(long, conflicts_with = "unlock")]
         dry_run: bool,
     },
-    /// Download public reference data onto the Ark
+    /// Download public data onto the Ark
     Fetch {
         /// Slot name or id from `ark data list`
         #[arg(value_parser = parse_slot, required_unless_present = "all", conflicts_with = "all")]
@@ -246,13 +267,16 @@ pub(crate) enum Data {
         /// Fetch every reference on offer, in order
         #[arg(long)]
         all: bool,
+        /// Fill the slot with a public genome, by name or sample ID
+        #[arg(long, value_name = "NAME", value_parser = samples::Parser, hide_possible_values = true, conflicts_with = "all")]
+        sample: Option<samples::Sample>,
         /// Show the plan without changing the Ark
         #[arg(long, conflicts_with = "unlock")]
         dry_run: bool,
         /// Download cache directory
         #[arg(long, value_name = "DIR", conflicts_with = "no_cache")]
         cache: Option<PathBuf>,
-        /// Stream without keeping a copy
+        /// Keep no copy in the cache
         #[arg(long)]
         no_cache: bool,
     },
@@ -262,7 +286,7 @@ pub(crate) enum Data {
         #[arg(value_parser = populations(), hide_possible_values = true, conflicts_with = "all")]
         population: Option<String>,
         /// Only male or female samples
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, hide_possible_values = true)]
         sex: Option<Sex>,
         /// List every sample of every population
         #[arg(long)]

@@ -65,7 +65,7 @@ impl Ark {
     ///
     /// It returns the verifier's identity information. Every operation of the
     /// connection reads time from the stream's clock. Failure closes the stream.
-    pub(crate) fn attach<R, W, V>(
+    pub fn attach<R, W, V>(
         stream: transport::Stream<R, W>,
         verifier: &V,
         cloud: impl FnOnce(&Identity) -> Option<(crate::trust::Environment, crate::trust::Realm)>,

@@ -95,7 +95,8 @@ or the request is fixed.
 - `dependency-missing` means a reference slot requires a slot that is empty,
   such as the owner's calls. Fill that one first.
 - `no-download` means the Ark offers no download for the slot
-  `ark data fetch` names. `ark data show` shows the slot's requirements.
+  `ark data fetch` names. `ark data show` shows the slot's requirements, and
+  --sample fills snp-indel-calls with a public sample instead.
 - `ark` means the Ark refused the request. Act on its message, never on its
   number, which can change between firmware builds.
 - `unsupported` means the Ark never serves the request in its build or role,

@@ -6,7 +6,7 @@
 
 //! Scripted wire peers, attestations and test clocks for connection and trust tests.
 
-use crate::{Ark, Error, Identity, TrustMode};
+use super::{Ark, Error, Identity, TrustMode};
 use darkbio_clock::{Clock, TestClock};
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};

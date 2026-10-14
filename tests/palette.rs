@@ -263,6 +263,10 @@ fn test_samples_help_and_completion() {
         !text.contains("ACB") && !text.contains("YRI"),
         "help omits population value lists"
     );
+    assert!(
+        !text.contains("possible values:"),
+        "help omits the sex value list"
+    );
 
     // The zsh script describes each population, while help leaves the codes out
     let output = ark(&["completions", "zsh"]);
@@ -284,6 +288,35 @@ fn test_samples_help_and_completion() {
     assert!(
         text.contains("male") && text.contains("female"),
         "sex completion values"
+    );
+    assert!(
+        text.contains("forked-knoll\\:\"NA12878 · CEU · female\""),
+        "sample description in zsh completion"
+    );
+
+    // The fetch page describes --sample without listing the cohort
+    let output = ark(&["data", "fetch", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "fetch help succeeds");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with("Download public data onto the Ark\n"),
+        "fetch one-liner"
+    );
+    assert!(
+        text.contains("--sample <NAME>"),
+        "sample option placeholder"
+    );
+    assert!(
+        text.contains("Fill the slot with a public genome, by name or sample ID"),
+        "sample option help"
+    );
+    assert!(
+        !text.contains("possible values:"),
+        "help omits sample value lists"
+    );
+    assert!(
+        !text.contains("orange-ravine"),
+        "help omits catalog names beyond its examples"
     );
 }
 
@@ -833,12 +866,66 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             ],
         ),
         (
+            vec!["data", "fetch", "reference-genome", "--all"],
+            "[SLOT] cannot be combined with --all",
+            vec!["see `ark data fetch --help`"],
+        ),
+        (
+            vec!["data", "fetch", "--all", "reference-genome"],
+            "--all cannot be combined with [SLOT]",
+            vec!["see `ark data fetch --help`"],
+        ),
+        (
+            vec!["data", "fetch", "--all", "--no-cache", "--cache", "unused"],
+            "--no-cache cannot be combined with --cache",
+            vec!["see `ark data fetch --help`"],
+        ),
+        (
+            vec!["data", "fetch", "--all", "--cache", "unused", "--no-cache"],
+            "--cache cannot be combined with --no-cache",
+            vec!["see `ark data fetch --help`"],
+        ),
+        (
             vec!["data", "samples", "JTP"],
             "unknown population 'JTP'",
             vec![
                 "a similar value exists: `JPT`",
                 "use a population code from `ark data samples`",
             ],
+        ),
+        (
+            vec![
+                "data",
+                "fetch",
+                "snp-indel-calls",
+                "--sample",
+                "orange-ravin",
+            ],
+            "unknown sample 'orange-ravin'",
+            vec![
+                "a similar value exists: `orange-ravine`",
+                "use a sample name or id from `ark data samples`",
+            ],
+        ),
+        (
+            vec!["data", "fetch", "snp-indel-calls", "--sample", "????"],
+            "unknown sample '????'",
+            vec!["use a sample name or id from `ark data samples`"],
+        ),
+        (
+            vec!["data", "fetch", "reference-genome", "--sample", "HG00096"],
+            "--sample fills snp-indel-calls, not reference-genome",
+            vec!["run `ark data fetch reference-genome`"],
+        ),
+        (
+            vec!["data", "fetch", "1", "--sample", "orange-ravine"],
+            "--sample fills snp-indel-calls, not reference-genome",
+            vec!["run `ark data fetch reference-genome`"],
+        ),
+        (
+            vec!["data", "fetch", "42", "--sample", "orange-ravine"],
+            "--sample fills snp-indel-calls, not 42",
+            vec![],
         ),
         (
             vec!["data", "samples", "unknown"],
@@ -1084,6 +1171,38 @@ fn usage_errors_are_json_in_both_streams() {
         let message = document["error"]["message"].as_str().unwrap();
         assert!(!message.contains("Usage:"), "{message}");
     }
+}
+
+/// Checks that --sample needs a named slot and refuses --all.
+#[test]
+fn test_sample_fetch_requires_a_slot_and_conflicts_with_all() {
+    for (args, message) in [
+        (
+            vec!["data", "fetch", "--all", "--sample", "orange-ravine"],
+            "--all cannot be combined with --sample",
+        ),
+        (
+            vec!["data", "fetch", "--sample", "HG00096", "--all"],
+            "--sample cannot be combined with --all",
+        ),
+    ] {
+        let output = ark(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr,
+            format!("error[usage]: {message}\nhint: see `ark data fetch --help`\n"),
+            "{args:?}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    let output = ark(&["data", "fetch", "--sample", "HG00096"]);
+    assert_eq!(output.status.code(), Some(2), "sample needs a slot");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error[usage]: missing the slot name or id\nhint: see `ark data fetch --help`\n",
+        "missing slot guidance"
+    );
 }
 
 /// Checks that firmware confirmation is listed only on its command and fails

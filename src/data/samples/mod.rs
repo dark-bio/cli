@@ -4,12 +4,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! The public sample catalog and the listing of `ark data samples`.
+//! The public sample catalog, the pins of its files and `ark data samples`.
 
 mod adjectives;
 mod codec;
 mod nouns;
 mod people;
+mod pins;
 mod populations;
 
 pub(crate) use populations::POPULATIONS;
@@ -22,8 +23,10 @@ use crate::{
     },
     style::Theme,
 };
-use clap::ValueEnum;
+use clap::{ValueEnum, builder::TypedValueParser};
+use darkbio_connect::schema::SlotDownload;
 use people::PEOPLE;
+use pins::PINS;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -49,6 +52,115 @@ struct Person {
     father: Option<&'static str>,
     /// Mother's sample ID, when she is in the cohort.
     mother: Option<&'static str>,
+}
+
+/// A person of the catalog, as `--sample` selects them by name or ID.
+#[derive(Clone, Copy)]
+pub(crate) struct Sample(
+    /// The selected person.
+    &'static Person,
+);
+
+impl Sample {
+    /// Finds the catalog person a sample ID or a name stands for.
+    fn parse(value: &str) -> Option<Self> {
+        let decoded = codec::decode(value);
+        let sample = decoded.as_deref().unwrap_or(value);
+        PEOPLE
+            .binary_search_by_key(&sample, |person| person.sample)
+            .ok()
+            .map(|index| Self(&PEOPLE[index]))
+    }
+
+    /// Returns the sample ID, such as `NA12878`.
+    pub(super) fn id(self) -> &'static str {
+        self.0.sample
+    }
+
+    /// Derives the person's two-word name, such as `forked-knoll`.
+    pub(super) fn name(self) -> String {
+        codec::encode(self.0.sample).expect("catalog sample IDs lie in the codec's domain")
+    }
+
+    /// Builds an offer for the person's DRAGEN 4.4.7 calls from their pin.
+    pub(super) fn download(self) -> SlotDownload {
+        let index = PINS
+            .binary_search_by_key(&self.id(), |pin| pin.sample)
+            .expect("every catalog person has exactly one pin");
+        let pin = &PINS[index];
+        let sample = self.id();
+        SlotDownload {
+            url: format!(
+                "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/{sample}/{sample}.hard-filtered.vcf.gz"
+            ),
+            bytes: pin.size,
+            sha256: pin.sha256.into(),
+        }
+    }
+}
+
+/// Pinned size and SHA-256 of one person's variant call file.
+struct Pin {
+    /// Sample ID of the file's person.
+    sample: &'static str,
+    /// Length in bytes.
+    size: u64,
+    /// SHA-256 of the file, in lowercase hex.
+    sha256: &'static str,
+}
+
+/// Parser of `--sample`, which takes names and IDs and completes each name
+/// with its sample ID, population and sex.
+#[derive(Clone)]
+pub(crate) struct Parser;
+
+impl TypedValueParser for Parser {
+    type Value = Sample;
+
+    fn parse_ref(
+        &self,
+        command: &clap::Command,
+        argument: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Sample, clap::Error> {
+        let value = clap::builder::StringValueParser::new().parse_ref(command, argument, value)?;
+        Sample::parse(&value).ok_or_else(|| {
+            let mut error =
+                clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(command);
+            error.insert(
+                clap::error::ContextKind::InvalidArg,
+                clap::error::ContextValue::String("--sample <NAME>".into()),
+            );
+            error.insert(
+                clap::error::ContextKind::InvalidValue,
+                clap::error::ContextValue::String(value),
+            );
+            error
+        })
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(PEOPLE.iter().map(|person| {
+            clap::builder::PossibleValue::new(Sample(person).name()).help(format!(
+                "{} · {} · {}",
+                person.sample,
+                person.population,
+                match person.sex {
+                    Sex::Male => "male",
+                    Sex::Female => "female",
+                }
+            ))
+        })))
+    }
+}
+
+/// Lists every name and sample ID, for suggesting a near match to a typo.
+pub(crate) fn selectors() -> impl Iterator<Item = String> {
+    PEOPLE
+        .iter()
+        .flat_map(|person| [Sample(person).name(), person.sample.to_owned()])
 }
 
 /// A population of the cohort.
@@ -157,6 +269,58 @@ fn sample_table(theme: &Theme, rows: &[Value], all: bool) -> String {
 mod tests {
     use super::*;
     use crate::style::Color;
+
+    /// Checks that every person has one nonempty pin, in sample ID order.
+    #[test]
+    fn test_every_person_has_one_pin() {
+        for pair in PINS.windows(2) {
+            assert!(
+                pair[0].sample < pair[1].sample,
+                "pin order at {}",
+                pair[0].sample
+            );
+        }
+        for pin in PINS {
+            assert!(pin.size > 0, "nonempty file for {}", pin.sample);
+            assert!(
+                PEOPLE
+                    .binary_search_by_key(&pin.sample, |person| person.sample)
+                    .is_ok(),
+                "pin belongs to the catalog: {}",
+                pin.sample
+            );
+        }
+        assert_eq!(PINS.len(), PEOPLE.len(), "one pin for every catalog person");
+        for (pin, person) in PINS.iter().zip(PEOPLE) {
+            assert_eq!(pin.sample, person.sample, "pin for {}", person.sample);
+        }
+    }
+
+    /// Checks that names and IDs select only people in the catalog.
+    #[test]
+    fn test_sample_selection_requires_a_catalog_person() {
+        for person in PEOPLE {
+            let name = codec::encode(person.sample).unwrap();
+            for value in [person.sample, name.as_str()] {
+                assert_eq!(Sample::parse(value).unwrap().id(), person.sample, "{value}");
+            }
+        }
+        for value in [
+            "HG00000",
+            "hg00096",
+            "HG30000",
+            "orange-ravin",
+            "ravine-orange",
+            "",
+        ] {
+            assert!(Sample::parse(value).is_none(), "unknown sample {value:?}");
+        }
+        let outside = codec::encode("HG00000").unwrap();
+        assert!(
+            Sample::parse(&outside).is_none(),
+            "name outside the catalog"
+        );
+    }
 
     /// Checks the catalog's size, order, population codes, counts and parents.
     #[test]

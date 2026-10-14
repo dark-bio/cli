@@ -4,14 +4,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Reference data downloads, with their planning, transport recovery and cache
+//! Public data downloads, with their planning, transport recovery and cache
 //! replay.
 //!
-//! Each attempt starts a new Ark upload and replays the retained bytes from disk.
+//! A personal slot's download is verified before its one upload asks for approval.
+//! Each reference attempt starts a new upload and replays retained bytes from disk.
 //! The HTTP range request opens only when replay reaches the missing suffix.
 //! Opening it earlier leaves the response unread while a large prefix uploads.
 
-use super::{Operation, Progress, cache, download, filled, select};
+mod personal;
+
+use super::{Operation, Progress, cache, download, filled, samples::Sample, select};
 use crate::{
     args::slot_name,
     context::{Connection, Context},
@@ -20,7 +23,10 @@ use crate::{
     output::Output,
 };
 use darkbio_clock::Clock;
-use darkbio_connect::{Dataset, schema::SlotStatus};
+use darkbio_connect::{
+    Client, Dataset,
+    schema::{SlotKind, SlotOrigin, SlotStatus},
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -30,21 +36,48 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Plans the references and installs each available download.
+/// Which slots a fetch fills, from the Ark's offers or from a sample.
+pub(super) enum Target {
+    /// Every reference slot the Ark offers a download for, in dependency order.
+    All,
+    /// One slot, from the download the Ark offers for it.
+    Slot(i32),
+    /// The snp-indel-calls slot, from a sample's pinned variant calls.
+    Sample(Sample),
+}
+
+/// Plans the target's downloads and installs each one.
 ///
 /// Planning all references also checks their dependencies and orders the work,
-/// skipping filled slots and those without offers. A slot picked by `id` is
-/// installed alone and needs an offer unless filled. Stops at the first failure
+/// skipping filled slots and those without offers. A named slot is installed
+/// alone, from the Ark's offer or a sample's pin. It stops at the first failure
 /// and reports completed, failed and unattempted slots. A dry run only plans.
 pub(super) fn fetch(
     context: &Context,
     connection: &Connection,
     slots: &[SlotStatus],
-    id: Option<i32>,
+    target: Target,
     dry_run: bool,
     directory: Option<&Path>,
     no_cache: bool,
 ) -> Result<(), Error> {
+    // A sample's pin stands in for an offer on the slot the Ark reports
+    let (id, sample) = match target {
+        Target::All => (None, None),
+        Target::Slot(id) => (Some(id), None),
+        Target::Sample(sample) => (Some(SlotKind::SnpIndelCalls as i32), Some(sample)),
+    };
+    let selected;
+    let slots = if let Some(sample) = sample {
+        selected = [SlotStatus {
+            download: Some(sample.download()),
+            ..select(slots, SlotKind::SnpIndelCalls as i32)?.clone()
+        }];
+        &selected
+    } else {
+        slots
+    };
+
     // Order the plan and validate every offer it downloads before any change
     let directory = directory
         .map(Path::to_path_buf)
@@ -55,8 +88,9 @@ pub(super) fn fetch(
         Some(directory.as_path())
     };
     let ordered = plan(slots, id)?;
-    execute(context, &ordered, dry_run, directory, |source| {
-        install(context, connection, source, directory)
+    let agent = http::agent(Duration::from_secs(context.options.timeout), 5);
+    execute(context, &ordered, sample, dry_run, directory, |source| {
+        install(context, &connection.client, source, directory, &agent)
     })
 }
 
@@ -66,6 +100,7 @@ pub(super) fn fetch(
 fn execute(
     context: &Context,
     ordered: &[&SlotStatus],
+    sample: Option<Sample>,
     dry_run: bool,
     directory: Option<&Path>,
     mut install: impl FnMut(&Source) -> Result<(), Error>,
@@ -76,7 +111,7 @@ fn execute(
         .iter()
         .map(|slot| {
             let offer = download(slot);
-            json!({
+            let mut row = json!({
                 "slot": slot_name(slot.kind),
                 "id": slot.kind,
                 "url": offer.map(|offer| offer.0),
@@ -93,7 +128,12 @@ fn execute(
                     "not-attempted"
                 },
                 "error": null,
-            })
+            });
+            if let Some(sample) = sample {
+                row["sample"] = json!(sample.id());
+                row["name"] = json!(sample.name());
+            }
+            row
         })
         .collect();
     context.interrupt.partial(json!({"fetched":rows}));
@@ -226,7 +266,7 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
     Ok(ordered)
 }
 
-/// Validated reference offer used by both protocol upload and HTTP/cache handling.
+/// Validated public download, shared by the upload and the HTTP and cache code.
 struct Source {
     /// Filename, exact length, target slot and binary digest passed to connect.
     dataset: Dataset,
@@ -234,6 +274,8 @@ struct Source {
     url: String,
     /// Canonical lowercase SHA-256 used as a cache basename.
     hash: String,
+    /// Whether the target is a personal slot, whose upload the owner approves.
+    personal: bool,
 }
 
 /// Validates a nonempty HTTPS offer and its complete digest before any
@@ -241,11 +283,16 @@ struct Source {
 fn offer(slot: &SlotStatus) -> Result<Source, Error> {
     // The slot must advertise a download with a URL that parses
     let (url, size, hash) = download(slot).ok_or_else(|| {
-        Error::new(
+        let error = Error::new(
             5,
             "no-download",
             format!("{} advertises no download", slot_name(slot.kind)),
-        )
+        );
+        if slot.kind == SlotKind::SnpIndelCalls as i32 {
+            error.hint("--sample fills it with a public genome from `ark data samples`")
+        } else {
+            error
+        }
     })?;
     let uri: ureq::http::Uri = url
         .parse()
@@ -291,46 +338,37 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
         },
         url: url.into(),
         hash: hex::encode(sha256),
+        personal: slot.origin == SlotOrigin::Personal as i32,
     })
 }
 
-/// Replays a complete cache or streams a download through a fresh Ark upload.
+/// Installs a download into its slot.
 ///
-/// At most three network attempts resume retained bytes when possible. Protocol
-/// refusals are returned; only source failures or a corrupt prefix permit replay.
-/// A refused HTTP range discards the prefix before the next attempt.
+/// A personal slot downloads and verifies the file before one upload, since
+/// that upload asks the owner. A reference replays a cached copy or streams the
+/// download into the Ark, in up to three attempts that resume kept bytes. Only
+/// a broken source or a corrupt kept prefix earns another attempt, and a
+/// refused range request drops the prefix first.
 fn install(
     context: &Context,
-    connection: &Connection,
+    client: &Client,
     source: &Source,
     directory: Option<&Path>,
+    agent: &ureq::Agent,
 ) -> Result<(), Error> {
+    if source.personal {
+        return personal::install(context, client, source, directory, agent);
+    }
     let mut directory = directory;
-    let clock = connection.client.clock();
-    let slot = source.dataset.slot.expect("reference slot");
+    let clock = client.clock();
+    let slot = source.dataset.slot.expect("download target slot");
 
     // Upload a complete cached copy first, removing one that is corrupt or
     // unreadable
     if let Some(directory) = directory {
         let path = directory.join(&source.hash);
         if let Ok(mut file) = File::open(&path) {
-            let mut progress = Progress::new(
-                context,
-                clock.clone(),
-                slot,
-                source.dataset.size,
-                Operation::Fetch,
-            );
-            let result = connection.client.upload_dataset(
-                &source.dataset,
-                &mut file,
-                context.timing(),
-                |stage| progress.update(stage),
-            );
-            context.interrupt.clear();
-            if result.is_ok() {
-                context.output.end_stage(None, None);
-            }
+            let result = replay(context, client, source, &mut file);
             match result {
                 Ok(()) => {
                     context
@@ -342,7 +380,7 @@ fn install(
                     context.output.fail_stage(None);
                     context.output.event(
                         "warning",
-                        "cached reference failed verification; downloading it again",
+                        "cached download failed verification; downloading it again",
                     );
                     let _ = fs::remove_file(&path);
                 }
@@ -361,7 +399,6 @@ fn install(
 
     // Download in up to three attempts, each locking the cache entry or
     // streaming without one when it is unavailable
-    let agent = http::agent(Duration::from_secs(context.options.timeout), 5);
     for attempt in 0..3 {
         let entry = match directory {
             Some(path) => {
@@ -382,20 +419,17 @@ fn install(
 
         // Upload through the reader, stamping each session start and
         // acknowledgment for its stall check
-        let mut reader = Reader::new(&agent, source, &context.output, clock.clone(), entry)?;
+        let mut reader = Reader::new(agent, source, &context.output, clock.clone(), entry)?;
         let last_upload = reader.last_upload.clone();
         let mut progress = Progress::new(
             context,
             clock.clone(),
             slot,
             source.dataset.size,
-            Operation::Fetch,
+            Operation::Fetch { approval: false },
         );
-        let result = connection.client.upload_dataset(
-            &source.dataset,
-            &mut reader,
-            context.timing(),
-            |stage| {
+        let result =
+            client.upload_dataset(&source.dataset, &mut reader, context.timing(), |stage| {
                 if matches!(
                     stage,
                     darkbio_connect::UploadProgress::Started { .. }
@@ -404,8 +438,7 @@ fn install(
                     last_upload.set(Some(clock.now()));
                 }
                 progress.update(stage);
-            },
-        );
+            });
         context.interrupt.clear();
         let corrupt = matches!(&result, Err(darkbio_connect::Error::Integrity(_)));
         let failed = reader.failed;
@@ -478,6 +511,32 @@ fn install(
         }
     }
     unreachable!("last attempt returns its result")
+}
+
+/// Uploads a local copy once, leaving any failure for the caller to report.
+fn replay(
+    context: &Context,
+    client: &Client,
+    source: &Source,
+    file: &mut File,
+) -> Result<(), darkbio_connect::Error> {
+    let mut progress = Progress::new(
+        context,
+        client.clock(),
+        source.dataset.slot.expect("download target slot"),
+        source.dataset.size,
+        Operation::Fetch {
+            approval: source.personal,
+        },
+    );
+    let result = client.upload_dataset(&source.dataset, file, context.timing(), |stage| {
+        progress.update(stage)
+    });
+    context.interrupt.clear();
+    if result.is_ok() {
+        context.output.end_stage(None, None);
+    }
+    result
 }
 
 /// Checks that a partial response covers exactly the bytes from `offset` to
@@ -617,8 +676,7 @@ impl<'a> Reader<'a> {
         // A resume needs an exact range answer, and a full download a plain
         // success
         if self.offset > 0 && !valid_range(&response, self.offset, self.source.dataset.size) {
-            // The Ark already has the prefix. Reset the cache and let connect
-            // cancel this upload before the next attempt starts from zero.
+            // Reset the cache so the next attempt starts from zero
             if let Some(entry) = &mut self.entry {
                 entry.reset()?;
             }
@@ -740,6 +798,8 @@ impl Read for Reader<'_> {
 /// Tests of reference planning, offer validation, resume and cache replay.
 #[cfg(test)]
 mod tests {
+    mod personal;
+
     use super::*;
     use clap::Parser;
     use darkbio_clock::TestClock;
@@ -749,6 +809,363 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+
+    /// Parses a sample the way the command line does.
+    fn sample(value: &str) -> Sample {
+        let cli = crate::args::Cli::parse_from([
+            "ark",
+            "data",
+            "fetch",
+            "snp-indel-calls",
+            "--sample",
+            value,
+        ]);
+        cli.validate().unwrap();
+        let Some(crate::args::Command::Data(crate::args::Data::Fetch {
+            sample: Some(sample),
+            ..
+        })) = cli.command
+        else {
+            panic!("sample fetch command");
+        };
+        sample
+    }
+
+    /// Builds an empty snp-indel-calls slot offering the sample's pinned file.
+    fn sample_slot(sample: Sample) -> SlotStatus {
+        SlotStatus {
+            kind: SlotKind::SnpIndelCalls as i32,
+            origin: SlotOrigin::Personal as i32,
+            state: SlotState::Empty as i32,
+            download: Some(sample.download()),
+            ..Default::default()
+        }
+    }
+
+    /// Checks HG00096's source against its separately measured size and digest.
+    #[test]
+    fn test_sample_source_matches_independent_pin() {
+        for value in ["HG00096", "orange-ravine"] {
+            let source = offer(&sample_slot(sample(value))).unwrap();
+            assert_eq!(
+                source.url,
+                "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/HG00096/HG00096.hard-filtered.vcf.gz",
+                "{value} URL"
+            );
+            assert_eq!(
+                source.dataset.name, "HG00096.hard-filtered.vcf.gz",
+                "{value} filename"
+            );
+            assert_eq!(source.dataset.size, 437_027_190, "{value} size");
+            assert_eq!(source.dataset.slot, Some(3), "{value} target");
+            assert_eq!(
+                source.hash, "488f8b0fc05cfae2a2c7b4208367abefa8401fcef3151e32feb5587d71303260",
+                "{value} digest"
+            );
+            assert_eq!(
+                hex::encode(source.dataset.sha256.unwrap()),
+                "488f8b0fc05cfae2a2c7b4208367abefa8401fcef3151e32feb5587d71303260",
+                "{value} upload digest"
+            );
+        }
+    }
+
+    /// Checks that only snp-indel-calls points a missing download at samples.
+    #[test]
+    fn test_no_download_suggests_samples_only_for_variant_calls() {
+        for id in [1, 2, 3, 4, 42] {
+            let error = plan(&[reference(id, &[], false)], Some(id)).unwrap_err();
+            assert_eq!((error.class, error.code), (5, "no-download"), "slot {id}");
+            assert_eq!(
+                error.hints,
+                if id == 3 {
+                    vec!["--sample fills it with a public genome from `ark data samples`"]
+                } else {
+                    vec![]
+                },
+                "slot {id} guidance"
+            );
+        }
+    }
+
+    /// Runs a sample plan that must install nothing, and checks its output.
+    fn check_sample_plan(test: &str, filled: bool, dry_run: bool) {
+        for captured in crate::testing::narration(test, |output, _| {
+            let sample = sample("orange-ravine");
+            let mut slot = sample_slot(sample);
+            if filled {
+                slot.state = SlotState::Filled as i32;
+            }
+            let slots = [slot];
+            let ordered = plan(&slots, Some(3)).unwrap();
+            let context = Context {
+                options: crate::args::Cli::parse_from(["ark"]).options,
+                interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                output,
+            };
+            execute(&context, &ordered, Some(sample), dry_run, None, |_| {
+                panic!("a dry run or filled slot never installs a sample")
+            })
+            .unwrap();
+        }) {
+            if captured.json {
+                let document: Value = serde_json::from_str(&captured.stdout).unwrap();
+                assert_eq!(
+                    document["fetched"].as_array().unwrap().len(),
+                    1,
+                    "one selected slot"
+                );
+                let row = &document["fetched"][0];
+                assert_eq!(row["sample"], "HG00096", "selected sample");
+                assert_eq!(row["name"], "orange-ravine", "selected name");
+                assert_eq!(row["size_bytes"], 437_027_190, "pinned file length");
+                assert_eq!(
+                    row["sha256"],
+                    "488f8b0fc05cfae2a2c7b4208367abefa8401fcef3151e32feb5587d71303260",
+                    "pinned digest"
+                );
+                assert_eq!(
+                    row["outcome"],
+                    if filled { "skipped" } else { "planned" },
+                    "plan outcome"
+                );
+            } else {
+                assert_eq!(
+                    captured
+                        .stdout
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<Vec<_>>(),
+                    ["SLOT", "SIZE", "CACHED", "OUTCOME"],
+                    "fetch columns stay unchanged"
+                );
+            }
+            if filled {
+                captured.contains(&["snp-indel-calls is already filled"]);
+            } else {
+                assert!(
+                    captured.stderr.is_empty(),
+                    "dry run has no download or approval events"
+                );
+            }
+        }
+    }
+
+    /// Checks that a sample dry run plans the pinned file and moves nothing.
+    #[test]
+    fn test_sample_dry_run_only_plans() {
+        check_sample_plan(
+            "data::reference::tests::test_sample_dry_run_only_plans",
+            false,
+            true,
+        );
+    }
+
+    /// Checks that a filled slot keeps its data and skips the sample.
+    #[test]
+    fn test_sample_fetch_skips_a_filled_slot() {
+        check_sample_plan(
+            "data::reference::tests::test_sample_fetch_skips_a_filled_slot",
+            true,
+            false,
+        );
+    }
+
+    /// Checks a sample fetch end to end, from download to processing and cache.
+    #[test]
+    fn test_sample_fetch_downloads_processes_and_caches() {
+        use darkbio_connect::{
+            Ark, TrustMode, schema,
+            trust::{Environment, Realm},
+        };
+        use schema::host_to_ark::Content;
+        use std::sync::{Arc, Mutex};
+
+        for captured in crate::testing::narration(
+            "data::reference::tests::test_sample_fetch_downloads_processes_and_caches",
+            |output, clock| {
+                // Serve a small invented file from the scripted HTTP server
+                let bytes = b"tiny variant-call fixture\n";
+                let digest = "df9a83175f9bf0ab03383500321104f6bd1ae0367631ce81c2909d7813f68a79";
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!(
+                    "http://{}/HG00096.hard-filtered.vcf.gz",
+                    listener.local_addr().unwrap()
+                );
+                let server = serve(listener, vec![(200, String::new(), bytes.to_vec())]);
+                let directory = Directory::new();
+                let sample = sample("orange-ravine");
+                let mut slot = sample_slot(sample);
+                let download = slot.download.as_mut().unwrap();
+                download.bytes = bytes.len() as u64;
+                download.sha256 = digest.into();
+
+                // Script an Ark that takes the upload and fills the slot
+                let stored = Arc::new(Mutex::new(slot.clone()));
+                let mut peer = crate::testing::peer::Peer::spawn(
+                    &clock.clock(),
+                    Box::new({
+                        let stored = stored.clone();
+                        move |session, request, responder| {
+                            let deadline = session.clock().now() + Duration::from_secs(10);
+                            match request {
+                                Content::DeviceInfo(_) => {
+                                    responder
+                                        .reply(
+                                            schema::DeviceInfoResponse {
+                                                cloud_synced: true,
+                                                cloud_clock: session
+                                                    .clock()
+                                                    .system_time()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap()
+                                                    .as_secs(),
+                                                ..Default::default()
+                                            },
+                                            deadline,
+                                        )
+                                        .unwrap();
+                                }
+                                Content::SlotUploadStart(request) => {
+                                    assert_eq!(
+                                        request.name, "HG00096.hard-filtered.vcf.gz",
+                                        "sample filename sent to Ark"
+                                    );
+                                    assert_eq!(request.kind, 3, "personal slot target");
+                                    assert_eq!(request.size, 26, "fixture upload size");
+                                    assert_eq!(
+                                        request.chunk, bytes,
+                                        "downloaded bytes reach the Ark"
+                                    );
+                                    responder
+                                        .reply(
+                                            schema::SlotUploadStartResponse { session: 7 },
+                                            deadline,
+                                        )
+                                        .unwrap();
+                                }
+                                Content::SlotUploadProcess(request) => {
+                                    assert_eq!(request.session, 7, "upload session to process");
+                                    let mut slot = stored.lock().unwrap();
+                                    slot.state = SlotState::Filled as i32;
+                                    slot.bytes = 26;
+                                    responder
+                                        .reply(
+                                            schema::SlotUploadProcessResponse {
+                                                phase_in: 1,
+                                                phase_progress: 10_000,
+                                                phases: vec![schema::SlotPhase {
+                                                    name: "Indexing".into(),
+                                                    desc: String::new(),
+                                                }],
+                                                ..Default::default()
+                                            },
+                                            deadline,
+                                        )
+                                        .unwrap();
+                                }
+                                Content::SlotList(_) => {
+                                    responder
+                                        .reply(
+                                            schema::SlotListResponse {
+                                                slots: vec![stored.lock().unwrap().clone()],
+                                            },
+                                            deadline,
+                                        )
+                                        .unwrap();
+                                }
+                                _ => panic!("unexpected sample fetch request: {request:?}"),
+                            }
+                            true
+                        }
+                    }),
+                );
+                let trust = TrustMode::Recover(Box::new(peer.identity.clone()));
+                let (ark, _) = Ark::attach(peer.stream(), &trust, |_| {
+                    Some((Environment::Develop, Realm::Hardware))
+                })
+                .unwrap();
+                let client = ark.client();
+                let context = Context {
+                    options: crate::args::Cli::parse_from(["ark"]).options,
+                    interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                    output,
+                };
+
+                // Plan and install, swapping only the URL for the test server
+                let slots = [slot];
+                let ordered = plan(&slots, Some(3)).unwrap();
+                let agent = agent();
+                execute(
+                    &context,
+                    &ordered,
+                    Some(sample),
+                    false,
+                    Some(&directory.0),
+                    |source| {
+                        let source = Source {
+                            url: url.clone(),
+                            dataset: source.dataset.clone(),
+                            hash: source.hash.clone(),
+                            personal: source.personal,
+                        };
+                        install(&context, &client, &source, Some(&directory.0), &agent)
+                    },
+                )
+                .unwrap();
+
+                // Read back the processed slot and the cached file
+                let slots = client
+                    .call(schema::SlotListRequest {}, context.timing())
+                    .unwrap()
+                    .slots;
+                assert_eq!(
+                    slots[0].state,
+                    SlotState::Filled as i32,
+                    "sample slot is processed"
+                );
+                assert_eq!(slots[0].bytes, 26, "processed fixture length");
+                assert_eq!(
+                    fs::read(directory.0.join(digest)).unwrap(),
+                    bytes,
+                    "verified cache bytes"
+                );
+                let requests = server.join().unwrap();
+                assert_eq!(requests.len(), 1, "one HTTP download");
+                assert!(
+                    requests[0].starts_with("get /hg00096.hard-filtered.vcf.gz http/1.1\r\n"),
+                    "sample request path"
+                );
+                drop(ark);
+            },
+        ) {
+            captured.contains(&[
+                "Approve the upload on your phone, in Ark Companion",
+                "Approved on your phone",
+                "Fetched snp-indel-calls",
+                "Indexing",
+                "cache:",
+            ]);
+            captured.approvals(&[("upload", Some("phone"))]);
+            if captured.json {
+                let document: Value = serde_json::from_str(&captured.stdout).unwrap();
+                assert_eq!(
+                    document["fetched"][0],
+                    json!({
+                        "slot": "snp-indel-calls", "id": 3,
+                        "url": "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/HG00096/HG00096.hard-filtered.vcf.gz",
+                        "size_bytes": 26,
+                        "sha256": "df9a83175f9bf0ab03383500321104f6bd1ae0367631ce81c2909d7813f68a79",
+                        "cached": false, "outcome": "done", "error": null,
+                        "sample": "HG00096", "name": "orange-ravine",
+                    }),
+                    "completed sample fetch row"
+                );
+            }
+        }
+    }
 
     /// A fetch with nothing to fetch reads as its sentence, and JSON keeps the
     /// empty list.
@@ -771,7 +1188,7 @@ mod tests {
                 };
 
                 // Print the empty plan, which installs nothing
-                let result = execute(&context, &ordered, false, None, |_| {
+                let result = execute(&context, &ordered, None, false, None, |_| {
                     panic!("an empty reference plan has no installation")
                 });
                 assert!(result.is_ok(), "empty fetch succeeds: {result:?}");
@@ -850,6 +1267,7 @@ mod tests {
             },
             url,
             hash: hex::encode(hash),
+            personal: false,
         }
     }
 
@@ -996,17 +1414,24 @@ mod tests {
             let mut installed = Vec::new();
             writeln!(std::io::stdout(), "<result>").unwrap();
             let result = plan(&slots, id).and_then(|ordered| {
-                execute(&context, &ordered, dry_run, Some(&directory.0), |source| {
-                    installed.push(source.dataset.slot.unwrap());
-                    assert_eq!(source.url, "https://example.test/reference.gz");
-                    assert_eq!(source.dataset.size, 10);
-                    assert_eq!(source.dataset.sha256, Some([0xab; 32]));
-                    if scenario == "failed" {
-                        Err(Error::new(5, "ark", "reference upload refused"))
-                    } else {
-                        Ok(())
-                    }
-                })
+                execute(
+                    &context,
+                    &ordered,
+                    None,
+                    dry_run,
+                    Some(&directory.0),
+                    |source| {
+                        installed.push(source.dataset.slot.unwrap());
+                        assert_eq!(source.url, "https://example.test/reference.gz");
+                        assert_eq!(source.dataset.size, 10);
+                        assert_eq!(source.dataset.sha256, Some([0xab; 32]));
+                        if scenario == "failed" {
+                            Err(Error::new(5, "ark", "reference upload refused"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
             });
             let expected = match scenario.as_str() {
                 "all" | "filled" => vec![1, 2],

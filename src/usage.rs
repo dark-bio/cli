@@ -47,6 +47,7 @@ pub(crate) fn from_clap(
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => match option {
             "<SLOT>" | "[SLOT]" | "--slot" => format!("unknown slot '{value}'"),
             "<POPULATION>" | "[POPULATION]" => format!("unknown population '{value}'"),
+            "--sample" => format!("unknown sample '{value}'"),
             "--env" => format!("unknown environment '{value}'"),
             "--timeout" => "timeout must be a positive number of seconds".into(),
             "<SHELL>" => format!("unknown shell '{value}'"),
@@ -58,8 +59,11 @@ pub(crate) fn from_clap(
             "[POPULATION] cannot be combined with --all".into()
         }
         ErrorKind::ArgumentConflict => format!(
-            "{argument} cannot be combined with {}",
+            "{option} cannot be combined with {}",
             context(error, ContextKind::PriorArg)
+                .split_whitespace()
+                .next()
+                .unwrap_or("argument")
         ),
         _ => "invalid arguments".into(),
     };
@@ -92,6 +96,7 @@ pub(crate) fn from_clap(
         let suggested = match option {
             "<SLOT>" | "[SLOT]" | "--slot" => similar(&value, args::slot_names()),
             "<POPULATION>" | "[POPULATION]" => similar_population(&value),
+            "--sample" => similar(&value, crate::data::samples::selectors()),
             "--env" => similar(
                 &value,
                 args::environments().map(|environment| environment.to_string()),
@@ -113,6 +118,11 @@ pub(crate) fn from_clap(
             result
                 .hints
                 .push("use a population code from `ark data samples`".into());
+        }
+        if option == "--sample" {
+            result
+                .hints
+                .push("use a sample name or id from `ark data samples`".into());
         }
     }
     if result.hints.is_empty() {

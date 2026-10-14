@@ -113,6 +113,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
         args::Data::Fetch {
             slot,
             all: _,
+            sample,
             dry_run,
             cache,
             no_cache,
@@ -120,7 +121,10 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
             context,
             &connection,
             &slots,
-            slot,
+            match sample {
+                Some(sample) => reference::Target::Sample(sample),
+                None => slot.map_or(reference::Target::All, reference::Target::Slot),
+            },
             dry_run,
             cache.as_deref(),
             no_cache,
@@ -347,9 +351,12 @@ fn approve_change(output: &Output, slot: i32, repair: bool) {
 pub(super) enum Operation {
     /// Upload of a local file, which the Ark identifies first.
     Upload,
-    /// Fetch of a reference the Ark offers, read from the cache when it holds
-    /// a copy.
-    Fetch,
+    /// Fetch of a public file, read from the cache when it holds a copy.
+    Fetch {
+        /// Whether the target slot's upload asks the owner, as a personal
+        /// slot's does.
+        approval: bool,
+    },
 }
 
 /// Upload presentation and partial-result facts shared by local and reference
@@ -357,8 +364,8 @@ pub(super) enum Operation {
 pub(crate) struct Progress<'a> {
     /// Output and interruption handles for this invocation.
     context: &'a Context,
-    /// Identified or advertised target used for approval guidance.
-    slot: i32,
+    /// Whether the upload waits for the owner's approval on their phone.
+    approval: bool,
     /// Rate history beginning at the first acknowledged upload observation.
     transfer: Transfer,
     /// Independent rate history for each device processing step.
@@ -384,7 +391,7 @@ impl<'a> Progress<'a> {
                 completed: Some(format!("Uploaded {}", crate::style::bytes(size))),
                 ..Update::new("uploading", "Uploading")
             },
-            Operation::Fetch => Update {
+            Operation::Fetch { .. } => Update {
                 completed: Some(format!(
                     "Fetched {} · {}",
                     slot_name(slot),
@@ -395,7 +402,10 @@ impl<'a> Progress<'a> {
         };
         Self {
             context,
-            slot,
+            approval: match operation {
+                Operation::Upload => upload_approval(slot),
+                Operation::Fetch { approval } => approval,
+            },
             transfer: Transfer::new(context.output.terminal(), clock.clone(), transfer),
             processing: Processing::new(context.output.terminal(), clock),
             uploaded: 0,
@@ -413,11 +423,11 @@ impl<'a> Progress<'a> {
                     .stage("identifying", "Identifying dataset", None)
             }
             UploadProgress::Identified(info) => {
-                self.slot = info.kind;
+                self.approval = upload_approval(info.kind);
                 identification(&self.context.output, &info);
             }
             UploadProgress::Preparing => {
-                if upload_approval(self.slot) {
+                if self.approval {
                     self.context.output.approve(
                         "upload",
                         Some("phone"),
@@ -641,7 +651,7 @@ mod tests {
                         62,
                     ),
                     (
-                        Operation::Fetch,
+                        Operation::Fetch { approval: false },
                         schema::SlotKind::ReferenceGenome as i32,
                         3221225472,
                         250,
