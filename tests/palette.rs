@@ -894,13 +894,7 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             ],
         ),
         (
-            vec![
-                "data",
-                "fetch",
-                "snp-indel-calls",
-                "--sample",
-                "notable-owe",
-            ],
+            vec!["data", "fetch", "small-variants", "--sample", "notable-owe"],
             "unknown sample 'notable-owe'",
             vec![
                 "a similar value exists: `notable-owen`",
@@ -908,23 +902,49 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             ],
         ),
         (
-            vec!["data", "fetch", "snp-indel-calls", "--sample", "????"],
+            vec!["data", "fetch", "small-variants", "--sample", "????"],
             "unknown sample '????'",
             vec!["use a sample name or id from `ark data samples`"],
         ),
         (
             vec!["data", "fetch", "reference-genome", "--sample", "HG00096"],
-            "--sample fills snp-indel-calls, not reference-genome",
+            "--sample fills small-variants, not reference-genome",
             vec!["run `ark data fetch reference-genome`"],
         ),
         (
             vec!["data", "fetch", "1", "--sample", "notable-owen"],
-            "--sample fills snp-indel-calls, not reference-genome",
+            "--sample fills small-variants, not reference-genome",
             vec!["run `ark data fetch reference-genome`"],
         ),
         (
+            vec!["data", "fetch", "gene-annotations", "--sample", "HG00096"],
+            "--sample fills small-variants, not gene-annotations",
+            vec!["run `ark data fetch gene-annotations`"],
+        ),
+        (
+            vec!["data", "fetch", "4", "--sample", "HG00096"],
+            "--sample fills small-variants, not variant-catalog",
+            vec!["run `ark data fetch variant-catalog`"],
+        ),
+        (
+            vec![
+                "data",
+                "fetch",
+                "structural-variants",
+                "--sample",
+                "HG00096",
+            ],
+            "--sample fills small-variants, not structural-variants",
+            vec!["run `ark data upload FILE` with the owner's own file"],
+        ),
+        (
+            vec!["data", "fetch", "6", "--sample", "HG00096"],
+            "--sample fills small-variants, not copy-number-variants",
+            vec!["run `ark data upload FILE` with the owner's own file"],
+        ),
+        (
             vec!["data", "fetch", "42", "--sample", "notable-owen"],
-            "--sample fills snp-indel-calls, not 42",
+            "--sample fills small-variants, not 42",
             vec![],
         ),
         (
@@ -948,10 +968,15 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             vec!["see `ark data samples --help`"],
         ),
         (
-            vec!["data", "show", "snp-indel-call"],
-            "unknown slot 'snp-indel-call'",
+            vec!["data", "show", "snp-indel-calls"],
+            "unknown slot 'snp-indel-calls'",
+            vec!["use a slot name or id from `ark data list`"],
+        ),
+        (
+            vec!["data", "show", "small-variant"],
+            "unknown slot 'small-variant'",
             vec![
-                "a similar value exists: `snp-indel-calls`",
+                "a similar value exists: `small-variants`",
                 "use a slot name or id from `ark data list`",
             ],
         ),

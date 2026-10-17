@@ -4,11 +4,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Pinned sizes and SHA-256s of the samples' snp-indel-calls files.
+//! Pinned sizes and SHA-256s of the samples' small variant files.
 
 use super::Pin;
 
-/// Every person's snp-indel-calls file, in sample ID order.
+/// Every person's small variant file, in sample ID order.
 ///
 /// Each file was hashed once, after it matched upstream's MD5 or ETag, and a
 /// download that differs from its pin fails.

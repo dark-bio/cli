@@ -104,6 +104,90 @@ fn slots() -> Vec<SlotStatus> {
     ]
 }
 
+/// Builds the six slots in the order the Ark lists them, all filled, with long
+/// invented texts on the two new personal slots.
+fn genome_slots() -> Vec<SlotStatus> {
+    use schema::{SlotKind, SlotOrigin};
+
+    // Sizes and builds that exercise the table's column widths
+    let mut slots: Vec<_> = [
+        (SlotKind::ReferenceGenome, "GRCh38.p14", "", 1_022_427_344),
+        (SlotKind::GeneAnnotations, "GRCh38.p14", "", 215_062_938),
+        (SlotKind::SmallVariants, "GRCh38.p13", "", 307_547_341),
+        (SlotKind::VariantCatalog, "GRCh38.p14", "157", 6_227_702_579),
+    ]
+    .into_iter()
+    .map(|(kind, build, version, bytes)| SlotStatus {
+        kind: kind as i32,
+        state: SlotState::Filled as i32,
+        origin: if kind == SlotKind::SmallVariants {
+            SlotOrigin::Personal as i32
+        } else {
+            SlotOrigin::Reference as i32
+        },
+        deps: if kind == SlotKind::SmallVariants {
+            vec![]
+        } else {
+            vec![SlotKind::SmallVariants as i32]
+        },
+        build: build.into(),
+        version: version.into(),
+        bytes,
+        ..Default::default()
+    })
+    .collect();
+
+    // The new personal slots carry texts as long as the Ark's, which their
+    // pages wrap
+    slots.splice(
+        3..3,
+        [
+            SlotStatus {
+                kind: SlotKind::StructuralVariants as i32,
+                name: "Structural Variants".into(),
+                desc: "A third sample collection of plain values with grouped labels. Each \
+                group names a few values that belong together, and a value may sit in \
+                more than one group."
+                    .into(),
+                format: "Plain text with one group on each line, its label first and its \
+                values after it, separated by spaces. Labels are lowercase words, and \
+                values are whole numbers. A group may repeat an earlier value, and a line \
+                may end with a comment after a hash sign. Blank lines are skipped. The \
+                collection stays under one thousand lines, so its page wraps this text \
+                across several lines on a narrow screen."
+                    .into(),
+                state: SlotState::Filled as i32,
+                origin: SlotOrigin::Personal as i32,
+                deps: vec![SlotKind::SmallVariants as i32],
+                build: "GRCh38.p13".into(),
+                bytes: 2_097_152,
+                ..Default::default()
+            },
+            SlotStatus {
+                kind: SlotKind::CopyNumberVariants as i32,
+                name: "Copy Number Variants".into(),
+                desc: "A fourth sample collection of plain values, each with a count of how \
+                often it appears."
+                    .into(),
+                format: "Plain text with one value and its count on each line, separated by a \
+                single space. Counts are whole numbers from zero to nine, and values keep \
+                the order they were first seen in. A line may end with a comment after a \
+                hash sign, and blank lines are skipped. The collection stays under one \
+                hundred lines, so its page wraps this text across several lines on a \
+                narrow screen."
+                    .into(),
+                state: SlotState::Filled as i32,
+                origin: SlotOrigin::Personal as i32,
+                deps: vec![SlotKind::SmallVariants as i32],
+                build: "GRCh38.p13".into(),
+                bytes: 1_048_576,
+                ..Default::default()
+            },
+        ],
+    );
+    slots
+}
+
 /// Runs one scenario in a child test process, capturing its real stdout and
 /// stderr so results and hints stay distinguishable.
 fn capture(scenario: &str, json: bool) -> (String, String) {
@@ -160,43 +244,17 @@ fn inventory_output() {
             }
             "empty" => super::paths::print(&output, &[]).unwrap(),
             "list" => listing(&output, &slots()).unwrap(),
-            "four-slots" => {
-                let slots: Vec<_> = [
-                    (
-                        schema::SlotKind::ReferenceGenome,
-                        "GRCh38.p14",
-                        "",
-                        1_022_427_344,
-                    ),
-                    (
-                        schema::SlotKind::GeneAnnotations,
-                        "GRCh38.p14",
-                        "",
-                        215_062_938,
-                    ),
-                    (
-                        schema::SlotKind::SnpIndelCalls,
-                        "GRCh38.p13",
-                        "",
-                        307_547_341,
-                    ),
-                    (
-                        schema::SlotKind::VariantCatalog,
-                        "GRCh38.p14",
-                        "157",
-                        6_227_702_579,
-                    ),
-                ]
-                .into_iter()
-                .map(|(kind, build, version, bytes)| SlotStatus {
-                    kind: kind as i32,
-                    state: SlotState::Filled as i32,
-                    build: build.into(),
-                    version: version.into(),
-                    bytes,
-                    ..Default::default()
-                })
-                .collect();
+            "six-slots" => listing(&output, &genome_slots()).unwrap(),
+            "show5" => show(&output, &genome_slots(), 5).unwrap(),
+            "show6" => show(&output, &genome_slots(), 6).unwrap(),
+            "missing-small-variants" | "single-dependent" => {
+                let mut slots = genome_slots();
+                for slot in &mut slots {
+                    slot.state = SlotState::Empty as i32;
+                }
+                if scenario == "single-dependent" {
+                    slots.retain(|slot| [3, 5].contains(&slot.kind));
+                }
                 listing(&output, &slots).unwrap();
             }
             "show41" => show(&output, &slots(), 41).unwrap(),
@@ -360,12 +418,12 @@ fn inventory_output() {
     }
 }
 
-/// Four typical slots print as four rows of five columns within 80 columns.
+/// Six typical slots print as six rows of five columns within 80 columns.
 #[test]
-fn test_data_list_fits_four_slots_at_eighty_columns() {
-    let (stdout, stderr) = capture("four-slots", false);
+fn test_data_list_fits_six_slots_at_eighty_columns() {
+    let (stdout, stderr) = capture("six-slots", false);
     assert!(stderr.is_empty());
-    assert_eq!(stdout.lines().count(), 5);
+    assert_eq!(stdout.lines().count(), 7);
     assert!(
         stdout
             .lines()
@@ -374,11 +432,318 @@ fn test_data_list_fits_four_slots_at_eighty_columns() {
     assert_eq!(
         stdout,
         concat!(
-            "SLOT              STATE     BUILD       VERSION       SIZE\n",
-            "reference-genome  ✓ filled  GRCh38.p14  -        975.1 MiB\n",
-            "gene-annotations  ✓ filled  GRCh38.p14  -        205.1 MiB\n",
-            "snp-indel-calls   ✓ filled  GRCh38.p13  -        293.3 MiB\n",
-            "variant-catalog   ✓ filled  GRCh38.p14  157        5.8 GiB\n",
+            "SLOT                  STATE     BUILD       VERSION       SIZE\n",
+            "reference-genome      ✓ filled  GRCh38.p14  -        975.1 MiB\n",
+            "gene-annotations      ✓ filled  GRCh38.p14  -        205.1 MiB\n",
+            "small-variants        ✓ filled  GRCh38.p13  -        293.3 MiB\n",
+            "structural-variants   ✓ filled  GRCh38.p13  -          2.0 MiB\n",
+            "copy-number-variants  ✓ filled  GRCh38.p13  -          1.0 MiB\n",
+            "variant-catalog       ✓ filled  GRCh38.p14  157        5.8 GiB\n",
         )
     );
+}
+
+/// Checks that an unfilled slot gets one hint naming every slot that requires
+/// it, in list order, and that a lone dependent reads in the singular.
+#[test]
+fn test_data_list_groups_dependency_hints() {
+    for (scenario, message) in [
+        (
+            "missing-small-variants",
+            "reference-genome, gene-annotations, structural-variants, copy-number-variants and variant-catalog require small-variants; fill it first",
+        ),
+        (
+            "single-dependent",
+            "structural-variants requires small-variants; fill it first",
+        ),
+    ] {
+        for json in [false, true] {
+            let (_, stderr) = capture(scenario, json);
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<Value>(stderr.trim()).unwrap(),
+                    json!({"event": "hint", "message": message}),
+                    "{scenario}"
+                );
+            } else {
+                assert_eq!(
+                    stderr.split_whitespace().collect::<Vec<_>>().join(" "),
+                    format!("hint: {message}"),
+                    "{scenario}"
+                );
+                assert!(
+                    stderr
+                        .lines()
+                        .all(|line| console::measure_text_width(line) <= 80)
+                );
+            }
+        }
+    }
+}
+
+/// Checks that the new personal slots' pages keep their texts whole and wrap
+/// them within 80 columns.
+#[test]
+fn test_personal_slot_descriptions_fit_eighty_columns() {
+    for (scenario, name) in [
+        ("show5", "structural-variants"),
+        ("show6", "copy-number-variants"),
+    ] {
+        let (stdout, stderr) = capture(scenario, true);
+        assert!(stderr.is_empty());
+        let slot: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(slot["slot"], name, "{scenario}");
+        assert_eq!(slot["origin"], "personal", "{scenario}");
+        assert_eq!(slot["requires"], json!(["small-variants"]), "{scenario}");
+
+        // The reading view holds the same description and format as the JSON
+        let (stdout, stderr) = capture(scenario, false);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout
+                .lines()
+                .all(|line| console::measure_text_width(line) <= 80)
+        );
+        let joined = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(joined.contains(slot["description"].as_str().unwrap()));
+        assert!(joined.contains(slot["format"].as_str().unwrap()));
+        assert!(joined.contains("Dependencies small-variants (filled)"));
+    }
+}
+
+/// Uploads a structural variants file to a scripted Ark whose small-variants
+/// slot is in `state`, checking which requests reach it.
+fn upload_with_requirement(
+    output: Output,
+    clock: &darkbio_clock::TestClock,
+    state: SlotState,
+    dry_run: bool,
+) -> Result<(), Error> {
+    use darkbio_connect::{
+        Ark, TrustMode,
+        trust::{Environment, Realm},
+    };
+    use schema::host_to_ark::Content;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    // Record each request, so the order of identification, listing and upload
+    // can be checked
+    let bytes = b"invented upload fixture\n";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut peer = crate::testing::peer::Peer::spawn(
+        &clock.clock(),
+        Box::new({
+            let requests = requests.clone();
+            move |session, request, responder| {
+                let deadline = session.clock().now() + Duration::from_secs(10);
+                match request {
+                    Content::DeviceInfo(_) => {
+                        responder
+                            .reply(
+                                schema::DeviceInfoResponse {
+                                    cloud_synced: true,
+                                    cloud_clock: session
+                                        .clock()
+                                        .system_time()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    ..Default::default()
+                                },
+                                deadline,
+                            )
+                            .unwrap();
+                    }
+                    Content::SlotIdentify(request) => {
+                        requests.lock().unwrap().push("identify");
+                        assert_eq!(request.chunk, bytes);
+                        responder
+                            .reply(
+                                schema::SlotIdentifyResponse {
+                                    kind: schema::SlotKind::StructuralVariants as i32,
+                                    conf: schema::SlotConfidence::High as i32,
+                                    ..Default::default()
+                                },
+                                deadline,
+                            )
+                            .unwrap();
+                    }
+                    Content::SlotList(_) => {
+                        requests.lock().unwrap().push("list");
+                        let mut slots = genome_slots();
+                        for slot in &mut slots {
+                            if slot.kind == 3 {
+                                slot.state = state as i32;
+                            } else if slot.kind == 5 {
+                                slot.state = SlotState::Empty as i32;
+                            }
+                        }
+                        responder
+                            .reply(schema::SlotListResponse { slots }, deadline)
+                            .unwrap();
+                    }
+                    Content::SlotUploadStart(request) => {
+                        requests.lock().unwrap().push("start");
+                        assert_eq!(state, SlotState::Filled);
+                        assert!(!dry_run);
+                        assert_eq!(request.kind, 5);
+                        assert_eq!(request.chunk, bytes);
+                        responder
+                            .reply(schema::SlotUploadStartResponse { session: 7 }, deadline)
+                            .unwrap();
+                    }
+                    Content::SlotUploadProcess(request) => {
+                        requests.lock().unwrap().push("process");
+                        assert_eq!(request.session, 7);
+                        responder
+                            .reply(
+                                schema::SlotUploadProcessResponse {
+                                    phase_in: 1,
+                                    phase_progress: 10_000,
+                                    phases: vec![schema::SlotPhase {
+                                        name: "Indexing".into(),
+                                        desc: String::new(),
+                                    }],
+                                    ..Default::default()
+                                },
+                                deadline,
+                            )
+                            .unwrap();
+                    }
+                    _ => panic!("unexpected upload request: {request:?}"),
+                }
+                true
+            }
+        }),
+    );
+
+    // Run the upload over the scripted connection
+    let trust = TrustMode::Recover(Box::new(peer.identity.clone()));
+    let (ark, _) = Ark::attach(peer.stream(), &trust, |_| {
+        Some((Environment::Develop, Realm::Hardware))
+    })
+    .unwrap();
+    let context = Context {
+        options: Cli::parse_from(["ark"]).options,
+        interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+        output,
+    };
+    let result = upload_file(
+        &context,
+        &ark.client(),
+        "sample.sv.vcf",
+        bytes.len() as u64,
+        &mut std::io::Cursor::new(bytes),
+        None,
+        dry_run,
+    );
+    let expected = if state == SlotState::Filled && !dry_run {
+        vec!["identify", "list", "start", "process"]
+    } else {
+        vec!["identify", "list"]
+    };
+    assert_eq!(*requests.lock().unwrap(), expected);
+    result
+}
+
+/// Checks that an unfilled required slot, empty or damaged, fails the upload
+/// before it starts or asks for an approval.
+#[test]
+fn test_upload_refuses_unfilled_requirement_before_approval() {
+    for captured in crate::testing::narration(
+        "data::scenarios::test_upload_refuses_unfilled_requirement_before_approval",
+        |output, clock| {
+            for state in [SlotState::Empty, SlotState::Damaged] {
+                let error =
+                    upload_with_requirement(output.clone(), clock, state, false).unwrap_err();
+                assert_eq!(error.code, "dependency-missing", "{state:?}");
+                assert_eq!(error.class, 5, "{state:?}");
+                assert_eq!(
+                    error.message,
+                    "structural-variants requires small-variants, which is not filled",
+                    "{state:?}"
+                );
+                assert_eq!(error.hints, ["fill small-variants first"], "{state:?}");
+                output.error(&error);
+            }
+        },
+    ) {
+        captured.approvals(&[]);
+        assert!(!captured.stderr.contains("Approve"));
+        assert!(captured.stdout.is_empty());
+        if captured.json {
+            let events = captured.events();
+            let errors: Vec<_> = events
+                .iter()
+                .filter(|event| event["event"] == "error")
+                .collect();
+            assert_eq!(errors.len(), 2);
+            for error in errors {
+                assert_eq!(
+                    error["error"],
+                    json!({
+                        "code": "dependency-missing",
+                        "message": "structural-variants requires small-variants, which is not filled",
+                        "hints": ["fill small-variants first"],
+                    })
+                );
+            }
+        } else {
+            let text = captured
+                .stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.contains("error[dependency-missing]: structural-variants requires small-variants, which is not filled"));
+            assert!(text.contains("hint: fill small-variants first"));
+        }
+    }
+}
+
+/// Checks that a filled required slot lets the upload start, ask for its
+/// approval and finish.
+#[test]
+fn test_upload_accepts_filled_requirement() {
+    for captured in crate::testing::narration(
+        "data::scenarios::test_upload_accepts_filled_requirement",
+        |output, clock| {
+            upload_with_requirement(output, clock, SlotState::Filled, false).unwrap();
+        },
+    ) {
+        captured.approvals(&[("upload", Some("phone"))]);
+        captured.contains(&[
+            "Identified as structural-variants",
+            "Approve the upload on your phone",
+        ]);
+        if captured.json {
+            let value: Value = serde_json::from_str(&captured.stdout).unwrap();
+            assert_eq!(value["slot"], "structural-variants");
+            assert_eq!(value["uploaded_bytes"], 24);
+            assert_eq!(value["phases"], json!(["Indexing"]));
+        }
+    }
+}
+
+/// Checks that a dry run reports an empty required slot instead of failing,
+/// and starts nothing.
+#[test]
+fn test_upload_dry_run_reports_empty_requirement() {
+    for captured in crate::testing::narration(
+        "data::scenarios::test_upload_dry_run_reports_empty_requirement",
+        |output, clock| {
+            upload_with_requirement(output, clock, SlotState::Empty, true).unwrap();
+        },
+    ) {
+        captured.approvals(&[]);
+        assert!(!captured.stderr.contains("Approve"));
+        if captured.json {
+            let value: Value = serde_json::from_str(&captured.stdout).unwrap();
+            assert_eq!(value["state"], "empty");
+            assert_eq!(value["requires"], json!(["small-variants"]));
+            assert_eq!(value["uploaded_bytes"], 0);
+        } else {
+            assert!(captured.stdout.contains("small-variants (not filled)"));
+        }
+    }
 }

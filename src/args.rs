@@ -11,7 +11,7 @@
 
 use crate::data::samples::{self, Sex};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use darkbio_connect::trust::Environment;
+use darkbio_connect::{schema::SlotKind, trust::Environment};
 use std::path::PathBuf;
 
 /// Lists an enum's variants, and fails to compile when the list misses one.
@@ -61,7 +61,7 @@ impl Cli {
     /// come from any level. This rejects `--dry-run` with `--unlock`, `--quiet`
     /// with `--verbose`, `--version` with a command, `--sex` on
     /// `ark data samples` without a population or `--all`, and `--sample` on a
-    /// slot other than snp-indel-calls.
+    /// slot other than small-variants.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         // --sex narrows a list of people, which takes a population or --all
         if matches!(
@@ -78,24 +78,34 @@ impl Cli {
             );
         }
 
-        // --sample fills only snp-indel-calls, refused before anything connects
+        // --sample fills only small-variants, refused before anything connects
         if let Some(Command::Data(Data::Fetch {
             slot: Some(slot),
             sample: Some(_),
             ..
         })) = &self.command
-            && *slot != darkbio_connect::schema::SlotKind::SnpIndelCalls as i32
+            && *slot != SlotKind::SmallVariants as i32
         {
             let name = slot_name(*slot);
-            let mut error = crate::error::Error::new(
+            let error = crate::error::Error::new(
                 2,
                 "usage",
-                format!("--sample fills snp-indel-calls, not {name}"),
+                format!("--sample fills small-variants, not {name}"),
             );
-            if slot_names().any(|known| known == name) {
-                error = error.hint(format!("run `ark data fetch {name}`"));
-            }
-            return Err(error);
+
+            // Point the other personal slots at an upload, and a reference at
+            // the download the Ark offers for it
+            return Err(match SlotKind::try_from(*slot) {
+                Ok(SlotKind::StructuralVariants | SlotKind::CopyNumberVariants) => {
+                    error.hint("run `ark data upload FILE` with the owner's own file")
+                }
+                Ok(
+                    SlotKind::ReferenceGenome
+                    | SlotKind::GeneAnnotations
+                    | SlotKind::VariantCatalog,
+                ) => error.hint(format!("run `ark data fetch {name}`")),
+                _ => error,
+            });
         }
 
         let dry = matches!(
@@ -368,7 +378,7 @@ pub(crate) fn parse_slot(value: &str) -> Result<i32, String> {
         return Ok(id);
     }
     let name = format!("SLOT_KIND_{}", value.replace('-', "_").to_ascii_uppercase());
-    darkbio_connect::schema::SlotKind::from_str_name(&name)
+    SlotKind::from_str_name(&name)
         .filter(|kind| *kind as i32 > 0 && slot_name(*kind as i32) == value)
         .map(i32::from)
         .ok_or_else(|| format!("unknown slot {value:?}; use a name or id from `ark data list`"))
@@ -376,7 +386,7 @@ pub(crate) fn parse_slot(value: &str) -> Result<i32, String> {
 
 /// Formats known protocol slot names, retaining unknown IDs as decimal selectors.
 pub(crate) fn slot_name(id: i32) -> String {
-    darkbio_connect::schema::SlotKind::try_from(id)
+    SlotKind::try_from(id)
         .map(|kind| {
             kind.as_str_name()
                 .trim_start_matches("SLOT_KIND_")
@@ -386,19 +396,21 @@ pub(crate) fn slot_name(id: i32) -> String {
         .unwrap_or_else(|_| id.to_string())
 }
 
-/// Lists the name of every slot kind, spelled as [`parse_slot`] accepts it.
+/// Lists the name of every slot kind this build knows, in id order, spelled as
+/// [`parse_slot`] accepts it.
+///
+/// The wire's slot kinds are non-exhaustive, so no match can prove this list
+/// complete, and a new kind is added here by hand.
 pub(crate) fn slot_names() -> impl Iterator<Item = String> {
-    use darkbio_connect::schema::SlotKind;
-    variants!(
-        SlotKind,
-        SlotKind::Unspecified,
+    [
         SlotKind::ReferenceGenome,
         SlotKind::GeneAnnotations,
-        SlotKind::SnpIndelCalls,
+        SlotKind::SmallVariants,
         SlotKind::VariantCatalog,
-    )
+        SlotKind::StructuralVariants,
+        SlotKind::CopyNumberVariants,
+    ]
     .into_iter()
-    .filter(|kind| *kind as i32 > 0)
     .map(|kind| slot_name(kind as i32))
 }
 
@@ -453,12 +465,19 @@ mod tests {
     /// positive id parses, known or not.
     #[test]
     fn slots_are_exact_and_future_ids_remain_addressable() {
-        for (id, name) in [
+        let known = [
             (1, "reference-genome"),
             (2, "gene-annotations"),
-            (3, "snp-indel-calls"),
+            (3, "small-variants"),
             (4, "variant-catalog"),
-        ] {
+            (5, "structural-variants"),
+            (6, "copy-number-variants"),
+        ];
+        assert_eq!(
+            slot_names().collect::<Vec<_>>(),
+            known.map(|(_, name)| name)
+        );
+        for (id, name) in known {
             assert_eq!(slot_name(id), name);
             assert_eq!(parse_slot(name), Ok(id));
             assert_eq!(parse_slot(&id.to_string()), Ok(id));
@@ -470,9 +489,10 @@ mod tests {
             "0",
             "unspecified",
             "-1",
-            "SNP-INDEL-CALLS",
-            "snp_indel_calls",
-            "snp",
+            "SMALL-VARIANTS",
+            "small_variants",
+            "small",
+            "snp-indel-calls",
             "2147483648",
         ] {
             assert!(parse_slot(invalid).is_err());

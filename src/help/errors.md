@@ -92,11 +92,11 @@ or the request is fixed.
 - `update-unverified` means the Ark came back from a firmware update running
   another build than the one installed. Check `ark status` and
   `ark firmware list` before choosing a build again.
-- `dependency-missing` means a reference slot requires a slot that is empty,
-  such as the owner's calls. Fill that one first.
+- `dependency-missing` means the slot requires another that is not filled,
+  such as small-variants. Fill that one first.
 - `no-download` means the Ark offers no download for the slot
   `ark data fetch` names. `ark data show` shows the slot's requirements, and
-  --sample fills snp-indel-calls with a public sample instead.
+  --sample fills small-variants with a public sample instead.
 - `ark` means the Ark refused the request. Act on its message, never on its
   number, which can change between firmware builds.
 - `unsupported` means the Ark never serves the request in its build or role,

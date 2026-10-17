@@ -1,10 +1,10 @@
 # Datasets
 
-An Ark keeps its data in slots, one per kind of dataset. The personal slot
-holds the owner's variant calls, which ark uploads with their approval on
-the phone, or a public sample's, which it fetches with the same approval.
-The reference slots hold public data that the Ark offers for download, which
-ark fetches without an approval. Every data command but
+An Ark keeps its data in slots, one per kind of dataset. The personal slots
+hold the owner's variant calls, which ark uploads with their approval on the
+phone. A public sample can fill the small variants instead, fetched with the
+same approval. The reference slots hold public data that the Ark offers for
+download, which ark fetches without an approval. Every data command but
 `ark data samples` needs a paired, unlocked Ark, as `ark help devices`
 describes. `ark data paths` maps what apps read from the slots, as
 `ark help apps` describes.
@@ -18,7 +18,10 @@ has these slots:
 
 - reference-genome, the human reference genome assembly
 - gene-annotations, the genes and their coordinates on that assembly
-- snp-indel-calls, the owner's variant calls, from a VCF file
+- small-variants, the owner's SNVs and short indels, from a VCF file
+- structural-variants, the owner's structural variants, such as deletions,
+  duplications, inversions and breakends, from a VCF file
+- copy-number-variants, the owner's copy number segments, from a VCF file
 - variant-catalog, dbSNP's catalog of rsIDs and their positions
 
 With --json each slot carries:
@@ -50,37 +53,44 @@ so GRCh38.p14 references beside GRCh38.p13 calls are normal.
 
 ## Filling an Ark
 
-Every reference slot requires snp-indel-calls, since the Ark offers the
-references for the assembly of the owner's calls. Calls on GRCh37 or GRCh38
-get all three references, and calls on other assemblies, such as
-T2T-CHM13v2.0, only some. A fresh Ark fills in two steps:
+Every other slot requires small-variants. The Ark offers the references for
+the assembly of the owner's small variants, and takes structural variants
+and copy numbers only on that assembly family. Calls on GRCh37 or GRCh38 get
+all three references, and calls on other assemblies, such as T2T-CHM13v2.0,
+only some. A fresh Ark fills in three steps:
 
-1. `ark data upload calls.vcf.gz` uploads the owner's calls, approved on
-   their phone. `ark data fetch snp-indel-calls --sample NAME` fetches a
-   public sample instead, approved the same way.
+1. `ark data upload calls.vcf.gz` uploads the owner's small variants,
+   approved on their phone. `ark data fetch small-variants --sample NAME`
+   fetches a public sample instead, approved the same way.
 2. `ark data fetch --all` downloads every reference the Ark offers for the
    calls' assembly, without an approval.
+3. `ark data upload` takes the structural variant and copy number files from
+   the same sequencing, each approved on the phone. Both are optional.
 
 ## Uploading
 
-`ark data upload FILE` uploads the owner's variant calls, a VCF file with
-one person's genotypes, plain or compressed. The Ark first identifies the
-file from its first bytes, and refuses any other kind of file with
-file-rejected, naming the reason. `ark data show snp-indel-calls` gives the
-exact format it accepts. --slot names the slot you expect, and the upload
-fails with invalid-slot when the Ark identifies another. --dry-run stops
-after the identification and reports the target slot's state and
-requirements.
+`ark data upload FILE` uploads one of the owner's variant call files, a VCF
+file with one person's genotypes, plain or compressed. The Ark first
+identifies the file from its first bytes, which picks its slot among
+small-variants, structural-variants and copy-number-variants. It refuses any
+other kind of file with file-rejected, naming the reason, and
+`ark data show SLOT` gives the exact format each slot accepts. --slot names
+the slot you expect, and the upload fails with invalid-slot when the Ark
+identifies another. --dry-run stops after the identification and reports
+the target slot's state and requirements.
 
 The target slot has to be empty, since the Ark refuses to overwrite a
-dataset. Replacing the owner's calls takes `ark data delete snp-indel-calls`
-first. New calls on another assembly family leave the references of the old
-one in place, so delete those too and fetch them again. The owner approves
-the upload on their phone within 1 minute, and ark uploads the file and
-waits while the Ark validates and indexes it, which takes minutes to an
-hour. A file that fails validation ends with error[ark], exit 5, naming the
-reason. Once processing has started it runs to the end on the Ark, even when
-ark is interrupted.
+dataset, and the slots it requires have to be filled. So structural variants
+and copy numbers fail with dependency-missing while small-variants is empty,
+before any approval. Replacing the owner's small variants takes
+`ark data delete small-variants` first, which leaves the slots requiring it
+in place. Delete the structural variants and copy numbers too, since they
+come from the same sequencing, and the references when the new calls are on
+another assembly family. The owner approves the upload on their phone within
+1 minute, and ark uploads the file and waits while the Ark validates and
+indexes it, which takes minutes to an hour. A file that fails validation
+ends with error[ark], exit 5, naming the reason. Once processing has started
+it runs to the end on the Ark, even when ark is interrupted.
 
 ## Reference downloads
 
@@ -93,8 +103,8 @@ filled ones. ark never builds a reference's download address itself.
 
 --all skips a reference slot that offers no file, as for calls on an
 assembly without that reference, and notes which. It fails with
-dependency-missing when the owner's calls are missing, and checks every
-offer before it downloads anything. Naming a slot that offers no file fails
+dependency-missing while small-variants is empty, and checks every offer
+before it downloads anything. Naming a slot that offers no file fails
 with no-download. The first failure stops the rest. Each slot ends as done,
 skipped, failed or not-attempted, or as planned or skipped under --dry-run.
 --json returns them as fetched, each with slot, id, url, size_bytes, sha256,
@@ -132,13 +142,13 @@ With a population or --all it returns samples, each with name, sample,
 population, sex, father and mother, where a parent outside the cohort is
 null.
 
-`ark data fetch snp-indel-calls --sample NAME` fills the empty personal slot
-with a sample, named or given by its sample ID. ark downloads the whole file
-first and checks it against a size and SHA-256 built into it. Only then does
-the upload ask the owner on their phone, as for their own calls, and the Ark
-processes the calls like any upload. A failed upload is not retried, since
-that would ask the owner again, but the cached copy saves the download on
-the next run. A sample's calls take 390 to 550 MiB.
+`ark data fetch small-variants --sample NAME` fills the empty small-variants
+slot with a sample's calls, named or given by its sample ID. ark downloads
+the whole file first and checks it against a size and SHA-256 built into
+it. Only then does the upload ask the owner on their phone, as for their own
+calls, and the Ark processes the calls like any upload. A failed upload is
+not retried, since that would ask the owner again, but the cached copy saves
+the download on the next run. A sample's calls take 390 to 550 MiB.
 
 ## Emptying a slot
 

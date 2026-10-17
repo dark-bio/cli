@@ -42,7 +42,7 @@ pub(super) enum Target {
     All,
     /// One slot, from the download the Ark offers for it.
     Slot(i32),
-    /// The snp-indel-calls slot, from a sample's pinned variant calls.
+    /// The small-variants slot, from a sample's pinned variant calls.
     Sample(Sample),
 }
 
@@ -65,13 +65,13 @@ pub(super) fn fetch(
     let (id, sample) = match target {
         Target::All => (None, None),
         Target::Slot(id) => (Some(id), None),
-        Target::Sample(sample) => (Some(SlotKind::SnpIndelCalls as i32), Some(sample)),
+        Target::Sample(sample) => (Some(SlotKind::SmallVariants as i32), Some(sample)),
     };
     let selected;
     let slots = if let Some(sample) = sample {
         selected = [SlotStatus {
             download: Some(sample.download()),
-            ..select(slots, SlotKind::SnpIndelCalls as i32)?.clone()
+            ..select(slots, SlotKind::SmallVariants as i32)?.clone()
         }];
         &selected
     } else {
@@ -242,15 +242,16 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
                                 .iter()
                                 .any(|ordered: &&SlotStatus| ordered.kind == *dependency)))
             }) {
+                let dependency = slot_name(*dependency);
                 return Err(Error::new(
                     5,
                     "dependency-missing",
                     format!(
-                        "{} requires {}",
+                        "{} requires {dependency}, which is not filled",
                         slot_name(slot.kind),
-                        slot_name(*dependency)
                     ),
-                ));
+                )
+                .hint(format!("fill {dependency} first")));
             }
         }
         ordered.push(slot);
@@ -288,10 +289,16 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
             "no-download",
             format!("{} advertises no download", slot_name(slot.kind)),
         );
-        if slot.kind == SlotKind::SnpIndelCalls as i32 {
-            error.hint("--sample fills it with a public genome from `ark data samples`")
-        } else {
-            error
+        // Small variants come from a sample, and the other personal slots from
+        // the owner's own file
+        match SlotKind::try_from(slot.kind) {
+            Ok(SlotKind::SmallVariants) => {
+                error.hint("--sample fills it with a public genome from `ark data samples`")
+            }
+            Ok(SlotKind::StructuralVariants | SlotKind::CopyNumberVariants) => {
+                error.hint("run `ark data upload FILE` with the owner's own file")
+            }
+            _ => error,
         }
     })?;
     let uri: ureq::http::Uri = url
@@ -816,7 +823,7 @@ mod tests {
             "ark",
             "data",
             "fetch",
-            "snp-indel-calls",
+            "small-variants",
             "--sample",
             value,
         ]);
@@ -831,10 +838,10 @@ mod tests {
         sample
     }
 
-    /// Builds an empty snp-indel-calls slot offering the sample's pinned file.
+    /// Builds an empty small-variants slot offering the sample's pinned file.
     fn sample_slot(sample: Sample) -> SlotStatus {
         SlotStatus {
-            kind: SlotKind::SnpIndelCalls as i32,
+            kind: SlotKind::SmallVariants as i32,
             origin: SlotOrigin::Personal as i32,
             state: SlotState::Empty as i32,
             download: Some(sample.download()),
@@ -870,18 +877,20 @@ mod tests {
         }
     }
 
-    /// Checks that only snp-indel-calls points a missing download at samples.
+    /// Checks that a missing download points small-variants at the samples and
+    /// the other personal slots at an upload, and leaves the rest without a
+    /// hint.
     #[test]
     fn test_no_download_suggests_samples_only_for_variant_calls() {
-        for id in [1, 2, 3, 4, 42] {
+        for id in [1, 2, 3, 4, 5, 6, 42] {
             let error = plan(&[reference(id, &[], false)], Some(id)).unwrap_err();
             assert_eq!((error.class, error.code), (5, "no-download"), "slot {id}");
             assert_eq!(
                 error.hints,
-                if id == 3 {
-                    vec!["--sample fills it with a public genome from `ark data samples`"]
-                } else {
-                    vec![]
+                match id {
+                    3 => vec!["--sample fills it with a public genome from `ark data samples`"],
+                    5 | 6 => vec!["run `ark data upload FILE` with the owner's own file"],
+                    _ => vec![],
                 },
                 "slot {id} guidance"
             );
@@ -943,7 +952,7 @@ mod tests {
                 );
             }
             if filled {
-                captured.contains(&["snp-indel-calls is already filled"]);
+                captured.contains(&["small-variants is already filled"]);
             } else {
                 assert!(
                     captured.stderr.is_empty(),
@@ -1144,7 +1153,7 @@ mod tests {
             captured.contains(&[
                 "Approve the upload on your phone, in Ark Companion",
                 "Approved on your phone",
-                "Fetched snp-indel-calls",
+                "Fetched small-variants",
                 "Indexing",
                 "cache:",
             ]);
@@ -1154,7 +1163,7 @@ mod tests {
                 assert_eq!(
                     document["fetched"][0],
                     json!({
-                        "slot": "snp-indel-calls", "id": 3,
+                        "slot": "small-variants", "id": 3,
                         "url": "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/HG00096/HG00096.hard-filtered.vcf.gz",
                         "size_bytes": 26,
                         "sha256": "df9a83175f9bf0ab03383500321104f6bd1ae0367631ce81c2909d7813f68a79",
@@ -1176,7 +1185,7 @@ mod tests {
             |output, _| {
                 // Plan from an inventory that holds only personal data
                 let slots = [SlotStatus {
-                    kind: SlotKind::SnpIndelCalls as i32,
+                    kind: SlotKind::SmallVariants as i32,
                     origin: SlotOrigin::Personal as i32,
                     ..Default::default()
                 }];
@@ -1397,8 +1406,12 @@ mod tests {
             match scenario.as_str() {
                 "all" | "dry-run" | "failed" => {}
                 "named" => id = Some(4),
-                "missing-calls" => {
-                    slots[3].state = SlotState::Empty as i32;
+                "missing-calls" | "damaged-calls" => {
+                    slots[3].state = if scenario == "damaged-calls" {
+                        SlotState::Damaged
+                    } else {
+                        SlotState::Empty
+                    } as i32;
                     for slot in &mut slots {
                         slot.download = None;
                     }
@@ -1464,6 +1477,7 @@ mod tests {
             ("dry-run", 0, None),
             ("named", 5, Some("no-download")),
             ("missing-calls", 5, Some("dependency-missing")),
+            ("damaged-calls", 5, Some("dependency-missing")),
             ("skipped-dependency", 5, Some("dependency-missing")),
             ("filled", 0, None),
             ("malformed", 1, Some("file-rejected")),
@@ -1502,6 +1516,29 @@ mod tests {
                 if scenario != "failed" {
                     assert_eq!(document["error"]["code"], error, "{scenario}");
                     assert_eq!(events.len(), 1, "{scenario}");
+                    let dependency = match scenario {
+                        "missing-calls" | "damaged-calls" => Some((
+                            "variant-catalog requires small-variants, which is not filled",
+                            "fill small-variants first",
+                        )),
+                        "skipped-dependency" => Some((
+                            "gene-annotations requires variant-catalog, which is not filled",
+                            "fill variant-catalog first",
+                        )),
+                        _ => None,
+                    };
+                    if let Some((message, hint)) = dependency {
+                        assert_eq!(
+                            document["error"],
+                            json!({
+                                "code": "dependency-missing",
+                                "message": message,
+                                "hints": [hint],
+                            }),
+                            "{scenario}"
+                        );
+                        assert_eq!(events[0]["error"], document["error"], "{scenario}");
+                    }
                     continue;
                 }
             }

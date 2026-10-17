@@ -202,19 +202,21 @@ const CONTRACTS: &[Contract] = &[
             time: "seconds",
             json: "slot, id, name, description, format, state, origin, damage, requires, \
                 size_bytes, build, version, download (url, size_bytes, sha256), required_by, cached",
-            examples: "ark data show snp-indel-calls\nark data show 3 --json",
+            examples: "ark data show small-variants\nark data show 3 --json",
         }),
     },
     Contract {
         path: "data upload",
         paragraph: "The Ark identifies the file from its first bytes and accepts one person's \
-            variant calls in VCF, plain or compressed, into the empty snp-indel-calls \
-            slot. The owner approves on their phone, then ark sends the file and waits \
-            while the Ark validates and indexes it. --dry-run stops after the \
-            identification.",
+            variant calls in VCF, plain or compressed, into the empty small-variants, \
+            structural-variants or copy-number-variants slot it names. Structural \
+            variants and copy numbers fail with dependency-missing while small-variants \
+            is empty, before any approval. The owner approves on their phone, then ark \
+            sends the file and waits while the Ark validates and indexes it. --dry-run \
+            stops after the identification.",
         footer: Some(ContractFooter {
-            requires: "an empty target slot, a paired, unlocked Ark and the cloud (--unlock \
-                only if status reports locked)",
+            requires: "an empty target slot whose required slots are filled, a paired, \
+                unlocked Ark and the cloud (--unlock only if status reports locked)",
             approval: "on your phone within 1 minute; none with --dry-run",
             time: "minutes to an hour; each processing step reports its own progress",
             json: "slot, id, confidence, uploaded_bytes, phases, duration_seconds; \
@@ -226,7 +228,7 @@ const CONTRACTS: &[Contract] = &[
         path: "data fetch",
         paragraph: "ark streams the file the Ark offers for a reference slot, checking it \
             against the offered SHA-256 on the way. --sample instead fills the \
-            snp-indel-calls slot with a genome from `ark data samples`. The whole file \
+            small-variants slot with a genome from `ark data samples`. The whole file \
             downloads and is checked against the size and SHA-256 built into ark before \
             its upload asks for approval, and that upload is never retried. A copy stays \
             in this computer's cache. A filled slot is skipped, with no download and no \
@@ -244,7 +246,7 @@ const CONTRACTS: &[Contract] = &[
             json: "fetched, each with slot, id, url, size_bytes, sha256, cached, outcome, \
                 error; --sample adds sample and name; --dry-run marks pending rows as planned",
             examples: "ark data fetch --all\n\
-                ark data fetch snp-indel-calls --sample affable-hazel --dry-run --json",
+                ark data fetch small-variants --sample affable-hazel --dry-run --json",
         }),
     },
     Contract {
@@ -276,7 +278,7 @@ const CONTRACTS: &[Contract] = &[
             approval: "on your phone within 2 minutes; none with --dry-run",
             time: "seconds after the approval",
             json: "slot, id, state, changed; --dry-run adds required_by",
-            examples: "ark data delete snp-indel-calls\nark data delete snp-indel-calls --dry-run --json",
+            examples: "ark data delete small-variants\nark data delete small-variants --dry-run --json",
         }),
     },
     Contract {
@@ -290,7 +292,7 @@ const CONTRACTS: &[Contract] = &[
             approval: "on your phone within 2 minutes; none with --dry-run",
             time: "seconds after the approval",
             json: "slot, id, state, changed; --dry-run adds required_by",
-            examples: "ark data repair snp-indel-calls\nark data repair snp-indel-calls --dry-run --json",
+            examples: "ark data repair small-variants\nark data repair small-variants --dry-run --json",
         }),
     },
     Contract {
