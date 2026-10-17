@@ -282,6 +282,10 @@ mod tests {
                 .spawn()
                 .unwrap();
             let mut stderr = BufReader::new(child.stderr.take().unwrap());
+
+            // Hold the child's input open until it exits, since `wait` closes it
+            // first and the child would then end on its closed input instead
+            let input = child.stdin.take();
             let mut ready = String::new();
             assert!(
                 stderr.read_line(&mut ready).unwrap() > 0,
@@ -305,6 +309,7 @@ mod tests {
                 Some(expected),
                 "signal exit class"
             );
+            drop(input);
             assert_eq!(
                 std::fs::read_dir(&directory).unwrap().count(),
                 0,
