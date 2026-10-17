@@ -121,7 +121,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
             no_cache,
         } => reference::fetch(
             context,
-            &connection,
+            &connection.client,
             &slots,
             match sample {
                 Some(sample) => reference::Target::Sample(sample),
@@ -177,15 +177,15 @@ fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), E
                     .any(|other| other.kind == *dependency && filled(other))
             {
                 let dependents = required_by(slots, *dependency);
-                let (last, preceding) = dependents.split_last().unwrap();
-                let subject = if preceding.is_empty() {
-                    format!("{last} requires")
+                let names = join_names(&dependents);
+                let verb = if dependents.len() == 1 {
+                    "requires"
                 } else {
-                    format!("{} and {last} require", preceding.join(", "))
+                    "require"
                 };
                 output.event(
                     "hint",
-                    format!("{subject} {}; fill it first", slot_name(*dependency)),
+                    format!("{names} {verb} {}; fill it first", slot_name(*dependency)),
                 );
             }
         }
@@ -572,6 +572,15 @@ fn required_by(slots: &[SlotStatus], id: i32) -> Vec<String> {
         .filter(|slot| slot.deps.contains(&id))
         .map(|slot| slot_name(slot.kind))
         .collect()
+}
+
+/// Joins names into an English list, such as `a, b and c`.
+fn join_names(names: &[String]) -> String {
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, preceding)) => format!("{} and {last}", preceding.join(", ")),
+    }
 }
 
 /// Borrows the advertised URL, length and digest without validating or

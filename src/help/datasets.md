@@ -2,8 +2,8 @@
 
 An Ark keeps its data in slots, one per kind of dataset. The personal slots
 hold the owner's variant calls, which ark uploads with their approval on the
-phone. A public sample can fill the small variants instead, fetched with the
-same approval. The reference slots hold public data that the Ark offers for
+phone. A public sample can fill all three instead, fetched with the same
+approvals. The reference slots hold public data that the Ark offers for
 download, which ark fetches without an approval. Every data command but
 `ark data samples` needs a paired, unlocked Ark, as `ark help devices`
 describes. `ark data paths` maps what apps read from the slots, as
@@ -60,12 +60,14 @@ all three references, and calls on other assemblies, such as T2T-CHM13v2.0,
 only some. A fresh Ark fills in three steps:
 
 1. `ark data upload calls.vcf.gz` uploads the owner's small variants,
-   approved on their phone. `ark data fetch small-variants --sample NAME`
-   fetches a public sample instead, approved the same way.
+   approved on their phone. `ark data fetch --sample NAME` instead fills all
+   three personal slots from one public sample, each file approved the same
+   way.
 2. `ark data fetch --all` downloads every reference the Ark offers for the
    calls' assembly, without an approval.
 3. `ark data upload` takes the structural variant and copy number files from
-   the same sequencing, each approved on the phone. Both are optional.
+   the same sequencing, each approved on the phone. Both are optional, and a
+   sample has filled them already.
 
 ## Uploading
 
@@ -115,14 +117,15 @@ shows. A file is kept under its SHA-256, and a cached file uploads again
 without a download. An interrupted download keeps what arrived and resumes
 from there, and network failures get 3 attempts in all. --cache picks
 another directory. --no-cache streams a reference without keeping a copy,
-and keeps a sample in a temporary file until its upload ends. The cache
-holds only public files, references and samples.
+and keeps each sample file in a temporary file until its upload ends. The
+cache holds only public files, references and samples.
 
 ## Public samples
 
 `ark data samples` lists public genomes for testing an Ark with real data.
-They are the variant calls of the 1000 Genomes Project's 3,202 people, made
-by Illumina's DRAGEN 4.4.7. The list is built into ark and needs no Ark.
+They are the 1000 Genomes Project's 3,202 people, each with small variant,
+structural variant and copy number calls made by Illumina's DRAGEN 4.4.7.
+The list is built into ark and needs no Ark.
 
 Each sample keeps a fixed name made from its sample ID, an adjective and a
 given name that matches the person's sex, such as affable-hazel for HG03730.
@@ -142,13 +145,18 @@ With a population or --all it returns samples, each with name, sample,
 population, sex, father and mother, where a parent outside the cohort is
 null.
 
-`ark data fetch small-variants --sample NAME` fills the empty small-variants
-slot with a sample's calls, named or given by its sample ID. ark downloads
-the whole file first and checks it against a size and SHA-256 built into
-it. Only then does the upload ask the owner on their phone, as for their own
-calls, and the Ark processes the calls like any upload. A failed upload is
-not retried, since that would ask the owner again, but the cached copy saves
-the download on the next run. A sample's calls take 390 to 550 MiB.
+`ark data fetch --sample NAME` fills the three personal slots from one
+sample, named or given by its sample ID, so a sample never mixes with other
+data. While any personal slot holds data, damaged included, it fails with
+slot-filled before it downloads anything. It then fills small-variants,
+structural-variants and copy-number-variants in that order. For each file,
+ark downloads the whole file and checks it against a size and SHA-256 built
+into ark. Only then does the upload ask the owner on their phone, as for
+their own calls, and the Ark processes the file like any upload. The first
+failure stops the rest. A failed upload is not retried, since that would ask
+the owner again, but the cached copies save the downloads on the next run.
+A sample's three files take 410 to 570 MiB, nearly all of it the small
+variants.
 
 ## Emptying a slot
 

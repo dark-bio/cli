@@ -25,9 +25,8 @@ use crate::{
     style::Theme,
 };
 use clap::{ValueEnum, builder::TypedValueParser};
-use darkbio_connect::schema::SlotDownload;
+use darkbio_connect::schema::{SlotDownload, SlotKind};
 use people::PEOPLE;
-use pins::PINS;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -81,24 +80,31 @@ impl Sample {
     }
 
     /// Derives the person's name, such as `affable-hazel`.
-    pub(super) fn name(self) -> String {
+    pub(crate) fn name(self) -> String {
         codec::encode(self.0)
     }
 
-    /// Builds an offer for the person's DRAGEN 4.4.7 calls from their pin.
-    pub(super) fn download(self) -> SlotDownload {
-        let index = PINS
-            .binary_search_by_key(&self.id(), |pin| pin.sample)
-            .expect("every catalog person has exactly one pin");
-        let pin = &PINS[index];
-        let sample = self.id();
-        SlotDownload {
-            url: format!(
-                "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/{sample}/{sample}.hard-filtered.vcf.gz"
-            ),
-            bytes: pin.size,
-            sha256: pin.sha256.into(),
-        }
+    /// Builds an offer for each of the person's three DRAGEN 4.4.7 files from
+    /// its pin, in the order a sample fills the slots.
+    pub(super) fn downloads(self) -> [(SlotKind, SlotDownload); 3] {
+        [
+            (SlotKind::SmallVariants, "hard-filtered.vcf.gz", pins::SMALL_VARIANTS),
+            (SlotKind::StructuralVariants, "sv.vcf.gz", pins::STRUCTURAL_VARIANTS),
+            (SlotKind::CopyNumberVariants, "cnv.vcf.gz", pins::COPY_NUMBER_VARIANTS),
+        ].map(|(kind, suffix, pins)| {
+            let index = pins
+                .binary_search_by_key(&self.id(), |pin| pin.sample)
+                .expect("every catalog person has one pin per kind");
+            let pin = &pins[index];
+            let sample = self.id();
+            (kind, SlotDownload {
+                url: format!(
+                    "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/{sample}/{sample}.{suffix}"
+                ),
+                bytes: pin.size,
+                sha256: pin.sha256.into(),
+            })
+        })
     }
 }
 
@@ -275,29 +281,32 @@ mod tests {
     use super::*;
     use crate::style::Color;
 
-    /// Checks that every person has one nonempty pin, in sample ID order.
+    /// Checks that each table pins one nonempty file for every catalog
+    /// person, in sample ID order.
     #[test]
     fn test_every_person_has_one_pin() {
-        for pair in PINS.windows(2) {
-            assert!(
-                pair[0].sample < pair[1].sample,
-                "pin order at {}",
-                pair[0].sample
-            );
-        }
-        for pin in PINS {
-            assert!(pin.size > 0, "nonempty file for {}", pin.sample);
-            assert!(
-                PEOPLE
-                    .binary_search_by_key(&pin.sample, |person| person.sample)
-                    .is_ok(),
-                "pin belongs to the catalog: {}",
-                pin.sample
-            );
-        }
-        assert_eq!(PINS.len(), PEOPLE.len(), "one pin for every catalog person");
-        for (pin, person) in PINS.iter().zip(PEOPLE) {
-            assert_eq!(pin.sample, person.sample, "pin for {}", person.sample);
+        for pins in [
+            pins::SMALL_VARIANTS,
+            pins::STRUCTURAL_VARIANTS,
+            pins::COPY_NUMBER_VARIANTS,
+        ] {
+            assert_eq!(pins.len(), 3_202);
+            assert_eq!(pins.len(), PEOPLE.len());
+            for pair in pins.windows(2) {
+                assert!(pair[0].sample < pair[1].sample, "{}", pair[0].sample);
+            }
+            for (pin, person) in pins.iter().zip(PEOPLE) {
+                assert_eq!(pin.sample, person.sample, "{}", person.sample);
+                assert!(pin.size > 0, "{}", pin.sample);
+                assert_eq!(pin.sha256.len(), 64, "{}", pin.sample);
+                assert!(
+                    pin.sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "{}",
+                    pin.sample
+                );
+            }
         }
     }
 

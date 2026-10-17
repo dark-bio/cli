@@ -60,8 +60,8 @@ impl Cli {
     /// Clap checks conflicts within one parser level, while a global flag may
     /// come from any level. This rejects `--dry-run` with `--unlock`, `--quiet`
     /// with `--verbose`, `--version` with a command, `--sex` on
-    /// `ark data samples` without a population or `--all`, and `--sample` on a
-    /// slot other than small-variants.
+    /// `ark data samples` without a population or `--all`, and `--sample` with
+    /// a slot.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         // --sex narrows a list of people, which takes a population or --all
         if matches!(
@@ -78,34 +78,17 @@ impl Cli {
             );
         }
 
-        // --sample fills only small-variants, refused before anything connects
+        // A sample fills every personal slot, so it names none
         if let Some(Command::Data(Data::Fetch {
-            slot: Some(slot),
-            sample: Some(_),
+            slot: Some(_),
+            sample: Some(sample),
             ..
         })) = &self.command
-            && *slot != SlotKind::SmallVariants as i32
         {
-            let name = slot_name(*slot);
-            let error = crate::error::Error::new(
-                2,
-                "usage",
-                format!("--sample fills small-variants, not {name}"),
+            return Err(
+                crate::error::Error::new(2, "usage", "--sample takes no slot")
+                    .hint(format!("run `ark data fetch --sample {}`", sample.name())),
             );
-
-            // Point the other personal slots at an upload, and a reference at
-            // the download the Ark offers for it
-            return Err(match SlotKind::try_from(*slot) {
-                Ok(SlotKind::StructuralVariants | SlotKind::CopyNumberVariants) => {
-                    error.hint("run `ark data upload FILE` with the owner's own file")
-                }
-                Ok(
-                    SlotKind::ReferenceGenome
-                    | SlotKind::GeneAnnotations
-                    | SlotKind::VariantCatalog,
-                ) => error.hint(format!("run `ark data fetch {name}`")),
-                _ => error,
-            });
         }
 
         let dry = matches!(
@@ -272,12 +255,12 @@ pub(crate) enum Data {
     /// Download public data onto the Ark
     Fetch {
         /// Slot name or id from `ark data list`
-        #[arg(value_parser = parse_slot, required_unless_present = "all", conflicts_with = "all")]
+        #[arg(value_parser = parse_slot, required_unless_present_any = ["all", "sample"], conflicts_with = "all")]
         slot: Option<i32>,
         /// Fetch every reference on offer, in order
         #[arg(long)]
         all: bool,
-        /// Fill the slot with a public genome, by name or sample ID
+        /// Fill personal slots with a public genome, by name or ID
         #[arg(long, value_name = "NAME", value_parser = samples::Parser, hide_possible_values = true, conflicts_with = "all")]
         sample: Option<samples::Sample>,
         /// Show the plan without changing the Ark
@@ -438,6 +421,43 @@ fn parse_timeout(value: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks that `--sample` parses without a slot, and that naming any slot
+    /// with it fails with a usage error hinting at the slotless form.
+    #[test]
+    fn test_sample_fetch_takes_no_slot() {
+        for name in ["HG00096", "notable-owen"] {
+            let cli = Cli::try_parse_from(["ark", "data", "fetch", "--sample", name]).unwrap();
+            cli.validate().unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Data(Data::Fetch {
+                    slot: None,
+                    sample: Some(_),
+                    ..
+                }))
+            ));
+
+            for slot in [
+                "small-variants",
+                "structural-variants",
+                "copy-number-variants",
+                "1",
+                "42",
+            ] {
+                let cli =
+                    Cli::try_parse_from(["ark", "data", "fetch", slot, "--sample", name]).unwrap();
+                let error = cli.validate().unwrap_err();
+                assert_eq!((error.class, error.code), (2, "usage"), "{slot}");
+                assert_eq!(error.message, "--sample takes no slot", "{slot}");
+                assert_eq!(
+                    error.hints,
+                    ["run `ark data fetch --sample notable-owen`"],
+                    "{slot}"
+                );
+            }
+        }
+    }
 
     /// Checks that every environment name parses, alone and as a global flag,
     /// while an unknown name fails.

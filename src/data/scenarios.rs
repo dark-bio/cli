@@ -514,7 +514,7 @@ fn test_personal_slot_descriptions_fit_eighty_columns() {
 /// Uploads a structural variants file to a scripted Ark whose small-variants
 /// slot is in `state`, checking which requests reach it.
 fn upload_with_requirement(
-    output: Output,
+    context: &Context,
     clock: &darkbio_clock::TestClock,
     state: SlotState,
     dry_run: bool,
@@ -624,13 +624,8 @@ fn upload_with_requirement(
         Some((Environment::Develop, Realm::Hardware))
     })
     .unwrap();
-    let context = Context {
-        options: Cli::parse_from(["ark"]).options,
-        interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
-        output,
-    };
     let result = upload_file(
-        &context,
+        context,
         &ark.client(),
         "sample.sv.vcf",
         bytes.len() as u64,
@@ -654,9 +649,13 @@ fn test_upload_refuses_unfilled_requirement_before_approval() {
     for captured in crate::testing::narration(
         "data::scenarios::test_upload_refuses_unfilled_requirement_before_approval",
         |output, clock| {
+            let context = Context {
+                options: Cli::parse_from(["ark"]).options,
+                interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                output,
+            };
             for state in [SlotState::Empty, SlotState::Damaged] {
-                let error =
-                    upload_with_requirement(output.clone(), clock, state, false).unwrap_err();
+                let error = upload_with_requirement(&context, clock, state, false).unwrap_err();
                 assert_eq!(error.code, "dependency-missing", "{state:?}");
                 assert_eq!(error.class, 5, "{state:?}");
                 assert_eq!(
@@ -665,7 +664,7 @@ fn test_upload_refuses_unfilled_requirement_before_approval() {
                     "{state:?}"
                 );
                 assert_eq!(error.hints, ["fill small-variants first"], "{state:?}");
-                output.error(&error);
+                context.output.error(&error);
             }
         },
     ) {
@@ -708,7 +707,12 @@ fn test_upload_accepts_filled_requirement() {
     for captured in crate::testing::narration(
         "data::scenarios::test_upload_accepts_filled_requirement",
         |output, clock| {
-            upload_with_requirement(output, clock, SlotState::Filled, false).unwrap();
+            let context = Context {
+                options: Cli::parse_from(["ark"]).options,
+                interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                output,
+            };
+            upload_with_requirement(&context, clock, SlotState::Filled, false).unwrap();
         },
     ) {
         captured.approvals(&[("upload", Some("phone"))]);
@@ -732,7 +736,12 @@ fn test_upload_dry_run_reports_empty_requirement() {
     for captured in crate::testing::narration(
         "data::scenarios::test_upload_dry_run_reports_empty_requirement",
         |output, clock| {
-            upload_with_requirement(output, clock, SlotState::Empty, true).unwrap();
+            let context = Context {
+                options: Cli::parse_from(["ark"]).options,
+                interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                output,
+            };
+            upload_with_requirement(&context, clock, SlotState::Empty, true).unwrap();
         },
     ) {
         captured.approvals(&[]);

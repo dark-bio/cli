@@ -94,9 +94,13 @@ or the request is fixed.
   `ark firmware list` before choosing a build again.
 - `dependency-missing` means the slot requires another that is not filled,
   such as small-variants. Fill that one first.
+- `slot-filled` means `ark data fetch --sample` found a personal slot that
+  holds data, damaged or not, since a sample never mixes with other data.
+  Empty each slot the hints name, then run it again.
 - `no-download` means the Ark offers no download for the slot
   `ark data fetch` names. `ark data show` shows the slot's requirements, and
-  --sample fills small-variants with a public sample instead.
+  `ark data fetch --sample` fills the personal slots with a public sample
+  instead.
 - `ark` means the Ark refused the request. Act on its message, never on its
   number, which can change between firmware builds.
 - `unsupported` means the Ark never serves the request in its build or role,

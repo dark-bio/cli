@@ -227,32 +227,34 @@ const CONTRACTS: &[Contract] = &[
     Contract {
         path: "data fetch",
         paragraph: "ark streams the file the Ark offers for a reference slot, checking it \
-            against the offered SHA-256 on the way. --sample instead fills the \
-            small-variants slot with a genome from `ark data samples`. The whole file \
-            downloads and is checked against the size and SHA-256 built into ark before \
-            its upload asks for approval, and that upload is never retried. A copy stays \
-            in this computer's cache. A filled slot is skipped, with no download and no \
-            approval. --all fetches every reference slot that offers a file, in the \
-            order their requirements set, and skips the rest.",
+            against the offered SHA-256 on the way, and skips a filled slot with no \
+            download. --all fetches every reference slot that offers a file, in the order \
+            their requirements set, and skips the rest. --sample instead fills the three \
+            personal slots from one genome in `ark data samples`, and fails with \
+            slot-filled while any of them holds data. Each file downloads whole and is \
+            checked against the size and SHA-256 built into ark before its upload asks for \
+            approval. That upload is never retried, the first failure stops the rest, and \
+            copies stay in this computer's cache.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark; the cloud unless status reports synced, and \
                 always for a --sample upload's approval; the download host to download a file \
-                not yet cached; for a reference, an offered download (--unlock only if status \
-                reports locked)",
-            approval: "on your phone within 1 minute once a --sample download is \
-                verified; none for a reference; --unlock needs your phone",
+                not yet cached; for a reference, an offered download; for --sample, empty \
+                personal slots (--unlock only if status reports locked)",
+            approval: "on your phone within 1 minute for each --sample file, once its \
+                download is verified; none for a reference; --unlock needs your phone",
             time: "minutes per slot, an hour or more for the variant catalog; network failures \
                 get 3 attempts",
             json: "fetched, each with slot, id, url, size_bytes, sha256, cached, outcome, \
                 error; --sample adds sample and name; --dry-run marks pending rows as planned",
             examples: "ark data fetch --all\n\
-                ark data fetch small-variants --sample affable-hazel --dry-run --json",
+                ark data fetch --sample affable-hazel --dry-run --json",
         }),
     },
     Contract {
         path: "data samples",
-        paragraph: "The genomes are the variant calls of the 1000 Genomes Project's 3,202 \
-            people, made by Illumina's DRAGEN 4.4.7. Each keeps a fixed name, an \
+        paragraph: "The genomes are the 1000 Genomes Project's 3,202 people, each with small \
+            variant, structural variant and copy number calls made by Illumina's DRAGEN \
+            4.4.7. Each keeps a fixed name, an \
             adjective and a given name of the person's sex, such as affable-hazel for \
             HG03730, and `ark data fetch --sample` takes either. With no population the \
             list shows the 26 populations, and with one it shows that population's \
