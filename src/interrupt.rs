@@ -9,6 +9,7 @@
 use crate::{error::Error, output::Output};
 use darkbio_connect::{Client, Closer, schema};
 use serde_json::{Value, json};
+use std::fs::{File, OpenOptions};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -108,6 +109,38 @@ impl Interrupt {
         self.0.lock().expect("cancellation not poisoned").target = None;
     }
 
+    /// Creates a temporary file that the OS removes, even when a signal ends ark.
+    ///
+    /// Unix unlinks the file as soon as it opens, holding the cancellation lock
+    /// so no signal lands in between. Windows deletes it once its handle closes,
+    /// which process exit does too.
+    pub fn temporary_file(&self) -> std::io::Result<File> {
+        let _state = self.0.lock().expect("cancellation not poisoned");
+        let path = std::env::temp_dir().join(format!(
+            "ark-download-{}.tmp",
+            hex::encode(darkbio_crypto::rand::generate(16))
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            /// Windows' `FILE_FLAG_DELETE_ON_CLOSE`, removing the file with its
+            /// last handle.
+            const DELETE_ON_CLOSE: u32 = 0x04000000;
+            options.share_mode(0).custom_flags(DELETE_ON_CLOSE);
+        }
+        let file = options.open(&path)?;
+        #[cfg(not(windows))]
+        std::fs::remove_file(&path)?;
+        Ok(file)
+    }
+
     /// Synchronizes command completion with a handler already holding
     /// cancellation state.
     ///
@@ -202,6 +235,89 @@ unsafe extern "system" fn console_handler(event: u32) -> windows_sys::core::BOOL
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Checks that a signal leaves no temporary download behind, although exit
+    /// skips destructors.
+    #[test]
+    fn test_signals_remove_temporary_downloads() {
+        use clap::Parser;
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            process::{Command, Stdio},
+        };
+
+        // As the child, hold a written temporary file open until the signal
+        if std::env::var_os("ARK_TEST_TEMP_SIGNAL_CHILD").is_some() {
+            let options = crate::args::Cli::parse_from(["ark", "--json", "-v"]).options;
+            let output = Output::new(&options);
+            let interrupt = Interrupt::install(output.clone()).unwrap();
+            let mut file = interrupt.temporary_file().unwrap();
+            file.write_all(b"temporary download bytes").unwrap();
+            output.event("step", "temporary download ready");
+            let _ = std::io::stdin().read_to_end(&mut Vec::new());
+            panic!("child input closed before signal");
+        }
+
+        // Give each child its own temp directory, which must be empty once it
+        // exits
+        for (signal, expected) in [("-INT", 130), ("-TERM", 143)] {
+            let directory = std::env::temp_dir().join(format!(
+                "ark-signal-test-{}",
+                hex::encode(darkbio_crypto::rand::generate(16))
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interrupt::tests::test_signals_remove_temporary_downloads",
+                    "--nocapture",
+                ])
+                .env("ARK_TEST_TEMP_SIGNAL_CHILD", "1")
+                .env("TMPDIR", &directory)
+                .env("TMP", &directory)
+                .env("TEMP", &directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stderr = BufReader::new(child.stderr.take().unwrap());
+
+            // Hold the child's input open until it exits, since `wait` closes it
+            // first and the child would then end on its closed input instead
+            let input = child.stdin.take();
+            let mut ready = String::new();
+            assert!(
+                stderr.read_line(&mut ready).unwrap() > 0,
+                "child reached temporary download"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&ready).unwrap()["message"],
+                "temporary download ready",
+                "temporary file is open before signaling"
+            );
+            assert!(
+                Command::new("kill")
+                    .args([signal, &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "signal sent"
+            );
+            assert_eq!(
+                child.wait().unwrap().code(),
+                Some(expected),
+                "signal exit class"
+            );
+            drop(input);
+            assert_eq!(
+                std::fs::read_dir(&directory).unwrap().count(),
+                0,
+                "signal leaves no temporary download"
+            );
+            std::fs::remove_dir(directory).unwrap();
+        }
+    }
 
     /// Checks that a signal before any task still ends with a complete JSON
     /// failure and the shell's conventional exit class.

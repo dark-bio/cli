@@ -48,8 +48,8 @@ These commands wait on the owner, for at most the window the Ark opens:
   in Ark Companion. The Ark and the phone then show colors, and the owner
   presses the Ark's button with its pin within 60s when they match.
 - `ark data upload` waits up to 1 minute for an approval on the phone, since
-  it uploads the owner's own calls. References come through
-  `ark data fetch`, which needs none.
+  it fills the owner's personal slot. So does `ark data fetch --sample`,
+  once its download is verified. Fetching a reference needs none.
 - `ark data delete` and `ark data repair` wait up to 2 minutes for an
   approval on the phone.
 - `ark firmware update` needs nothing while the Ark is unpaired. A paired,
@@ -145,11 +145,15 @@ runtime of its own, so an app runs on an Ark, hardware or emulated.
 
 `ark data list` shows each slot and its state, and `ark data show SLOT` what
 it requires. The owner's variant calls come first, through
-`ark data upload FILE` and an approval on the phone. `ark data fetch --all`
-then downloads the public references the Ark offers for the calls'
-assembly, without an approval, and skips any it offers none for. The
-variant catalog alone takes an hour or more. `ark help datasets` covers
-both.
+`ark data upload FILE` and an approval on the phone. Without calls of their
+own, such as on an emulator, `ark data fetch snp-indel-calls --sample NAME`
+fetches a public genome. Unless the person names one, pick NAME at random
+from `ark data samples --all`, never a fixed default, so tests spread over
+many genomes. Its approval comes once the download finishes, which takes a
+few minutes. `ark data fetch --all` then downloads the public references the
+Ark offers for the calls' assembly, without an approval, and skips any it
+offers none for. The variant catalog alone takes an hour or more.
+`ark help datasets` covers all of it.
 
 ### Update firmware
 

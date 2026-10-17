@@ -9,9 +9,18 @@
 
 use crate::output::Output;
 use darkbio_clock::TestClock;
+use darkbio_connect::{Ark, Error, Identity, TrustMode};
 use std::io::Write;
 use std::thread;
 use std::time::Instant;
+
+/// Scripted Ark peers from the connection library's own tests.
+///
+/// The library and the command share one package, and the library's test code
+/// never compiles into the command's tests, so this compiles its file again.
+#[path = "../connect/src/testing.rs"]
+#[expect(dead_code, reason = "the command's tests use only part of the harness")]
+pub(crate) mod peer;
 
 /// What a scenario printed in one mode, on a terminal, in a pipe or as JSON.
 pub(crate) struct Narration {
