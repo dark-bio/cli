@@ -27,14 +27,14 @@ use std::time::Duration;
 /// installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
-/// First firmware version with the six dataset slots this CLI uses.
-pub(crate) const MINIMUM_VERSION: &str = "0.13.0";
+/// First released firmware with the six dataset slots this CLI uses.
+pub(crate) const MINIMUM_VERSION: &str = "0.13.1";
 
 /// Earliest publish time of a develop build this CLI accepts, in Unix seconds.
 ///
 /// It moves forward whenever a change on the current release needs developers
 /// to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_792_403_986; // 2026-10-19 10:23:16 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_792_446_096; // 2026-10-19 21:41:36 UTC
 
 /// Checks that the firmware is at least [`MINIMUM_VERSION`], and that a
 /// mutable develop build has a publish time at or after
@@ -1084,26 +1084,28 @@ mod tests {
     #[test]
     fn test_compatibility_requires_the_protocol_batch() {
         for version in [
-            "0.13.0-develop",
-            "0.13.0-edd6482",
+            "0.13.1-develop",
+            "0.13.1-36da538",
             "0.14.0-develop",
             "1.0.0-0000000",
         ] {
             assert!(
-                check_compatibility(&info(version, 1_792_403_986)).is_ok(),
+                check_compatibility(&info(version, 1_792_446_096)).is_ok(),
                 "{version}"
             );
         }
         for version in [
+            "0.13.0-develop",
+            "0.13.0-edd6482",
             "0.12.1-develop",
             "0.12.0-74d557e",
             "0.11.7-develop",
             "0.11.7-abcdef0",
             "0.10.99-abcdef0",
             "unknown",
-            "0.13.0",
+            "0.13.1",
         ] {
-            let error = check_compatibility(&info(version, 1_792_403_987)).unwrap_err();
+            let error = check_compatibility(&info(version, 1_792_446_097)).unwrap_err();
             assert_eq!(error.code, "firmware-outdated", "{version}");
             assert_eq!(error.class, 5);
         }
@@ -1113,8 +1115,8 @@ mod tests {
     /// it.
     #[test]
     fn test_develop_builds_need_the_cutoff_but_tagged_builds_do_not() {
-        for version in ["0.13.0-develop", "0.14.0-develop"] {
-            for publish in [0, 1_792_403_985] {
+        for version in ["0.13.1-develop", "0.14.0-develop"] {
+            for publish in [0, 1_792_446_095] {
                 let error = check_compatibility(&info(version, publish)).unwrap_err();
                 assert_eq!(error.code, "firmware-outdated");
                 assert_eq!(error.class, 5);
@@ -1123,11 +1125,11 @@ mod tests {
                     "develop build is outdated; rebuild or update the firmware"
                 );
             }
-            for publish in [1_792_403_986, 1_792_403_987] {
+            for publish in [1_792_446_096, 1_792_446_097] {
                 assert!(check_compatibility(&info(version, publish)).is_ok());
             }
         }
-        for version in ["0.13.0-edd6482", "0.14.0-abcdef0"] {
+        for version in ["0.13.1-36da538", "0.14.0-abcdef0"] {
             assert!(check_compatibility(&info(version, 0)).is_ok());
         }
     }
@@ -1141,42 +1143,31 @@ mod tests {
             (true, false, Approval::Button),
             (true, true, Approval::Phone),
         ] {
-            let mut device = info("0.13.0-develop", 1_792_403_986);
+            let mut device = info("0.13.1-develop", 1_792_446_096);
             device.paired = paired;
             device.unlocked = unlocked;
             assert_eq!(approval(&device), Some(expected));
             device.firmware_publish -= 1;
             assert_eq!(approval(&device), None);
-            device.firmware_version = "0.12.0-74d557e".into();
+            device.firmware_version = "0.13.0-edd6482".into();
             assert_eq!(approval(&device), None);
         }
     }
 
-    /// Checks the gate against published image stamps. The v0.12.0 release fails
-    /// the version floor, the last develop build before v0.13.0 fails the cutoff
-    /// on its boot and both emulator images, and the v0.13.0 release passes, as
-    /// does a develop build stamped with it.
+    /// Checks the gate against published image stamps. The v0.13.0 release fails
+    /// the version floor, the last develop build before v0.13.1 fails the cutoff,
+    /// and the v0.13.1 release passes, as does a develop build stamped with it.
     #[test]
     fn test_published_images_straddle_the_cutoff() {
         for (version, publish, message) in [
             (
-                "0.12.0-74d557e",
-                1_791_649_628,
-                "firmware 0.12.0-74d557e requires an update; minimum 0.13.0",
+                "0.13.0-edd6482",
+                1_792_403_986,
+                "firmware 0.13.0-edd6482 requires an update; minimum 0.13.1",
             ),
             (
-                "0.13.0-develop",
-                1_792_402_580, // last develop build before v0.13.0, boot image
-                "develop build is outdated; rebuild or update the firmware",
-            ),
-            (
-                "0.13.0-develop",
-                1_792_403_017, // same build, arm64 emulator image
-                "develop build is outdated; rebuild or update the firmware",
-            ),
-            (
-                "0.13.0-develop",
-                1_792_402_571, // same build, amd64 emulator image
+                "0.13.1-develop",
+                1_792_420_858,
                 "develop build is outdated; rebuild or update the firmware",
             ),
         ] {
@@ -1188,10 +1179,10 @@ mod tests {
             );
             assert_eq!(error.message, message, "{version}/{publish}");
         }
-        for version in ["0.13.0-edd6482", "0.13.0-develop"] {
-            // The v0.13.0 release's boot image stamp
+        for version in ["0.13.1-36da538", "0.13.1-develop"] {
+            // The v0.13.1 release's boot image stamp
             assert!(
-                check_compatibility(&info(version, 1_792_403_986)).is_ok(),
+                check_compatibility(&info(version, 1_792_446_096)).is_ok(),
                 "{version}"
             );
         }
