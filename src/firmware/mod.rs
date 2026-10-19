@@ -27,14 +27,14 @@ use std::time::Duration;
 /// installation.
 pub(crate) const REBOOT_WAIT: Duration = Duration::from_secs(120);
 
-/// First firmware version speaking the wire protocol this CLI uses.
-pub(crate) const MINIMUM_VERSION: &str = "0.12.0";
+/// First firmware version with the six dataset slots this CLI uses.
+pub(crate) const MINIMUM_VERSION: &str = "0.13.0";
 
 /// Earliest publish time of a develop build this CLI accepts, in Unix seconds.
 ///
 /// It moves forward whenever a change on the current release needs developers
 /// to rebuild their image.
-pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_791_649_628; // 2026-10-10 16:27:08 UTC
+pub(crate) const MINIMUM_DEVELOP_PUBLISH: u64 = 1_792_403_986; // 2026-10-19 10:23:16 UTC
 
 /// Checks that the firmware is at least [`MINIMUM_VERSION`], and that a
 /// mutable develop build has a publish time at or after
@@ -1082,27 +1082,28 @@ mod tests {
     /// Builds from the minimum version up pass the gate, and older or malformed
     /// versions fail it.
     #[test]
-    fn compatibility_requires_the_protocol_batch() {
+    fn test_compatibility_requires_the_protocol_batch() {
         for version in [
-            "0.12.0-develop",
-            "0.12.0-abcdef0",
             "0.13.0-develop",
+            "0.13.0-edd6482",
+            "0.14.0-develop",
             "1.0.0-0000000",
         ] {
             assert!(
-                check_compatibility(&info(version, MINIMUM_DEVELOP_PUBLISH)).is_ok(),
+                check_compatibility(&info(version, 1_792_403_986)).is_ok(),
                 "{version}"
             );
         }
         for version in [
+            "0.12.1-develop",
+            "0.12.0-74d557e",
             "0.11.7-develop",
             "0.11.7-abcdef0",
             "0.10.99-abcdef0",
             "unknown",
-            "0.12.0",
+            "0.13.0",
         ] {
-            let error =
-                check_compatibility(&info(version, MINIMUM_DEVELOP_PUBLISH + 1)).unwrap_err();
+            let error = check_compatibility(&info(version, 1_792_403_987)).unwrap_err();
             assert_eq!(error.code, "firmware-outdated", "{version}");
             assert_eq!(error.class, 5);
         }
@@ -1111,9 +1112,9 @@ mod tests {
     /// Develop builds need the publish cutoff, and tagged builds pass without
     /// it.
     #[test]
-    fn develop_builds_need_the_cutoff_but_tagged_builds_do_not() {
-        for version in ["0.12.0-develop", "0.13.0-develop"] {
-            for publish in [0, MINIMUM_DEVELOP_PUBLISH - 1] {
+    fn test_develop_builds_need_the_cutoff_but_tagged_builds_do_not() {
+        for version in ["0.13.0-develop", "0.14.0-develop"] {
+            for publish in [0, 1_792_403_985] {
                 let error = check_compatibility(&info(version, publish)).unwrap_err();
                 assert_eq!(error.code, "firmware-outdated");
                 assert_eq!(error.class, 5);
@@ -1122,11 +1123,11 @@ mod tests {
                     "develop build is outdated; rebuild or update the firmware"
                 );
             }
-            for publish in [MINIMUM_DEVELOP_PUBLISH, MINIMUM_DEVELOP_PUBLISH + 1] {
+            for publish in [1_792_403_986, 1_792_403_987] {
                 assert!(check_compatibility(&info(version, publish)).is_ok());
             }
         }
-        for version in ["0.12.0-abcdef0", "0.13.0-abcdef0"] {
+        for version in ["0.13.0-edd6482", "0.14.0-abcdef0"] {
             assert!(check_compatibility(&info(version, 0)).is_ok());
         }
     }
@@ -1134,42 +1135,64 @@ mod tests {
     /// The predicted approval follows the pairing and lock state, but only on
     /// supported firmware.
     #[test]
-    fn approval_uses_device_state_only_on_supported_firmware() {
+    fn test_approval_uses_device_state_only_on_supported_firmware() {
         for (paired, unlocked, expected) in [
             (false, false, Approval::None),
             (true, false, Approval::Button),
             (true, true, Approval::Phone),
         ] {
-            let mut device = info("0.12.0-develop", MINIMUM_DEVELOP_PUBLISH);
+            let mut device = info("0.13.0-develop", 1_792_403_986);
             device.paired = paired;
             device.unlocked = unlocked;
             assert_eq!(approval(&device), Some(expected));
             device.firmware_publish -= 1;
             assert_eq!(approval(&device), None);
-            device.firmware_version = "0.11.7-abcdef0".into();
+            device.firmware_version = "0.12.0-74d557e".into();
             assert_eq!(approval(&device), None);
         }
     }
 
-    /// Checks the cutoff against the publish times of real develop images, the
-    /// last build it refuses and the first it accepts.
+    /// Checks the gate against published image stamps. The v0.12.0 release fails
+    /// the version floor, the last develop build before v0.13.0 fails the cutoff
+    /// on its boot and both emulator images, and the v0.13.0 release passes, as
+    /// does a develop build stamped with it.
     #[test]
-    fn published_develop_images_straddle_the_cutoff() {
-        for (i, (version, publish, accepted)) in [
-            ("0.12.0-develop", 1_791_647_343, false), // last refused, amd64 emulator
-            ("0.12.0-develop", 1_791_647_356, false), // last refused, arm64 boot
-            ("0.12.0-develop", 1_791_647_790, false), // last refused, arm64 emulator
-            ("0.12.1-develop", 1_791_652_057, true),  // first accepted, amd64 emulator
-            ("0.12.1-develop", 1_791_652_068, true),  // first accepted, arm64 boot
-            ("0.12.1-develop", 1_791_652_480, true),  // first accepted, arm64 emulator
-        ]
-        .into_iter()
-        .enumerate()
-        {
+    fn test_published_images_straddle_the_cutoff() {
+        for (version, publish, message) in [
+            (
+                "0.12.0-74d557e",
+                1_791_649_628,
+                "firmware 0.12.0-74d557e requires an update; minimum 0.13.0",
+            ),
+            (
+                "0.13.0-develop",
+                1_792_402_580, // last develop build before v0.13.0, boot image
+                "develop build is outdated; rebuild or update the firmware",
+            ),
+            (
+                "0.13.0-develop",
+                1_792_403_017, // same build, arm64 emulator image
+                "develop build is outdated; rebuild or update the firmware",
+            ),
+            (
+                "0.13.0-develop",
+                1_792_402_571, // same build, amd64 emulator image
+                "develop build is outdated; rebuild or update the firmware",
+            ),
+        ] {
+            let error = check_compatibility(&info(version, publish)).unwrap_err();
             assert_eq!(
-                check_compatibility(&info(version, publish)).is_ok(),
-                accepted,
-                "{i}"
+                (error.class, error.code),
+                (5, "firmware-outdated"),
+                "{version}/{publish}"
+            );
+            assert_eq!(error.message, message, "{version}/{publish}");
+        }
+        for version in ["0.13.0-edd6482", "0.13.0-develop"] {
+            // The v0.13.0 release's boot image stamp
+            assert!(
+                check_compatibility(&info(version, 1_792_403_986)).is_ok(),
+                "{version}"
             );
         }
     }

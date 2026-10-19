@@ -307,7 +307,10 @@ fn test_samples_help_and_completion() {
         "sample option placeholder"
     );
     assert!(
-        text.contains("Fill the slot with a public genome, by name or sample ID"),
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Fill personal slots with a public genome, by name or ID"),
         "sample option help"
     );
     assert!(
@@ -894,13 +897,7 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             ],
         ),
         (
-            vec![
-                "data",
-                "fetch",
-                "snp-indel-calls",
-                "--sample",
-                "notable-owe",
-            ],
+            vec!["data", "fetch", "--sample", "notable-owe"],
             "unknown sample 'notable-owe'",
             vec![
                 "a similar value exists: `notable-owen`",
@@ -908,24 +905,55 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             ],
         ),
         (
-            vec!["data", "fetch", "snp-indel-calls", "--sample", "????"],
+            vec!["data", "fetch", "--sample", "????"],
             "unknown sample '????'",
             vec!["use a sample name or id from `ark data samples`"],
         ),
         (
             vec!["data", "fetch", "reference-genome", "--sample", "HG00096"],
-            "--sample fills snp-indel-calls, not reference-genome",
-            vec!["run `ark data fetch reference-genome`"],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
         ),
         (
             vec!["data", "fetch", "1", "--sample", "notable-owen"],
-            "--sample fills snp-indel-calls, not reference-genome",
-            vec!["run `ark data fetch reference-genome`"],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
+        ),
+        (
+            vec!["data", "fetch", "gene-annotations", "--sample", "HG00096"],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
+        ),
+        (
+            vec!["data", "fetch", "4", "--sample", "HG00096"],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
+        ),
+        (
+            vec![
+                "data",
+                "fetch",
+                "structural-variants",
+                "--sample",
+                "HG00096",
+            ],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
+        ),
+        (
+            vec!["data", "fetch", "6", "--sample", "HG00096"],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
         ),
         (
             vec!["data", "fetch", "42", "--sample", "notable-owen"],
-            "--sample fills snp-indel-calls, not 42",
-            vec![],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
+        ),
+        (
+            vec!["data", "fetch", "small-variants", "--sample", "HG00096"],
+            "--sample takes no slot",
+            vec!["run `ark data fetch --sample notable-owen`"],
         ),
         (
             vec!["data", "samples", "unknown"],
@@ -948,10 +976,15 @@ fn test_usage_errors_name_inputs_and_preserve_suggestions() {
             vec!["see `ark data samples --help`"],
         ),
         (
-            vec!["data", "show", "snp-indel-call"],
-            "unknown slot 'snp-indel-call'",
+            vec!["data", "show", "snp-indel-calls"],
+            "unknown slot 'snp-indel-calls'",
+            vec!["use a slot name or id from `ark data list`"],
+        ),
+        (
+            vec!["data", "show", "small-variant"],
+            "unknown slot 'small-variant'",
             vec![
-                "a similar value exists: `snp-indel-calls`",
+                "a similar value exists: `small-variants`",
                 "use a slot name or id from `ark data list`",
             ],
         ),
@@ -1173,9 +1206,10 @@ fn usage_errors_are_json_in_both_streams() {
     }
 }
 
-/// Checks that --sample needs a named slot and refuses --all.
+/// Checks that `--sample` conflicts with `--all`, and that a fetch without
+/// either needs a slot.
 #[test]
-fn test_sample_fetch_requires_a_slot_and_conflicts_with_all() {
+fn test_sample_fetch_conflicts_with_all() {
     for (args, message) in [
         (
             vec!["data", "fetch", "--all", "--sample", "notable-owen"],
@@ -1196,8 +1230,8 @@ fn test_sample_fetch_requires_a_slot_and_conflicts_with_all() {
         );
         assert!(output.stdout.is_empty(), "{args:?}");
     }
-    let output = ark(&["data", "fetch", "--sample", "HG00096"]);
-    assert_eq!(output.status.code(), Some(2), "sample needs a slot");
+    let output = ark(&["data", "fetch"]);
+    assert_eq!(output.status.code(), Some(2), "plain fetch needs a slot");
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "error[usage]: missing the slot name or id\nhint: see `ark data fetch --help`\n",

@@ -14,18 +14,12 @@
 
 mod personal;
 
-use super::{Operation, Progress, cache, download, filled, samples::Sample, select};
-use crate::{
-    args::slot_name,
-    context::{Connection, Context},
-    error::Error,
-    http,
-    output::Output,
-};
+use super::{Operation, Progress, cache, download, filled, join_names, samples::Sample, select};
+use crate::{args::slot_name, context::Context, error::Error, http, output::Output};
 use darkbio_clock::Clock;
 use darkbio_connect::{
     Client, Dataset,
-    schema::{SlotKind, SlotOrigin, SlotStatus},
+    schema::{SlotOrigin, SlotState, SlotStatus},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -42,43 +36,38 @@ pub(super) enum Target {
     All,
     /// One slot, from the download the Ark offers for it.
     Slot(i32),
-    /// The snp-indel-calls slot, from a sample's pinned variant calls.
+    /// The three personal slots, filled from one sample's pinned files.
     Sample(Sample),
 }
 
 /// Plans the target's downloads and installs each one.
 ///
 /// Planning all references also checks their dependencies and orders the work,
-/// skipping filled slots and those without offers. A named slot is installed
-/// alone, from the Ark's offer or a sample's pin. It stops at the first failure
-/// and reports completed, failed and unattempted slots. A dry run only plans.
+/// skipping filled slots and those without offers. A sample needs every
+/// personal slot empty, and fills the three it pins in order. It stops at the
+/// first failure and reports completed, failed and unattempted slots. A dry run
+/// only plans.
 pub(super) fn fetch(
     context: &Context,
-    connection: &Connection,
+    client: &Client,
     slots: &[SlotStatus],
     target: Target,
     dry_run: bool,
     directory: Option<&Path>,
     no_cache: bool,
 ) -> Result<(), Error> {
-    // A sample's pin stands in for an offer on the slot the Ark reports
-    let (id, sample) = match target {
-        Target::All => (None, None),
-        Target::Slot(id) => (Some(id), None),
-        Target::Sample(sample) => (Some(SlotKind::SnpIndelCalls as i32), Some(sample)),
-    };
+    // Check the whole plan before anything downloads
     let selected;
-    let slots = if let Some(sample) = sample {
-        selected = [SlotStatus {
-            download: Some(sample.download()),
-            ..select(slots, SlotKind::SnpIndelCalls as i32)?.clone()
-        }];
-        &selected
-    } else {
-        slots
+    let (ordered, sample) = match target {
+        Target::All => (plan(slots, None)?, None),
+        Target::Slot(id) => (plan(slots, Some(id))?, None),
+        Target::Sample(sample) => {
+            selected = sample_plan(slots, sample)?;
+            (selected.iter().collect(), Some(sample))
+        }
     };
 
-    // Order the plan and validate every offer it downloads before any change
+    // Downloads go to the cache directory, unless --no-cache asks for none
     let directory = directory
         .map(Path::to_path_buf)
         .unwrap_or_else(cache::directory);
@@ -87,11 +76,60 @@ pub(super) fn fetch(
     } else {
         Some(directory.as_path())
     };
-    let ordered = plan(slots, id)?;
     let agent = http::agent(Duration::from_secs(context.options.timeout), 5);
     execute(context, &ordered, sample, dry_run, directory, |source| {
-        install(context, &connection.client, source, directory, &agent)
+        install(context, client, source, directory, &agent)
     })
+}
+
+/// Plans the sample's three pinned files, refusing while any personal slot
+/// holds data.
+fn sample_plan(slots: &[SlotStatus], sample: Sample) -> Result<Vec<SlotStatus>, Error> {
+    // Any occupied personal slot would mix the sample with other data
+    let occupied: Vec<_> = slots
+        .iter()
+        .filter(|slot| {
+            slot.origin == SlotOrigin::Personal as i32 && slot.state != SlotState::Empty as i32
+        })
+        .collect();
+    if !occupied.is_empty() {
+        let names = join_names(
+            &occupied
+                .iter()
+                .map(|slot| slot_name(slot.kind))
+                .collect::<Vec<_>>(),
+        );
+        let verb = if occupied.len() == 1 { "holds" } else { "hold" };
+        let mut error = Error::new(
+            5,
+            "slot-filled",
+            format!("{names} {verb} data, and a sample fills only empty personal slots"),
+        );
+        for slot in occupied {
+            let action = if slot.state == SlotState::Damaged as i32 {
+                "repair"
+            } else {
+                "delete"
+            };
+            error = error.hint(format!("run `ark data {action} {}`", slot_name(slot.kind)));
+        }
+        return Err(error);
+    }
+
+    // Each target slot must be in the Ark's list, and takes the sample's pin
+    // as its offer
+    sample
+        .downloads()
+        .into_iter()
+        .map(|(kind, download)| {
+            let slot = SlotStatus {
+                download: Some(download),
+                ..select(slots, kind as i32)?.clone()
+            };
+            offer(&slot)?;
+            Ok(slot)
+        })
+        .collect()
 }
 
 /// Installs a validated plan in order, retaining skipped and unattempted rows.
@@ -242,15 +280,16 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
                                 .iter()
                                 .any(|ordered: &&SlotStatus| ordered.kind == *dependency)))
             }) {
+                let dependency = slot_name(*dependency);
                 return Err(Error::new(
                     5,
                     "dependency-missing",
                     format!(
-                        "{} requires {}",
+                        "{} requires {dependency}, which is not filled",
                         slot_name(slot.kind),
-                        slot_name(*dependency)
                     ),
-                ));
+                )
+                .hint(format!("fill {dependency} first")));
             }
         }
         ordered.push(slot);
@@ -288,8 +327,11 @@ fn offer(slot: &SlotStatus) -> Result<Source, Error> {
             "no-download",
             format!("{} advertises no download", slot_name(slot.kind)),
         );
-        if slot.kind == SlotKind::SnpIndelCalls as i32 {
-            error.hint("--sample fills it with a public genome from `ark data samples`")
+        // A personal slot fills from the owner's own file or a sample
+        if slot.origin == SlotOrigin::Personal as i32 {
+            error
+                .hint("run `ark data upload FILE` with the owner's own file")
+                .hint("run `ark data fetch --sample NAME` for a public genome")
         } else {
             error
         }
@@ -799,6 +841,7 @@ impl Read for Reader<'_> {
 #[cfg(test)]
 mod tests {
     mod personal;
+    mod samples;
 
     use super::*;
     use clap::Parser;
@@ -812,14 +855,7 @@ mod tests {
 
     /// Parses a sample the way the command line does.
     fn sample(value: &str) -> Sample {
-        let cli = crate::args::Cli::parse_from([
-            "ark",
-            "data",
-            "fetch",
-            "snp-indel-calls",
-            "--sample",
-            value,
-        ]);
+        let cli = crate::args::Cli::parse_from(["ark", "data", "fetch", "--sample", value]);
         cli.validate().unwrap();
         let Some(crate::args::Command::Data(crate::args::Data::Fetch {
             sample: Some(sample),
@@ -831,13 +867,13 @@ mod tests {
         sample
     }
 
-    /// Builds an empty snp-indel-calls slot offering the sample's pinned file.
+    /// Builds an empty small-variants slot offering the sample's pinned file.
     fn sample_slot(sample: Sample) -> SlotStatus {
         SlotStatus {
-            kind: SlotKind::SnpIndelCalls as i32,
+            kind: SlotKind::SmallVariants as i32,
             origin: SlotOrigin::Personal as i32,
             state: SlotState::Empty as i32,
-            download: Some(sample.download()),
+            download: Some(sample.downloads().into_iter().next().unwrap().1),
             ..Default::default()
         }
     }
@@ -870,107 +906,36 @@ mod tests {
         }
     }
 
-    /// Checks that only snp-indel-calls points a missing download at samples.
+    /// Checks that a missing download hints at an upload and a sample for a
+    /// personal slot, and at nothing for any other.
     #[test]
-    fn test_no_download_suggests_samples_only_for_variant_calls() {
-        for id in [1, 2, 3, 4, 42] {
-            let error = plan(&[reference(id, &[], false)], Some(id)).unwrap_err();
-            assert_eq!((error.class, error.code), (5, "no-download"), "slot {id}");
-            assert_eq!(
-                error.hints,
-                if id == 3 {
-                    vec!["--sample fills it with a public genome from `ark data samples`"]
-                } else {
-                    vec![]
-                },
-                "slot {id} guidance"
-            );
-        }
-    }
-
-    /// Runs a sample plan that must install nothing, and checks its output.
-    fn check_sample_plan(test: &str, filled: bool, dry_run: bool) {
-        for captured in crate::testing::narration(test, |output, _| {
-            let sample = sample("notable-owen");
-            let mut slot = sample_slot(sample);
-            if filled {
-                slot.state = SlotState::Filled as i32;
-            }
-            let slots = [slot];
-            let ordered = plan(&slots, Some(3)).unwrap();
-            let context = Context {
-                options: crate::args::Cli::parse_from(["ark"]).options,
-                interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
-                output,
-            };
-            execute(&context, &ordered, Some(sample), dry_run, None, |_| {
-                panic!("a dry run or filled slot never installs a sample")
-            })
-            .unwrap();
-        }) {
-            if captured.json {
-                let document: Value = serde_json::from_str(&captured.stdout).unwrap();
+    fn test_no_download_hints_follow_slot_origin() {
+        for (origin, hints) in [
+            (
+                SlotOrigin::Personal as i32,
+                vec![
+                    "run `ark data upload FILE` with the owner's own file",
+                    "run `ark data fetch --sample NAME` for a public genome",
+                ],
+            ),
+            (SlotOrigin::Reference as i32, vec![]),
+            (0, vec![]),
+            (42, vec![]),
+        ] {
+            for id in [1, 2, 3, 4, 5, 6, 42] {
+                let slot = SlotStatus {
+                    origin,
+                    ..reference(id, &[], false)
+                };
+                let error = plan(&[slot], Some(id)).unwrap_err();
                 assert_eq!(
-                    document["fetched"].as_array().unwrap().len(),
-                    1,
-                    "one selected slot"
+                    (error.class, error.code),
+                    (5, "no-download"),
+                    "{origin}/{id}"
                 );
-                let row = &document["fetched"][0];
-                assert_eq!(row["sample"], "HG00096", "selected sample");
-                assert_eq!(row["name"], "notable-owen", "selected name");
-                assert_eq!(row["size_bytes"], 437_027_190, "pinned file length");
-                assert_eq!(
-                    row["sha256"],
-                    "488f8b0fc05cfae2a2c7b4208367abefa8401fcef3151e32feb5587d71303260",
-                    "pinned digest"
-                );
-                assert_eq!(
-                    row["outcome"],
-                    if filled { "skipped" } else { "planned" },
-                    "plan outcome"
-                );
-            } else {
-                assert_eq!(
-                    captured
-                        .stdout
-                        .lines()
-                        .next()
-                        .unwrap()
-                        .split_whitespace()
-                        .collect::<Vec<_>>(),
-                    ["SLOT", "SIZE", "CACHED", "OUTCOME"],
-                    "fetch columns stay unchanged"
-                );
-            }
-            if filled {
-                captured.contains(&["snp-indel-calls is already filled"]);
-            } else {
-                assert!(
-                    captured.stderr.is_empty(),
-                    "dry run has no download or approval events"
-                );
+                assert_eq!(error.hints, hints, "{origin}/{id}");
             }
         }
-    }
-
-    /// Checks that a sample dry run plans the pinned file and moves nothing.
-    #[test]
-    fn test_sample_dry_run_only_plans() {
-        check_sample_plan(
-            "data::reference::tests::test_sample_dry_run_only_plans",
-            false,
-            true,
-        );
-    }
-
-    /// Checks that a filled slot keeps its data and skips the sample.
-    #[test]
-    fn test_sample_fetch_skips_a_filled_slot() {
-        check_sample_plan(
-            "data::reference::tests::test_sample_fetch_skips_a_filled_slot",
-            true,
-            false,
-        );
     }
 
     /// Checks a sample fetch end to end, from download to processing and cache.
@@ -1144,7 +1109,7 @@ mod tests {
             captured.contains(&[
                 "Approve the upload on your phone, in Ark Companion",
                 "Approved on your phone",
-                "Fetched snp-indel-calls",
+                "Fetched small-variants",
                 "Indexing",
                 "cache:",
             ]);
@@ -1154,7 +1119,7 @@ mod tests {
                 assert_eq!(
                     document["fetched"][0],
                     json!({
-                        "slot": "snp-indel-calls", "id": 3,
+                        "slot": "small-variants", "id": 3,
                         "url": "https://1000genomes-dragen-v4-4-7.s3.amazonaws.com/data/individuals/hg38-alt_masked.cnv.graph.hla.methyl_cg.rna-11-r5.0-2/HG00096/HG00096.hard-filtered.vcf.gz",
                         "size_bytes": 26,
                         "sha256": "df9a83175f9bf0ab03383500321104f6bd1ae0367631ce81c2909d7813f68a79",
@@ -1176,7 +1141,7 @@ mod tests {
             |output, _| {
                 // Plan from an inventory that holds only personal data
                 let slots = [SlotStatus {
-                    kind: SlotKind::SnpIndelCalls as i32,
+                    kind: SlotKind::SmallVariants as i32,
                     origin: SlotOrigin::Personal as i32,
                     ..Default::default()
                 }];
@@ -1397,8 +1362,12 @@ mod tests {
             match scenario.as_str() {
                 "all" | "dry-run" | "failed" => {}
                 "named" => id = Some(4),
-                "missing-calls" => {
-                    slots[3].state = SlotState::Empty as i32;
+                "missing-calls" | "damaged-calls" => {
+                    slots[3].state = if scenario == "damaged-calls" {
+                        SlotState::Damaged
+                    } else {
+                        SlotState::Empty
+                    } as i32;
                     for slot in &mut slots {
                         slot.download = None;
                     }
@@ -1464,6 +1433,7 @@ mod tests {
             ("dry-run", 0, None),
             ("named", 5, Some("no-download")),
             ("missing-calls", 5, Some("dependency-missing")),
+            ("damaged-calls", 5, Some("dependency-missing")),
             ("skipped-dependency", 5, Some("dependency-missing")),
             ("filled", 0, None),
             ("malformed", 1, Some("file-rejected")),
@@ -1502,6 +1472,29 @@ mod tests {
                 if scenario != "failed" {
                     assert_eq!(document["error"]["code"], error, "{scenario}");
                     assert_eq!(events.len(), 1, "{scenario}");
+                    let dependency = match scenario {
+                        "missing-calls" | "damaged-calls" => Some((
+                            "variant-catalog requires small-variants, which is not filled",
+                            "fill small-variants first",
+                        )),
+                        "skipped-dependency" => Some((
+                            "gene-annotations requires variant-catalog, which is not filled",
+                            "fill variant-catalog first",
+                        )),
+                        _ => None,
+                    };
+                    if let Some((message, hint)) = dependency {
+                        assert_eq!(
+                            document["error"],
+                            json!({
+                                "code": "dependency-missing",
+                                "message": message,
+                                "hints": [hint],
+                            }),
+                            "{scenario}"
+                        );
+                        assert_eq!(events[0]["error"], document["error"], "{scenario}");
+                    }
                     continue;
                 }
             }

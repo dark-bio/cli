@@ -27,13 +27,15 @@ use darkbio_connect::{
     schema::{self, SlotState, SlotStatus},
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::Seek;
 
 /// Dispatches dataset commands after applying CLI unlock and dry-run policy.
 ///
-/// Path entries, slot metadata and refusal messages come from the Ark. The CLI
-/// does not predict whether a requested delete, repair or upload will be
-/// accepted.
+/// Path entries, slot metadata and refusal messages come from the Ark, which
+/// decides whether a delete, repair or upload goes ahead. Only an upload's
+/// required slots are checked here first, so an unfilled one fails before the
+/// owner is asked.
 pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
     // The sample catalog is built in, so it lists without an Ark
     if let args::Data::Samples {
@@ -119,7 +121,7 @@ pub(crate) fn run(context: &Context, command: args::Data) -> Result<(), Error> {
             no_cache,
         } => reference::fetch(
             context,
-            &connection,
+            &connection.client,
             &slots,
             match sample {
                 Some(sample) => reference::Target::Sample(sample),
@@ -153,8 +155,9 @@ fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), E
         Some("No slots found"),
     )?;
 
-    // Hint at repairing damage, fetching missing references and filling
-    // missing dependencies
+    // Hint at repairing damage and fetching missing references, and name each
+    // unfilled requirement once, with every slot that requires it
+    let mut hinted = HashSet::new();
     for slot in slots {
         if slot.state == SlotState::Damaged as i32 {
             output.event(
@@ -168,17 +171,21 @@ fn listing(output: &crate::output::Output, slots: &[SlotStatus]) -> Result<(), E
             );
         }
         for dependency in &slot.deps {
-            if !slots
-                .iter()
-                .any(|other| other.kind == *dependency && filled(other))
+            if hinted.insert(*dependency)
+                && !slots
+                    .iter()
+                    .any(|other| other.kind == *dependency && filled(other))
             {
+                let dependents = required_by(slots, *dependency);
+                let names = join_names(&dependents);
+                let verb = if dependents.len() == 1 {
+                    "requires"
+                } else {
+                    "require"
+                };
                 output.event(
                     "hint",
-                    format!(
-                        "{} requires {}; fill it first",
-                        slot_name(slot.kind),
-                        slot_name(*dependency)
-                    ),
+                    format!("{names} {verb} {}; fill it first", slot_name(*dependency)),
                 );
             }
         }
@@ -197,11 +204,7 @@ fn show(output: &crate::output::Output, slots: &[SlotStatus], id: i32) -> Result
     output.document_with(&value, |theme| crate::output::human::document(theme, &view))
 }
 
-/// Identifies a local file, checks an optional target constraint and either plans
-/// or uploads it.
-///
-/// The upload rewinds the prefix that identification consumed, and a failure
-/// still prints the progress reached.
+/// Opens a local file and connects to an unlocked Ark for [`upload_file`].
 fn upload(
     context: &Context,
     path: &std::path::Path,
@@ -217,15 +220,38 @@ fn upload(
         .ok_or_else(|| Error::new(1, "file-unreadable", "filename is not valid UTF-8"))?;
     let connection = context.connect(None)?;
     context.require_unlocked(&connection, dry_run)?;
+    upload_file(
+        context,
+        &connection.client,
+        name,
+        size,
+        &mut file,
+        required,
+        dry_run,
+    )
+}
 
+/// Identifies an open file and either plans or uploads it.
+///
+/// The upload refuses a slot other than `required`, and a target whose
+/// required slots are not filled, before it asks for an approval. It rewinds
+/// the prefix that identification consumed, and a failure still prints the
+/// progress reached.
+fn upload_file(
+    context: &Context,
+    client: &darkbio_connect::Client,
+    name: &str,
+    size: u64,
+    file: &mut (impl std::io::Read + Seek),
+    required: Option<i32>,
+    dry_run: bool,
+) -> Result<(), Error> {
     // Let the Ark identify the file, refusing a rejection or a slot other than
     // the required one
     context
         .output
         .stage("identifying", &format!("Identifying {name}"), None);
-    let identified = connection
-        .client
-        .identify_dataset(name, size, &mut file, context.timing())?;
+    let identified = client.identify_dataset(name, size, file, context.timing())?;
     if !identified.rejection.is_empty() {
         return Err(Error::new(1, "file-rejected", identified.rejection));
     }
@@ -252,13 +278,14 @@ fn upload(
     });
     identification(&context.output, &identified);
 
+    // Read the slots, which both the dry run and the requirement check need
+    let slots = client
+        .call(schema::SlotListRequest {}, context.timing())?
+        .slots;
+    let target = select(&slots, identified.kind)?;
+
     // A dry run plans against the target slot's state and dependencies
     if dry_run {
-        let slots = connection
-            .client
-            .call(schema::SlotListRequest {}, context.timing())?
-            .slots;
-        let target = select(&slots, identified.kind)?;
         value["state"] = json!(state(target));
         value["requires"] = json!(
             target
@@ -273,9 +300,28 @@ fn upload(
             .document_with(&value, |theme| crate::output::human::document(theme, &view));
     }
 
+    // Refuse an unfilled required slot before the upload asks for an approval
+    for dependency in &target.deps {
+        if !slots
+            .iter()
+            .any(|slot| slot.kind == *dependency && filled(slot))
+        {
+            let dependency = slot_name(*dependency);
+            return Err(Error::new(
+                5,
+                "dependency-missing",
+                format!(
+                    "{} requires {dependency}, which is not filled",
+                    slot_name(target.kind)
+                ),
+            )
+            .hint(format!("fill {dependency} first")));
+        }
+    }
+
     // Upload from the start, keeping the partial result current on every stage
     file.rewind()?;
-    let clock = connection.client.clock();
+    let clock = client.clock();
     let started = clock.now();
     let mut progress = Progress::new(
         context,
@@ -285,14 +331,14 @@ fn upload(
         Operation::Upload,
     );
     context.interrupt.partial(value.clone());
-    let result = connection.client.upload_dataset(
+    let result = client.upload_dataset(
         &Dataset {
             name: name.into(),
             size,
             slot: Some(identified.kind),
             sha256: None,
         },
-        &mut file,
+        file,
         context.timing(),
         |stage| {
             progress.update(stage);
@@ -528,6 +574,15 @@ fn required_by(slots: &[SlotStatus], id: i32) -> Vec<String> {
         .collect()
 }
 
+/// Joins names into an English list, such as `a, b and c`.
+fn join_names(names: &[String]) -> String {
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, preceding)) => format!("{} and {last}", preceding.join(", ")),
+    }
+}
+
 /// Borrows the advertised URL, length and digest without validating or
 /// fetching them.
 pub(crate) fn download(slot: &SlotStatus) -> Option<(&str, u64, &str)> {
@@ -635,7 +690,7 @@ mod tests {
                 identification(
                     output,
                     &schema::SlotIdentifyResponse {
-                        kind: schema::SlotKind::SnpIndelCalls as i32,
+                        kind: schema::SlotKind::SmallVariants as i32,
                         conf: schema::SlotConfidence::High as i32,
                         summary: "Sample calls".into(),
                         ..Default::default()
@@ -644,7 +699,7 @@ mod tests {
                 for (operation, slot, size, seconds, phase, duration) in [
                     (
                         Operation::Upload,
-                        schema::SlotKind::SnpIndelCalls as i32,
+                        schema::SlotKind::SmallVariants as i32,
                         307547341,
                         22,
                         "Compressing",
@@ -705,7 +760,7 @@ mod tests {
                 }
                 context.interrupt.clear();
                 for repair in [false, true] {
-                    approve_change(output, schema::SlotKind::SnpIndelCalls as i32, repair);
+                    approve_change(output, schema::SlotKind::SmallVariants as i32, repair);
                     output.finish();
                     clock.advance(Duration::from_secs(6));
                     output.end_stage(None, None);
@@ -714,7 +769,7 @@ mod tests {
         {
             captured.contains(&[
                 "Identifying calls.vcf.gz",
-                "Identified as snp-indel-calls · high confidence",
+                "Identified as small-variants · high confidence",
                 "Approve the upload on your phone, in Ark Companion",
                 "Approved on your phone · 14s",
                 "Uploading",
@@ -726,9 +781,9 @@ mod tests {
                 "Indexing · 2m 31s",
                 "Preparing the upload",
                 "Uploaded 1.0 KiB · 1s",
-                "Approve deleting snp-indel-calls on your phone, in Ark Companion",
+                "Approve deleting small-variants on your phone, in Ark Companion",
                 "Approved on your phone · 6s",
-                "Approve repairing snp-indel-calls on your phone, in Ark Companion",
+                "Approve repairing small-variants on your phone, in Ark Companion",
                 "Approved on your phone · 6s",
             ]);
             captured.approvals(&[
@@ -751,7 +806,10 @@ mod tests {
         for kind in [ReferenceGenome, GeneAnnotations, VariantCatalog] {
             assert!(!upload_approval(kind as i32));
         }
-        assert!(upload_approval(SnpIndelCalls as i32));
+        for kind in [SmallVariants, StructuralVariants, CopyNumberVariants] {
+            assert!(upload_approval(kind as i32), "{kind:?}");
+        }
+        assert!(upload_approval(42));
     }
 
     /// Checks that a slot kind this CLI does not know keeps its texts and
