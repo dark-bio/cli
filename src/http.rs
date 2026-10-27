@@ -119,6 +119,7 @@ impl<T: Transport> Idle<T> {
             NextTimeout {
                 after: self.timeout.into(),
                 reason: ureq::Timeout::RecvBody,
+                ..timeout
             }
         } else {
             timeout
