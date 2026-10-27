@@ -11,10 +11,12 @@ https://github.com/dark-bio/examples.
 
 ## Running an app
 
-`ark run FILE` uploads the app, then follows its task to the end:
+`ark run FILE` loads the app, then follows its task to the end. Apps using
+other apps run from Ark Hub for now.
 
-1. The Ark checks the module, runs the manifest pass, and checks the
-   manifest and every grant. It refuses the app at the first check that
+1. ark hashes the file and serves it as the Ark requests its bytes. The Ark
+   checks the module, runs the manifest pass, and checks the manifest and
+   every grant. It refuses the app at the first check that
    fails, naming the rule, before the owner is asked.
 2. The owner approves the run on their phone within 5 minutes. They see the
    app's name and version, whether it is a develop build, and every grant of
@@ -29,6 +31,9 @@ Under -v, ark shows the task id once the Ark assigns it. At steps 2 and 4 it
 passes on an approval. Only the connection that started the task receives
 its report. Ending that connection, by stopping ark or losing the Ark,
 cancels a task still running and drops its report.
+
+Loading and running have no overall time limit. --timeout bounds other
+machine replies, and never shortens an approval or the loading phase.
 
 Without --json the report goes to stdout exactly as the app printed it, so
 `ark run app.wasm > report.md` keeps it. With --json the document holds:

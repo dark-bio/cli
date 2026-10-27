@@ -61,7 +61,7 @@
 //! session. [`Client::upload_dataset`] streams a [`Dataset`] and waits for
 //! processing. [`Client::update_firmware`] streams a [`Firmware`], obtains
 //! cloud access keys, verifies and installs it; success acknowledges
-//! installation, not the later reboot. [`Client::execute`] uploads an app,
+//! installation, not the later reboot. [`Ark::execute`] runs one app,
 //! obtains approval and retrieves its released result and output. A released
 //! failed app returns `success: false`; a withheld report returns a remote
 //! error. Standard error is kept for develop builds. Firmware preparation may
@@ -146,6 +146,10 @@ pub enum Error {
     /// App transfer or execution status was invalid.
     #[error("execution failed: {0}")]
     Execution(String),
+
+    /// Refusal of an app that pins dependencies this client cannot serve.
+    #[error("apps using other apps run from Ark Hub for now")]
+    ExecutionDependency,
 
     /// An app source could not supply its advertised bytes.
     #[error("failed to read app: {0}")]

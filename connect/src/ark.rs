@@ -138,6 +138,35 @@ impl Ark {
         Ok(self.incoming.recv()?)
     }
 
+    /// Runs one app on the Ark, from loading it to reading its released result.
+    ///
+    /// It hashes `reader` from its start, creates the task with that digest and
+    /// serves the Ark's module requests by seeking to each offset asked for. A
+    /// request for any other digest is refused, since the app then pins
+    /// dependencies this client cannot serve. The Ark checks the module, its
+    /// manifest and its grants. A released result returns even when the task
+    /// failed, with `success` false. A withheld report returns a remote error.
+    ///
+    /// Loading waits for the Ark without an inactivity limit, while a deadline
+    /// the caller gives covers the whole run. Reads and progress callbacks run
+    /// on this thread and must return promptly, since a deadline cannot
+    /// interrupt a blocking reader. On a failure it tries to cancel the task
+    /// within the time left, at most 1s, and never retries.
+    ///
+    /// [`ExecutionProgress::Started`] carries the task id for a cancel through
+    /// [`schema::ExecutionCancelRequest`] on a client handle. Closing the
+    /// connection ends the task. Each output stream is read once.
+    pub fn execute(
+        &mut self,
+        reader: &mut (impl io::Read + io::Seek),
+        timing: impl Into<Timing>,
+        progress: impl FnMut(ExecutionProgress),
+    ) -> Result<ExecutionOutcome, Error> {
+        let timing = timing.into();
+        self.services.sync(&self.requester, timing)?;
+        execution::execute(&self.requester, &self.incoming, reader, timing, progress)
+    }
+
     /// Returns a handle for closing the session from another thread, including
     /// while its owner is blocked in [`Self::recv`].
     pub fn closer(&self) -> Closer {
@@ -447,38 +476,6 @@ impl Client {
         let timing = timing.into();
         self.services.sync(&self.requester, timing)?;
         dataset::upload(&self.requester, dataset, reader, timing, progress)
-    }
-
-    /// Uploads an app, obtains companion approval and reads its released result.
-    ///
-    /// The source must contain exactly `size` bytes. The Ark validates the app
-    /// and its dataset requirements. A released unsuccessful app still returns
-    /// its result; inspect its `success` flag. A withheld report returns a remote
-    /// error. Standard error is kept for develop builds.
-    ///
-    /// Setup, upload, approvals and execution share any absolute deadline. Reads
-    /// and progress callbacks run on this thread and must return promptly. The
-    /// deadline cannot interrupt a blocking reader. Failed operations attempt
-    /// cancellation within the remaining time, at most 1s, and are never
-    /// retried.
-    ///
-    /// [`ExecutionProgress::Started`] supplies the task ID for cancellation with
-    /// [`schema::ExecutionCancelRequest`] through another client clone. Closing
-    /// the connection ends the task. Each output stream is consumed once, so
-    /// only one caller should retrieve a task's output.
-    pub fn execute(
-        &self,
-        size: u64,
-        reader: &mut impl io::Read,
-        timing: impl Into<Timing>,
-        progress: impl FnMut(ExecutionProgress),
-    ) -> Result<ExecutionOutcome, Error> {
-        let timing = timing.into();
-        self.services.sync(&self.requester, timing)?;
-        execution::execute(&self.requester, size, reader, timing, progress, |taskid| {
-            self.call(schema::ExecutionScheduleRequest { taskid }, timing)
-                .map(drop)
-        })
     }
 }
 

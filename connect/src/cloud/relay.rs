@@ -1413,7 +1413,7 @@ mod tests {
             |client| {
                 client
                     .send(
-                        schema::ExecutionScheduleRequest::default(),
+                        schema::ExecutionStartRequest::default(),
                         Timing::inactivity(TIMEOUT),
                     )
                     .map(drop)

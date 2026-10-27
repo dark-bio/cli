@@ -299,18 +299,19 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         path: "run",
-        paragraph: "ark sends the app, and the Ark checks it before the owner approves the run, \
-            switching on optional grants and answering the app's questions. Once the app \
+        paragraph: "The Ark loads and checks the app before the owner approves the run. \
+            The owner chooses optional grants and answers the app's questions. Once the app \
             ends, the owner reviews its report. ark prints it if they release it, and \
             fails if they decline. When the app reports failure, ark still prints the \
-            released report, then fails with app-failed.",
+            released report, then fails with app-failed. Apps using other apps run from Ark \
+            Hub for now.",
         footer: Some(ContractFooter {
             requires: "a paired, unlocked Ark and the cloud (--unlock only if status reports \
                 locked)",
             approval: "on your phone twice, the run within 5 minutes and its report within 10 \
                 minutes",
-            time: "the two approvals, plus however long the app runs; --timeout bounds only \
-                machine replies",
+            time: "loading and running have no overall limit; \
+                --timeout bounds other machine replies, not loading or approvals",
             json: "task, app (name, version, \
                 develop), success, paths, media, stdout or stdout_base64, stderr or \
                 stderr_base64, duration_seconds",

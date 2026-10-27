@@ -13,7 +13,8 @@ run helps once the input is fixed or the confirmation given.
 - `file-not-found`, `file-unreadable` and `file-empty` mean the named file
   cannot be used. Check its path and permissions, and that it is not empty.
 - `file-rejected` means the Ark or ark refused the file's content, and the
-  message says why. Fix the file, or use another one.
+  message says why. Fix the file, or use another one. Apps using other apps
+  run from Ark Hub for now.
 - `invalid-slot` means the Ark identified another slot than --slot names, or
   has no such slot. `ark data list` shows the slots.
 - `invalid-key` means --pubkey is not a valid public key.

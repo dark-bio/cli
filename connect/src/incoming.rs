@@ -8,8 +8,9 @@
 //! application.
 
 use crate::cloud::Services;
-use darkbio_wire::protocol::{self, Responder, Session, schema};
+use darkbio_wire::protocol::{self, Message, Promise, Responder, Session, schema};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Bounded queue of the requests left for the application.
@@ -36,6 +37,49 @@ struct State {
 }
 
 impl Incoming {
+    /// Serves application requests until an outgoing request settles.
+    ///
+    /// Completion wakes the same condition as incoming requests, so the call
+    /// returns even when no request arrives before the response or the timeout.
+    /// The caller keeps other application receivers idle until it returns.
+    pub(crate) fn serve(
+        self: &Arc<Self>,
+        pending: &mut Promise<Message>,
+        mut handle: impl FnMut(schema::ark_to_host::Content, Responder) -> Result<(), crate::Error>,
+    ) -> Result<(), crate::Error> {
+        // Publish completion under the queue lock so the wake cannot be lost
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        let incoming = self.clone();
+        pending.notify(move || {
+            let _state = incoming
+                .state
+                .lock()
+                .expect("incoming requests not poisoned");
+            done.store(true, Ordering::Relaxed);
+            incoming.ready.notify_all();
+        });
+
+        // Handle each request outside the lock, leaving relay dispatch free
+        let mut state = self.state.lock().expect("incoming requests not poisoned");
+        loop {
+            if finished.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if let Some((request, responder)) = state.queue.pop_front() {
+                state.bytes -= request.encoded_len();
+                drop(state);
+                handle(request, responder)?;
+                state = self.state.lock().expect("incoming requests not poisoned");
+            } else {
+                state = self
+                    .ready
+                    .wait(state)
+                    .expect("incoming requests not poisoned");
+            }
+        }
+    }
+
     /// Takes the next queued request, blocking until one arrives or the
     /// session ends.
     ///
