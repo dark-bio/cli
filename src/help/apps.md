@@ -3,8 +3,8 @@
 An app is one WebAssembly module for WASI preview 1, and the Ark runs it
 twice. In the manifest pass it runs without arguments and prints its
 manifest, which names the app and lists what it reads and asks. In the
-report pass it gets the data directory as its first argument, reads its
-grants as files and prints a report. Apps run on an Ark, hardware or
+processing pass it gets the data directory as its first argument, reads
+its grants as files and prints a report. Apps run on an Ark, hardware or
 emulated, since ark has no app runtime of its own. Worked apps in Rust, Go,
 C and Python, with fixtures that run them on this computer, are at
 https://github.com/dark-bio/examples.
@@ -22,8 +22,8 @@ other apps run from Ark Hub for now.
    app's name and version, whether it is a develop build, and every grant of
    their data in the Ark's own words. They switch on the optional grants
    they choose and answer the app's questions.
-3. The report pass runs, with the granted data and the answers mounted
-   read-only. It has no time limit.
+3. The processing pass runs, with the granted data and the answers
+   mounted read-only. It has no time limit.
 4. The owner reviews the report on their phone within 10 minutes, then
    releases it to this command or declines, which drops it from the Ark.
 
@@ -91,8 +91,10 @@ key or a manifest number it does not know.
   Grants. An app that reads nothing leaves it out.
 - `[inputs.NAME]` asks the owner one question, as described under
   Questions.
-- `[output]` holds report, the report's media type. text/markdown is the
-  default and the only type the Ark accepts.
+- `[outputs]` declares the files the app writes for the apps that use it,
+  one empty table per name, such as `colors = {}`.
+- `[apps.NAME]` pins an app this app uses by its module's sha256, and binds
+  each of its inputs.
 - `[listing]` holds what Ark Hub shows for the app, and the Ark skips it.
 
 Display text, such as a name, a prompt or a choice, holds at least one
@@ -175,8 +177,8 @@ The map never carries a value from the owner's data.
 
 - The manifest pass gets 32 MiB of memory, 250ms and 64 KiB of output, and
   its stderr is discarded. It must exit 0.
-- The report pass gets 128 MiB of memory and 1 MiB per output stream, with
-  no time limit. A stream that passes 1 MiB is cut there, and the run fails.
+- The processing pass gets 128 MiB of memory and 1 MiB per output stream,
+  with no time limit. A stream past 1 MiB is cut there, and the run fails.
 - A report is UTF-8 text without control characters other than line feed
   and tab, line or paragraph separators, or text direction controls. A
   stream that breaks this rule is dropped, and the run fails. A develop
