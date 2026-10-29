@@ -77,6 +77,7 @@ impl From<ConnectError> for Error {
     fn from(error: ConnectError) -> Self {
         use ConnectError::*;
         match error {
+            ExecutionDependency => Self::new(1, "file-rejected", error.to_string()),
             Remote(remote) => {
                 // A large application code can share the low bits of a reserved
                 // code. Only a full-width match carries protocol-level meaning.

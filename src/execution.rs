@@ -11,38 +11,37 @@ use crate::{
     error::Error,
     interrupt::Target,
     output::Output,
-    progress::{Transfer, Update},
+    progress::Update,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
 use darkbio_connect::{ExecutionOutcome, ExecutionProgress};
 use serde_json::{Value, json};
 use std::path::Path;
 
-/// Uploads and runs the app at `path` after unlock.
+/// Loads and runs the app at `path` after unlock.
 ///
 /// The connection library owns protocol sequencing, and the CLI owns progress,
 /// partial results and byte-preserving report output. An app failure retains
 /// its returned result.
 pub(crate) fn run(context: &Context, path: &Path) -> Result<(), Error> {
     // Open the app before connecting, then require an unlocked Ark
-    let (mut file, size) = open_file(path)?;
+    let (mut file, _) = open_file(path)?;
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
-    let connection = context.connect(None)?;
+    let mut connection = context.connect(None)?;
     context.require_unlocked(&connection, false)?;
 
     // The result starts unknown and fills in as the task goes
     let mut value = partial();
-    let clock = connection.client.clock();
-    let mut narration = Narration::new(&context.output, &name, size, clock);
+    let mut narration = Narration::new(&context.output, &name);
 
-    // Upload and run the app, registering the task for interruption as soon as
+    // Load and run the app, registering the task for interruption as soon as
     // the Ark names it
     let result = connection
-        .client
-        .execute(size, &mut file, context.timing(), |stage| {
+        .ark
+        .execute(&mut file, context.timing(), |stage| {
             if let ExecutionProgress::Started { taskid } = stage {
                 value["task"] = json!(taskid.to_string());
                 context.interrupt.target(Target::Task(taskid));
@@ -68,35 +67,23 @@ pub(crate) fn run(context: &Context, path: &Path) -> Result<(), Error> {
     print(&context.output, value, result)
 }
 
-/// Narration of an app run, from sending the file to the owner's review.
+/// Narration of an app run, from loading the file to the owner's review.
 struct Narration<'a> {
     /// Output the narration goes to.
     output: &'a Output,
     /// File name of the app, as the instructions and outcomes name it.
     name: &'a str,
-    /// Rate and time left of sending the app.
-    transfer: Transfer,
     /// Whether the review began, which ended the running stage.
     reviewed: bool,
 }
 
 impl<'a> Narration<'a> {
-    /// Prepares to narrate sending `size` bytes, whose rate starts at the
-    /// first acknowledgment.
-    fn new(output: &'a Output, name: &'a str, size: u64, clock: darkbio_clock::Clock) -> Self {
+    /// Prepares to narrate loading and running the named app.
+    fn new(output: &'a Output, name: &'a str) -> Self {
         Self {
             output,
             name,
             reviewed: false,
-            transfer: Transfer::new(
-                output.terminal(),
-                clock,
-                Update {
-                    completed: Some(format!("Sent {name}")),
-                    completed_fact: Some(crate::style::bytes(size)),
-                    ..Update::new("sending", &format!("Sending {name}"))
-                },
-            ),
         }
     }
 
@@ -111,13 +98,12 @@ impl<'a> Narration<'a> {
             }
             ExecutionProgress::Started { taskid } => {
                 self.output.event("step", format!("task {taskid}"));
-                self.output.progress(self.transfer.initial());
             }
-            ExecutionProgress::Uploading { uploaded, total } => {
-                if let Some(line) = self.transfer.update(uploaded, total) {
-                    self.output.progress(&line);
-                }
-            }
+            ExecutionProgress::Loading => self.output.stage(
+                "loading",
+                &format!("Loading {name}"),
+                Some(&format!("Loaded {name}")),
+            ),
             ExecutionProgress::Authorizing => self.output.approve(
                 "run",
                 Some("phone"),
@@ -224,20 +210,12 @@ mod tests {
     fn test_app_narration() {
         for captured in
             crate::testing::narration("execution::tests::test_app_narration", |output, clock| {
-                let mut narration =
-                    Narration::new(&output, "cilantro.wasm", 1258291, clock.clock());
+                let mut narration = Narration::new(&output, "cilantro.wasm");
                 narration.update(ExecutionProgress::Preparing);
                 narration.update(ExecutionProgress::Started { taskid: 7 });
-                narration.update(ExecutionProgress::Uploading {
-                    uploaded: 0,
-                    total: 1258291,
-                });
+                narration.update(ExecutionProgress::Loading);
                 output.finish();
                 clock.advance(Duration::from_secs(2));
-                narration.update(ExecutionProgress::Uploading {
-                    uploaded: 1258291,
-                    total: 1258291,
-                });
                 narration.update(ExecutionProgress::Authorizing);
                 output.finish();
                 clock.advance(Duration::from_secs(46));
@@ -261,8 +239,8 @@ mod tests {
         {
             captured.contains(&[
                 "Preparing cilantro.wasm",
-                "Sending cilantro.wasm",
-                "Sent cilantro.wasm · 1.2 MiB",
+                "Loading cilantro.wasm",
+                "Loaded cilantro.wasm · 2s",
                 "Approve running cilantro.wasm on your phone, in Ark Companion",
                 "Approved on your phone · 41s",
                 "Running cilantro.wasm · 5s",
@@ -287,9 +265,9 @@ mod tests {
     fn test_fast_app_narration() {
         for captured in crate::testing::narration(
             "execution::tests::test_fast_app_narration",
-            |output, clock| {
+            |output, _clock| {
                 for review in [true, false] {
-                    let mut narration = Narration::new(&output, "fast.wasm", 1024, clock.clock());
+                    let mut narration = Narration::new(&output, "fast.wasm");
                     narration.update(ExecutionProgress::Authorizing);
                     if review {
                         narration.update(ExecutionProgress::Reviewing {
